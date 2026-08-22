@@ -1,0 +1,61 @@
+{
+  "entities": {
+    "valutazione": {
+      "title": "Valutazione",
+      "description": "I risultati delle valutazioni degli studenti.",
+      "type": "object",
+      "properties": {
+        "Timestamp": { "type": "string" },
+        "Docente_Email": { "type": "string" },
+        "Tipo": { "type": "string" },
+        "Nome": { "type": "string" },
+        "Email": { "type": "string" },
+        "Voto_Suggerito": { "type": "string" },
+        "Autovalutazione": { "type": "string" },
+        "AntiCopia_TabSwitch": { "type": "integer" },
+        "AntiCopia_IncollaBloccato": { "type": "integer" },
+        "AntiCopia_InfractionsLog": { "type": "string" },
+        "Full_Evaluation": { "type": "string" },
+        "Risposte_Studente": { "type": "string" }
+      },
+      "required": ["Timestamp", "Tipo", "Email"]
+    },
+    "docente": {
+      "title": "Docente",
+      "description": "Le configurazioni dei docenti autorizzati.",
+      "type": "object",
+      "properties": {
+        "email": { "type": "string" },
+        "gasUrl": { "type": "string" },
+        "role": { "type": "string" }
+      },
+      "required": ["email", "role"]
+    },
+    "active_session": {
+      "title": "Sessione Attiva",
+      "description": "Le sessioni d'esame attivate dai docenti.",
+      "type": "object",
+      "properties": {
+        "pin": { "type": "string" },
+        "title": { "type": "string" },
+        "expiry": { "type": "string" },
+        "teacherEmail": { "type": "string" }
+      },
+      "required": ["pin", "expiry"]
+    }
+  },
+  "firestore": {
+    "valutazioni/{valId}": {
+      "schema": "valutazione",
+      "description": "Collezione dei risultati dei test degli studenti."
+    },
+    "docenti/{docId}": {
+      "schema": "docente",
+      "description": "Collezione delle configurazioni dei docenti."
+    },
+    "active_sessions/{sessionId}": {
+      "schema": "active_session",
+      "description": "Collezione delle sessioni attive d'esame."
+    }
+  }
+}

@@ -1,0 +1,6 @@
+{
+  "name": "Educational Architect",
+  "description": "Interactive AI-powered review platform for quizzes and workbooks, with student copy-protection and metacognitive self-evaluations.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

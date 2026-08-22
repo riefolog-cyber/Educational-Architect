@@ -1,0 +1,61 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=Space+Grotesk:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-display: "Space Grotesk", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
+}
+
+body {
+  font-family: var(--font-sans);
+  background-color: #0b0f19;
+  background-image: 
+    radial-gradient(at 0% 0%, rgba(67, 56, 202, 0.4) 0px, transparent 50%), 
+    radial-gradient(at 50% 0%, rgba(30, 27, 75, 0.5) 0px, transparent 50%), 
+    radial-gradient(at 100% 0%, rgba(14, 165, 233, 0.45) 0px, transparent 50%), 
+    radial-gradient(at 50% 100%, rgba(112, 26, 117, 0.4) 0px, transparent 50%);
+  background-attachment: fixed;
+  color: #f8fafc;
+  min-height: 100vh;
+}
+
+/* Custom subtle animation overlays */
+@keyframes pulseGlow {
+  0%, 100% { opacity: 0.2; }
+  50% { opacity: 0.4; }
+}
+
+.glowing-mesh {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: radial-gradient(circle at 50% 30%, rgba(99, 102, 241, 0.05) 0%, transparent 70%);
+  animation: pulseGlow 10s ease-in-out infinite;
+}
+
+/* Safe selections for dark inputs */
+select option {
+  background-color: #0f172a !important;
+  color: #f8fafc !important;
+}
+
+/* Custom scrollbars */
+::-webkit-scrollbar {
+  width: 6px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.15);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.3);
+}
+

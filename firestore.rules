@@ -1,0 +1,25 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Collection for authorized teachers
+    match /docenti/{docId} {
+      allow read, write: if request.auth != null;
+    }
+
+    // Collection for exam submissions and evaluations
+    match /valutazioni/{valId} {
+      allow read, create, update: if true;
+      allow delete: if request.auth != null;
+    }
+
+    // Collection for keeping track of active exam sessions
+    match /active_sessions/{sessionId} {
+      allow read, write: if true;
+    }
+  }
+}
