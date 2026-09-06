@@ -38,12 +38,19 @@ import {
   Settings,
   Eye,
   EyeOff,
-  Shield
+  Shield,
+  Wand2
 } from "lucide-react";
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
 import { formatMarkdown } from "../utils";
+import { 
+  autoCorrectExamJSON, 
+  canAutoCorrectStructure, 
+  tolerantJsonParse, 
+  ExamCorrectionResult 
+} from "../utils/examStructureRepair";
 
 interface TeacherDashboardProps {
   user: any;
@@ -65,6 +72,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [validationError, setValidationError] = useState<string | null>(null);
   const [validationOk, setValidationOk] = useState(false);
   const [pinStatus, setPinStatus] = useState("");
+  const [autoCorrectionNotice, setAutoCorrectionNotice] = useState<ExamCorrectionResult | null>(null);
+  const [canAutoRepair, setCanAutoRepair] = useState<boolean>(false);
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -131,13 +140,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const validateExamJSON = (text: string): any => {
     setValidationError(null);
     setValidationOk(false);
+    setCanAutoRepair(false);
     
     if (!text.trim()) return null;
 
     try {
-      const data = JSON.parse(text);
+      const data = tolerantJsonParse(text);
       if (!data || typeof data !== "object") {
         setValidationError("Il file inserito non costituisce un oggetto JSON valido.");
+        setCanAutoRepair(canAutoCorrectStructure(text));
         return null;
       }
 
@@ -146,17 +157,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
       if (!isWorkbook && !isQuiz) {
         setValidationError("Struttura non riconosciuta. Mancano 'sections' (Workbook) o liste di domande 'multipleChoice'/'openEnded' (Quiz).");
+        setCanAutoRepair(canAutoCorrectStructure(text));
         return null;
       }
 
       if (isWorkbook) {
         if (!data.title) {
           setValidationError("Errore Workbook: Manca il campo stringa 'title'.");
+          setCanAutoRepair(true);
           return null;
         }
         for (let i = 0; i < data.sections.length; i++) {
           if (!data.sections[i].title) {
             setValidationError(`Errore Sezione ${i + 1}: Manca la proprietà 'title'.`);
+            setCanAutoRepair(true);
             return null;
           }
         }
@@ -168,6 +182,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             const q = data.multipleChoice[i];
             if (!q.question || !q.options || !Array.isArray(q.options) || q.correctIndex === undefined) {
               setValidationError(`Errore Crocetta ${i + 1}: Domanda a scelta multipla incompleta (manca testo, opzioni, o indice corretta).`);
+              setCanAutoRepair(true);
               return null;
             }
           }
@@ -176,6 +191,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           for (let i = 0; i < data.openEnded.length; i++) {
             if (!data.openEnded[i].question) {
               setValidationError(`Errore Domanda Aperta ${i + 1}: Manca il testo quesito.`);
+              setCanAutoRepair(true);
               return null;
             }
           }
@@ -186,7 +202,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       return data;
     } catch (e: any) {
       setValidationError(`Sintassi JSON non valida: ${e.message}`);
+      setCanAutoRepair(canAutoCorrectStructure(text));
       return null;
+    }
+  };
+
+  // Automatic repair handler with comprehensive informative notice
+  const handleAutoCorrect = (interactive = true): boolean => {
+    if (!jsonText.trim()) return false;
+    const result = autoCorrectExamJSON(jsonText, materia.trim());
+    if (result.success) {
+      setJsonText(result.correctedJson);
+      setAutoCorrectionNotice(result);
+      validateExamJSON(result.correctedJson);
+      if (result.title && !materia.trim()) {
+        setMateria(result.title);
+      }
+      return true;
+    } else {
+      if (interactive) {
+        alert(`⚠️ Correzione automatica non riuscita: ${result.summaryNotice}`);
+      }
+      return false;
     }
   };
 
@@ -199,7 +236,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     reader.onload = (event) => {
       const text = event.target?.result as string;
       setJsonText(text);
-      validateExamJSON(text);
+      const valid = validateExamJSON(text);
+      if (!valid && canAutoCorrectStructure(text)) {
+        // Automatically attempt repair on upload with clear notice!
+        const repairResult = autoCorrectExamJSON(text, materia.trim());
+        if (repairResult.success) {
+          setJsonText(repairResult.correctedJson);
+          setAutoCorrectionNotice(repairResult);
+          validateExamJSON(repairResult.correctedJson);
+          if (repairResult.title && !materia.trim()) {
+            setMateria(repairResult.title);
+          }
+        }
+      }
     };
     reader.readAsText(file);
   };
@@ -218,9 +267,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       return;
     }
 
-    const examObj = validateExamJSON(jsonText);
+    let examObj = validateExamJSON(jsonText);
+    if (!examObj && canAutoCorrectStructure(jsonText)) {
+      const repairResult = autoCorrectExamJSON(jsonText, materia.trim());
+      if (repairResult.success) {
+        setJsonText(repairResult.correctedJson);
+        setAutoCorrectionNotice(repairResult);
+        examObj = validateExamJSON(repairResult.correctedJson);
+      }
+    }
+
     if (!examObj) {
-      alert("⚠️ Correggi la sintassi JSON prima dell'attivazione.");
+      alert("⚠️ Correggi la sintassi JSON o applica la correzione automatica della struttura prima dell'attivazione.");
       return;
     }
     
@@ -1062,15 +1120,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <label className="uppercase font-bold text-slate-500 text-[10px]">Carica File JSON Esame</label>
-                  <label className="cursor-pointer text-[10px] text-teal-400 hover:underline">
-                    Sfoglia...
-                    <input
-                      type="file"
-                      accept=".json"
-                      onChange={handleFileUpload}
-                      className="hidden"
-                    />
-                  </label>
+                  <div className="flex items-center gap-3">
+                    {jsonText.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => handleAutoCorrect(true)}
+                        title="Verifica e correggi automaticamente la struttura del file JSON"
+                        className="text-[10px] text-amber-400 hover:text-amber-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                      >
+                        <Wand2 className="w-3 h-3" />
+                        <span>Correggi Struttura</span>
+                      </button>
+                    )}
+                    <label className="cursor-pointer text-[10px] text-teal-400 hover:underline">
+                      Sfoglia...
+                      <input
+                        type="file"
+                        accept=".json"
+                        onChange={handleFileUpload}
+                        className="hidden"
+                      />
+                    </label>
+                  </div>
                 </div>
                 <textarea
                   placeholder='Incolla qui la struttura JSON dell&#39;esame o sfoglia il file...'
@@ -1079,11 +1150,98 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   className="w-full min-h-[140px] p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-slate-200 text-[11px] font-mono outline-none focus:border-indigo-500"
                 />
 
+                {/* Validation Error Message */}
                 {validationError && (
-                  <p className="p-2.5 rounded-lg bg-red-500/5 text-red-400 border border-red-500/10 text-[11px] flex items-start gap-1.5">
-                    <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
-                    <span>{validationError}</span>
-                  </p>
+                  <div className="space-y-2">
+                    <p className="p-2.5 rounded-lg bg-red-500/5 text-red-400 border border-red-500/10 text-[11px] flex items-start gap-1.5">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0 mt-0.5" />
+                      <span>{validationError}</span>
+                    </p>
+
+                    {/* Automatic correction card when unrecognized structure or repairable syntax detected */}
+                    {(canAutoRepair || validationError.includes("Struttura non riconosciuta") || validationError.includes("Mancano 'sections'")) && (
+                      <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-left space-y-2.5 shadow-sm">
+                        <div className="flex items-start gap-2">
+                          <Wand2 className="w-4 h-4 text-amber-400 shrink-0 mt-0.5" />
+                          <div>
+                            <p className="text-xs font-bold text-amber-300">
+                              Correzione Automatica Struttura Disponibile (con Avviso)
+                            </p>
+                            <p className="text-[11px] text-slate-300 mt-0.5 leading-relaxed">
+                              Rilevata struttura non standard (ad es. lista di domande senza 'sections' o 'multipleChoice', chiavi in italiano o campi da normalizzare). Clicca in basso per adattare e correggere istantaneamente l'esame nel formato ufficiale.
+                            </p>
+                          </div>
+                        </div>
+                        <button
+                          type="button"
+                          onClick={() => handleAutoCorrect(true)}
+                          className="w-full py-2 px-3 bg-amber-500 hover:bg-amber-400 active:scale-[0.99] text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer"
+                        >
+                          <Wand2 className="w-3.5 h-3.5" />
+                          ✨ Correggi ed Adatta Automaticamente la Struttura (con Avviso)
+                        </button>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* Auto-Correction Applied Notice Banner */}
+                {autoCorrectionNotice && (
+                  <div className="p-3.5 bg-teal-950/40 border border-teal-500/30 rounded-xl text-left space-y-2.5 shadow-md">
+                    <div className="flex items-start justify-between gap-2 border-b border-teal-500/15 pb-2">
+                      <div className="flex items-center gap-2">
+                        <div className="p-1 bg-teal-500/20 rounded-md text-teal-400">
+                          <CheckCircle className="w-4 h-4" />
+                        </div>
+                        <div>
+                          <div className="flex items-center gap-2 flex-wrap">
+                            <span className="text-xs font-bold text-teal-300">
+                              Avviso: Correzione Automatica Effettuata con Successo
+                            </span>
+                            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-teal-500/20 text-teal-200 border border-teal-500/30 font-bold">
+                              Formato {autoCorrectionNotice.detectedType}
+                            </span>
+                          </div>
+                          <p className="text-[11px] text-slate-300 mt-0.5">
+                            {autoCorrectionNotice.summaryNotice}
+                          </p>
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setAutoCorrectionNotice(null)}
+                        className="text-slate-400 hover:text-white text-xs p-1"
+                        title="Chiudi avviso"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+
+                    {autoCorrectionNotice.changes && autoCorrectionNotice.changes.length > 0 && (
+                      <div className="space-y-1">
+                        <p className="text-[10px] uppercase font-bold text-teal-400/80">Modifiche di Adattamento Applicate:</p>
+                        <ul className="space-y-1 text-[11px] text-slate-300 pl-1">
+                          {autoCorrectionNotice.changes.map((change, cIdx) => (
+                            <li key={cIdx} className="flex items-start gap-1.5">
+                              <span className="text-teal-400 font-bold">✓</span>
+                              <span>{change}</span>
+                            </li>
+                          ))}
+                        </ul>
+                      </div>
+                    )}
+
+                    <div className="pt-1.5 border-t border-teal-500/10 flex items-center justify-between text-[10px] text-slate-400">
+                      <span>Struttura esame convalidata e pronta per l'attivazione.</span>
+                      <button
+                        type="button"
+                        onClick={() => setAutoCorrectionNotice(null)}
+                        className="text-teal-400 hover:underline font-semibold"
+                      >
+                        Nascondi avviso
+                      </button>
+                    </div>
+                  </div>
                 )}
 
                 {validationOk && (
