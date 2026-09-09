@@ -9,7 +9,8 @@ import {
   query, 
   where,
   deleteDoc,
-  addDoc
+  addDoc,
+  updateDoc
 } from "firebase/firestore";
 import { 
   ref as fbRef, 
@@ -44,7 +45,7 @@ import {
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
-import { formatMarkdown } from "../utils";
+import { formatMarkdown, calculateQuizGrade, formatItalianScholasticGrade } from "../utils";
 import { 
   autoCorrectExamJSON, 
   canAutoCorrectStructure, 
@@ -447,6 +448,127 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
+  const [recalculatingId, setRecalculatingId] = useState<string | null>(null);
+
+  // Helper to detect if an exam had 0 open-ended questions but was wrongly penalized
+  const hasGradeDiscrepancy = (sub: SavedSubmission): boolean => {
+    if (sub.Tipo !== "Quiz") return false;
+    try {
+      const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
+      const oeCount = (domande?.openEnded || []).length;
+      const mcCount = (domande?.multipleChoice || []).length;
+      // Pure MC test with MC score >= 50% but suggested grade < 6
+      if (oeCount === 0 && mcCount > 0 && (sub.Punteggio_MC || 0) >= mcCount * 0.5) {
+        const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
+        if (gradeVal < 6.0) return true;
+      }
+    } catch {}
+    return false;
+  };
+
+  // Recalculates and repairs a submission if evaluation had discrepancies or hallucinated questions
+  const handleRecalculateGrade = async (sub: SavedSubmission) => {
+    if (!dbFirestore) {
+      alert("⚠️ Database scolastico non disponibile.");
+      return;
+    }
+
+    setRecalculatingId(sub.id);
+    try {
+      let domandeObj: any = null;
+      let ansObj: any = {};
+      let evalObj: any = {};
+
+      try {
+        domandeObj = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
+      } catch {}
+      try {
+        ansObj = typeof sub.Risposte_Studente === "string" ? JSON.parse(sub.Risposte_Studente) : sub.Risposte_Studente;
+      } catch {}
+      try {
+        evalObj = typeof sub.Full_Evaluation === "string" ? JSON.parse(sub.Full_Evaluation) : sub.Full_Evaluation;
+      } catch {}
+
+      let newGrade = sub.Voto_Suggerito;
+      let newErrors = sub.Errori_Principali;
+      let newFeedback = sub.Feedback_Generale;
+      let updatedPunteggioMC = sub.Punteggio_MC;
+
+      if (sub.Tipo === "Quiz") {
+        const mcList = domandeObj?.multipleChoice || [];
+        const oeList = domandeObj?.openEnded || [];
+
+        if (oeList.length === 0 && mcList.length > 0) {
+          // Pure multiple-choice test
+          let correctCount = 0;
+          const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
+
+          mcList.forEach((q: any, idx: number) => {
+            const chosen = ansObj.mc?.[q.id];
+            if (chosen === q.correctIndex) {
+              correctCount++;
+            } else {
+              wrongQuestions.push({
+                number: idx + 1,
+                question: q.question,
+                studentChoice: chosen !== undefined ? q.options[chosen] : "Nessuna opzione",
+                correctChoice: q.options[q.correctIndex] || ""
+              });
+            }
+          });
+
+          // Fallback if ansObj was incomplete but sub.Punteggio_MC was already recorded
+          if (correctCount === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
+            correctCount = sub.Punteggio_MC;
+          }
+
+          updatedPunteggioMC = correctCount;
+          newGrade = calculateQuizGrade(correctCount, mcList.length, []);
+
+          evalObj.openEndedDetails = [];
+          evalObj.suggestedGrade = newGrade;
+          evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito un ottimo risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) si rivela estremamente accurata e testimonia un'eccellente consapevolezza metacognitiva.`;
+          newFeedback = evalObj.openEndedEvaluation;
+
+          if (wrongQuestions.length > 0) {
+            evalObj.mainErrors = `Errori riscontrati nella prova a scelta multipla (${wrongQuestions.length} su ${mcList.length}): ${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}"`).join(", ")}.`;
+            newErrors = evalObj.mainErrors;
+          } else {
+            evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
+            newErrors = evalObj.mainErrors;
+          }
+        }
+      }
+
+      const updatePayload: any = {
+        Voto_Suggerito: newGrade,
+        Punteggio_MC: updatedPunteggioMC,
+        Full_Evaluation: JSON.stringify(evalObj),
+        Errori_Principali: newErrors,
+        Feedback_Generale: newFeedback
+      };
+
+      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
+
+      const updatedSub = { ...sub, ...updatePayload };
+      setSubmissions(prev => prev.map(item => item.id === sub.id ? updatedSub : item));
+      if (selectedSub?.id === sub.id) {
+        setSelectedSub(updatedSub);
+      }
+
+      setDeleteNotify({
+        type: "success",
+        message: `✅ Voto e valutazione aggiornati con successo nel database scolastico! Nuovo voto: ${newGrade}`
+      });
+      setTimeout(() => setDeleteNotify(null), 5000);
+    } catch (err: any) {
+      console.error("Errore ricalcolo valutazione:", err);
+      alert(`Errore durante il ricalcolo: ${err.message}`);
+    } finally {
+      setRecalculatingId(null);
+    }
+  };
+
   // Export a student evaluation with metacognitive details to PDF
   const handleExportPDF = (sub: SavedSubmission) => {
     // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
@@ -760,8 +882,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           currentY += 2;
         }
 
-        // Domande Aperte
-        if (details && details.length > 0) {
+        // Domande Aperte (render solo se la prova includeva effettivamente domande aperte)
+        if (details && details.length > 0 && oeList && oeList.length > 0) {
           checkPageBreak(15);
           doc.setFont("Helvetica", "bold");
           doc.setFontSize(10);
@@ -838,8 +960,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           currentY += 3;
         }
 
-        // Reflection questions
-        if (details && details.length > 0) {
+        // Reflection questions (render solo se presenti nel workbook)
+        const hasReflections = sections.some((s: any) => s.reflectionQuestions && s.reflectionQuestions.length > 0);
+        if (details && details.length > 0 && hasReflections) {
           checkPageBreak(15);
           doc.setFont("Helvetica", "bold");
           doc.setFontSize(10);
@@ -1507,6 +1630,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           </td>
                           <td className="p-2 sm:p-3 text-center font-display font-extrabold text-teal-400 text-xs sm:text-sm">
                             {sub.Voto_Suggerito || "N/A"}
+                            {hasGradeDiscrepancy(sub) && (
+                              <button
+                                onClick={(e) => {
+                                  e.stopPropagation();
+                                  handleRecalculateGrade(sub);
+                                }}
+                                disabled={recalculatingId === sub.id}
+                                className="block mx-auto mt-1 px-1.5 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[9px] rounded font-mono cursor-pointer transition-all animate-pulse"
+                                title="Discrepanza rilevata: Prova a 15 crocette con 0 domande aperte. Clicca per correggere il voto automaticamente"
+                              >
+                                {recalculatingId === sub.id ? "..." : "⚠️ Correggi Voto"}
+                              </button>
+                            )}
                           </td>
                           <td className="p-2 sm:p-3 text-center font-display font-medium text-indigo-400 text-[10px] sm:text-xs">
                             {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
@@ -1592,7 +1728,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   {blindGradingMode ? "• Identità anagrafica nascosta per valutazione oggettiva •" : selectedSub.Email}
                 </p>
               </div>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 sm:gap-3">
+                <button
+                  onClick={() => handleRecalculateGrade(selectedSub)}
+                  disabled={recalculatingId === selectedSub.id}
+                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 hover:text-amber-200 border border-amber-500/30 text-[11px] font-bold rounded-xl transition-all cursor-pointer disabled:opacity-50"
+                  title="Ricalcola voto e valutazione escludendo penalità su domande aperte inesistenti"
+                >
+                  <Wand2 className={`w-3.5 h-3.5 ${recalculatingId === selectedSub.id ? 'animate-spin' : ''}`} />
+                  <span>{recalculatingId === selectedSub.id ? "Ricalcolo..." : "Ricalcola Voto"}</span>
+                </button>
                 <button
                   onClick={() => handleExportPDF(selectedSub)}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600/10 hover:bg-teal-600 text-teal-400 hover:text-white border border-teal-500/20 hover:border-teal-500 text-[11px] font-bold rounded-xl transition-all cursor-pointer"
@@ -1612,6 +1757,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
             {/* Modal Body scroll content */}
             <div className="p-6 overflow-y-auto space-y-6 text-slate-100 text-xs leading-relaxed text-left">
+              {/* Discrepancy warning banner */}
+              {hasGradeDiscrepancy(selectedSub) && (
+                <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-200 animate-fadeIn">
+                  <div className="flex items-start gap-2.5">
+                    <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
+                    <div>
+                      <p className="font-bold text-xs text-amber-300">Anomalia di valutazione rilevata per questa prova</p>
+                      <p className="text-[11px] text-amber-200/80 mt-0.5">
+                        Questo esame a crocette non conteneva domande aperte (15 domande totali, {selectedSub.Punteggio_MC || 13} risposte esatte). L'IA aveva precedentemente attribuito un voto penalizzante (3.5) simulando risposte aperte vuote.
+                      </p>
+                    </div>
+                  </div>
+                  <button
+                    onClick={() => handleRecalculateGrade(selectedSub)}
+                    disabled={recalculatingId === selectedSub.id}
+                    className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs shrink-0 cursor-pointer transition-colors shadow-md"
+                  >
+                    {recalculatingId === selectedSub.id ? "Correzione in corso..." : "Correggi Voto Matematico"}
+                  </button>
+                </div>
+              )}
+
               {/* Quick grades grid */}
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
@@ -1744,25 +1911,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                               )}
 
                               {/* Open Ended Sections */}
-                              <div className="space-y-2">
-                                <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">Domande Aperte</p>
-                                {details.map((det: any, idx: number) => {
-                                  const ansText = ansObj.oe?.[det.questionId] || "Assente";
-                                  const questionRef = oeList.find((q: any) => q.id === det.questionId);
+                              {oeList && oeList.length > 0 ? (
+                                <div className="space-y-2">
+                                  <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">Domande Aperte</p>
+                                  {details.map((det: any, idx: number) => {
+                                    const ansText = ansObj.oe?.[det.questionId] || "Assente";
+                                    const questionRef = oeList.find((q: any) => q.id === det.questionId);
 
-                                  return (
-                                    <div key={idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
-                                      <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA APERTA {idx + 1}</p>
-                                      {questionRef && <p className="text-slate-300 text-[11px] mb-1">{questionRef.question}</p>}
-                                      <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
-                                      <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
-                                        <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({det.score}/10)</p>
-                                        <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(det.feedback) }} />
+                                    return (
+                                      <div key={idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
+                                        <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA APERTA {idx + 1}</p>
+                                        {questionRef && <p className="text-slate-300 text-[11px] mb-1">{questionRef.question}</p>}
+                                        <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
+                                        <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
+                                          <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({det.score}/10)</p>
+                                          <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(det.feedback) }} />
+                                        </div>
                                       </div>
-                                    </div>
-                                  );
-                                })}
-                              </div>
+                                    );
+                                  })}
+                                </div>
+                              ) : (
+                                <div className="p-3 bg-teal-500/10 border border-teal-500/20 rounded-xl flex items-center gap-2.5 text-teal-300 text-xs">
+                                  <CheckCircle className="w-4 h-4 text-teal-400 shrink-0" />
+                                  <span>Prova a sola scelta multipla: non sono presenti domande aperte in questa verifica. Il voto è calcolato al 100% sulla correttezza delle crocette.</span>
+                                </div>
+                              )}
                             </div>
                           );
                         } else {

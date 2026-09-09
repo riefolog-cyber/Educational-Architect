@@ -228,8 +228,78 @@ async function runEvaluationCore(reqBody: any) {
 
   if (tipo === "Quiz") {
     const mcScore = report.punteggioMC || 0;
-    const mcCount = (report.domande?.multipleChoice || []).length;
-    
+    const mcList = report.domande?.multipleChoice || [];
+    const mcCount = mcList.length;
+    const oeList = report.domande?.openEnded || [];
+    const oeCount = oeList.length;
+
+    // CASE 1: QUIZ WITH ONLY MULTIPLE CHOICE QUESTIONS (No open-ended questions in exam)
+    if (oeCount === 0) {
+      const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
+      mcList.forEach((q: any, idx: number) => {
+        const userIdx = report.risposte?.mc?.[q.id];
+        if (userIdx !== q.correctIndex) {
+          wrongQuestions.push({
+            number: idx + 1,
+            question: q.question,
+            studentChoice: (userIdx !== undefined && q.options?.[userIdx]) ? q.options[userIdx] : "Nessuna risposta selezionata",
+            correctChoice: q.options?.[q.correctIndex] || "Opzione corretta"
+          });
+        }
+      });
+
+      const mathGrade = calculateQuizGrade(mcScore, mcCount, []);
+
+      const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
+Questa prova è un Quiz composto ESCLUSIVAMENTE da domande a scelta multipla (crocette). In questo esame NON sono presenti domande aperte.
+Lo studente ha ottenuto un punteggio di ${mcScore} risposte esatte su ${mcCount} domande (punteggio matematico: ${((mcScore / (mcCount || 1)) * 10).toFixed(1)}/10), con voto scolastico: ${mathGrade}.
+Numero di errori commessi: ${wrongQuestions.length}.
+Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10.
+
+[DIRETTIVE DI VALUTAZIONE E DOCIMOLOGIA]
+1. Sintesi errori concettuali ("mainErrors"):
+   ${wrongQuestions.length > 0 
+     ? `Spiega in modo pedagogico, chiaro e costruttivo i concetti delle domande in cui l'alunno ha sbagliato (${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}" [Scelta studente: "${w.studentChoice}" vs Corretta: "${w.correctChoice}"]`).join("; ")}). Chiarisci perché l'opzione corretta è quella valida, senza toni punitivi.`
+     : `L'alunno ha risposto correttamente a tutte le domande del quiz (punteggio pieno ${mcScore}/${mcCount}). Esprimi compiacimento per l'impeccabile preparazione.`}
+2. Giudizio complessivo ("openEndedEvaluation"):
+   Fornisci un giudizio didattico complessivo equilibrato, positivo e motivante sull'andamento della prova a scelta multipla (${mcScore}/${mcCount}, voto ${mathGrade}).
+   Dedica l'ultimo paragrafo all'analisi metacognitiva: confronta il voto matematico (${mathGrade}) con l'autovalutazione dell'alunno (${report.autovalutazione}/10).
+   - Se l'autovalutazione è vicina o coerente con il punteggio (es. 8/10 a fronte di un voto reale di 8.7), loda esplicitamente l'eccellente lucidità e maturità metacognitiva dello studente.
+   - Se è stata troppo severa o troppo ottimistica, commentalo con tatto e costruttività.
+3. DIVIETO CRITICO ASSOLUTO: NON menzionare domande aperte, NON accusare lo studente di aver lasciato fogli o domande in bianco, e NON inventare quesiti aperti fittizi. Questa prova conteneva solo domande a scelta multipla.`;
+
+      const response = await generateWithRetry({
+        model: "gemini-3.5-flash",
+        contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
+        config: {
+          systemInstruction,
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+          thinkingConfig: {
+            thinkingLevel: "LOW"
+          },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              mainErrors: { type: Type.STRING, description: "Sintesi pedagogica degli errori a scelta multipla e nozioni da consolidare." },
+              openEndedEvaluation: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
+            },
+            required: ["mainErrors", "openEndedEvaluation"]
+          }
+        }
+      });
+
+      const responseText = extractResponseText(response);
+      if (!responseText) throw new Error("Risposta vuota dall'IA.");
+
+      const evaluation = parseJsonResponse(responseText);
+      evaluation.suggestedGrade = mathGrade;
+      evaluation.openEndedDetails = [];
+      return evaluation;
+    }
+
+    // CASE 2: QUIZ WITH OPEN ENDED QUESTIONS (Mixed or pure open-ended)
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana (scuola superiore). Valuta le risposte aperte dello studente in base alle domande del test e ai criteri impostati dal docente. Il tuo stile valutativo deve riflettere la docimologia scolastica italiana moderna.
 
 [REGOLE DI VALUTAZIONE E DOCIMOLOGIA]
@@ -259,7 +329,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
 
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
-      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
       config: {
         systemInstruction,
         temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
@@ -300,9 +370,55 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     return evaluation;
 
   } else if (tipo === "Workbook") {
+    const sections = report.domande?.sections || [];
+    const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+    const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
     const fibScore = report.punteggioFIB || 0;
-    const fibCount = report.totaleFIB || 0;
+    const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
+    const rqCount = rqList.length;
 
+    // CASE 1: WORKBOOK WITH ONLY FILL-IN-THE-BLANK (No reflection questions)
+    if (rqCount === 0) {
+      const mathGrade = formatItalianScholasticGrade(fibCount > 0 ? (fibScore / fibCount) * 10 : 0);
+      const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
+Questa prova di Workbook è composta ESCLUSIVAMENTE da completamenti terminologici (Fill-in-the-blank / frasi da completare). NON sono presenti domande di riflessione aperta.
+L'alunno ha completato correttamente ${fibScore} frasi su ${fibCount} (voto matematico: ${mathGrade}).
+Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10.
+
+Fornisci un giudizio complessivo equilibrato e motivante.
+Dedica l'ultimo paragrafo all'analisi metacognitiva confrontando il voto ottenuto (${mathGrade}) con l'autovalutazione (${report.autovalutazione}/10).
+NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
+
+      const response = await generateWithRetry({
+        model: "gemini-3.5-flash",
+        contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
+        config: {
+          systemInstruction,
+          temperature: 0.1,
+          maxOutputTokens: 2048,
+          thinkingConfig: { thinkingLevel: "LOW" },
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              overallFeedback: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
+            },
+            required: ["overallFeedback"]
+          }
+        }
+      });
+
+      const responseText = extractResponseText(response);
+      if (!responseText) throw new Error("Risposta vuota dall'IA.");
+
+      const evaluation = parseJsonResponse(responseText);
+      evaluation.suggestedGrade = mathGrade;
+      evaluation.fibScore = fibScore;
+      evaluation.reflectionDetails = [];
+      return evaluation;
+    }
+
+    // CASE 2: WORKBOOK WITH REFLECTION QUESTIONS
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana. Valuta le riflessioni critiche e personali contenute nel Workbook/Quaderno dello studente sottoforma di risposte aperte.
 
 [REGOLE DI VALUTAZIONE E DOCIMOLOGIA DEL WORKBOOK]

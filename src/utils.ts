@@ -80,3 +80,50 @@ export async function fetchWithRetry(url: string, options: RequestInit = {}, ret
   }
   throw lastError || new Error("Richiesta fallita dopo diversi tentativi.");
 }
+
+// Helper to format grades in traditional Italian scholastic notations (e.g. 6-, 6½, 7+, 10 (Eccellente))
+export function formatItalianScholasticGrade(gradeNum: number): string {
+  if (isNaN(gradeNum)) return "—";
+  if (gradeNum >= 10) return "10 (Eccellente)";
+  if (gradeNum < 2) return gradeNum.toFixed(1);
+
+  const rounded = Math.round(gradeNum * 10) / 10; // e.g. 5.8
+  const frac = gradeNum - Math.floor(gradeNum);
+  const base = Math.floor(gradeNum);
+
+  let notation = "";
+  if (frac < 0.15) {
+    notation = `${base}`;
+  } else if (frac >= 0.15 && frac < 0.35) {
+    notation = `${base}+`;
+  } else if (frac >= 0.35 && frac < 0.65) {
+    notation = `${base}½`;
+  } else if (frac >= 0.65 && frac < 0.85) {
+    notation = `${base + 1}-`;
+  } else {
+    notation = `${base + 1}`;
+  }
+
+  return `${rounded.toFixed(1)} (${notation})`;
+}
+
+// Helper to calculate mathematical grades for Quiz
+export function calculateQuizGrade(mcScore: number, mcCount: number, oeScores: number[]): string {
+  let finalGrade = 0;
+  
+  if (mcCount > 0 && oeScores.length > 0) {
+    const mcFraction = mcScore / mcCount; // 0 to 1
+    const oeFraction = oeScores.reduce((a, b) => a + b, 0) / (oeScores.length * 10); // 0 to 1
+    
+    // Balanced weight: 40% Multiple Choice, 60% Open Ended
+    finalGrade = (mcFraction * 4.0) + (oeFraction * 6.0);
+  } else if (mcCount > 0) {
+    // Pure multiple-choice test: 100% based on multiple choice questions
+    finalGrade = (mcScore / mcCount) * 10;
+  } else if (oeScores.length > 0) {
+    // Pure open-ended test: 100% based on open-ended questions
+    finalGrade = oeScores.reduce((a, b) => a + b, 0) / oeScores.length;
+  }
+  
+  return formatItalianScholasticGrade(finalGrade);
+}
