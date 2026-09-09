@@ -127,3 +127,24 @@ export function calculateQuizGrade(mcScore: number, mcCount: number, oeScores: n
   
   return formatItalianScholasticGrade(finalGrade);
 }
+
+// Helper to calculate mathematical grades for Workbook
+export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqScores: number[]): string {
+  let finalGrade = 0;
+  
+  if (fibCount > 0 && rqScores.length > 0) {
+    const fibFraction = fibScore / fibCount; // 0 to 1
+    const rqFraction = rqScores.reduce((a, b) => a + b, 0) / (rqScores.length * 10); // 0 to 1
+    
+    // Balanced weight: 40% Fill-in-Blank, 60% Reflection Questions
+    finalGrade = (fibFraction * 4.0) + (rqFraction * 6.0);
+  } else if (fibCount > 0) {
+    // Pure fill-in-the-blank test
+    finalGrade = (fibScore / fibCount) * 10;
+  } else if (rqScores.length > 0) {
+    // Pure reflection test
+    finalGrade = rqScores.reduce((a, b) => a + b, 0) / rqScores.length;
+  }
+  
+  return formatItalianScholasticGrade(finalGrade);
+}

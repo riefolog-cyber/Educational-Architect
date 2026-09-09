@@ -45,7 +45,7 @@ import {
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
-import { formatMarkdown, calculateQuizGrade, formatItalianScholasticGrade } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade } from "../utils";
 import { 
   autoCorrectExamJSON, 
   canAutoCorrectStructure, 
@@ -67,7 +67,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
-  const [expiryTime, setExpiryTime] = useState("");
+  const [expiryTime, setExpiryTime] = useState(() => {
+    const d = new Date();
+    d.setHours(d.getHours() + 2);
+    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+  });
   const timeInputRef = useRef<HTMLInputElement>(null);
   const [jsonText, setJsonText] = useState("");
   const [validationError, setValidationError] = useState<string | null>(null);
@@ -287,14 +291,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       examObj.title = materia.trim();
     }
 
-    // Set precise expiry timestamp: Today + selected Hour/Minute
+    // Set precise expiry timestamp: Today + selected Hour/Minute (or +2 hours fallback)
     const expiryDate = new Date();
-    const [h, m] = expiryTime.split(":");
-    expiryDate.setHours(parseInt(h), parseInt(m), 0, 0);
-
-    // Smart adjustment: If the selected hour has already passed today, assume tomorrow
-    if (expiryDate.getTime() < Date.now()) {
-      expiryDate.setDate(expiryDate.getDate() + 1);
+    if (expiryTime && expiryTime.includes(":")) {
+      const [h, m] = expiryTime.split(":");
+      const parsedH = parseInt(h, 10);
+      const parsedM = parseInt(m, 10);
+      if (!isNaN(parsedH) && !isNaN(parsedM)) {
+        expiryDate.setHours(parsedH, parsedM, 0, 0);
+        // Smart adjustment: If the selected hour has already passed today, assume tomorrow
+        if (expiryDate.getTime() < Date.now()) {
+          expiryDate.setDate(expiryDate.getDate() + 1);
+        }
+      } else {
+        expiryDate.setHours(expiryDate.getHours() + 2);
+      }
+    } else {
+      // Default to 2 hours if no time was specified
+      expiryDate.setHours(expiryDate.getHours() + 2);
     }
 
     const sessionPayload = {
@@ -450,17 +464,27 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   const [recalculatingId, setRecalculatingId] = useState<string | null>(null);
 
-  // Helper to detect if an exam had 0 open-ended questions but was wrongly penalized
+  // Helper to detect if an exam had 0 open-ended/reflection questions but was wrongly penalized
   const hasGradeDiscrepancy = (sub: SavedSubmission): boolean => {
-    if (sub.Tipo !== "Quiz") return false;
     try {
       const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
-      const oeCount = (domande?.openEnded || []).length;
-      const mcCount = (domande?.multipleChoice || []).length;
-      // Pure MC test with MC score >= 50% but suggested grade < 6
-      if (oeCount === 0 && mcCount > 0 && (sub.Punteggio_MC || 0) >= mcCount * 0.5) {
-        const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
-        if (gradeVal < 6.0) return true;
+      if (sub.Tipo === "Quiz") {
+        const oeCount = (domande?.openEnded || []).length;
+        const mcCount = (domande?.multipleChoice || []).length;
+        // Pure MC test with MC score >= 50% but suggested grade < 6
+        if (oeCount === 0 && mcCount > 0 && (sub.Punteggio_MC || 0) >= mcCount * 0.5) {
+          const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
+          if (gradeVal < 6.0) return true;
+        }
+      } else if (sub.Tipo === "Workbook") {
+        const sections = domande?.sections || [];
+        const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+        const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+        // Pure FIB workbook with FIB score >= 50% but suggested grade < 6
+        if (rqList.length === 0 && fibList.length > 0 && (sub.Punteggio_FIB || 0) >= fibList.length * 0.5) {
+          const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
+          if (gradeVal < 6.0) return true;
+        }
       }
     } catch {}
     return false;
@@ -493,6 +517,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       let newErrors = sub.Errori_Principali;
       let newFeedback = sub.Feedback_Generale;
       let updatedPunteggioMC = sub.Punteggio_MC;
+      let updatedPunteggioFIB = sub.Punteggio_FIB;
 
       if (sub.Tipo === "Quiz") {
         const mcList = domandeObj?.multipleChoice || [];
@@ -505,14 +530,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
           mcList.forEach((q: any, idx: number) => {
             const chosen = ansObj.mc?.[q.id];
-            if (chosen === q.correctIndex) {
+            if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
               correctCount++;
             } else {
               wrongQuestions.push({
                 number: idx + 1,
                 question: q.question,
-                studentChoice: chosen !== undefined ? q.options[chosen] : "Nessuna opzione",
-                correctChoice: q.options[q.correctIndex] || ""
+                studentChoice: (chosen !== undefined && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
+                correctChoice: q.options?.[q.correctIndex] || ""
               });
             }
           });
@@ -527,7 +552,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
           evalObj.openEndedDetails = [];
           evalObj.suggestedGrade = newGrade;
-          evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito un ottimo risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) si rivela estremamente accurata e testimonia un'eccellente consapevolezza metacognitiva.`;
+          evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
           newFeedback = evalObj.openEndedEvaluation;
 
           if (wrongQuestions.length > 0) {
@@ -538,15 +563,50 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             newErrors = evalObj.mainErrors;
           }
         }
+      } else if (sub.Tipo === "Workbook") {
+        const sections = domandeObj?.sections || [];
+        const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+        const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+
+        if (rqList.length === 0 && fibList.length > 0) {
+          // Pure fill-in-the-blank workbook
+          let correctFib = 0;
+          fibList.forEach((fib: any) => {
+            const userAns = (ansObj.wbFib?.[fib.id] || "").trim().toLowerCase();
+            const correctAnswers = (fib.answer || "").split(",").map((s: string) => s.trim().toLowerCase());
+            const isCorrect = correctAnswers.some(ans => {
+              if (ans === userAns) return true;
+              if (userAns.length >= 4 && ans.includes(userAns)) return true;
+              return false;
+            });
+            if (isCorrect) correctFib++;
+          });
+
+          if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
+            correctFib = sub.Punteggio_FIB;
+          }
+
+          updatedPunteggioFIB = correctFib;
+          newGrade = calculateWorkbookGrade(correctFib, fibList.length, []);
+          evalObj.reflectionDetails = [];
+          evalObj.suggestedGrade = newGrade;
+          evalObj.overallFeedback = `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
+          newFeedback = evalObj.overallFeedback;
+        }
       }
 
       const updatePayload: any = {
         Voto_Suggerito: newGrade,
-        Punteggio_MC: updatedPunteggioMC,
         Full_Evaluation: JSON.stringify(evalObj),
         Errori_Principali: newErrors,
         Feedback_Generale: newFeedback
       };
+      if (updatedPunteggioMC !== undefined) {
+        updatePayload.Punteggio_MC = updatedPunteggioMC;
+      }
+      if (updatedPunteggioFIB !== undefined) {
+        updatePayload.Punteggio_FIB = updatedPunteggioFIB;
+      }
 
       await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
 

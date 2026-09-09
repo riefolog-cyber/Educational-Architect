@@ -210,10 +210,12 @@ const reqToJobCache = new Map<string, string>();
 
 function getRequestHash(body: any): string {
   try {
+    const student = body?.studentEmail || body?.report?.email || (body?.prompt?.match(/Email:\s*([^\)]+)/)?.[1]?.trim() || "");
+    const pin = body?.sessionPin || "";
     const tipo = body?.tipo || "";
-    // Unique key consisting of test type and content of answers
+    // Unique key consisting of student identifier, PIN, test type and content of answers
     const answersContent = JSON.stringify(body?.report?.risposte || {});
-    return `${tipo}_${answersContent.length}_${answersContent.slice(0, 40)}`;
+    return `${student}_${pin}_${tipo}_${answersContent}`;
   } catch (err) {
     return "hash_" + Math.random().toString(36).substring(7);
   }
@@ -512,9 +514,23 @@ async function processQueue() {
     const result = await runEvaluationCore(job.reqBody);
     job.status = "completed";
     job.result = result;
+    // Release hash from active deduplication cache after 30 seconds
+    setTimeout(() => {
+      for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+        if (cachedJobId === job.id) {
+          reqToJobCache.delete(hashKey);
+        }
+      }
+    }, 30000);
   } catch (err: any) {
     job.status = "failed";
     job.error = err.message || "Errore durante la valutazione";
+    // Release hash immediately on error to allow fast retry
+    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+      if (cachedJobId === job.id) {
+        reqToJobCache.delete(hashKey);
+      }
+    }
   } finally {
     activeWorkers--;
     // Auto purge extremely old jobs & request cache
@@ -620,8 +636,17 @@ app.post("/api/generate-recovery-plan", async (req, res) => {
   }
 
   try {
+    const hasOpenEnded = ((examData?.openEnded || []).length > 0) || 
+      ((examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []).length > 0);
+
+    const examFormatInstruction = hasOpenEnded
+      ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
+      : "AVVERTENZA FONDAMENTALE SULLA STRUTTURA: Questa prova NON contiene domande a risposta aperta (è composta esclusivamente da domande a risposta multipla o completamenti testo). NON citare in nessun caso 'risposte brevi', 'superficiali', 'risposte non argomentate' o 'spazi lasciati in bianco'. Concentrati rigorosamente sui concetti teorici delle crocette errate e sui nodi concettuali da consolidare.";
+
     const prompt = `Sei un docente tutor empatico, saggio ed esperto di scuola secondaria di secondo grado italiana (scuola superiore).
 Il tuo obiettivo è generare un **Piano di Studio e Recupero Didattico Personalizzato** su misura per uno studente che ha completato una prova di verifica.
+
+${examFormatInstruction}
 
 DATI DI COPERTURA E RISULTATI:
 - Tipologia Prova: ${tipo || "Verifica"}
@@ -632,15 +657,15 @@ DATI DI COPERTURA E RISULTATI:
 - Valutazione Estesa (Giudizio e Dettaglio Punteggi): ${JSON.stringify(evaluation || {})}
 
 IL TUO COMPITO:
-1. Analizza le lacune teoriche e concettuali commesse dallo studente (sia nei MCQ/Fill-in-the-blank che nelle riflessioni/domande aperte).
+1. Analizza le lacune teoriche e concettuali commesse dallo studente.
 2. Genera una guida di recupero di circa 350-450 parole, ben rifinita, rivolgendoti INDIVIDUALMENTE allo studente dandogli del "tu" con un tono caldo, incoraggiante, costruttivo e focalizzato sull'autoefficacia scolastica (adottando il tipico stile formativo dei docenti tutor).
 3. Restituisci il testo formattato esclusivamente in standard Markdown (con titoli ###, grassetti **, corsivi * ed elenchi puntati -). Non racchiudere il testo in blocchi di codice (come \`\`\`markdown o \`\`\`html) ed evita categoricamente qualsiasi tag HTML (come <p> o <h4>) o parentesi angolari.
 
 Il piano deve comprendere tassativamente queste 4 aree logiche:
-- 🔍 **Attenta Diagnosi delle tue Difficoltà**: identificando in quali quesiti si sono riscontrate risposte brevi, scorrette o superficiali rispetto a quello che si richiedeva.
+- 🔍 **Attenta Diagnosi delle tue Difficoltà**: identificando in quali quesiti si sono riscontrati errori concettuali rispetto a quello che si richiedeva.
 - 📖 **Concetti Fondamentali da Ripassare**: 2 o 3 punti teorici cardine con un brevissimo chiarimento concettuale di riferimento per aiutarlo a ricordare.
 - 🏃 **Esercizi Pratici e Domande di Consolidamento**: 2 o 3 nuove tracce o problemi (ispirati sul tema originale dell'esame) su cui lo studente può allenarsi a rispondere o meditare.
-- 💡 **Suggerimenti di Metodo di Studio**: consigli adatti per questa tipologia di verifiche (es. come ampliare l'esposizione, come preparare mappe concettuali o riassunti orali).
+- 💡 **Suggerimenti di Metodo di Studio**: consigli adatti per questa tipologia di verifiche (es. come preparare schemi riassuntivi, mappe concettuali o ripassi mirati).
 
 Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
 

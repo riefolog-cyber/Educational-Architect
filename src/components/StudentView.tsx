@@ -449,7 +449,28 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     timerIntervalRef.current = setInterval(() => {
       if (expiryTime) {
         const now = Date.now();
-        const target = new Date(expiryTime).getTime();
+        let target = new Date(expiryTime).getTime();
+
+        // Safe fallback: if expiryTime was formatted as "HH:mm" instead of a full ISO string
+        if (isNaN(target) && typeof expiryTime === "string" && expiryTime.includes(":")) {
+          const parts = expiryTime.split(":");
+          const d = new Date();
+          d.setHours(parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0, 0, 0);
+          if (d.getTime() < now - 1000 * 60 * 60 * 12) {
+            d.setDate(d.getDate() + 1);
+          }
+          target = d.getTime();
+        }
+
+        if (isNaN(target)) {
+          // Fallback to elapsed counter if invalid date
+          elapsedRef.current = Math.floor((Date.now() - startTimeRef.current) / 1000);
+          const min = String(Math.floor(elapsedRef.current / 60)).padStart(2, "0");
+          const sec = String(elapsedRef.current % 60).padStart(2, "0");
+          setRemainingTimeText(`⏱️ In corso: ${min}:${sec}`);
+          return;
+        }
+
         const diff = target - now;
 
         if (diff <= 0) {
@@ -491,7 +512,15 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Helper to check if exam is expired
   const isTimeCurrentlyExpired = () => {
     if (!expiryTime) return false;
-    return Date.now() > new Date(expiryTime).getTime();
+    let target = new Date(expiryTime).getTime();
+    if (isNaN(target) && typeof expiryTime === "string" && expiryTime.includes(":")) {
+      const parts = expiryTime.split(":");
+      const d = new Date();
+      d.setHours(parseInt(parts[0], 10) || 0, parseInt(parts[1], 10) || 0, 0, 0);
+      target = d.getTime();
+    }
+    if (isNaN(target)) return false;
+    return Date.now() > target;
   };
 
   const handleStartExam = () => {
@@ -550,33 +579,63 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     saveDraft(sessionPin, updatedAnswers);
   };
 
-  // Verify that student answered everything
-  const checkValidation = (): boolean => {
+  // Verify that student answered everything and return missing items list
+  const getMissingQuestions = (): string[] => {
+    const missing: string[] = [];
+
     if (examType === "quiz") {
-      const mcKeys = Object.keys(answers.mc);
-      const totalMc = (examData?.multipleChoice || []).length;
-      
-      const oeKeys = Object.keys(answers.oe);
-      const totalOe = (examData?.openEnded || []).length;
+      const mcList = examData?.multipleChoice || [];
+      mcList.forEach((q: any, idx: number) => {
+        if (answers.mc[q.id] === undefined) {
+          missing.push(`Domanda ${idx + 1} (a scelta multipla)`);
+        }
+      });
 
-      const allMcSelected = mcKeys.length >= totalMc;
-      const allOeFilled = oeKeys.length >= totalOe && (examData?.openEnded || []).every((q: any) => (answers.oe[q.id] || "").trim().length > 0);
-
-      return allMcSelected && allOeFilled;
+      const oeList = examData?.openEnded || [];
+      oeList.forEach((q: any, idx: number) => {
+        if (!(answers.oe[q.id] || "").trim()) {
+          missing.push(`Domanda Aperta ${mcList.length + idx + 1}`);
+        }
+      });
     } else {
-      const fibList = examData?.sections?.flatMap((s: any) => s.fillInTheBlank || []) || [];
-      const rqList = examData?.sections?.flatMap((s: any) => s.reflectionQuestions || []) || [];
+      const sections = examData?.sections || [];
+      let fibIdx = 1;
+      let rqIdx = 1;
 
-      const allFibFilled = fibList.every((f: any) => (answers.wbFib[f.id] || "").trim().length > 0);
-      const allRqFilled = rqList.every((r: any) => (answers.wbRq[r.id] || "").trim().length > 0);
+      sections.forEach((sec: any) => {
+        (sec.fillInTheBlank || []).forEach((f: any) => {
+          if (!(answers.wbFib[f.id] || "").trim()) {
+            missing.push(`Termine ${fibIdx} da completare ("${f.clue || 'Parola mancante'}")`);
+          }
+          fibIdx++;
+        });
 
-      return allFibFilled && allRqFilled;
+        (sec.reflectionQuestions || []).forEach((r: any) => {
+          if (!(answers.wbRq[r.id] || "").trim()) {
+            missing.push(`Riflessione Critica ${rqIdx}`);
+          }
+          rqIdx++;
+        });
+      });
     }
+
+    return missing;
+  };
+
+  const checkValidation = (): boolean => {
+    return getMissingQuestions().length === 0;
   };
 
   const handleSubmitQuizPrompt = () => {
-    if (!checkValidation()) {
-      alert("⚠️ Attenzione: Sei pregato di rispondere a tutte le domande dell'esame prima di consegnare!");
+    const missing = getMissingQuestions();
+    if (missing.length > 0) {
+      const displayMissing = missing.slice(0, 5);
+      const remainingCount = missing.length - displayMissing.length;
+      let msg = "⚠️ Attenzione: per completare la consegna devi rispondere a tutte le domande.\n\nMancano:\n• " + displayMissing.join("\n• ");
+      if (remainingCount > 0) {
+        msg += `\n...e altre ${remainingCount} domande`;
+      }
+      alert(msg);
       return;
     }
     setActiveScreen("self-assessment");
@@ -815,6 +874,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const payload = {
       tipo: examType === "quiz" ? "Quiz" : "Workbook",
       prompt: evaluationPrompt,
+      studentEmail: user?.email || "",
+      studentName: user?.displayName || "Studente",
+      sessionPin: sessionPin || "",
       report: {
         domande: examPayload,
         risposte: sanitizedAnswers,
@@ -2020,8 +2082,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
-            {/* Detailed open-ended reviews mapping */}
-            {examType === "quiz" && examData?.openEnded && (
+            {/* Detailed open-ended reviews mapping (only if openEnded questions exist) */}
+            {examType === "quiz" && (examData?.openEnded || []).length > 0 && (
               <div className="space-y-4 pt-2">
                 <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
                   Dettaglio Punteggi Domande Aperte:
@@ -2064,8 +2126,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
-            {/* Workbook detailed reflections reviews mapping */}
-            {examType === "workbook" && examData?.sections && (
+            {/* Workbook detailed reflections reviews mapping (only if reflection questions exist) */}
+            {examType === "workbook" && examData?.sections && (examData.sections.flatMap((sec: any) => sec.reflectionQuestions || []).length > 0) && (
               <div className="space-y-4 pt-2">
                 <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
                   Dettaglio Punteggi Riflessioni Workbook:
