@@ -2074,6 +2074,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
                             </p>
                           )}
+                          {q.explanation && (
+                            <div className="mt-2 text-[11px] text-slate-300 bg-black/30 p-2 rounded-lg border border-white/5 flex items-start gap-1.5">
+                              <span className="shrink-0">💡</span>
+                              <span><strong className="text-slate-200">Spiegazione:</strong> {q.explanation}</span>
+                            </div>
+                          )}
                         </div>
                       </div>
                     );

@@ -7,6 +7,7 @@ export interface MultipleChoiceQuestion {
   question: string;
   options: string[];
   correctIndex: number;
+  explanation?: string;
 }
 
 export interface OpenEndedQuestion {

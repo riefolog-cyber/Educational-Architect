@@ -59,10 +59,10 @@ export function canAutoCorrectStructure(text: string): boolean {
     // If it's an object
     if (typeof data === "object") {
       // Check for wrapped root keys
-      if (data.exam || data.quiz || data.workbook || data.test || data.data || data.content || data.compito) {
+      if (data.exam || data.quiz || data.workbook || data.test || data.data || data.content || data.compito || data.verifica) {
         return true;
       }
-      // Check for questions / domande
+      // Check for questions / domande / vero_falso / multipla
       if (
         data.questions ||
         data.domande ||
@@ -73,6 +73,12 @@ export function canAutoCorrectStructure(text: string): boolean {
         data.domandeAperte ||
         data.aperte ||
         data.crocette ||
+        data.multipla ||
+        data.scelta_multipla ||
+        data.veroFalso ||
+        data.vero_falso ||
+        data.trueFalse ||
+        data.true_false ||
         data.sezioni ||
         data.capitoli ||
         data.parts
@@ -213,10 +219,20 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
   }
 
   // --- REPAIR QUIZ ---
-  const title =
+  let title =
     (typeof parsed === "object" && !Array.isArray(parsed) && (parsed.title || parsed.titolo || parsed.materia || parsed.nome || parsed.name)) ||
-    defaultSubject ||
-    "Verifica di Apprendimento";
+    defaultSubject;
+
+  if (!title && Array.isArray(parsed) && parsed.length > 0) {
+    const itemWithSubject = parsed.find((it: any) => it?.argomento || it?.materia || it?.tema || it?.titolo || it?.title);
+    if (itemWithSubject) {
+      title = itemWithSubject.argomento || itemWithSubject.materia || itemWithSubject.tema || itemWithSubject.titolo || itemWithSubject.title;
+    }
+  }
+
+  if (!title) {
+    title = "Verifica di Apprendimento";
+  }
 
   if (!Array.isArray(parsed) && !parsed.title && title) {
     changes.push(`Assegnato titolo al Quiz: '${title}'.`);
@@ -224,6 +240,9 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
   const mcList: any[] = [];
   const openList: any[] = [];
+  let vfCount = 0;
+  let mcCount = 0;
+  let openCount = 0;
 
   // Helper to normalize a single question
   const processQuestionItem = (q: any, index: number) => {
@@ -231,6 +250,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
     // Handle plain string as open question
     if (typeof q === "string") {
+      openCount++;
       openList.push({
         id: `q_open_${openList.length + 1}`,
         question: q,
@@ -238,20 +258,127 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       return;
     }
 
-    const questionText = q.question || q.domanda || q.quesito || q.testo || q.text || q.prompt || q.enunciato || `Domanda ${index + 1}`;
-    const rawOptions = q.options || q.opzioni || q.scelte || q.answers || q.risposte || q.choices || q.alternative;
-    const isExplicitMc = q.type === "multipleChoice" || q.type === "mc" || q.type === "scelta_multipla" || q.type === "crocetta";
-    const isExplicitOpen = q.type === "openEnded" || q.type === "open" || q.type === "aperta" || q.type === "domanda_aperta";
+    const rawType = String(q.tipo || q.type || q.categoria || q.category || "").toLowerCase().trim();
 
-    // If options array exists and has at least 2 items, or is explicitly marked multiple choice
+    // Check if explicitly or implicitly Vero/Falso
+    const hasAffermazione = q.affermazione !== undefined && q.affermazione !== null;
+    const isExplicitVf =
+      rawType === "vero_falso" ||
+      rawType === "vero-falso" ||
+      rawType === "verofalso" ||
+      rawType === "true_false" ||
+      rawType === "true-false" ||
+      rawType === "tf" ||
+      rawType === "vf" ||
+      rawType === "boolean" ||
+      rawType === "vero/falso" ||
+      rawType === "vero o falso";
+
+    const isBooleanAnswer =
+      typeof q.corretta === "boolean" ||
+      typeof q.correct === "boolean" ||
+      typeof q.isCorrect === "boolean" ||
+      (typeof q.corretta === "string" && ["vero", "falso", "true", "false"].includes(q.corretta.toLowerCase().trim()));
+
+    const isVeroFalso = isExplicitVf || (hasAffermazione && (!q.opzioni && !q.options)) || (isBooleanAnswer && (!q.opzioni && !q.options));
+
+    // Extract statement / question text
+    const rawStatement =
+      q.affermazione ||
+      q.statement ||
+      q.question ||
+      q.domanda ||
+      q.quesito ||
+      q.testo ||
+      q.text ||
+      q.prompt ||
+      q.enunciato ||
+      q.frase ||
+      q.sentence ||
+      `Domanda ${index + 1}`;
+
+    let questionText = String(rawStatement).trim();
+
+    const rawOptions = q.options || q.opzioni || q.scelte || q.answers || q.risposte || q.choices || q.alternative || q.distrattori;
+
+    const isExplicitMc =
+      rawType === "multiplechoice" ||
+      rawType === "multiple_choice" ||
+      rawType === "multipla" ||
+      rawType === "scelta_multipla" ||
+      rawType === "sceltamultipla" ||
+      rawType === "scelta-multipla" ||
+      rawType === "crocetta" ||
+      rawType === "crocette" ||
+      rawType === "mc" ||
+      rawType === "mcq";
+
+    const isExplicitOpen =
+      rawType === "openended" ||
+      rawType === "open_ended" ||
+      rawType === "open" ||
+      rawType === "aperta" ||
+      rawType === "domanda_aperta" ||
+      rawType === "domandaaperta" ||
+      rawType === "risposta_aperta" ||
+      rawType === "aperto";
+
+    const explanation = q.spiegazione || q.explanation || q.commento || q.feedback || q.nota || undefined;
+
+    // --- CASE 1: VERO / FALSO ---
+    if (isVeroFalso) {
+      vfCount++;
+      // Format question clearly with Vero o Falso prefix if missing
+      if (!/^(vero\s+o\s+falso|vero\/falso|v\/f|vf)[\s:]/i.test(questionText)) {
+        questionText = `Vero o Falso: ${questionText}`;
+      }
+
+      let optionsArray: string[] = ["Vero", "Falso"];
+      if (Array.isArray(rawOptions) && rawOptions.length >= 2) {
+        optionsArray = rawOptions.map((opt: any) =>
+          typeof opt === "object" && opt !== null ? (opt.text || opt.opzione || opt.label || JSON.stringify(opt)) : String(opt)
+        );
+      }
+
+      // Determine correctIndex
+      let correctIdx = 0;
+      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
+
+      if (rawCorrect === false || (typeof rawCorrect === "string" && ["falso", "false", "f", "no"].includes(rawCorrect.toLowerCase().trim()))) {
+        const falseIdx = optionsArray.findIndex((o) => /^(falso|false|f|no)$/i.test(o.trim()));
+        correctIdx = falseIdx >= 0 ? falseIdx : 1;
+      } else if (rawCorrect === true || (typeof rawCorrect === "string" && ["vero", "true", "v", "si", "sì"].includes(rawCorrect.toLowerCase().trim()))) {
+        const trueIdx = optionsArray.findIndex((o) => /^(vero|true|v|s[iì])$/i.test(o.trim()));
+        correctIdx = trueIdx >= 0 ? trueIdx : 0;
+      } else if (typeof rawCorrect === "number") {
+        correctIdx = rawCorrect >= 0 && rawCorrect < optionsArray.length ? rawCorrect : (rawCorrect === optionsArray.length && rawCorrect > 0 ? rawCorrect - 1 : 0);
+      } else if (typeof rawCorrect === "string") {
+        const matchIdx = optionsArray.findIndex((o) => o.trim().toLowerCase() === rawCorrect.trim().toLowerCase());
+        if (matchIdx >= 0) correctIdx = matchIdx;
+      }
+
+      mcList.push({
+        id: q.id || `q_mc_${mcList.length + 1}`,
+        question: questionText,
+        options: optionsArray,
+        correctIndex: correctIdx,
+        ...(explanation ? { explanation } : {}),
+      });
+      return;
+    }
+
+    // --- CASE 2: MULTIPLE CHOICE ---
     if ((Array.isArray(rawOptions) && rawOptions.length >= 2) || isExplicitMc) {
+      mcCount++;
       const optionsArray: string[] = Array.isArray(rawOptions)
-        ? rawOptions.map((opt: any) => (typeof opt === "object" && opt !== null ? opt.text || opt.opzione || opt.label || JSON.stringify(opt) : String(opt)))
+        ? rawOptions.map((opt: any) =>
+            typeof opt === "object" && opt !== null ? (opt.text || opt.opzione || opt.label || JSON.stringify(opt)) : String(opt)
+          )
         : ["Vero", "Falso"];
 
       // Determine correctIndex
       let correctIdx = 0;
-      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione;
+      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
 
       if (typeof rawCorrect === "number") {
         if (rawCorrect >= 0 && rawCorrect < optionsArray.length) {
@@ -279,6 +406,10 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
             correctIdx = num >= 0 && num < optionsArray.length ? num : (num === optionsArray.length && num > 0 ? num - 1 : 0);
           }
         }
+      } else if (rawCorrect === false) {
+        correctIdx = 1;
+      } else if (rawCorrect === true) {
+        correctIdx = 0;
       }
 
       mcList.push({
@@ -286,19 +417,30 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
         question: questionText,
         options: optionsArray,
         correctIndex: correctIdx,
+        ...(explanation ? { explanation } : {}),
       });
-    } else if (isExplicitOpen || !rawOptions || !Array.isArray(rawOptions) || rawOptions.length < 2) {
+      return;
+    }
+
+    // --- CASE 3: OPEN ENDED ---
+    if (isExplicitOpen || !rawOptions || !Array.isArray(rawOptions) || rawOptions.length < 2) {
+      openCount++;
       openList.push({
         id: q.id || `q_open_${openList.length + 1}`,
         question: questionText,
       });
+      return;
     }
   };
 
   // Case 1: Root is an Array of questions
   if (Array.isArray(parsed)) {
     parsed.forEach((item, idx) => processQuestionItem(item, idx));
-    changes.push(`Rilevato array principale: estratte ${mcList.length} domande a scelta multipla e ${openList.length} domande aperte.`);
+    const breakdown = [];
+    if (vfCount > 0) breakdown.push(`${vfCount} Vero/Falso`);
+    if (mcCount > 0) breakdown.push(`${mcCount} a scelta multipla`);
+    if (openCount > 0) breakdown.push(`${openCount} aperte`);
+    changes.push(`Rilevato array principale: estratte ${mcList.length} domande chiuse (${breakdown.join(", ") || "nessuna"}) e ${openList.length} aperte.`);
   } else {
     // Case 2: Object with generic questions array
     const genericList =
@@ -312,11 +454,11 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
     if (Array.isArray(genericList)) {
       genericList.forEach((item, idx) => processQuestionItem(item, idx));
-      changes.push(`Riorganizzata lista '${parsed.questions ? "questions" : "domande"}' in ${mcList.length} crocette e ${openList.length} domande aperte.`);
+      changes.push(`Riorganizzata lista 'domande' in ${mcList.length} chiuse (${vfCount} Vero/Falso, ${mcCount} Scelta Multipla) e ${openList.length} aperte.`);
     }
 
-    // Case 3: Object with multipleChoice / sceltaMultipla
-    const rawMc = parsed.multipleChoice || parsed.sceltaMultipla || parsed.scelteMultiple || parsed.crocette || parsed.mcq;
+    // Case 3: Object with multipleChoice / sceltaMultipla / multipla
+    const rawMc = parsed.multipleChoice || parsed.sceltaMultipla || parsed.scelteMultiple || parsed.crocette || parsed.mcq || parsed.multipla || parsed.scelta_multipla;
     if (Array.isArray(rawMc)) {
       rawMc.forEach((item, idx) => processQuestionItem({ ...item, type: "multipleChoice" }, idx));
       if (!genericList) {
@@ -324,7 +466,14 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       }
     }
 
-    // Case 4: Object with openEnded / domandeAperte
+    // Case 3b: Object with veroFalso / vero_falso / trueFalse
+    const rawVf = parsed.veroFalso || parsed.vero_falso || parsed.trueFalse || parsed.true_false;
+    if (Array.isArray(rawVf)) {
+      rawVf.forEach((item, idx) => processQuestionItem({ ...item, tipo: "vero_falso" }, idx));
+      changes.push(`Normalizzato elenco 'veroFalso' (${vfCount} quesiti).`);
+    }
+
+    // Case 4: Object with openEnded / domandeAperte / aperte
     const rawOpen = parsed.openEnded || parsed.domandeAperte || parsed.aperte || parsed.quesitiAperti;
     if (Array.isArray(rawOpen)) {
       rawOpen.forEach((item, idx) => processQuestionItem({ ...item, type: "openEnded" }, idx));
@@ -357,6 +506,11 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
   const formattedJson = JSON.stringify(finalQuiz, null, 2);
 
+  const breakdownParts = [];
+  if (vfCount > 0) breakdownParts.push(`${vfCount} Vero/Falso`);
+  if (mcCount > 0) breakdownParts.push(`${mcCount} Scelta Multipla`);
+  const mcDesc = breakdownParts.length > 0 ? breakdownParts.join(" e ") : `${mcList.length} domande a scelta multipla`;
+
   return {
     success: true,
     correctedJson: formattedJson,
@@ -364,6 +518,6 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     detectedType: "Quiz",
     title,
     changes,
-    summaryNotice: `Struttura Quiz corretta automaticamente! Configurate ${mcList.length} domande a scelta multipla e ${openList.length} domande a risposta aperta.`,
+    summaryNotice: `Struttura Quiz corretta automaticamente! Configurate ${mcList.length} domande a risposta chiusa (${mcDesc}) e ${openList.length} domande a risposta aperta.`,
   };
 }

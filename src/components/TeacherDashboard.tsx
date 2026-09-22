@@ -1964,6 +1964,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                           <span className="text-slate-400">Scelta: <span className={isCorrect ? 'text-teal-400' : 'text-rose-400'}>{selectedOptText}</span></span>
                                           {!isCorrect && <span className="text-slate-500">| Corretta: <span className="text-teal-400">{correctOptText}</span></span>}
                                         </div>
+                                        {q.explanation && (
+                                          <p className="mt-1.5 p-1.5 bg-black/30 rounded border border-white/5 text-[10px] text-slate-400 italic">
+                                            💡 Spiegazione: {q.explanation}
+                                          </p>
+                                        )}
                                       </div>
                                     );
                                   })}
