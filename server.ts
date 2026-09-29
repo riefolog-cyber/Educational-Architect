@@ -773,6 +773,142 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con la seguente 
   }
 });
 
+// API endpoint for generating a complete new exam from an educational topic/text using Gemini
+app.post("/api/generate-exam", async (req, res) => {
+  const { topic, gradeLevel, examType, numQuestions, includeOpenEnded, difficulty } = req.body;
+
+  if (!getApiKey()) {
+    return res.status(500).json({ 
+      error: "La chiave API di Gemini non è configurata nell'ambiente. Configura la chiave nei Secrets." 
+    });
+  }
+
+  if (!topic || !topic.trim()) {
+    return res.status(400).json({ error: "Specificare un argomento o un testo per la generazione della verifica." });
+  }
+
+  try {
+    const isWorkbook = (examType || "").toLowerCase() === "workbook";
+    const qCount = Math.max(3, Math.min(Number(numQuestions) || 6, 15));
+    const schoolLevel = gradeLevel || "Scuola Secondaria di II Grado (Scuola Superiore)";
+    const diffLevel = difficulty || "intermedio";
+
+    let promptSystem = "";
+    if (isWorkbook) {
+      promptSystem = `Sei un docente esperto e autore di testi scolastici per la scuola italiana (${schoolLevel}).
+Il tuo compito è creare un **Workbook didattico interattivo** sull'argomento fornito dal docente.
+Difficoltà richiesta: ${diffLevel}.
+Numero di sezioni: 2 o 3 sezioni tematiche ben articolate.
+
+STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
+{
+  "title": "[Titolo chiaro e accattivante della verifica]",
+  "sections": [
+    {
+      "title": "[Titolo sezione 1]",
+      "sintesi": "[Breve testo didattico chiaro e rigoroso di 2-3 paragrafi che introduce i concetti chiave]",
+      "fillInTheBlank": [
+        {
+          "id": "fib_1",
+          "sentence": "Frase didattica con una singola parola o concetto chiave omesso indicato tra parentesi quadre o da completare (es. 'L'organo principale della respirazione cellulare è il [mitocondrio].')",
+          "answer": "mitocondrio"
+        }
+      ],
+      "reflectionQuestions": [
+        {
+          "id": "rq_1",
+          "question": "Quesito aperto di riflessione critica, argomentazione o applicazione pratica personale (es. 'Spiega per quale motivo...')"
+        }
+      ]
+    }
+  ],
+  "recommendedDurationMinutes": 45,
+  "summaryDescription": "Breve descrizione degli obiettivi educativi e competenze testate."
+}
+
+Ogni sezione DEVE contenere da 2 a 4 frasi fillInTheBlank e 1 domanda di riflessione (reflectionQuestions).
+Genera solo JSON valido conforme allo schema.`;
+    } else {
+      promptSystem = `Sei un docente esperto e autore di verifiche scolastiche per la scuola italiana (${schoolLevel}).
+Il tuo compito è creare un **Quiz didattico a scelta multipla** sull'argomento fornito dal docente.
+Difficoltà richiesta: ${diffLevel}.
+Numero di domande a risposta multipla da generare: ${qCount}.
+${includeOpenEnded ? "Includi anche 1 o 2 domande a risposta aperta (openEnded) per valutare l'argomentazione critica personale." : "Non includere domande aperte (array openEnded vuoto: [])."}
+
+STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
+{
+  "title": "[Titolo chiaro e accattivante del Quiz]",
+  "multipleChoice": [
+    {
+      "id": "mc_1",
+      "question": "[Testo del quesito chiaro e inequivocabile]",
+      "options": ["Opzione A (esatta o distrattore)", "Opzione B", "Opzione C", "Opzione D"],
+      "correctIndex": 0,
+      "explanation": "Breve spiegazione didattica del perché questa opzione è corretta."
+    }
+  ],
+  "openEnded": ${includeOpenEnded ? `[
+    {
+      "id": "oe_1",
+      "question": "[Domanda di argomentazione critica aperta coerente con il livello scolastico]"
+    }
+  ]` : `[]`},
+  "recommendedDurationMinutes": ${Math.round(qCount * 3 + (includeOpenEnded ? 15 : 0))},
+  "summaryDescription": "Breve sintesi degli obiettivi didattici della prova."
+}
+
+REGOLE ESSENZIALI:
+1. Le 4 opzioni di ciascuna domanda a scelta multipla devono essere plausibili e grammaticalmente omogenee (nessun distrattore banale).
+2. L'indice 'correctIndex' deve corrispondere rigorosamente all'opzione esatta. Distribuisci le risposte corrette tra gli indici 0, 1, 2, 3 senza concentrarle tutte su una sola lettera.
+3. Genera solo JSON valido conforme.`;
+    }
+
+    const response = await generateWithRetry({
+      model: "gemini-3.5-flash",
+      contents: `Argomento o testo della verifica didattica:\n${topic}`,
+      config: {
+        systemInstruction: promptSystem,
+        temperature: 0.2,
+        maxOutputTokens: 3500,
+        responseMimeType: "application/json"
+      }
+    });
+
+    const responseText = extractResponseText(response);
+    if (!responseText) {
+      throw new Error("Risposta vuota ricevuta dal modello di intelligenza artificiale.");
+    }
+
+    const generatedData = parseJsonResponse(responseText);
+    
+    // Format JSON string for teacher editor
+    const formattedJson = JSON.stringify({
+      title: generatedData.title || topic.substring(0, 40),
+      ...(isWorkbook ? { sections: generatedData.sections } : {
+        multipleChoice: generatedData.multipleChoice || [],
+        openEnded: generatedData.openEnded || []
+      })
+    }, null, 2);
+
+    return res.json({
+      status: "success",
+      title: generatedData.title || topic.substring(0, 40),
+      examType: isWorkbook ? "workbook" : "quiz",
+      recommendedDurationMinutes: generatedData.recommendedDurationMinutes || 45,
+      summaryDescription: generatedData.summaryDescription || "",
+      examObj: JSON.parse(formattedJson),
+      formattedJson
+    });
+
+  } catch (error: any) {
+    console.error("AI Exam generation failed:", error);
+    return res.status(500).json({ 
+      error: "La generazione assistita con IA non è andata a buon fine.", 
+      details: error.message 
+    });
+  }
+});
+
 // Global error handler for JSON parsing and other synchronous middleware errors
 app.use((err: any, req: any, res: any, next: any) => {
   console.error('[EXPRESS ERROR]:', err);

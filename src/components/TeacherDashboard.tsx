@@ -40,7 +40,11 @@ import {
   Eye,
   EyeOff,
   Shield,
-  Wand2
+  Wand2,
+  Printer,
+  Shuffle,
+  Activity,
+  Users
 } from "lucide-react";
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
@@ -52,6 +56,9 @@ import {
   tolerantJsonParse, 
   ExamCorrectionResult 
 } from "../utils/examStructureRepair";
+import AiExamGeneratorModal from "./AiExamGeneratorModal";
+import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
+import PrintableReportModal from "./PrintableReportModal";
 
 interface TeacherDashboardProps {
   user: any;
@@ -99,6 +106,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [blindGradingMode, setBlindGradingMode] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
+
+  // New features state
+  const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
+  const [showAiModal, setShowAiModal] = useState<boolean>(false);
+  const [dashboardTab, setDashboardTab] = useState<"submissions" | "live_monitor">("submissions");
+  const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
+  const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
 
 
 
@@ -318,6 +332,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       teacherId: user?.uid || "mock_teacher",
       teacherEmail: user?.email || "docente_sandbox@scuola.it",
       backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim(),
+      randomizeQuestions,
       active: true,
       createdAt: new Date().toISOString()
     };
@@ -349,6 +364,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           teacherEmail: user?.email || "docente_sandbox@scuola.it",
           teacherId: user?.uid || "mock_teacher",
           data: examObj,
+          randomizeQuestions,
           active: true,
           createdAt: new Date().toISOString(),
           backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim()
@@ -366,6 +382,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
 
         setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata con successo! Gli studenti possono accedere.`);
+        setDashboardTab("live_monitor");
         
         const friendlyScadenza = expiryDate.toLocaleString("it-IT", {
           day: "2-digit",
@@ -1302,6 +1319,30 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 </div>
               </div>
 
+              {/* AI Exam Generator Fast Action */}
+              <div className="p-3 bg-gradient-to-r from-indigo-950/60 to-purple-950/60 border border-indigo-500/30 rounded-2xl space-y-2">
+                <div className="flex items-center justify-between">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5">
+                    <Sparkles className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
+                    <span>Creazione Assistita da IA</span>
+                  </span>
+                  <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-500/30">
+                    Gemini 3.5 Flash
+                  </span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-normal">
+                  Non hai pronto il file JSON? Genera una verifica completa (Quiz o Workbook) partendo da qualsiasi argomento o testo.
+                </p>
+                <button
+                  type="button"
+                  onClick={() => setShowAiModal(true)}
+                  className="w-full py-2 px-3 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition-all shadow-md shadow-indigo-600/20 cursor-pointer"
+                >
+                  <Sparkles className="w-3.5 h-3.5" />
+                  <span>✨ Crea Verifica con IA (da Argomento)</span>
+                </button>
+              </div>
+
               <div className="space-y-2">
                 <div className="flex justify-between items-center">
                   <label className="uppercase font-bold text-slate-500 text-[10px]">Carica File JSON Esame</label>
@@ -1334,6 +1375,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   onChange={(e) => { setJsonText(e.target.value); validateExamJSON(e.target.value); }}
                   className="w-full min-h-[140px] p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-slate-200 text-[11px] font-mono outline-none focus:border-indigo-500"
                 />
+
+                {/* Anti-cheat Question & Option Randomization Toggle */}
+                <label className="flex items-center gap-2.5 p-2.5 bg-slate-950/50 border border-white/10 rounded-xl cursor-pointer hover:bg-slate-950/80 transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={randomizeQuestions}
+                    onChange={(e) => setRandomizeQuestions(e.target.checked)}
+                    className="w-4 h-4 accent-indigo-500 rounded cursor-pointer"
+                  />
+                  <div className="text-left">
+                    <span className="text-[11px] font-bold text-white flex items-center gap-1.5">
+                      <Shuffle className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Randomizza Domande e Opzioni (Anti-Copia)</span>
+                    </span>
+                    <p className="text-[10px] text-slate-400 leading-normal">
+                      Mescola l'ordine dei quesiti per ciascun banco mantenendo intatta la correzione.
+                    </p>
+                  </div>
+                </label>
 
                 {/* Validation Error Message */}
                 {validationError && (
@@ -1555,35 +1615,74 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         </div>
 
-        {/* Right column: Database Submissions Explorer */}
+        {/* Right column: Database Submissions Explorer & Classroom Live Monitor */}
         <div className="lg:col-span-2 space-y-6">
           <div className="bg-slate-900/40 border border-white/10 p-5 sm:p-6 rounded-3xl backdrop-blur-md space-y-6">
-            <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4.5 border-b border-white/5 pb-4.5">
-              <div>
-                <h3 className="text-lg font-display font-bold text-white flex items-center gap-1.5">
-                  <FileCode className="w-5 h-5 text-indigo-400" />
-                  Registro delle Consegne
-                </h3>
-                <p className="text-xs text-slate-400 mt-0.5">Elenco storico degli elaborati corretti dall'IA didattica.</p>
-              </div>
-              <div className="flex items-center gap-2 w-full sm:w-auto">
-                <button
-                  onClick={handleExportCSV}
-                  className="flex items-center gap-1 py-1.5 px-3 bg-teal-600 hover:bg-teal-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer shadow-md"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  Esporta in CSV
-                </button>
-                <button
-                  onClick={handleLoadSubmissions}
-                  disabled={loadingSubmissions}
-                  className="flex items-center gap-1 py-1.5 px-3 bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs transition-colors cursor-pointer disabled:opacity-40"
-                >
-                  <RefreshCw className={`w-3.5 h-3.5 ${loadingSubmissions ? "animate-spin" : ""}`} />
-                  Ricarica Registro
-                </button>
-              </div>
+            
+            {/* Tab switch between Registro Consegne and Monitoraggio Live */}
+            <div className="flex items-center gap-2 border-b border-white/10 pb-4">
+              <button
+                type="button"
+                onClick={() => setDashboardTab("submissions")}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer ${
+                  dashboardTab === "submissions"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                    : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
+                }`}
+              >
+                <FileCode className="w-4 h-4" />
+                <span>Registro Consegne ({submissions.length})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setDashboardTab("live_monitor")}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer ${
+                  dashboardTab === "live_monitor"
+                    ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                    : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
+                }`}
+              >
+                <span className="relative flex h-2.5 w-2.5">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-500"></span>
+                </span>
+                <span>📡 Monitoraggio Live Aula</span>
+              </button>
             </div>
+
+            {dashboardTab === "live_monitor" ? (
+              <ClassroomLiveMonitor 
+                pin={pin.trim() || submissions[0]?.Pin || ""} 
+                examTitle={materia} 
+              />
+            ) : (
+              <>
+                <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4.5 border-b border-white/5 pb-4.5">
+                  <div>
+                    <h3 className="text-lg font-display font-bold text-white flex items-center gap-1.5">
+                      <FileCode className="w-5 h-5 text-indigo-400" />
+                      Registro delle Consegne
+                    </h3>
+                    <p className="text-xs text-slate-400 mt-0.5">Elenco storico degli elaborati corretti dall'IA didattica.</p>
+                  </div>
+                  <div className="flex items-center gap-2 w-full sm:w-auto">
+                    <button
+                      onClick={handleExportCSV}
+                      className="flex items-center gap-1 py-1.5 px-3 bg-teal-600 hover:bg-teal-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer shadow-md"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      Esporta in CSV
+                    </button>
+                    <button
+                      onClick={handleLoadSubmissions}
+                      disabled={loadingSubmissions}
+                      className="flex items-center gap-1 py-1.5 px-3 bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs transition-colors cursor-pointer disabled:opacity-40"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${loadingSubmissions ? "animate-spin" : ""}`} />
+                      Ricarica Registro
+                    </button>
+                  </div>
+                </div>
 
             {/* Filter bar */}
             <div className="flex flex-col sm:flex-row gap-3">
@@ -1773,7 +1872,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   </button>
                                 </div>
                               ) : (
-                                <div className="flex gap-2.5">
+                                <div className="flex items-center gap-1.5">
+                                  <button
+                                    onClick={(e) => {
+                                      e.stopPropagation();
+                                      setPrintableSub(sub);
+                                      setShowPrintModal(true);
+                                    }}
+                                    className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
+                                    title="Stampa Scheda Valutazione A4 / PDF"
+                                  >
+                                    <Printer className="w-3.5 h-3.5" />
+                                  </button>
                                   <button
                                     onClick={() => setSelectedSub(sub)}
                                     className="px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-[10px] font-bold rounded cursor-pointer"
@@ -1798,6 +1908,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 </tbody>
               </table>
             </div>
+            </>
+            )}
           </div>
         </div>
       </div>
@@ -2141,19 +2253,30 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             </div>
 
             {/* Modal Footer */}
-            <div className="bg-slate-950 p-4 border-t border-white/5 flex justify-between items-center">
+            <div className="bg-slate-950 p-4 border-t border-white/5 flex flex-col sm:flex-row justify-between items-center gap-3">
               <span className="text-[10px] text-slate-500">ID record: {selectedSub.id}</span>
-              <div className="flex items-center gap-3">
+              <div className="flex items-center gap-2 flex-wrap">
+                <button
+                  onClick={() => {
+                    setPrintableSub(selectedSub);
+                    setShowPrintModal(true);
+                  }}
+                  className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl transition-colors cursor-pointer text-xs"
+                  title="Stampa Scheda Valutazione Didattica Ufficiale"
+                >
+                  <Printer className="w-4 h-4 text-indigo-400" />
+                  <span>Stampa Scheda A4</span>
+                </button>
                 <button
                   onClick={() => handleExportPDF(selectedSub)}
-                  className="flex items-center gap-1.5 px-4 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl transition-colors cursor-pointer"
+                  className="flex items-center gap-1.5 px-3 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
                 >
                   <Download className="w-4 h-4" />
                   <span>Scarica PDF Report</span>
                 </button>
                 <button
                   onClick={() => setSelectedSub(null)}
-                  className="px-5 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl transition-colors cursor-pointer"
+                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
                 >
                   Chiudi Esame
                 </button>
@@ -2162,6 +2285,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           </div>
         </div>
       )}
+
+      {/* AI Exam Generator Modal */}
+      <AiExamGeneratorModal
+        isOpen={showAiModal}
+        onClose={() => setShowAiModal(false)}
+        onApplyExam={(generatedJson, newTitle) => {
+          setJsonText(generatedJson);
+          if (newTitle) setMateria(newTitle);
+          validateExamJSON(generatedJson);
+        }}
+      />
+
+      {/* Printable Report Modal */}
+      <PrintableReportModal
+        isOpen={showPrintModal}
+        onClose={() => {
+          setShowPrintModal(false);
+          setPrintableSub(null);
+        }}
+        submission={printableSub}
+        examTitle={materia || printableSub?.Tipo}
+      />
 
     </div>
   );

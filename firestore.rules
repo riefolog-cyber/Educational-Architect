@@ -17,9 +17,12 @@ service cloud.firestore {
       allow delete: if request.auth != null;
     }
 
-    // Collection for keeping track of active exam sessions
+    // Collection for keeping track of active exam sessions and live classroom progress
     match /active_sessions/{sessionId} {
       allow read, write: if true;
+      match /{allChildren=**} {
+        allow read, write: if true;
+      }
     }
   }
 }

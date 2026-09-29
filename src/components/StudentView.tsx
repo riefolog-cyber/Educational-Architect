@@ -8,6 +8,7 @@ import {
   addDoc,
   doc,
   getDoc,
+  setDoc,
   query,
   where,
   getDocs,
@@ -33,8 +34,19 @@ import {
   Award,
   Maximize2,
   Minimize2,
-  Split
+  Split,
+  Printer,
+  Eye,
+  Type,
+  Sliders,
+  Sun,
+  Moon,
+  HelpCircle,
+  Shuffle,
+  GraduationCap
 } from "lucide-react";
+
+import PrintableReportModal from "./PrintableReportModal";
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SAMPLE_QUIZ, SAMPLE_WORKBOOK } from "../data";
@@ -117,6 +129,69 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Countdown clock state
   const [remainingTimeText, setRemainingTimeText] = useState("⏱️ Calcolo...");
   const [timerUrgent, setTimerUrgent] = useState(false);
+
+  // Accessibility (BES / DSA) state
+  const [showAccessibilityBar, setShowAccessibilityBar] = useState(false);
+  const [fontSize, setFontSize] = useState<"normal" | "large" | "xlarge">("normal");
+  const [dyslexicFont, setDyslexicFont] = useState(false);
+  const [contrastTheme, setContrastTheme] = useState<"dark" | "sepia" | "light">("dark");
+  const [readingRuler, setReadingRuler] = useState(false);
+  const [mouseY, setMouseY] = useState(0);
+
+  // Printable Report state
+  const [showPrintModal, setShowPrintModal] = useState(false);
+
+  // Reading ruler cursor tracker
+  useEffect(() => {
+    if (!readingRuler) return;
+    const handleMouseMove = (e: MouseEvent) => {
+      setMouseY(e.clientY);
+    };
+    window.addEventListener("mousemove", handleMouseMove);
+    return () => window.removeEventListener("mousemove", handleMouseMove);
+  }, [readingRuler]);
+
+  // Live progress synchronization to Firestore for Teacher Dashboard
+  const syncLiveProgress = async (status: "in_progress" | "self_evaluating" | "submitted" = "in_progress") => {
+    if (!dbFirestore || !sessionPin || !user?.email) return;
+    try {
+      const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+      const answeredCount = examType === "quiz"
+        ? Object.keys(answers.mc).length + Object.keys(answers.oe).filter(k => (answers.oe[k] || "").trim().length > 0).length
+        : Object.keys(answers.wbFib).length + Object.keys(answers.wbRq).filter(k => (answers.wbRq[k] || "").trim().length > 0).length;
+
+      const totalQuestions = examType === "quiz"
+        ? ((examData?.multipleChoice?.length || 0) + (examData?.openEnded?.length || 0))
+        : ((examData?.sections || []).flatMap((s: any) => [...(s.fillInTheBlank || []), ...(s.reflectionQuestions || [])]).length || 1);
+
+      const progressPercent = Math.min(100, Math.round((answeredCount / (totalQuestions || 1)) * 100));
+
+      const docRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey);
+      await setDoc(docRef, {
+        studentName: user.displayName || "Studente",
+        studentEmail: user.email,
+        answeredCount,
+        totalQuestions,
+        currentProgressPercent: progressPercent,
+        tabSwitches: behavior.tabSwitches,
+        pasteAttempts: behavior.pasteAttempts,
+        lastHeartbeat: new Date().toISOString(),
+        status
+      }, { merge: true });
+    } catch (err) {
+      console.warn("Live progress sync skipped:", err);
+    }
+  };
+
+  // Heartbeat syncing during active exam
+  useEffect(() => {
+    if (!isExamActive || !sessionPin || !user?.email) return;
+    syncLiveProgress("in_progress");
+    const interval = setInterval(() => {
+      syncLiveProgress("in_progress");
+    }, 12000);
+    return () => clearInterval(interval);
+  }, [isExamActive, sessionPin, user?.email, answers, behavior.tabSwitches, behavior.pasteAttempts]);
 
   // Ref for tracking focus/visibility lifecycle
   const wakeLockRef = useRef<any>(null);
@@ -318,8 +393,30 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           }
 
           setSessionPin(formattedPin);
-          setExamData(sessionData.data);
-          setExamType(sessionData.data.sections ? "workbook" : "quiz");
+
+          let examContent = sessionData.data;
+          // Anti-cheat: Randomize questions and options if enabled by teacher
+          if (sessionData.randomizeQuestions && examContent?.multipleChoice) {
+            const shuffledMC = examContent.multipleChoice.map((q: any) => {
+              if (!q.options || q.options.length < 2) return q;
+              const mapped = q.options.map((opt: string, idx: number) => ({ opt, idx }));
+              const shuffled = [...mapped].sort(() => Math.random() - 0.5);
+              const newCorrectIndex = shuffled.findIndex(item => item.idx === q.correctIndex);
+              return {
+                ...q,
+                options: shuffled.map(item => item.opt),
+                correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex
+              };
+            }).sort(() => Math.random() - 0.5);
+
+            examContent = {
+              ...examContent,
+              multipleChoice: shuffledMC
+            };
+          }
+
+          setExamData(examContent);
+          setExamType(examContent.sections ? "workbook" : "quiz");
           setExpiryTime(sessionData.expiry || null);
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
@@ -653,6 +750,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     setIsExamActive(true);
     setActiveScreen("exam-space");
+    syncLiveProgress("in_progress");
   };
 
   // MCQ handler
@@ -760,6 +858,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       return;
     }
     setActiveScreen("self-assessment");
+    syncLiveProgress("self_evaluating");
   };
 
   // OPTIMIZATION 3: Poll evaluation queue and save final results permanently on completion
@@ -863,6 +962,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           const docRef = await addDoc(collection(dbFirestore, "valutazioni"), submissionData);
           setActiveSubmissionId(docRef.id);
           setSavingStatus("✓ Tutti i voti e le note di integrità sono salvati nel database del docente!");
+          syncLiveProgress("submitted");
         } catch (dbErr: any) {
           console.error("Errore salvataggio firestore:", dbErr);
           setSavingStatus("⚠️ Connessione al database di classe non riuscita.");
@@ -1728,7 +1828,174 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       {/* Screen 3: Exam workspace space (Quiz OR Workbook) */}
       {activeScreen === "exam-space" && (
         <div className="space-y-6">
-          <div className="bg-slate-900/40 backdrop-blur-xl border border-white/10 p-6 sm:p-8 rounded-3xl">
+          {/* Reading ruler overlay for dyslexic students */}
+          {readingRuler && (
+            <div 
+              className="fixed left-0 right-0 pointer-events-none z-50 transition-all duration-75"
+              style={{ 
+                top: `${mouseY - 24}px`, 
+                height: '48px', 
+                backgroundColor: 'rgba(250, 204, 21, 0.12)', 
+                borderTop: '2px solid rgba(234, 179, 8, 0.4)', 
+                borderBottom: '2px solid rgba(234, 179, 8, 0.4)' 
+              }}
+            />
+          )}
+
+          <div className={`p-6 sm:p-8 rounded-3xl border transition-all ${
+            contrastTheme === "sepia"
+              ? "bg-[#faf6eb] text-[#2b251a] border-amber-900/20"
+              : contrastTheme === "light"
+              ? "bg-[#ffffff] text-[#0f172a] border-slate-300"
+              : "bg-slate-900/40 backdrop-blur-xl border-white/10 text-white"
+          }`}>
+            {/* Accessibility and Inclusive Tools Bar (BES / DSA) */}
+            <div className={`mb-6 p-3 rounded-2xl border transition-all ${
+              contrastTheme === "sepia"
+                ? "bg-amber-100/60 border-amber-300 text-amber-950"
+                : contrastTheme === "light"
+                ? "bg-slate-100 border-slate-200 text-slate-900"
+                : "bg-slate-950/60 border-white/10 text-white"
+            }`}>
+              <div className="flex items-center justify-between flex-wrap gap-2">
+                <button
+                  type="button"
+                  onClick={() => setShowAccessibilityBar(!showAccessibilityBar)}
+                  className="flex items-center gap-1.5 text-xs font-bold text-teal-400 hover:text-teal-300 transition-colors cursor-pointer"
+                >
+                  <Eye className="w-4 h-4" />
+                  <span>Strumenti di Accessibilità & Inclusione (BES / DSA)</span>
+                  <span className="text-[10px] text-slate-400 font-normal">
+                    {showAccessibilityBar ? "▲ Nascondi" : "▼ Personalizza"}
+                  </span>
+                </button>
+                
+                {/* Fast shortcuts if bar collapsed */}
+                <div className="flex items-center gap-1.5 text-[11px]">
+                  <button
+                    type="button"
+                    onClick={() => setDyslexicFont(!dyslexicFont)}
+                    className={`px-2 py-0.5 rounded-lg border text-[10px] font-bold cursor-pointer transition-all ${
+                      dyslexicFont
+                        ? "bg-teal-500/20 text-teal-300 border-teal-500/40"
+                        : "bg-slate-900 text-slate-400 border-white/5 hover:text-white"
+                    }`}
+                    title="Attiva font ad alta leggibilità con spaziatura aumentata per dislessia"
+                  >
+                    Font DSA {dyslexicFont ? "✓" : ""}
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setReadingRuler(!readingRuler)}
+                    className={`px-2 py-0.5 rounded-lg border text-[10px] font-bold cursor-pointer transition-all ${
+                      readingRuler
+                        ? "bg-amber-500/20 text-amber-300 border-amber-500/40"
+                        : "bg-slate-900 text-slate-400 border-white/5 hover:text-white"
+                    }`}
+                    title="Attiva la riga guida di lettura che segue il puntatore"
+                  >
+                    Guida Riga {readingRuler ? "✓" : ""}
+                  </button>
+                </div>
+              </div>
+
+              {showAccessibilityBar && (
+                <div className="pt-2 border-t border-white/5 grid grid-cols-1 sm:grid-cols-3 gap-2.5 text-xs animate-fadeIn mt-2">
+                  {/* Font size */}
+                  <div className="space-y-1">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Dimensione Testo</span>
+                    <div className="flex items-center gap-1">
+                      {(["normal", "large", "xlarge"] as const).map((sz) => (
+                        <button
+                          key={sz}
+                          type="button"
+                          onClick={() => setFontSize(sz)}
+                          className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                            fontSize === sz
+                              ? "bg-indigo-600 text-white shadow-sm"
+                              : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                          }`}
+                        >
+                          {sz === "normal" && "Normale"}
+                          {sz === "large" && "Medio (+15%)"}
+                          {sz === "xlarge" && "Grande (+30%)"}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+
+                  {/* Contrast Theme */}
+                  <div className="space-y-1">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Contrasto Visivo</span>
+                    <div className="flex items-center gap-1">
+                      <button
+                        type="button"
+                        onClick={() => setContrastTheme("dark")}
+                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                          contrastTheme === "dark"
+                            ? "bg-indigo-600 text-white"
+                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                        }`}
+                      >
+                        Notte
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setContrastTheme("sepia")}
+                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                          contrastTheme === "sepia"
+                            ? "bg-amber-600 text-white"
+                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                        }`}
+                      >
+                        Carta / Seppia
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setContrastTheme("light")}
+                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                          contrastTheme === "light"
+                            ? "bg-white text-slate-900 font-extrabold"
+                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                        }`}
+                      >
+                        Giorno
+                      </button>
+                    </div>
+                  </div>
+
+                  {/* Reading aids */}
+                  <div className="space-y-1">
+                    <span className="text-[10px] uppercase font-bold text-slate-400 block">Supporti di Lettura</span>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => setDyslexicFont(!dyslexicFont)}
+                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                          dyslexicFont
+                            ? "bg-teal-500/20 text-teal-300 border border-teal-500/40"
+                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                        }`}
+                      >
+                        Font DSA {dyslexicFont ? "✓" : ""}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setReadingRuler(!readingRuler)}
+                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                          readingRuler
+                            ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
+                        }`}
+                      >
+                        Guida Riga {readingRuler ? "✓" : ""}
+                      </button>
+                    </div>
+                  </div>
+                </div>
+              )}
+            </div>
+
             <div className="border-b border-white/5 pb-4 mb-6 text-center">
               <p className="text-xs uppercase font-mono tracking-wider text-teal-400 font-semibold mb-1">
                 {examType === "quiz" ? "Quiz dell'Istituto" : "Quaderno Workbook"}
@@ -2063,6 +2330,24 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               <h2 className="text-2xl font-display font-bold text-white mt-1">
                 Risultati della Valutazione
               </h2>
+            </div>
+
+            {/* Action Bar: Print / Export Official Report */}
+            <div className="flex items-center justify-between flex-wrap gap-3 bg-slate-950/60 p-3.5 rounded-2xl border border-white/10">
+              <div className="flex items-center gap-2">
+                <GraduationCap className="w-5 h-5 text-indigo-400" />
+                <span className="text-xs text-slate-300 font-medium">
+                  Scheda di valutazione didattica pronta per la visualizzazione o la stampa.
+                </span>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowPrintModal(true)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-indigo-600/20 cursor-pointer transition-all"
+              >
+                <Printer className="w-4 h-4" />
+                <span>Stampa o Salva Scheda PDF</span>
+              </button>
             </div>
 
             {/* Score box and self-assessment matching */}
@@ -2479,6 +2764,26 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           </button>
         </div>
       )}
+
+      {/* Official Printable Report Modal */}
+      <PrintableReportModal
+        isOpen={showPrintModal}
+        onClose={() => setShowPrintModal(false)}
+        submission={{
+          Nome: user?.displayName || "Studente",
+          Email: user?.email || "",
+          Tipo: examType === "quiz" ? "Quiz" : "Workbook",
+          Pin: sessionPin,
+          Timestamp: new Date().toISOString(),
+          Voto_Suggerito: evaluation?.suggestedGrade || "",
+          Autovalutazione: studentSelfGrade,
+          AntiCopia_TabSwitch: behavior.tabSwitches,
+          AntiCopia_IncollaBloccato: behavior.pasteAttempts,
+          Full_Evaluation: evaluation,
+          Risposte_Studente: answers
+        }}
+        examTitle={examData?.title}
+      />
     </div>
   );
 }
