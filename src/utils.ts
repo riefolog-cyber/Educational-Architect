@@ -148,3 +148,137 @@ export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqSco
   
   return formatItalianScholasticGrade(finalGrade);
 }
+
+export interface SplitScreenDetection {
+  isSplit: boolean;
+  reason?: string;
+  ratio: number;
+  mode?: "vertical" | "horizontal" | "floating";
+}
+
+// Robust split-screen and multi-window detection across mobile (Android/iOS) and desktop
+export function detectSplitScreenStatus(): SplitScreenDetection {
+  if (typeof window === "undefined" || typeof screen === "undefined") {
+    return { isSplit: false, ratio: 1 };
+  }
+
+  // Check if student is actively focusing an input or textarea (virtual keyboard on mobile decreases innerHeight)
+  const activeEl = document.activeElement;
+  const isInputFocused = !!activeEl && (
+    activeEl.tagName === "INPUT" ||
+    activeEl.tagName === "TEXTAREA" ||
+    (activeEl as HTMLElement).isContentEditable
+  );
+
+  const screenH = window.screen.availHeight || window.screen.height || 1;
+  const screenW = window.screen.availWidth || window.screen.width || 1;
+  const innerH = window.innerHeight || 1;
+  const innerW = window.innerWidth || 1;
+
+  const heightRatio = innerH / screenH;
+  const widthRatio = innerW / screenW;
+
+  const isPortrait = screenH >= screenW;
+
+  // If no input is focused (e.g. before starting exam, or reading questions/MCQ),
+  // a significant reduction in window dimensions indicates split-screen / multi-window
+  if (!isInputFocused) {
+    // 1. Vertical split screen (typical mobile Android portrait: WhatsApp on top, test app on bottom)
+    // In normal mobile mode, innerH / screenH is typically >= 0.78 even with browser address bar.
+    // In split screen, innerH / screenH drops to ~0.35 - 0.60.
+    if (isPortrait && heightRatio < 0.70) {
+      return {
+        isSplit: true,
+        reason: `Altezza visuale ridotta al ${Math.round(heightRatio * 100)}% dello schermo. Rilevata suddivisione schermo verticale (Split Screen / Multi-Finestra).`,
+        ratio: heightRatio,
+        mode: "vertical"
+      };
+    }
+
+    // 2. Horizontal split screen (side-by-side apps in landscape or tablet/desktop)
+    if (!isPortrait && widthRatio < 0.70) {
+      return {
+        isSplit: true,
+        reason: `Larghezza visuale ridotta al ${Math.round(widthRatio * 100)}% dello schermo. Rilevata suddivisione schermo orizzontale (Split Screen affiancato).`,
+        ratio: widthRatio,
+        mode: "horizontal"
+      };
+    }
+
+    // 3. Floating window / Pop-up view / Picture-in-picture view
+    if (heightRatio < 0.75 && widthRatio < 0.75) {
+      return {
+        isSplit: true,
+        reason: `Finestra ridotta (${Math.round(widthRatio * 100)}% x ${Math.round(heightRatio * 100)}%). Rilevata finestra ridotta o fluttuante.`,
+        ratio: Math.min(heightRatio, widthRatio),
+        mode: "floating"
+      };
+    }
+  }
+
+  return {
+    isSplit: false,
+    ratio: isPortrait ? heightRatio : widthRatio
+  };
+}
+
+// Request true full-screen mode on supporting devices (Android Chrome, Desktop, etc.)
+export async function requestAppFullScreen(): Promise<boolean> {
+  if (typeof document === "undefined") return false;
+  try {
+    const docEl: any = document.documentElement;
+    if (docEl.requestFullscreen) {
+      await docEl.requestFullscreen();
+      return true;
+    } else if (docEl.webkitRequestFullscreen) {
+      await docEl.webkitRequestFullscreen();
+      return true;
+    } else if (docEl.mozRequestFullScreen) {
+      await docEl.mozRequestFullScreen();
+      return true;
+    } else if (docEl.msRequestFullscreen) {
+      await docEl.msRequestFullscreen();
+      return true;
+    }
+  } catch (e) {
+    console.warn("Fullscreen request not granted or not supported:", e);
+  }
+  return false;
+}
+
+// Exit full screen
+export async function exitAppFullScreen(): Promise<boolean> {
+  if (typeof document === "undefined") return false;
+  try {
+    const doc: any = document;
+    if (doc.exitFullscreen) {
+      await doc.exitFullscreen();
+      return true;
+    } else if (doc.webkitExitFullscreen) {
+      await doc.webkitExitFullscreen();
+      return true;
+    } else if (doc.mozCancelFullScreen) {
+      await doc.mozCancelFullScreen();
+      return true;
+    } else if (doc.msExitFullscreen) {
+      await doc.msExitFullscreen();
+      return true;
+    }
+  } catch (e) {
+    console.warn("Exit fullscreen error:", e);
+  }
+  return false;
+}
+
+// Check if currently in full screen mode
+export function isAppFullScreen(): boolean {
+  if (typeof document === "undefined") return false;
+  const doc: any = document;
+  return !!(
+    doc.fullscreenElement ||
+    doc.webkitFullscreenElement ||
+    doc.mozFullScreenElement ||
+    doc.msFullscreenElement
+  );
+}
+

@@ -30,13 +30,24 @@ import {
   BookOpen,
   CheckSquare,
   History,
-  Award
+  Award,
+  Maximize2,
+  Minimize2,
+  Split
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SAMPLE_QUIZ, SAMPLE_WORKBOOK } from "../data";
 import { Answers, Behavior, SessionData, Evaluation, Infraction } from "../types";
-import { formatMarkdown, detectGibberish, fetchWithRetry } from "../utils";
+import { 
+  formatMarkdown, 
+  detectGibberish, 
+  fetchWithRetry, 
+  detectSplitScreenStatus, 
+  requestAppFullScreen, 
+  isAppFullScreen, 
+  SplitScreenDetection 
+} from "../utils";
 
 interface StudentViewProps {
   user: any;
@@ -81,11 +92,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     tabSwitches: 0,
     pasteAttempts: 0,
     rightClicks: 0,
+    splitScreenAttempts: 0,
     infractionsLog: []
   });
 
   const [isExamActive, setIsExamActive] = useState(false);
   const [infractionModalMsg, setInfractionModalMsg] = useState<string | null>(null);
+  
+  // Real-time split screen and display integrity state
+  const [splitScreenInfo, setSplitScreenInfo] = useState<SplitScreenDetection>(() => detectSplitScreenStatus());
+  const [isSplitScreenBlocked, setIsSplitScreenBlocked] = useState(false);
 
   // Self assessment state
   const [studentSelfGrade, setStudentSelfGrade] = useState("");
@@ -324,11 +340,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   // Anti-cheat trigger handler
-  const triggerInfraction = (type: any) => {
-    if (!isExamActive) return;
+  const triggerInfraction = (type: Infraction['type'], details?: string) => {
+    // Allow logging split screen infractions even right before activating or during start
+    if (!isExamActive && type !== "schermo_diviso") return;
 
     const timeStr = new Date().toLocaleTimeString("it-IT");
-    const newInfraction: Infraction = { time: timeStr, type };
+    const newInfraction: Infraction = { time: timeStr, type, details };
 
     setBehavior(prev => {
       const isDuplicate = prev.infractionsLog.some(inf => 
@@ -340,55 +357,126 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let switches = prev.tabSwitches;
       let pasteVal = prev.pasteAttempts;
       let rightC = prev.rightClicks;
+      let splitAttempts = prev.splitScreenAttempts || 0;
 
       if (type === "abbandono_pagina") switches++;
       if (type === "copia_incolla") pasteVal++;
       if (type === "tasto_destro") rightC++;
+      if (type === "schermo_diviso" || type === "uscita_schermo_intero") splitAttempts++;
 
       return {
         tabSwitches: switches,
         pasteAttempts: pasteVal,
         rightClicks: rightC,
+        splitScreenAttempts: splitAttempts,
         infractionsLog: [...prev.infractionsLog, newInfraction]
       };
     });
 
-    const messages = {
-      abbandono_pagina: "Attenzione fuggito! Hai abbandonato la finestra o disattivato lo schermo. Questa infrazione è stata inserita nel registro.",
+    const messages: Record<string, string> = {
+      abbandono_pagina: details || "Attenzione! Hai abbandonato la finestra o toccato un'altra applicazione. Questa infrazione è stata inserita nel registro.",
       tasto_vietato: "Scorciatoia vietata! L'uso di tasti funzione o strumenti di ispezione è severamente proibito.",
       copia_incolla: "Il copia/incolla è disattivato. Scrivi le tue risposte manualmente per favorire il nesso logico.",
-      tasto_destro: "Il mouse destro è bloccato per motivi di integrità d'esame."
+      tasto_destro: "Il mouse destro è bloccato per motivi di integrità d'esame.",
+      schermo_diviso: details || "Attenzione! È stata rilevata la modalità Schermo Diviso (Split Screen / Multi-Finestra). Chiudi le altre app per continuare.",
+      uscita_schermo_intero: details || "Attenzione! Sei uscito dalla modalità a schermo intero. La sessione d'esame richiede la visualizzazione a tutto schermo."
     };
 
     setInfractionModalMsg(messages[type] || "Rilevato comportamento non consentito.");
   };
 
-  // Set up listeners for browser-level cheating
+  // Real-time continuous split-screen and multi-window monitoring
+  useEffect(() => {
+    const checkScreen = () => {
+      const status = detectSplitScreenStatus();
+      setSplitScreenInfo(status);
+
+      if (isExamActive) {
+        if (status.isSplit) {
+          setIsSplitScreenBlocked(true);
+          triggerInfraction("schermo_diviso", status.reason);
+        } else {
+          setIsSplitScreenBlocked(false);
+        }
+      }
+    };
+
+    checkScreen();
+
+    const handleResize = () => {
+      checkScreen();
+    };
+
+    window.addEventListener("resize", handleResize);
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener("resize", handleResize);
+    }
+
+    // High frequency interval (every 600ms) to immediately catch multi-window splits or divider dragging
+    const intervalId = setInterval(checkScreen, 600);
+
+    return () => {
+      window.removeEventListener("resize", handleResize);
+      if (window.visualViewport) {
+        window.visualViewport.removeEventListener("resize", handleResize);
+      }
+      clearInterval(intervalId);
+    };
+  }, [isExamActive]);
+
+  // Set up listeners for browser-level cheating during active exam
   useEffect(() => {
     if (!isExamActive) return;
 
-    // Visibility Listener
+    // Visibility & Focus tracking
     let leaveTime: number | null = null;
+
+    const handleLeave = (reason: string) => {
+      if (!leaveTime) {
+        leaveTime = Date.now();
+        triggerInfraction("abbandono_pagina", reason);
+      }
+    };
+
+    const handleReturn = () => {
+      if (leaveTime) {
+        const duration = Math.round((Date.now() - leaveTime) / 1000);
+        leaveTime = null;
+        
+        setBehavior(prev => {
+          const logs = [...prev.infractionsLog];
+          for (let i = logs.length - 1; i >= 0; i--) {
+            if (logs[i].type === "abbandono_pagina" && logs[i].durationSeconds === undefined) {
+              logs[i].durationSeconds = duration;
+              break;
+            }
+          }
+          return { ...prev, infractionsLog: logs };
+        });
+      }
+    };
+
     const handleVisibility = () => {
       if (document.hidden) {
-        leaveTime = Date.now();
-        triggerInfraction("abbandono_pagina");
+        handleLeave("Cambio scheda o finestra minimizzata");
       } else {
-        if (leaveTime) {
-          const duration = Math.round((Date.now() - leaveTime) / 1000);
-          leaveTime = null;
-          
-          setBehavior(prev => {
-            const logs = [...prev.infractionsLog];
-            for (let i = logs.length - 1; i >= 0; i--) {
-              if (logs[i].type === "abbandono_pagina" && logs[i].durationSeconds === undefined) {
-                logs[i].durationSeconds = duration;
-                break;
-              }
-            }
-            return { ...prev, infractionsLog: logs };
-          });
-        }
+        handleReturn();
+      }
+    };
+
+    // Window Blur (Crucial for split-screen on mobile: fires immediately when user taps WhatsApp in the other split!)
+    const handleWindowBlur = () => {
+      handleLeave("Perdita focus finestra (interazione con altra app affiancata o barra di sistema)");
+    };
+
+    const handleWindowFocus = () => {
+      handleReturn();
+    };
+
+    // Fullscreen change listener
+    const handleFullscreenChange = () => {
+      if (!isAppFullScreen()) {
+        triggerInfraction("uscita_schermo_intero", "Uscita dalla modalità a schermo intero");
       }
     };
 
@@ -414,6 +502,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
+    window.addEventListener("blur", handleWindowBlur);
+    window.addEventListener("focus", handleWindowFocus);
+    document.addEventListener("fullscreenchange", handleFullscreenChange);
+    document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
     document.addEventListener("paste", handlePaste);
     document.addEventListener("contextmenu", handleContextMenu);
     document.addEventListener("keydown", handleKeyDown);
@@ -427,6 +519,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     return () => {
       document.removeEventListener("visibilitychange", handleVisibility);
+      window.removeEventListener("blur", handleWindowBlur);
+      window.removeEventListener("focus", handleWindowFocus);
+      document.removeEventListener("fullscreenchange", handleFullscreenChange);
+      document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
       document.removeEventListener("paste", handlePaste);
       document.removeEventListener("contextmenu", handleContextMenu);
       document.removeEventListener("keydown", handleKeyDown);
@@ -523,13 +619,38 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return Date.now() > target;
   };
 
-  const handleStartExam = () => {
-    setBehavior({
-      tabSwitches: 0,
-      pasteAttempts: 0,
-      rightClicks: 0,
-      infractionsLog: []
-    });
+  const handleStartExam = async () => {
+    // 1. Check if screen is split before starting
+    const currentStatus = detectSplitScreenStatus();
+    setSplitScreenInfo(currentStatus);
+
+    if (currentStatus.isSplit) {
+      const timeStr = new Date().toLocaleTimeString("it-IT");
+      const infraction: Infraction = {
+        time: timeStr,
+        type: "schermo_diviso",
+        details: currentStatus.reason || "Tentativo di avvio del test con schermo diviso / multi-finestra attivo"
+      };
+
+      setBehavior(prev => ({
+        ...prev,
+        splitScreenAttempts: (prev.splitScreenAttempts || 0) + 1,
+        infractionsLog: [...prev.infractionsLog, infraction]
+      }));
+
+      alert(
+        `⚠️ VIOLAZIONE INTEGRITÀ RILEVATA: SCHERMO DIVISO ATTIVO!\n\n` +
+        `${currentStatus.reason || "È stata rilevata la modalità split-screen / multi-finestra con un'altra app aperta."}\n\n` +
+        `È severamente vietato svolgere l'esame affiancando altre applicazioni (es. WhatsApp, app di messaggistica, browser).\n\n` +
+        `Per sbloccare e iniziare la prova devi prima chiudere l'altra applicazione ed espandere questa schermata a tutto schermo.\n\n` +
+        `Il tentativo di inizio con schermo diviso è stato registrato nel log d'esame per il docente.`
+      );
+      return;
+    }
+
+    // 2. Request browser full screen
+    await requestAppFullScreen();
+
     setIsExamActive(true);
     setActiveScreen("exam-space");
   };
@@ -711,6 +832,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Autovalutazione: cleanVal(rescue.studentSelfGrade),
             AntiCopia_TabSwitch: rescue.behavior.tabSwitches,
             AntiCopia_IncollaBloccato: rescue.behavior.pasteAttempts,
+            AntiCopia_SchermoDiviso: rescue.behavior.splitScreenAttempts || 0,
             AntiCopia_InfractionsLog: JSON.stringify(rescue.behavior.infractionsLog),
             Full_Evaluation: JSON.stringify(finalEval),
             Risposte_Studente: JSON.stringify(rescue.answers),
@@ -1486,35 +1608,107 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             </div>
           </div>
 
-          <div className="space-y-4 bg-slate-950/50 p-6 rounded-2xl border border-white/5 text-sm leading-relaxed mb-8">
+          <div className="space-y-4 bg-slate-950/50 p-6 rounded-2xl border border-white/5 text-sm leading-relaxed mb-6">
             <p className="font-semibold text-yellow-500 flex items-center gap-2">
               <Info className="w-4 h-4 shrink-0" />
-              Comportamenti rilevati e segnalati nel log docente:
+              Comportamenti monitorati e registrati nel log d'esame del docente:
             </p>
             <ul className="space-y-2.5 text-slate-300 pl-2">
               <li className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
-                <span><b>Uscita da schermo intero / Cambio Tab</b>: Ogni focus alterato archivia una segnalazione temporale.</span>
+                <span><b>Schermo Diviso / Multi-Finestra vietato</b>: È rigorosamente proibito affiancare altre applicazioni (es. WhatsApp, chat, browser). Il test richiede schermo intero a 100%.</span>
               </li>
               <li className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
-                <span><b>Copia & Incolla disabilitato</b>: I contenuti scritti devono scaturire dall'intento dell'alunno.</span>
+                <span><b>Uscita da schermo intero / Cambio Tab / Perdita Focus</b>: Ogni passaggio ad altre app o tocco su notifiche/finestre esterne archivia una violazione temporale con durata.</span>
               </li>
               <li className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
-                <span><b>Tasto Destro ed Ispezione bloccati</b>: Controlli protettivi attivi sul sorgente del foglio.</span>
+                <span><b>Copia & Incolla disabilitato</b>: I contenuti scritti devono scaturire dall'elaborazione autonoma dello studente.</span>
+              </li>
+              <li className="flex items-center gap-2">
+                <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
+                <span><b>Tasto Destro ed Ispezione bloccati</b>: Funzioni di copia e ispezione codice sorgente disabilitate.</span>
               </li>
             </ul>
+          </div>
 
-            
+          {/* Real-time Display Integrity / Split-Screen Diagnosis Box */}
+          <div className="mb-8">
+            {splitScreenInfo.isSplit ? (
+              <div className="p-4 bg-red-950/60 border-2 border-red-500/50 rounded-2xl text-left space-y-3 shadow-lg animate-pulse">
+                <div className="flex items-start gap-3">
+                  <div className="p-2 bg-red-500/20 rounded-xl text-red-400 shrink-0 mt-0.5">
+                    <AlertTriangle className="w-5 h-5" />
+                  </div>
+                  <div className="space-y-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <h4 className="text-sm font-bold text-red-300">
+                        ⚠️ Violazione Rilevata: Schermo Diviso / Multi-Finestra Attivo
+                      </h4>
+                      <span className="text-[10px] font-mono px-2 py-0.5 rounded-full bg-red-500/30 text-red-200 border border-red-500/40 font-bold">
+                        Spazio occupato: {Math.round(splitScreenInfo.ratio * 100)}%
+                      </span>
+                    </div>
+                    <p className="text-xs text-red-200/90 leading-relaxed">
+                      {splitScreenInfo.reason || "L'applicazione è attualmente aperta in modalità ridotta o condivisa con un'altra app (es. WhatsApp, app di messaggistica o browser)."}
+                    </p>
+                    <p className="text-[11px] text-red-300 font-semibold pt-1">
+                      ⛔ L'avvio della prova è <b>bloccato</b>. Chiudi l'altra applicazione ed espandi il test a schermo intero per sbloccare l'esame.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="pt-2 border-t border-red-500/20 flex flex-col sm:flex-row items-center justify-between gap-2">
+                  <span className="text-[10px] text-red-400/80 font-mono">
+                    Stato dispositivo: Multi-Window attivo ({splitScreenInfo.mode || "verticale"})
+                  </span>
+                  <button
+                    type="button"
+                    onClick={async () => {
+                      await requestAppFullScreen();
+                      const next = detectSplitScreenStatus();
+                      setSplitScreenInfo(next);
+                    }}
+                    className="w-full sm:w-auto px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer active:scale-95"
+                  >
+                    <Maximize2 className="w-3.5 h-3.5" />
+                    <span>Espandi a Schermo Intero</span>
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="p-3.5 bg-emerald-950/40 border border-emerald-500/30 rounded-2xl flex items-center justify-between gap-3 text-emerald-300 text-xs">
+                <div className="flex items-center gap-2">
+                  <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                  <span className="font-semibold">Schermo intero verificato (nessuna applicazione affiancata rilevata)</span>
+                </div>
+                <span className="text-[10px] bg-emerald-500/10 text-emerald-400 px-2.5 py-0.5 rounded-full font-mono font-bold border border-emerald-500/20">
+                  100% OK ✓
+                </span>
+              </div>
+            )}
           </div>
 
           <button
             onClick={handleStartExam}
-            className="w-full py-4 bg-emerald-500 text-emerald-950 hover:bg-emerald-400 font-bold rounded-2xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg shadow-emerald-500/10 active:scale-[0.98]"
+            className={`w-full py-4 font-bold rounded-2xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg active:scale-[0.98] ${
+              splitScreenInfo.isSplit
+                ? "bg-red-600 text-white hover:bg-red-500 border border-red-400/30 shadow-red-500/20"
+                : "bg-emerald-500 text-emerald-950 hover:bg-emerald-400 shadow-emerald-500/10"
+            }`}
           >
-            <span>Inizia la Prova</span>
-            <ChevronRight className="w-5 h-5" />
+            {splitScreenInfo.isSplit ? (
+              <>
+                <AlertTriangle className="w-5 h-5 text-amber-200" />
+                <span>⚠️ Schermo Diviso Rilevato — Chiudi l'altra app per Iniziare</span>
+              </>
+            ) : (
+              <>
+                <span>Inizia la Prova</span>
+                <ChevronRight className="w-5 h-5" />
+              </>
+            )}
           </button>
         </div>
       )}
@@ -2217,6 +2411,39 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               <span>Concludi e Torna alla Home</span>
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Active Exam Split-Screen Blocking Overlay */}
+      {isSplitScreenBlocked && isExamActive && (
+        <div className="fixed inset-0 bg-slate-950/95 z-[99999] flex flex-col justify-center items-center p-6 text-center leading-relaxed backdrop-blur-md">
+          <div className="p-4 bg-red-500/15 border-2 border-red-500/40 text-red-500 rounded-3xl mb-6 animate-pulse">
+            <AlertTriangle className="w-12 h-12" />
+          </div>
+          <h2 className="text-2xl sm:text-3xl font-display font-bold text-white mb-2 uppercase tracking-wide">
+            SCHERMO CONDIVISO RILEVATO
+          </h2>
+          <p className="text-sm text-red-200 max-w-lg mb-4 leading-relaxed">
+            È stata rilevata la modalità split-screen o un'altra applicazione (es. WhatsApp, chat, browser) affiancata al test d'esame.
+            La prova è stata <b>temporaneamente sospesa</b> e la violazione è stata annotata nel registro ufficiale del docente.
+          </p>
+          <div className="p-3 bg-red-900/30 border border-red-500/30 rounded-xl text-xs text-red-300 font-mono mb-6 max-w-md">
+            Chiudi l'altra applicazione oppure trascina il separatore per espandere il test a tutto schermo.
+          </div>
+          <button
+            onClick={async () => {
+              await requestAppFullScreen();
+              const next = detectSplitScreenStatus();
+              setSplitScreenInfo(next);
+              if (!next.isSplit) {
+                setIsSplitScreenBlocked(false);
+              }
+            }}
+            className="px-6 py-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer active:scale-95"
+          >
+            <Maximize2 className="w-4 h-4" />
+            <span>Espandi a Tutto Schermo</span>
+          </button>
         </div>
       )}
 

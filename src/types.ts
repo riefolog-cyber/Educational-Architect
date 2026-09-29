@@ -67,14 +67,16 @@ export interface Answers {
 
 export interface Infraction {
   time: string;
-  type: 'abbandono_pagina' | 'tasto_vietato' | 'copia_incolla' | 'tasto_destro';
+  type: 'abbandono_pagina' | 'tasto_vietato' | 'copia_incolla' | 'tasto_destro' | 'schermo_diviso' | 'uscita_schermo_intero';
   durationSeconds?: number;
+  details?: string;
 }
 
 export interface Behavior {
   tabSwitches: number;
   pasteAttempts: number;
   rightClicks: number;
+  splitScreenAttempts: number;
   infractionsLog: Infraction[];
 }
 
@@ -124,6 +126,7 @@ export interface SavedSubmission {
   Autovalutazione: string;
   AntiCopia_TabSwitch: number;
   AntiCopia_IncollaBloccato: number;
+  AntiCopia_SchermoDiviso?: number;
   AntiCopia_InfractionsLog: string; // JSON string
   Full_Evaluation: any; // JSON object or string
   Risposte_Studente: any; // JSON object or string

@@ -822,10 +822,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       doc.setTextColor(71, 85, 105);
       doc.text("MONITORAGGIO INTEGRITÀ", 150, currentY + 8);
       doc.setFontSize(10);
-      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
       if (totalViolations > 0) {
         doc.setTextColor(180, 83, 9); // Amber
-        doc.text(`Rilevato (${totalViolations} uscite/incolla)`, 150, currentY + 18);
+        doc.text(`Rilevato (${totalViolations} violazioni)`, 150, currentY + 18);
       } else {
         doc.setTextColor(5, 150, 105); // Emerald Green
         doc.text("Ottima (0 anomalie)", 150, currentY + 18);
@@ -1858,17 +1858,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   Statistiche Monitoraggio Integrità Autore
                 </p>
                 <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-300">
-                  <p>Uscite scheda: <b>{selectedSub.AntiCopia_TabSwitch}</b></p>
-                  <p>Incolla bloccati: <b>{selectedSub.AntiCopia_IncollaBloccato}</b></p>
+                  <p>Uscite / Focus: <b>{selectedSub.AntiCopia_TabSwitch || 0}</b></p>
+                  <p>Incolla bloccati: <b>{selectedSub.AntiCopia_IncollaBloccato || 0}</b></p>
+                  <p>Schermo diviso: <b className={(selectedSub.AntiCopia_SchermoDiviso || 0) > 0 ? "text-rose-400 font-bold" : ""}>{selectedSub.AntiCopia_SchermoDiviso || 0}</b></p>
                 </div>
 
                 {selectedSub.AntiCopia_InfractionsLog && (
                   <div className="mt-2 text-[10px] text-slate-400 font-mono">
                     <p className="font-bold uppercase text-yellow-500/80">Cronologia Completa:</p>
-                    <div className="max-h-16 overflow-y-auto mt-1 space-y-1">
-                      {JSON.parse(selectedSub.AntiCopia_InfractionsLog).map((inf: any, idx: number) => (
-                        <p key={idx}>• [{inf.time}] Violazione: {inf.type.replace("_", " ")}{inf.durationSeconds ? ` (${inf.durationSeconds}s fuori app)` : ""}</p>
-                      ))}
+                    <div className="max-h-24 overflow-y-auto mt-1 space-y-1">
+                      {JSON.parse(selectedSub.AntiCopia_InfractionsLog).map((inf: any, idx: number) => {
+                        let label = inf.type.replace(/_/g, " ");
+                        if (inf.type === "schermo_diviso") label = "Schermo Diviso (Multi-Window)";
+                        else if (inf.type === "uscita_schermo_intero") label = "Uscita Schermo Intero";
+                        else if (inf.type === "abbandono_pagina") label = "Abbandono Finestra / Cambio App";
+                        else if (inf.type === "copia_incolla") label = "Tentativo Copia/Incolla";
+                        else if (inf.type === "tasto_destro") label = "Click Tasto Destro";
+                        else if (inf.type === "tasto_vietato") label = "Scorciatoia / Ispezione";
+
+                        return (
+                          <p key={idx}>
+                            • [{inf.time}] <span className="font-bold text-slate-300">{label}</span>
+                            {inf.durationSeconds ? ` (${inf.durationSeconds}s fuori app)` : ""}
+                            {inf.details ? ` - ${inf.details}` : ""}
+                          </p>
+                        );
+                      })}
                     </div>
                   </div>
                 )}
