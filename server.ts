@@ -228,7 +228,13 @@ async function runEvaluationCore(reqBody: any) {
     throw new Error("La chiave API di Gemini non è configurata nell'ambiente.");
   }
 
-  if (tipo === "Quiz") {
+  if (!report) {
+    throw new Error("Dati della prova o risposte non pervenute al server.");
+  }
+
+  const normalizedTipo = String(tipo || "").trim().toLowerCase();
+
+  if (normalizedTipo === "quiz") {
     const mcScore = report.punteggioMC || 0;
     const mcList = report.domande?.multipleChoice || [];
     const mcCount = mcList.length;
@@ -371,7 +377,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     evaluation.suggestedGrade = calculateQuizGrade(mcScore, mcCount, oeScores);
     return evaluation;
 
-  } else if (tipo === "Workbook") {
+  } else if (normalizedTipo === "workbook") {
     const sections = report.domande?.sections || [];
     const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
     const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);

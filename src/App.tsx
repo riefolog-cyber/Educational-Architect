@@ -1,7 +1,9 @@
-import { useState, useEffect } from "react";
+import React, { useState, useEffect } from "react";
 import { 
   onAuthStateChanged, 
   signInWithPopup, 
+  signInWithRedirect,
+  getRedirectResult,
   signOut, 
   User 
 } from "firebase/auth";
@@ -23,7 +25,15 @@ import {
   LogIn,
   Layers,
   ChevronRight,
-  MonitorPlay
+  MonitorPlay,
+  HelpCircle,
+  Smartphone,
+  Globe,
+  AlertCircle,
+  ArrowRight,
+  ShieldCheck,
+  CheckCircle2,
+  X
 } from "lucide-react";
 
 import { motion, AnimatePresence } from "motion/react";
@@ -31,6 +41,17 @@ import { auth, googleProvider, dbFirestore } from "./firebase";
 import StudentView from "./components/StudentView";
 import TeacherDashboard from "./components/TeacherDashboard";
 import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
+
+// Helper to detect if user opened the link inside an in-app browser (WebView like WhatsApp, Classroom, etc.)
+function checkIsInAppBrowser(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || navigator.vendor || (window as any).opera || "";
+  return (
+    /FBAN|FBAV|Instagram|WhatsApp|Line|Twitter|Snapchat|Kakaotalk|GSA|musical_ly|BytedanceWebview/i.test(ua) ||
+    (ua.includes("wv") && ua.includes("Android")) ||
+    (/iPhone|iPod|iPad/i.test(ua) && ua.includes("Mobile") && !ua.includes("Safari") && !ua.includes("CriOS"))
+  );
+}
 
 export default function App() {
   // Authentication states
@@ -40,112 +61,288 @@ export default function App() {
   const [roleChecking, setRoleChecking] = useState(false);
   const [authError, setAuthError] = useState("");
   const [roleError, setRoleError] = useState("");
+  const [isPopupSigningIn, setIsPopupSigningIn] = useState(false);
+  const [isRedirectSigningIn, setIsRedirectSigningIn] = useState(false);
+
+  // Tab & Alternative login states
+  const [loginTab, setLoginTab] = useState<"google" | "direct">("google");
+  const [directName, setDirectName] = useState("");
+  const [directSurname, setDirectSurname] = useState("");
+  const [directEmail, setDirectEmail] = useState("");
+  const [directError, setDirectError] = useState("");
+  const [showWorkspaceHelp, setShowWorkspaceHelp] = useState(false);
 
   const [activePane, setActivePane] = useState<"home" | "student" | "teacher">("home");
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
+  const [inAppBrowserDetected, setInAppBrowserDetected] = useState(false);
 
-  // Verify and Bootstrap user role function
+  useEffect(() => {
+    setInAppBrowserDetected(checkIsInAppBrowser());
+
+    // Pre-fill student fields from previous session if present
+    try {
+      const savedName = localStorage.getItem("saved_student_name");
+      const savedSurname = localStorage.getItem("saved_student_surname");
+      const savedEmail = localStorage.getItem("saved_student_email");
+      if (savedName) setDirectName(savedName);
+      if (savedSurname) setDirectSurname(savedSurname);
+      if (savedEmail) setDirectEmail(savedEmail);
+    } catch (e) {
+      // Storage access blocked or restricted
+    }
+  }, []);
+
+  // Verify and Bootstrap user role function (fast & non-blocking for students)
   const checkUserRoleAndBootstrap = async (currentUser: any) => {
     if (!currentUser) {
       setRole("student");
       return;
     }
-    setRoleChecking(true);
-    setRoleError("");
-    try {
-      // Check if user is a hardcoded admin
-      const isHardcodedTeacher = 
-        currentUser?.email === "riefolo.giovanni@ferrarisfermiclass.it" || 
-        currentUser?.email === "riefolog@gmail.com";
-      
-      if (isHardcodedTeacher) {
-        setRole("admin");
-      } else if (dbFirestore) {
-        // Check the "docenti" collection
-        const docentiCollectionRef = collection(dbFirestore, "docenti");
-        const allDocentiSnap = await getDocs(docentiCollectionRef);
-
-        if (allDocentiSnap.empty && currentUser?.email) {
-          // BOOTSTRAP MODE: If the collection is completely empty,
-          // the first logged in user gets automatically promoted to admin.
-          // This makes cloning/remixing seamless for other teachers with their own Firebase project.
-          const docId = currentUser.email.replace(/[^a-zA-Z0-9]/g, "_");
-          await setDoc(doc(dbFirestore, "docenti", docId), {
-            email: currentUser.email,
-            role: "admin",
-            gasUrl: ""
-          });
-          setRole("admin");
-        } else {
-          const q = query(
-            docentiCollectionRef, 
-            where("email", "==", currentUser.email)
-          );
-          const querySnapshot = await getDocs(q);
-          if (!querySnapshot.empty && querySnapshot.docs[0].data().role === "admin") {
-            setRole("admin");
-          } else {
-            setRole("student");
-          }
-        }
-      } else {
-        setRole("student");
-      }
-    } catch (e: any) {
-      console.error("Errore recupero ruolo docente:", e);
-      setRole("student");
-      setRoleError(e.message || String(e));
-    } finally {
-      setRoleChecking(false);
-    }
-  };
-
-  // Auth changed listener
-  useEffect(() => {
-    if (!auth) {
-      setAuthLoading(false);
+    
+    // 1. Fast check for hardcoded teachers
+    const isHardcodedTeacher = 
+      currentUser?.email === "riefolo.giovanni@ferrarisfermiclass.it" || 
+      currentUser?.email === "riefolog@gmail.com";
+    
+    if (isHardcodedTeacher) {
+      setRole("admin");
       return;
     }
 
+    // Default to student immediately so UI is responsive
+    setRole("student");
+
+    // 2. Background check if teacher is listed in Firestore "docenti"
+    if (dbFirestore && currentUser?.email) {
+      setRoleChecking(true);
+      try {
+        const docentiCollectionRef = collection(dbFirestore, "docenti");
+        const q = query(
+          docentiCollectionRef, 
+          where("email", "==", currentUser.email)
+        );
+        const querySnapshot = await getDocs(q);
+        if (!querySnapshot.empty && querySnapshot.docs[0].data().role === "admin") {
+          setRole("admin");
+        }
+      } catch (e: any) {
+        console.warn("Verifica ruolo docente secondario:", e);
+      } finally {
+        setRoleChecking(false);
+      }
+    }
+  };
+
+  // Auth changed listener with redirect support & direct session recovery
+  useEffect(() => {
+    // Safety timeout: Ensure authLoading never blocks indefinitely
+    const safetyTimer = setTimeout(() => {
+      setAuthLoading(false);
+    }, 2200);
+
+    // 1. Check if student previously logged in via Direct Student Access (sessionStorage or localStorage)
+    try {
+      const savedDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
+      if (savedDirect) {
+        const parsed = JSON.parse(savedDirect);
+        if (parsed?.email) {
+          setUser(parsed);
+          setRole("student");
+          setAuthLoading(false);
+          clearTimeout(safetyTimer);
+          return;
+        }
+      }
+    } catch {
+      sessionStorage.removeItem("direct_student_user");
+      localStorage.removeItem("direct_student_user");
+    }
+
+    if (!auth) {
+      setAuthLoading(false);
+      clearTimeout(safetyTimer);
+      return;
+    }
+
+    // 2. Handle redirect auth result (e.g. for mobile browsers)
+    getRedirectResult(auth)
+      .then((result) => {
+        if (result?.user) {
+          setUser(result.user);
+          checkUserRoleAndBootstrap(result.user);
+        }
+      })
+      .catch((err) => {
+        console.error("Redirect Auth error:", err);
+        handleAuthErrorMessage(err);
+      });
+
+    // 3. Main onAuthStateChanged listener
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
+      clearTimeout(safetyTimer);
       setAuthLoading(true);
       if (currentUser) {
         setUser(currentUser);
         await checkUserRoleAndBootstrap(currentUser);
       } else {
-        setUser(null);
-        setRole("student");
-        setRoleError("");
+        // If not logged into Firebase, check if direct student was stored
+        try {
+          const currentDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
+          if (currentDirect) {
+            setUser(JSON.parse(currentDirect));
+            setRole("student");
+          } else {
+            setUser(null);
+            setRole("student");
+            setRoleError("");
+          }
+        } catch {
+          setUser(null);
+          setRole("student");
+        }
       }
       setAuthLoading(false);
     });
 
-    return () => unsubscribe();
+    return () => {
+      clearTimeout(safetyTimer);
+      unsubscribe();
+    };
   }, []);
 
-  const handleSignInGoogle = async () => {
+  const handleAuthErrorMessage = (err: any) => {
+    console.error("Google Auth failed:", err);
+    const code = err.code || "";
+    const msg = (err.message || "").toLowerCase();
+
+    if (code === "auth/popup-blocked") {
+      setAuthError(
+        "Finestra pop-up bloccata dal browser del tuo telefono (Safari o Chrome mobile). Clicca sul pulsante 'Accedi con Reindirizzamento' qui sotto, oppure usa la scheda 'Accesso Diretto Studente'."
+      );
+    } else if (code === "auth/popup-closed-by-user") {
+      setAuthError(
+        "Finestra di accesso chiusa prima del termine. Riprova e seleziona il tuo account @ferrarisfermiclass.it."
+      );
+    } else if (code === "auth/cancelled-popup-request") {
+      setAuthError(
+        "Richiesta annullata: un'altra finestra di accesso era già aperta. Attendi qualche secondo e riprova."
+      );
+    } else if (
+      code === "auth/admin-restricted-operation" ||
+      msg.includes("admin") ||
+      msg.includes("restricted") ||
+      msg.includes("policy") ||
+      msg.includes("blocked")
+    ) {
+      setAuthError(
+        "⚠️ Accesso bloccato dalla policy d'istituto (Google Workspace for Education): l'amministratore della scuola ha restrizioni attive per gli account degli studenti minori di 18 anni. Puoi utilizzare subito la scheda 'Accesso Diretto Studente' inserendo la tua email @ferrarisfermiclass.it per svolgere il test senza blocchi!"
+      );
+    } else if (code === "auth/unauthorized-domain") {
+      setAuthError(
+        "Questo host non è inserito tra i domini autorizzati su Firebase. Puoi entrare subito usando la scheda 'Accesso Diretto Studente'."
+      );
+    } else if (code === "auth/network-request-failed") {
+      setAuthError(
+        "Errore di rete o Wi-Fi scolastico con restrizioni di rete. Prova con la rete dati cellulare o usa la scheda 'Accesso Diretto Studente'."
+      );
+    } else {
+      setAuthError(err.message || "Errore durante l'autenticazione Google. Prova con l'Accesso Diretto Studente.");
+    }
+  };
+
+  const handleSignInGoogle = async (useRedirect = false) => {
     setAuthError("");
     if (!auth || !googleProvider) {
       setAuthError("Servizi Firebase non configurati. Impossibile autenticare.");
       return;
     }
+
+    if (inAppBrowserDetected && !useRedirect) {
+      setAuthError(
+        "Stai aprendo il link dentro WhatsApp o Classroom. Google blocca l'accesso nei browser interni (disallowed_useragent). Tocca i 3 puntini ⋮ in alto a destra e seleziona 'Apri in Chrome' o 'Apri in Safari', oppure usa la scheda 'Accesso Diretto Studente' per entrare subito."
+      );
+      return;
+    }
+
     try {
-      await signInWithPopup(auth, googleProvider);
-    } catch (err: any) {
-      console.error("Google Auth failed:", err);
-      if (err.code === "auth/unauthorized-domain") {
-        setAuthError(
-          "Questo dominio di test non è inserito negli host autorizzati su Firebase Console. Configura i domini autorizzati."
-        );
+      if (useRedirect) {
+        setIsRedirectSigningIn(true);
+        await signInWithRedirect(auth, googleProvider);
       } else {
-        setAuthError(err.message);
+        setIsPopupSigningIn(true);
+        await signInWithPopup(auth, googleProvider);
       }
+    } catch (err: any) {
+      handleAuthErrorMessage(err);
+    } finally {
+      setIsPopupSigningIn(false);
+      setIsRedirectSigningIn(false);
     }
   };
 
+  // Direct student access with name, surname and school email
+  const handleDirectStudentLogin = (e: React.FormEvent) => {
+    e.preventDefault();
+    setDirectError("");
+
+    const nome = directName.trim();
+    const cognome = directSurname.trim();
+    const email = directEmail.trim().toLowerCase();
+
+    if (!nome || !cognome) {
+      setDirectError("Inserisci sia il nome che il cognome per identificare la prova.");
+      return;
+    }
+
+    if (!email || !email.includes("@")) {
+      setDirectError("Inserisci un indirizzo email valido.");
+      return;
+    }
+
+    // Must be school domain or valid educational email
+    const isSchoolOrEdu = 
+      email.endsWith("@ferrarisfermiclass.it") || 
+      email.endsWith(".it") ||
+      email.endsWith("@gmail.com");
+
+    if (!isSchoolOrEdu) {
+      setDirectError("Inserisci l'indirizzo email istituzionale (@ferrarisfermiclass.it).");
+      return;
+    }
+
+    const studentUser = {
+      displayName: `${nome} ${cognome}`,
+      email: email,
+      isDirectAccess: true
+    };
+
+    try {
+      sessionStorage.setItem("direct_student_user", JSON.stringify(studentUser));
+      localStorage.setItem("direct_student_user", JSON.stringify(studentUser));
+      localStorage.setItem("saved_student_name", nome);
+      localStorage.setItem("saved_student_surname", cognome);
+      localStorage.setItem("saved_student_email", email);
+    } catch (e) {
+      // Storage access blocked or restricted
+    }
+
+    setUser(studentUser);
+    setRole("student");
+    setActivePane("student");
+  };
+
   const handleSignOut = async () => {
+    try {
+      sessionStorage.removeItem("direct_student_user");
+      localStorage.removeItem("direct_student_user");
+    } catch (e) {}
+
     if (auth) {
-      await signOut(auth);
+      try {
+        await signOut(auth);
+      } catch (e) {
+        console.warn("SignOut error:", e);
+      }
     }
     setUser(null);
     setRole("student");
@@ -209,36 +406,248 @@ export default function App() {
                   {/* Privacy & Blind Grading Explanatory Banner Box */}
                   <PrivacyBannerBox onOpenModal={() => setShowPrivacyModal(true)} />
 
+                  {/* In-App Browser (WhatsApp/Classroom WebView) Alert Banner */}
+                  {inAppBrowserDetected && (
+                    <div className="bg-amber-950/60 border border-amber-500/40 p-4 rounded-2xl text-left text-xs leading-relaxed text-amber-200 space-y-2 shadow-lg animate-pulse">
+                      <div className="flex items-center gap-2 font-bold text-amber-300">
+                        <Smartphone className="w-4 h-4 shrink-0" />
+                        <span>ATTENZIONE: Stai aprendo il link dal browser interno di WhatsApp o Classroom</span>
+                      </div>
+                      <p className="text-[11px] text-amber-100/90 leading-relaxed">
+                        Google blocca per motivi di sicurezza l'accesso OAuth nei browser interni (errore <i>disallowed_useragent</i>).
+                      </p>
+                      <p className="text-[11px] font-semibold text-white bg-amber-900/40 p-2 rounded-xl border border-amber-500/20">
+                        👉 <b>Cosa fare:</b> Tocca i tre puntini <b>⋮</b> in alto a destra e scegli <b>"Apri in Chrome"</b> o <b>"Apri in Safari"</b>, oppure utilizza la scheda <b>"Accesso Diretto Studente"</b> qui sotto per entrare all'istante con la tua email scolastica.
+                      </p>
+                    </div>
+                  )}
+
                   {/* Authentication errors alert box */}
                   {authError && (
-                    <div className="bg-yellow-500/5 border border-yellow-500/20 p-4.5 rounded-2xl text-left text-xs leading-relaxed text-yellow-300 space-y-2">
-                      <p className="font-bold flex items-center gap-1.5 uppercase text-yellow-400">
-                        <ShieldAlert className="w-4 h-4 shrink-0" />
-                        Avviso Autenticazione Google
-                      </p>
-                      <p>{authError}</p>
+                    <div className="bg-rose-950/60 border border-rose-500/30 p-4 rounded-2xl text-left text-xs leading-relaxed text-rose-200 space-y-2 shadow-lg relative">
+                      <div className="flex items-start justify-between gap-2">
+                        <p className="font-bold flex items-center gap-1.5 uppercase text-rose-300">
+                          <ShieldAlert className="w-4 h-4 shrink-0 text-rose-400" />
+                          <span>Avviso Autenticazione Google</span>
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => setAuthError("")}
+                          className="text-rose-300 hover:text-white p-1 rounded-lg transition-colors cursor-pointer"
+                        >
+                          <X className="w-4 h-4" />
+                        </button>
+                      </div>
+                      <p className="text-xs text-rose-100/90">{authError}</p>
+                      <div className="pt-1 flex items-center gap-2">
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setAuthError("");
+                            setLoginTab("direct");
+                          }}
+                          className="text-[11px] font-bold text-white bg-rose-600 hover:bg-rose-500 px-3 py-1.5 rounded-lg transition-colors cursor-pointer"
+                        >
+                          Usa l'Accesso Diretto con Email Scolastica &rarr;
+                        </button>
+                      </div>
                     </div>
                   )}
 
                   {/* Secure Authentication Wrapper */}
                   {!user ? (
-                    <div className="bg-slate-900/40 backdrop-blur-xl border border-white/10 p-8 rounded-3xl text-center space-y-5 shadow-xl max-w-md mx-auto">
-                      <div className="inline-flex p-3 bg-teal-500/10 border border-teal-500/20 text-teal-400 rounded-2xl">
-                        <LogIn className="w-6 h-6" />
+                    <div className="bg-slate-900/50 backdrop-blur-xl border border-white/10 p-6 sm:p-8 rounded-3xl text-center space-y-5 shadow-2xl max-w-lg mx-auto">
+                      
+                      {/* Domain Badge Header */}
+                      <div className="flex flex-col items-center gap-2">
+                        <div className="inline-flex p-3 bg-teal-500/10 border border-teal-500/20 text-teal-400 rounded-2xl">
+                          <GraduationCap className="w-6 h-6" />
+                        </div>
+                        <div>
+                          <h3 className="text-lg font-display font-bold text-white">Accesso Piattaforma d'Istituto</h3>
+                          <div className="flex items-center justify-center gap-1.5 mt-1 text-slate-400 text-xs">
+                            <span>Dominio:</span>
+                            <span className="font-mono font-bold text-teal-400 bg-teal-500/10 px-2 py-0.5 rounded-md border border-teal-500/20 text-[11px]">
+                              @ferrarisfermiclass.it
+                            </span>
+                          </div>
+                        </div>
                       </div>
-                      <div>
-                        <h3 className="text-lg font-display font-bold text-white">Accesso Registrato Richiesto</h3>
-                        <p className="text-xs text-slate-400 mt-1 leading-relaxed">
-                          Effettua l'accesso con un Account Google scolastico autorizzato per accedere all'area Studente o Docente.
-                        </p>
+
+                      {/* Mode Switching Tabs */}
+                      <div className="grid grid-cols-2 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold">
+                        <button
+                          type="button"
+                          onClick={() => setLoginTab("google")}
+                          className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                            loginTab === "google"
+                              ? "bg-teal-600 text-white shadow-md font-bold"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          <Globe className="w-3.5 h-3.5" />
+                          <span>Account Google</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLoginTab("direct")}
+                          className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                            loginTab === "direct"
+                              ? "bg-indigo-600 text-white shadow-md font-bold"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          <BookOpen className="w-3.5 h-3.5" />
+                          <span>Accesso Diretto Studente</span>
+                        </button>
                       </div>
-                      <button
-                        onClick={handleSignInGoogle}
-                        className="w-full py-3 bg-white hover:bg-slate-100 text-slate-900 font-bold text-sm rounded-xl flex items-center justify-center gap-2.5 cursor-pointer transition-colors shadow-md active:scale-95"
-                      >
-                        <LogIn className="w-4 h-4 shrink-0" />
-                        Accedi con Google
-                      </button>
+
+                      {/* Tab 1: Google Authentication Options */}
+                      {loginTab === "google" && (
+                        <div className="space-y-3 pt-1">
+                          <p className="text-xs text-slate-300 leading-relaxed text-left">
+                            Accedi con il tuo Account Google scolastico. Verrà mostrato il selettore per scegliere il tuo profilo <b>@ferrarisfermiclass.it</b>.
+                          </p>
+
+                          <button
+                            type="button"
+                            onClick={() => handleSignInGoogle(false)}
+                            disabled={isPopupSigningIn || isRedirectSigningIn}
+                            className="w-full py-3.5 bg-white hover:bg-slate-100 disabled:opacity-60 active:scale-[0.98] text-slate-950 font-bold text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2.5 cursor-pointer transition-all shadow-md"
+                          >
+                            {isPopupSigningIn ? (
+                              <>
+                                <div className="w-4 h-4 rounded-full border-2 border-slate-900 border-t-transparent animate-spin" />
+                                <span>Connessione a Google in corso...</span>
+                              </>
+                            ) : (
+                              <>
+                                <LogIn className="w-4 h-4 shrink-0 text-slate-950" />
+                                <span>Accedi con Google (Pop-up)</span>
+                              </>
+                            )}
+                          </button>
+
+                          <div className="pt-2 border-t border-white/5 space-y-2">
+                            <p className="text-[11px] text-slate-400 text-left">
+                              Sei su iPhone/Android o hai i pop-up bloccati nel browser?
+                            </p>
+                            <button
+                              type="button"
+                              onClick={() => handleSignInGoogle(true)}
+                              disabled={isPopupSigningIn || isRedirectSigningIn}
+                              className="w-full py-2.5 bg-slate-800 hover:bg-slate-700 disabled:opacity-60 active:scale-[0.98] text-slate-200 border border-white/10 font-semibold text-xs rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all"
+                            >
+                              {isRedirectSigningIn ? (
+                                <>
+                                  <div className="w-3.5 h-3.5 rounded-full border-2 border-teal-400 border-t-transparent animate-spin" />
+                                  <span>Reindirizzamento verso Google in corso...</span>
+                                </>
+                              ) : (
+                                <>
+                                  <Smartphone className="w-3.5 h-3.5 text-teal-400" />
+                                  <span>Accedi con Reindirizzamento (consigliato su cellulare)</span>
+                                </>
+                              )}
+                            </button>
+                          </div>
+                        </div>
+                      )}
+
+                      {/* Tab 2: Direct Student Access (Zero Blockers for Minors / Google Workspace Policy) */}
+                      {loginTab === "direct" && (
+                        <form onSubmit={handleDirectStudentLogin} className="space-y-3.5 pt-1 text-left">
+                          <div className="p-3 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-[11px] text-indigo-200 leading-relaxed">
+                            💡 <b>Perché questa opzione:</b> Risolve all'istante l'accesso per gli studenti i cui account Google sono soggetti a restrizioni d'istituto per minori (&lt;18 anni) o blocchi pop-up su cellulare. Le risposte e i voti verranno registrati con il tuo nome e la tua email ufficiale.
+                          </div>
+
+                          {directError && (
+                            <div className="p-2.5 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-300 text-xs flex items-center gap-1.5">
+                              <AlertCircle className="w-4 h-4 shrink-0" />
+                              <span>{directError}</span>
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-2 gap-2.5">
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                                Nome
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={directName}
+                                onChange={(e) => setDirectName(e.target.value)}
+                                placeholder="es. Marco"
+                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                                Cognome
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={directSurname}
+                                onChange={(e) => setDirectSurname(e.target.value)}
+                                placeholder="es. Rossi"
+                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                              Email Istituzionale Scolastica
+                            </label>
+                            <input
+                              type="email"
+                              required
+                              value={directEmail}
+                              onChange={(e) => setDirectEmail(e.target.value)}
+                              placeholder="mario.rossi@ferrarisfermiclass.it"
+                              className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs font-mono outline-none transition-all placeholder:text-slate-600"
+                            />
+                            
+                            {/* Fast domain shortcut */}
+                            <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                              <span className="text-[10px] text-slate-400">Completa dominio:</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const prefix = directEmail.split("@")[0].trim();
+                                  setDirectEmail(prefix ? `${prefix}@ferrarisfermiclass.it` : "@ferrarisfermiclass.it");
+                                }}
+                                className="px-2.5 py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-mono text-[10px] rounded-lg border border-teal-500/30 transition-colors cursor-pointer flex items-center gap-1"
+                              >
+                                <span>+ @ferrarisfermiclass.it</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <button
+                            type="submit"
+                            className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-bold text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all shadow-md shadow-indigo-600/20"
+                          >
+                            <span>Entra nel Test come Studente</span>
+                            <ArrowRight className="w-4 h-4" />
+                          </button>
+                        </form>
+                      )}
+
+                      {/* Educational Guidance Trigger for Teachers & Students */}
+                      <div className="pt-2 border-t border-white/5">
+                        <button
+                          type="button"
+                          onClick={() => setShowWorkspaceHelp(true)}
+                          className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 hover:text-teal-300 transition-colors cursor-pointer"
+                        >
+                          <HelpCircle className="w-3.5 h-3.5 text-teal-400" />
+                          <span>Perché alcuni studenti con @ferrarisfermiclass.it non riescono ad accedere?</span>
+                        </button>
+                      </div>
+
                     </div>
                   ) : (
                     <>
@@ -394,6 +803,93 @@ export default function App() {
         isOpen={showPrivacyModal} 
         onClose={() => setShowPrivacyModal(false)} 
       />
+
+      {/* Google Workspace & Domain Troubleshooting Modal */}
+      {showWorkspaceHelp && (
+        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
+          <div className="bg-slate-900 border border-white/10 rounded-3xl max-w-xl w-full p-6 sm:p-8 space-y-5 text-left text-slate-200 text-xs shadow-2xl relative my-8">
+            <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
+              <div className="flex items-center gap-3">
+                <div className="p-2.5 bg-teal-500/10 border border-teal-500/20 text-teal-400 rounded-2xl shrink-0">
+                  <HelpCircle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base sm:text-lg font-display font-bold text-white">
+                    Perché alcuni studenti con @ferrarisfermiclass.it non entrano?
+                  </h3>
+                  <p className="text-[11px] text-slate-400 mt-0.5">
+                    Diagnostica delle 3 cause più frequenti negli istituti scolastici italiani
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowWorkspaceHelp(false)}
+                className="p-1.5 text-slate-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="space-y-4 max-h-[60vh] overflow-y-auto pr-1 leading-relaxed">
+              
+              {/* Cause 1: Google Workspace OU Age Restrictions */}
+              <div className="p-4 bg-slate-950/60 border border-white/5 rounded-2xl space-y-2">
+                <div className="flex items-center gap-2 text-indigo-300 font-bold text-xs">
+                  <span className="w-5 h-5 rounded-full bg-indigo-500/20 border border-indigo-500/30 flex items-center justify-center text-[10px] text-indigo-300 font-mono">1</span>
+                  <span>Politiche Google Workspace for Education (Minori vs Maggiorenni)</span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Nei domini scolastici Google Workspace, gli studenti appartenenti all'Unità Organizzativa dei <b>minori di 18 anni</b> hanno l'accesso alle applicazioni esterne bloccato di default da Google. Gli studenti maggiorenni (es. classi quinte) riescono ad accedere con Google, mentre i minorenni ricevono il messaggio <i>"Accesso bloccato: l'amministratore del tuo istituto non ha consentito l'accesso"</i>.
+                </p>
+                <div className="p-2.5 bg-indigo-950/40 border border-indigo-500/20 rounded-xl text-[10px] text-indigo-200">
+                  ✅ <b>Risoluzione istantanea per la lezione:</b> Gli studenti bloccati possono cliccare sulla scheda <b>"Accesso Diretto Studente"</b> e inserire nome, cognome e la loro email <code>@ferrarisfermiclass.it</code>: svolgeranno il test regolarmente e il loro voto comparirà nel registro docente.<br />
+                  🔧 <b>Risoluzione definitiva:</b> L'amministratore Google d'istituto può autorizzare l'app da <i>admin.google.com &rarr; Sicurezza &rarr; Controlli API</i>.
+                </div>
+              </div>
+
+              {/* Cause 2: Link opened in WhatsApp/Classroom in-app WebView */}
+              <div className="p-4 bg-slate-950/60 border border-white/5 rounded-2xl space-y-2">
+                <div className="flex items-center gap-2 text-amber-300 font-bold text-xs">
+                  <span className="w-5 h-5 rounded-full bg-amber-500/20 border border-amber-500/30 flex items-center justify-center text-[10px] text-amber-300 font-mono">2</span>
+                  <span>Link aperto dentro WhatsApp, Classroom o Gmail (Browser interno)</span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Se lo studente tocca il link dell'esame direttamente dentro l'applicazione di WhatsApp o Google Classroom, lo smartphone apre il link nel browser interno (WebView). Google <b>rifiuta categoricamente</b> l'accesso OAuth con l'errore <code>403: disallowed_useragent</code>.
+                </p>
+                <div className="p-2.5 bg-amber-950/40 border border-amber-500/20 rounded-xl text-[10px] text-amber-200">
+                  ✅ <b>Soluzione:</b> Lo studente deve toccare i <b>tre puntini ⋮ in alto a destra</b> e selezionare <b>"Apri in Chrome"</b> o <b>"Apri in Safari"</b>, oppure utilizzare l'Accesso Diretto Studente.
+                </div>
+              </div>
+
+              {/* Cause 3: Pop-up blockers on mobile (Safari / Chrome mobile) */}
+              <div className="p-4 bg-slate-950/60 border border-white/5 rounded-2xl space-y-2">
+                <div className="flex items-center gap-2 text-teal-300 font-bold text-xs">
+                  <span className="w-5 h-5 rounded-full bg-teal-500/20 border border-teal-500/30 flex items-center justify-center text-[10px] text-teal-300 font-mono">3</span>
+                  <span>Blocco delle finestre pop-up su smartphone (iPhone / Android)</span>
+                </div>
+                <p className="text-[11px] text-slate-300">
+                  Safari su iPhone e alcuni browser Android bloccano per sicurezza l'apertura delle finestre pop-up, impedendo la visualizzazione della schermata di login di Google.
+                </p>
+                <div className="p-2.5 bg-teal-950/40 border border-teal-500/20 rounded-xl text-[10px] text-teal-200">
+                  ✅ <b>Soluzione:</b> Cliccare sul pulsante grigio <b>"Accedi con Reindirizzamento (consigliato su cellulare)"</b> oppure entrare con l'Accesso Diretto.
+                </div>
+              </div>
+
+            </div>
+
+            <div className="pt-2 border-t border-white/10 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowWorkspaceHelp(false)}
+                className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition-colors cursor-pointer"
+              >
+                Ho Capito, Chiudi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

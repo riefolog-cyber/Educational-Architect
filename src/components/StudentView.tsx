@@ -771,14 +771,26 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
       let finalEval: Evaluation;
       let isFirstPoll = true;
+      let pollAttempts = 0;
+      const MAX_POLL_ATTEMPTS = 160; // Max ~2 minutes polling timeout
       while (true) {
+        pollAttempts++;
+        if (pollAttempts > MAX_POLL_ATTEMPTS) {
+          throw new Error("Il tempo di attesa per la correzione è scaduto (timeout di 2 minuti). Le tue risposte sono state salvate nella bozza locale: puoi riprovare a consegnare.");
+        }
+
         if (!isFirstPoll) {
           await new Promise(r => setTimeout(r, 750)); // Safely throttle next poll (faster response)
         }
         isFirstPoll = false;
 
         const statusResp = await fetch(`/api/evaluate/status/${jobId}`);
-        if (!statusResp.ok) throw new Error("Errore di rete durante la verifica dello stato.");
+        if (!statusResp.ok) {
+          if (statusResp.status === 404) {
+            throw new Error("La sessione di correzione sul server è scaduta o il server è stato riavviato. Riprova a consegnare.");
+          }
+          throw new Error(`Errore di rete durante la verifica dello stato (HTTP ${statusResp.status}).`);
+        }
 
         const statusRaw = await statusResp.text();
         let statusData;

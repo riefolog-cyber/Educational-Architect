@@ -27,6 +27,9 @@ try {
     dbFirestore = getFirestore(app);
   }
   googleProvider = new GoogleAuthProvider();
+  googleProvider.setCustomParameters({
+    prompt: "select_account"
+  });
 } catch (error) {
   console.error("Firebase failing to initialize. App will run in Sandbox mode.", error);
 }

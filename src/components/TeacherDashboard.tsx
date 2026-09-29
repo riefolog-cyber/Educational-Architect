@@ -98,6 +98,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [blindGradingMode, setBlindGradingMode] = useState(false);
+  const [linkCopied, setLinkCopied] = useState(false);
 
 
 
@@ -1146,6 +1147,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     document.body.appendChild(link);
     link.click();
     document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
 
@@ -1511,6 +1513,41 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   {pinStatus}
                 </div>
               )}
+
+              {/* Official Student Web Link Sharing Box */}
+              <div className="p-3.5 bg-teal-950/40 border border-teal-500/30 rounded-2xl text-left space-y-2 shadow-md">
+                <div className="flex items-center gap-2 text-teal-300 font-bold text-xs">
+                  <ExternalLink className="w-3.5 h-3.5 text-teal-400" />
+                  <span>Link da Condividere con gli Alunni</span>
+                </div>
+                <p className="text-[11px] text-slate-300 leading-relaxed">
+                  Invia <b>questo link web</b> agli studenti (su Classroom, registro o chat) insieme al PIN della prova:
+                </p>
+                <div className="flex items-center gap-2">
+                  <input
+                    type="text"
+                    readOnly
+                    value={typeof window !== "undefined" ? window.location.origin : ""}
+                    className="flex-1 bg-slate-950/80 border border-white/10 rounded-xl px-2.5 py-1.5 text-[11px] font-mono text-teal-200 outline-none select-all"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => {
+                      if (typeof window !== "undefined") {
+                        navigator.clipboard.writeText(window.location.origin);
+                        setLinkCopied(true);
+                        setTimeout(() => setLinkCopied(false), 3000);
+                      }
+                    }}
+                    className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white font-bold text-xs rounded-xl transition-all cursor-pointer shrink-0"
+                  >
+                    {linkCopied ? "Copiato ✓" : "Copia Link"}
+                  </button>
+                </div>
+                <p className="text-[10px] text-amber-300/90 leading-normal border-t border-teal-500/10 pt-1.5">
+                  ⚠️ <b>Non condividere il link di AI Studio</b> (<code>aistudio.google.com</code>): gli alunni minorenni verrebbero bloccati da Google Workspace. Condividi questo link web dell'app.
+                </p>
+              </div>
             </div>
 
 
