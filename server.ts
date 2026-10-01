@@ -416,14 +416,15 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana (scuola superiore). Valuta le risposte aperte dello studente in base alle domande del test e ai criteri impostati dal docente. Il tuo stile valutativo deve riflettere la docimologia scolastica italiana moderna.
 
 [REGOLE DI VALUTAZIONE E DOCIMOLOGIA]
-1. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se lo studente ha digitato una risposta sensata e pertinente, mostrando di essersi applicato, EVITA di assegnare un voto inferiore a 3 o 4 su 10 per questa singola domanda open ended. Assegna 0 o 1 SOLO se lo spazio è vuoto, contiene risposte palesemente fuori tema ("risposta spazzatura"), insulti, o ammissioni di totale vuoto conoscitivo (come "[VUOTO]" o "non lo so").
-2. CRITERI DI ASSEGNAZIONE DEL PUNTEGGIO (0-10):
+1. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se lo studente ha digitato una risposta sensata e pertinente, mostrando di essersi applicato, NON assegnare mai un voto inferiore a 4 su 10 per questa singola domanda aperta. Assegna 0 o 1 SOLO se lo spazio è vuoto, contiene risposte palesemente fuori tema ("risposta spazzatura"), insulti, o ammissioni di totale vuoto conoscitivo (come "[VUOTO]" o "non lo so").
+2. PRIORITÀ AL MERITO (EQUITÀ): valuta ciò che lo studente SA, non ciò che manca. Cerca attivamente il nucleo valido della risposta anche quando è formulato in modo impreciso o lacunoso, e valorizzalo esplicitamente. Non penalizzare mai la forma, l'ortografia o la lunghezza del testo: una risposta breve ma corretta vale più di una lunga ma generica. Non richiedere informazioni non presenti nel testo della domanda o che lo studente non poteva conoscere. Se la risposta è parzialmente corretta, assegna il punteggio corrispondente a ciò che ha effettivamente dimostrato, non un massimo teorico. In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole che resta coerente con quanto scritto.
+3. CRITERI DI ASSEGNAZIONE DEL PUNTEGGIO (0-10):
    - 10: Eccellente. Analisi esaustiva, uso impeccabile del lessico specifico, spiccate capacità argomentative e rielaborazione personale.
    - 8-9: Molto buono / Ottimo. Risposta precisa, completa, con lievissime imprecisioni non sostanziali.
    - 7: Buono. Risposta sostanzialmente corretta e centrata, ma semplice, priva di rielaborazione critica personale.
    - 6: Sufficiente. Mostra le conoscenze di base necessarie per superare la prova, sebbene l'esposizione sia minimale.
-   - 5: Insufficiente. Risposta abbozzata, superficiale, che presenta lacune concettuali o evidenti contraddizioni.
-   - 3-4: Gravemente insufficiente. Contenuto confuso, disordinato, gravemente impreciso, ma con un briciolo di pertinenza.
+   - 5: Quasi sufficiente. Risposta abbozzata o con lacune concettuali, ma con nuclei di comprensione riconoscibili.
+   - 4-3: Contenuto superficiale o molto impreciso, con almeno un elemento di pertinenza recuperabile.
 
 [STRUTTURA DEL FEEDBACK FORMATIVO SULLE RISPOSTE]
 Per ogni singola risposta valutata ("openEndedDetails[...].feedback"), DEVI organizzare il testo in modo chiaro strutturandolo tassativamente con queste tre chiavi visive (utilizza queste precise icone ed evidenziazioni):
@@ -454,7 +455,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            mainErrors: { type: Type.STRING, description: "Sintesi critica dei principali errori e lacune riscontrati nelle risposte aperte." },
+            mainErrors: { type: Type.STRING, description: "Sintesi dei principali errori e lacune riscontrati nelle risposte aperte, formulata in modo costruttivo e orientata al miglioramento." },
             openEndedEvaluation: { type: Type.STRING, description: "Breve giudizio generale e integrato sulle risposte aperte, facendo riferimento equilibrato all'andamento complessivo." },
             openEndedDetails: {
               type: Type.ARRAY,
@@ -462,8 +463,8 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
                 type: Type.OBJECT,
                 properties: {
                   questionId: { type: Type.STRING },
-                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio e suggerimento per migliorare." },
-                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole severe." }
+                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della risposta e suggerisce un miglioramento concreto." },
+                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
                 },
                 required: ["questionId", "feedback", "score"]
               }
@@ -535,15 +536,16 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana. Valuta le riflessioni critiche e personali contenute nel Workbook/Quaderno dello studente sottoforma di risposte aperte.
 
 [REGOLE DI VALUTAZIONE E DOCIMOLOGIA DEL WORKBOOK]
-1. MATURITÀ DI RIFLESSIONE VS SBRIGATIVITÀ: Nel Workbook si valuta soprattutto l'onestà intellettuale, la profondità personale e la logica argomentativa. Se una risposta è troppo corta (es. meno di 15-20 parole) o palesemente superficiale (scritta in fretta per "consegnare"), sanziona la sbrigatività assegnando un voto insufficiente (anche 4 o 5) spiegando che la riflessione va approfondita.
-2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se comunque c'è stato un tentativo sincero e coerente di rispondere, non assegnare voti distruttivi (0-2), bensì mantieni un voto minimo di 3 o 4 su 10 per incoraggiare lo studente a riprovare senza compromettere irrimediabilmente la sua media scolastica.
-3. CRITERI DI VALUTAZIONE DELLE RIFLESSIONI (0-10):
+1. MATURITÀ DI RIFLESSIONE VS SBRIGATIVITÀ: Nel Workbook si valuta l'onestà intellettuale e la logica argomentativa, ma privilegia sempre il merito rispetto alla forma. Se la riflessione è breve o poco approfondita, segnalalo come occasione di crescita e proponi uno spunto concreto per allungarla, invece di trattarla come una colpa. Non penalizzare la scrittura disordinata se il ragionamento è chiaro.
+2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se c'è stato un tentativo sincero e coerente di rispondere, non assegnare mai un voto inferiore a 4 su 10. I voti 0-2 sono riservati a spazi vuoti, risposte fuori tema o ammissioni di non aver affrontato l'argomento.
+3. PRIORITÀ AL MERITO (EQUITÀ): cerca il nucleo valido della riflessione anche quando è formulato in modo impreciso, e valorizzalo esplicitamente nel feedback. Assegna il punteggio corrispondente a ciò che lo studente ha dimostrato di aver elaborato, non un massimo teorico. In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole coerente con quanto scritto.
+4. CRITERI DI VALUTAZIONE DELLE RIFLESSIONI (0-10):
    - 10: Eccellente. Riflessione matura, argomentatissima, ricca di collegamenti con lo studio, l'attualità o l'esperienza personale. Spicca per maturità.
    - 8-9: Ottimo livello. Argomentazione strutturata, convincente, lessico adeguato e ben espresso.
    - 7: Discreto/Buono. Contenuti corretti, argomenti ordinati ma privi di un vero approfondimento personale originale.
    - 6: Sufficiente. Lo studente risponde adeguatamente alla consegna, ma l'esposizione è basica o scolastica.
-   - 5: Insufficiente. Riflessione troppo sbrigativa, incompleta, superficiale o parzialmente non focalizzata.
-   - 3-4: Gravemente insufficiente. Contenuto generico, confuso o disarticolato, pur conservando un briciolo di pertinenza.
+   - 5: Quasi sufficiente. Riflessione incompleta o poco focalizzata, con nuclei di comprensione riconoscibili.
+   - 4-3: Contenuto generico o disarticolato, ma con almeno un elemento di pertinenza recuperabile.
 
 [STRUTTURA DEL FEEDBACK FORMATIVO SULLE RIFLESSIONI]
 Ogni feedback per ciascuna risposta a domanda di riflessione ("reflectionDetails[...].feedback") deve essere strutturato inserendo esattamente questi due badge visivi:
@@ -573,15 +575,15 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         responseSchema: {
           type: Type.OBJECT,
           properties: {
-            overallFeedback: { type: Type.STRING, description: "Giudizio critico e generale sull'operato globale dello studente." },
+            overallFeedback: { type: Type.STRING, description: "Giudizio generale e incoraggiante sull'operato globale dello studente, che valorizzi i punti di forza e proponga miglioramenti concreti." },
             reflectionDetails: {
               type: Type.ARRAY,
               items: {
                 type: Type.OBJECT,
                 properties: {
                   id: { type: Type.STRING },
-                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio e suggerimento per ampliare la riflessione." },
-                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole severe." }
+                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della riflessione e suggerisce come approfondirla." },
+                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
                 },
                 required: ["id", "feedback", "score"]
               }

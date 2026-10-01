@@ -136,7 +136,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Accessibility (BES / DSA) state
   const [showAccessibilityBar, setShowAccessibilityBar] = useState(false);
   const [fontSize, setFontSize] = useState<"normal" | "large" | "xlarge">("normal");
-  const [dyslexicFont, setDyslexicFont] = useState(false);
   const [contrastTheme, setContrastTheme] = useState<"dark" | "sepia" | "light">("dark");
   const [readingRuler, setReadingRuler] = useState(false);
   const [mouseY, setMouseY] = useState(0);
@@ -146,7 +145,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   // BES / DSA wrapper classes actually applied to the exam workspace
   const accessibilityClasses = [
-    dyslexicFont ? "dsa-font" : "",
     fontSize === "large" ? "dsa-scale-115" : "",
     fontSize === "xlarge" ? "dsa-scale-130" : ""
   ].filter(Boolean).join(" ");
@@ -1108,31 +1106,38 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     let examPayload = examData;
 
     if (examType === "quiz") {
-      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: empatico, incoraggiante, ma severo e rigoroso sui contenuti. Devi correggere le domande aperte di un quiz.
+      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: incoraggiante e attento ai contenuti, senza rigidità burocratica. Devi correggere le domande aperte di un quiz.
       Dati dell'alunno: ${user?.displayName || "Studente"} (Email: ${user?.email || "scuola"}).
-      
-      Valuta SOLO le risposte alle DOMANDE APERTE dello studente. La sufficienza consiste in 6/10.
-      Atteggiamento pedagogico: Cerca sempre di valorizzare l’impegno e gli spunti positivi dell'alunno, ma sanziona la superficialità o le risposte palesemente evasive. Usa un tono costruttivo, chiaro e motivante, mai derisorio o unicamente punitivo.
-      
-      Regole per i punteggi:
-      - 0: risposta in bianco, "[VUOTO]", "non lo so", ammissione di ignoranza o frasi senza senso.
-      - 1-4: risposta completamente errata concettualmente, palesemente fuori tema, o eccessivamente breve senza spunti valutabili.
-      - 5: la risposta sfiora il concetto richiesto ma presenta errori o mancanze importanti (quasi sufficiente).
-      - 6: la risposta contiene gli elementi essenziali corretti, anche se esposti in modo molto basico (sufficiente).
-      - 7-8: chiara comprensione, buona terminologia e sufficiente livello di dettaglio.
-      - 9-10: esposizione eccellente, ricchezza dei dettagli, approfondimenti originali e piena padronanza.
 
-      IMPORTANTE: Fornisci per ogni domanda un feedback estremamente SINTETICO E CONCISO (massimo 2-3 frasi) in italiano impeccabile. Rivolgiti direttamente allo studente (ad es. "Hai colto bene il punto...", "Fai attenzione a...").`;
+      Valuta SOLO le risposte alle DOMANDE APERTE dello studente. La sufficienza consiste in 6/10.
+      Atteggiamento pedagogico: Dai priorità a ciò che lo studente SA, non a ciò che manca. Ricerca sempre il nucleo valido della risposta anche quando è formulato in modo impreciso, e valorizzalo esplicitamente nel feedback. Sottolinea i punti da migliorare come occasioni di crescita, non come errori da penalizzare. Tono costruttivo, chiaro e motivante, mai derisorio né punitivo.
+
+      Regole per i punteggi:
+      - 0: risposta in bianco, "[VUOTO]", "non lo so" o ammissione di non aver studiato l'argomento.
+      - 3-4: risposta parzialmente pertinente ma molto superficiale, con qualche spunto recuperabile. Se ci sono elementi corretti, non scendere sotto il 3.
+      - 5: la risposta sfiora il concetto richiesto ma presenta imprecisioni o lacune importanti (quasi sufficiente).
+      - 6: la risposta contiene gli elementi essenziali corretti, anche se esposti in modo molto basico (sufficiente).
+      - 7-8: comprensione chiara, buona terminologia e dettaglio adeguato.
+      - 9-10: esposizione ricca, approfondimenti originali e piena padronanza.
+
+      Criteri di equità da applicare sempre:
+      - Non penalizzare la forma, l'ortografia o la lunghezza: valuta il merito del contenuto. Una risposta breve ma corretta vale più di una lunga ma generica.
+      - Non richiedere informazioni non presenti nel testo della domanda o che lo studente non poteva conoscere.
+      - Se la risposta è parzialmente corretta, assegna il punteggio corrispondente a ciò che ha dimostrato di sapere, non un massimo teorico.
+      - In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole che resta comunque coerente con quanto scritto.
+      - La valutazione finale non deve mai essere inferiore a 4 se lo studente ha mostrato un tentativo serio di rispondere.
+
+      IMPORTANTE: Fornisci per ogni domanda un feedback estremamente SINTETICO E CONCISO (massimo 2-3 frasi) in italiano impeccabile. Inizia sempre riconoscendo un punto di forza della risposta, poi suggerisci un miglioramento concreto. Rivolgiti direttamente allo studente (ad es. "Hai colto bene il punto...", "Per approfondire potresti...").`;
     } else {
       evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: empatico, incoraggiante, ma rigoroso sulla qualità dell'impegno. Devi correggere un quaderno/workbook di riflessona critica.
       Dati dello studente: ${user?.displayName || "Studente"}.
       
       Valuta le riflessioni assegnando punteggi da 0 a 10 per ciascuna. L'obiettivo è stimolare lo spirito critico.
-      Atteggiamento pedagogico: Fai da guida. Valorizza chi si mette in gioco, ma penalizza severamente le risposte "fatte per sbrigarsi" o troppo sbrigative senza motivo. L'empatia non significa regalare voti se manca la serietà o si denota disinteresse verso l'argomento.
+      Atteggiamento pedagogico: Fai da guida incoraggiante. Valorizza sempre chi si mette in gioco e segnala le riflessioni sbrigative come occasione di crescita, non come colpa. Non penalizzare mai la forma o la lunghezza: una risposta breve ma ragionata vale più di una lunga ma generica.
       
       Regole di valutazione:
-      - Sotto le 10-15 parole, valuta attentamente se è un concentrato di verità (raro) o superficialità (molto probabile). Se superficiale, non può superare 4 o 5.
-      - Assegna 0 per "[VUOTO]", "non lo so", sciocchezze o tentativi di evadere la consegna.
+      - Se la risposta è breve, verifica se sia un concentrato di verità o se manchi profondità. Se ci sono elementi validi, non scendere sotto il 4.
+      - Assegna 0 per "[VUOTO]", "non lo so" o chi non ha affrontato l'argomento.
       - Dai valutazioni elevate (8-10) a chi elabora vere argomentazioni personali collegandole con la propria esperienza e la realtà, mostrando aver elaborato interiormente l'oggetto di studio.
       
       IMPORTANTE: Fornisci per ogni risposta un feedback SINTETICO E CONCISO (massimo 2-3 frasi) in un italiano colloquiale ma corretto, parlando direttamente al discente ("Hai riflettuto bene su questo..."). Questo è essenziale per ragioni tecniche del sistema.`;
@@ -1910,18 +1915,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                 <div className="flex items-center gap-1.5 text-[11px]">
                   <button
                     type="button"
-                    onClick={() => setDyslexicFont(!dyslexicFont)}
-                    className={`px-2 py-0.5 rounded-lg border text-[10px] font-bold cursor-pointer transition-all ${
-                      dyslexicFont
-                        ? "bg-teal-500/20 text-teal-300 border-teal-500/40"
-                        : "bg-slate-900 text-slate-400 border-white/5 hover:text-white"
-                    }`}
-                    title="Attiva font ad alta leggibilità con spaziatura aumentata per dislessia"
-                  >
-                    Font DSA {dyslexicFont ? "✓" : ""}
-                  </button>
-                  <button
-                    type="button"
                     onClick={() => setReadingRuler(!readingRuler)}
                     className={`px-2 py-0.5 rounded-lg border text-[10px] font-bold cursor-pointer transition-all ${
                       readingRuler
@@ -2003,30 +1996,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   {/* Reading aids */}
                   <div className="space-y-1">
                     <span className="text-[10px] uppercase font-bold text-slate-400 block">Supporti di Lettura</span>
-                    <div className="flex items-center gap-1.5">
-                      <button
-                        type="button"
-                        onClick={() => setDyslexicFont(!dyslexicFont)}
-                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
-                          dyslexicFont
-                            ? "bg-teal-500/20 text-teal-300 border border-teal-500/40"
-                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
-                        }`}
-                      >
-                        Font DSA {dyslexicFont ? "✓" : ""}
-                      </button>
-                      <button
-                        type="button"
-                        onClick={() => setReadingRuler(!readingRuler)}
-                        className={`flex-1 py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
-                          readingRuler
-                            ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
-                            : "bg-slate-900 text-slate-400 border border-white/5 hover:text-white"
-                        }`}
-                      >
-                        Guida Riga {readingRuler ? "✓" : ""}
-                      </button>
-                    </div>
+                    <button
+                      type="button"
+                      onClick={() => setReadingRuler(!readingRuler)}
+                      className={`w-full py-1 px-2 rounded-lg font-bold text-[10px] cursor-pointer transition-all ${
+                        readingRuler
+                          ? "bg-amber-500/20 text-amber-300 border border-amber-500/40"
+                          : "bg-slate-900 text-slate-400 border-white/5 hover:text-white"
+                      }`}
+                    >
+                      Guida Riga {readingRuler ? "✓" : ""}
+                    </button>
                   </div>
                 </div>
               )}
