@@ -117,11 +117,116 @@ function extractResponseText(response: any): string {
 const parseJsonResponse = (text: string) => {
   let cleanedText = text.trim();
   if (cleanedText.startsWith("```json")) {
-    cleanedText = cleanedText.replace(/^```json\s*/, "").replace(/\s*```$/, "");
+    cleanedText = cleanedText.replace(/^```json\s*/i, "").replace(/\s*```$/, "").trim();
   } else if (cleanedText.startsWith("```")) {
-    cleanedText = cleanedText.replace(/^```\s*/, "").replace(/\s*```$/, "");
+    cleanedText = cleanedText.replace(/^```\s*/, "").replace(/\s*```$/, "").trim();
   }
-  return JSON.parse(cleanedText);
+
+  // 1. Direct standard parse
+  try {
+    return JSON.parse(cleanedText);
+  } catch (initialErr: any) {
+    // 2. Remove trailing commas before } or ]
+    try {
+      const fixedCommas = cleanedText.replace(/,\s*([\]}])/g, "$1");
+      return JSON.parse(fixedCommas);
+    } catch {}
+
+    // 3. Resilient repair for truncated JSON outputs (e.g. unterminated strings / cut-off tokens)
+    try {
+      let candidate = cleanedText;
+
+      // Check if we are inside an unclosed string
+      let inString = false;
+      let escaped = false;
+      for (let i = 0; i < candidate.length; i++) {
+        const char = candidate[i];
+        if (char === '\\' && !escaped) {
+          escaped = true;
+          continue;
+        }
+        if (char === '"' && !escaped) {
+          inString = !inString;
+        }
+        escaped = false;
+      }
+
+      // If cut off mid-string, close the string
+      if (inString) {
+        candidate += '"';
+      }
+
+      // Remove any dangling trailing commas or incomplete key/value fragments at the end
+      candidate = candidate.replace(/,\s*("[^"]*"\s*:\s*)?$/, "");
+
+      // Balance unmatched opening brackets and braces
+      const stack: string[] = [];
+      let inStr = false;
+      let esc = false;
+      for (let i = 0; i < candidate.length; i++) {
+        const char = candidate[i];
+        if (char === '\\' && !esc) {
+          esc = true;
+          continue;
+        }
+        if (char === '"' && !esc) {
+          inStr = !inStr;
+        }
+        if (!inStr) {
+          if (char === '{') stack.push('}');
+          else if (char === '[') stack.push(']');
+          else if (char === '}' || char === ']') {
+            if (stack.length > 0 && stack[stack.length - 1] === char) {
+              stack.pop();
+            }
+          }
+        }
+        esc = false;
+      }
+
+      while (stack.length > 0) {
+        candidate += stack.pop();
+      }
+
+      candidate = candidate.replace(/,\s*([\]}])/g, "$1");
+      const repaired = JSON.parse(candidate);
+      console.warn("[JSON Parser] Successfully repaired truncated JSON response from model!");
+      return repaired;
+    } catch (repairErr) {
+      // 4. Fallback: Trim back to the last complete item delimiter `},` or `}` and close
+      try {
+        const lastObjectEnd = cleanedText.lastIndexOf("},");
+        if (lastObjectEnd !== -1) {
+          let pruned = cleanedText.substring(0, lastObjectEnd + 1);
+          const stack: string[] = [];
+          let inStr = false;
+          let esc = false;
+          for (let i = 0; i < pruned.length; i++) {
+            const char = pruned[i];
+            if (char === '\\' && !esc) { esc = true; continue; }
+            if (char === '"' && !esc) { inStr = !inStr; }
+            if (!inStr) {
+              if (char === '{') stack.push('}');
+              else if (char === '[') stack.push(']');
+              else if (char === '}' || char === ']') {
+                if (stack.length > 0 && stack[stack.length - 1] === char) stack.pop();
+              }
+            }
+            esc = false;
+          }
+          while (stack.length > 0) {
+            pruned += stack.pop();
+          }
+          pruned = pruned.replace(/,\s*([\]}])/g, "$1");
+          const repaired = JSON.parse(pruned);
+          console.warn("[JSON Parser] Successfully repaired JSON by pruning to last complete object!");
+          return repaired;
+        }
+      } catch {}
+
+      throw initialErr;
+    }
+  }
 };
 
 // Middleware for JSON parsing
@@ -708,9 +813,16 @@ app.post("/api/evaluate", async (req, res) => {
   }
 });
 
-// API: Health probe
-app.post("/api/analyze-exam", async (req, res) => {
-  const { examJson } = req.body;
+// API: Health probe & Docimological Analysis
+app.all("/api/analyze-exam", async (req, res) => {
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  if (req.method === "GET") {
+    return res.json({ status: "ok", endpoint: "/api/analyze-exam", message: "API attiva." });
+  }
+
+  const { examJson } = req.body || {};
 
   if (!examJson) {
     return res.status(400).json({ error: "Nessun contenuto JSON fornito per l'analisi dei criteri." });
@@ -774,8 +886,28 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con la seguente 
 });
 
 // API endpoint for generating a complete new exam from an educational topic/text using Gemini
-app.post("/api/generate-exam", async (req, res) => {
-  const { topic, gradeLevel, examType, numQuestions, includeOpenEnded, difficulty } = req.body;
+app.all("/api/generate-exam", async (req, res) => {
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+
+  const isGet = req.method === "GET";
+  const params = isGet ? req.query : (req.body || {});
+  const topic = (params.topic as string) || "";
+  const gradeLevel = (params.gradeLevel as string) || "";
+  const examType = (params.examType as string) || "";
+  const numQuestions = params.numQuestions;
+  const includeOpenEnded = params.includeOpenEnded === true || params.includeOpenEnded === "true";
+  const difficulty = (params.difficulty as string) || "";
+
+  // If a simple ping / health check GET request is received without topic
+  if (isGet && (!topic || !topic.trim())) {
+    return res.json({ 
+      status: "ok", 
+      endpoint: "/api/generate-exam",
+      message: "L'endpoint per la generazione esami assistita da IA è attivo e pronto a ricevere richieste." 
+    });
+  }
 
   if (!getApiKey()) {
     return res.status(500).json({ 
@@ -806,7 +938,7 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
   "sections": [
     {
       "title": "[Titolo sezione 1]",
-      "sintesi": "[Breve testo didattico chiaro e rigoroso di 2-3 paragrafi che introduce i concetti chiave]",
+      "sintesi": "[Testo didattico chiaro, rigoroso ed essenziale di 1-2 paragrafi sui concetti chiave]",
       "fillInTheBlank": [
         {
           "id": "fib_1",
@@ -869,7 +1001,7 @@ REGOLE ESSENZIALI:
       config: {
         systemInstruction: promptSystem,
         temperature: 0.2,
-        maxOutputTokens: 3500,
+        maxOutputTokens: 8192,
         responseMimeType: "application/json"
       }
     });

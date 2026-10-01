@@ -10,7 +10,8 @@ import {
   where,
   deleteDoc,
   addDoc,
-  updateDoc
+  updateDoc,
+  writeBatch
 } from "firebase/firestore";
 import { 
   ref as fbRef, 
@@ -44,7 +45,18 @@ import {
   Printer,
   Shuffle,
   Activity,
-  Users
+  Users,
+  ChevronDown,
+  ChevronUp,
+  Award,
+  BarChart2,
+  BookOpen,
+  Filter,
+  HelpCircle,
+  Layers,
+  ListOrdered,
+  Copy,
+  Check
 } from "lucide-react";
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
@@ -59,6 +71,25 @@ import {
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
 import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
 import PrintableReportModal from "./PrintableReportModal";
+
+export interface ExamSummary {
+  key: string;
+  pin: string;
+  title: string;
+  tipo: "Quiz" | "Workbook" | "Misto";
+  submissions: SavedSubmission[];
+  totalStudents: number;
+  latestDate: string;
+  firstDate: string;
+  averageGradeNumber: number | null;
+  averageGradeFormatted: string;
+  highestGrade: string;
+  lowestGrade: string;
+  passedCount: number;
+  failedCount: number;
+  passRate: number;
+  totalViolations: number;
+}
 
 interface TeacherDashboardProps {
   user: any;
@@ -101,8 +132,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"All" | "Quiz" | "Workbook">("All");
 
+  // View mode: "chronological" (individual submissions), "by_student" (aggregated by student), or "by_exam" (grouped by test/session)
+  const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam">("chronological");
+  const [studentSortBy, setStudentSortBy] = useState<"most_tests" | "name_asc" | "recent" | "highest_avg">("most_tests");
+  const [examSortBy, setExamSortBy] = useState<"recent" | "most_students" | "pin_asc" | "highest_avg" | "highest_pass_rate">("recent");
+  const [expandedStudentKey, setExpandedStudentKey] = useState<string | null>(null);
+  const [expandedExamKey, setExpandedExamKey] = useState<string | null>(null);
+  const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
+  const [copiedExamPin, setCopiedExamPin] = useState<string | null>(null);
+  const [showAccessHelpModal, setShowAccessHelpModal] = useState<boolean>(false);
+
   const [selectedSub, setSelectedSub] = useState<SavedSubmission | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
+  const [confirmDeleteExamKey, setConfirmDeleteExamKey] = useState<string | null>(null);
+  const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [blindGradingMode, setBlindGradingMode] = useState(false);
   const [linkCopied, setLinkCopied] = useState(false);
@@ -110,9 +153,29 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
-  const [dashboardTab, setDashboardTab] = useState<"submissions" | "live_monitor">("submissions");
+  const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
+
+  // Helper toggle for exam cards
+  const toggleExamExpanded = (key: string) => {
+    setExpandedExamKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
+  const handleCopyPin = (pinValue: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    if (!pinValue || pinValue === "—") return;
+    navigator.clipboard.writeText(pinValue);
+    setCopiedExamPin(pinValue);
+    setTimeout(() => {
+      setCopiedExamPin(prev => prev === pinValue ? null : prev);
+    }, 2000);
+  };
 
 
 
@@ -477,6 +540,53 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     } else {
       setDeleteNotify({ type: "error", message: "⚠️ Database scolastico non disponibile." });
       setTimeout(() => setDeleteNotify(null), 4000);
+    }
+  };
+
+  // Delete an entire exam group (all submissions belonging to this exam/session)
+  const handleDeleteExamGroup = async (exam: ExamSummary) => {
+    if (!dbFirestore) {
+      setDeleteNotify({ type: "error", message: "⚠️ Database scolastico non disponibile." });
+      setTimeout(() => setDeleteNotify(null), 4000);
+      return;
+    }
+
+    setIsDeletingExamGroup(exam.key);
+    try {
+      const idsToDelete = exam.submissions.map(s => s.id);
+      
+      // Batch delete in chunks of 400 (Firestore max limit per batch is 500)
+      for (let i = 0; i < idsToDelete.length; i += 400) {
+        const chunk = idsToDelete.slice(i, i + 400);
+        const batch = writeBatch(dbFirestore);
+        chunk.forEach(id => {
+          batch.delete(doc(dbFirestore, "valutazioni", id));
+        });
+        await batch.commit();
+      }
+
+      const idSet = new Set(idsToDelete);
+      setSubmissions(prev => prev.filter(sub => !idSet.has(sub.id)));
+      if (selectedSub && idSet.has(selectedSub.id)) {
+        setSelectedSub(null);
+      }
+      setConfirmDeleteExamKey(null);
+      setDeleteNotify({ 
+        type: "success", 
+        message: `✅ Gruppo prova "${exam.title}" eliminato con successo (${idsToDelete.length} ${idsToDelete.length === 1 ? "elaborato rimosso" : "elaborati rimossi"})!` 
+      });
+      setTimeout(() => setDeleteNotify(null), 5000);
+    } catch (e: any) {
+      console.error("Errore durante l'eliminazione del gruppo prova:", e);
+      setConfirmDeleteExamKey(null);
+      setDeleteNotify({ 
+        type: "error", 
+        message: `❌ Errore durante l'eliminazione della prova: ${e.message}. Verifica i permessi del database.` 
+      });
+      setTimeout(() => setDeleteNotify(null), 6000);
+      handleFirestoreError(e, OperationType.DELETE, `valutazioni/${exam.key}`);
+    } finally {
+      setIsDeletingExamGroup(null);
     }
   };
 
@@ -1103,8 +1213,207 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
+  // Aggregated submissions by student interface
+  interface StudentSummary {
+    key: string;
+    name: string;
+    email: string;
+    submissions: SavedSubmission[];
+    totalTests: number;
+    quizCount: number;
+    workbookCount: number;
+    latestDate: string;
+    latestSubmission: SavedSubmission;
+    averageGradeNumber: number | null;
+    averageGradeFormatted: string;
+    uniquePins: string[];
+    totalTabSwitches: number;
+    totalPasteAttempts: number;
+  }
+
+  // Helper to extract clean exam title from a submission
+  const getSubmissionExamTitle = (sub: SavedSubmission): string => {
+    if (sub.Domande_Esame) {
+      try {
+        const parsed = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
+        if (parsed && typeof parsed.title === "string" && parsed.title.trim()) {
+          return parsed.title.trim();
+        }
+      } catch {}
+    }
+    if (sub.Pin) {
+      return `Prova con PIN: ${sub.Pin}`;
+    }
+    return sub.Tipo === "Quiz" ? "Quiz Didattico Senza PIN" : "Workbook Didattico Senza PIN";
+  };
+
+  // Export single exam roster directly to CSV for class gradebook
+  const handleExportSingleExamCSV = (exam: ExamSummary) => {
+    const escapeCSVString = (val: any) => {
+      if (val === undefined || val === null) return "";
+      let str = String(val).replace(/"/g, '""');
+      if (str.includes(",") || str.includes("\n") || str.includes('\r') || str.includes('"')) {
+        return `"${str}"`;
+      }
+      return str;
+    };
+
+    const headers = [
+      "Nome Studente",
+      "Email",
+      "PIN Sessione",
+      "Titolo Prova",
+      "Tipologia",
+      "Voto IA Suggerito",
+      "Autovalutazione",
+      "Uscite Pagina (Tab Switch)",
+      "Incolla Bloccati",
+      "Errori Principali",
+      "Feedback Generale",
+      "Data e Ora Consegna"
+    ];
+
+    const rows = exam.submissions.map(sub => [
+      escapeCSVString(sub.Nome || "Anonimo"),
+      escapeCSVString(sub.Email || ""),
+      escapeCSVString(sub.Pin || exam.pin),
+      escapeCSVString(exam.title),
+      escapeCSVString(sub.Tipo || ""),
+      escapeCSVString(sub.Voto_Suggerito || ""),
+      escapeCSVString(sub.Autovalutazione || ""),
+      escapeCSVString(sub.AntiCopia_TabSwitch || 0),
+      escapeCSVString(sub.AntiCopia_IncollaBloccato || 0),
+      escapeCSVString(sub.Errori_Principali || ""),
+      escapeCSVString(sub.Feedback_Generale || ""),
+      escapeCSVString(sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "")
+    ]);
+
+    const BOM = "\uFEFF";
+    const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    const cleanTitle = (exam.pin !== "—" ? `pin_${exam.pin}` : exam.title).toLowerCase().replace(/[^a-z0-9]/g, "_");
+    link.setAttribute("download", `tabellone_voti_${cleanTitle}.csv`);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+  };
+
   // Export current list to CSV for Excel / Google Sheets
   const handleExportCSV = () => {
+    // Helper to sanitize cell values correctly
+    const escapeCSVString = (val: any) => {
+      if (val === undefined || val === null) return "";
+      let str = String(val).replace(/"/g, '""'); // Double quotes for escaping
+      if (str.includes(",") || str.includes("\n") || str.includes('\r') || str.includes('"')) {
+        return `"${str}"`;
+      }
+      return str;
+    };
+
+    const BOM = "\uFEFF";
+    const dateFormatted = new Date().toISOString().split('T')[0];
+
+    // Branch A: Aggregated Students Export
+    if (submissionViewMode === "by_student") {
+      if (filteredStudentSummaries.length === 0) {
+        alert("⚠️ Nessun dato studente da esportare con i filtri attuali.");
+        return;
+      }
+      const headers = [
+        "Nome Studente",
+        "Email",
+        "Totale Prove Svolte",
+        "Quiz Svolti",
+        "Workbook Svolti",
+        "Media Voti",
+        "Ultimo Voto Conseguito",
+        "Data Ultima Consegna",
+        "PIN Sessioni Svolte",
+        "Uscite Pagina Totali (Tab Switch)",
+        "Tentativi Incolla Bloccati Totali"
+      ];
+      const rows = filteredStudentSummaries.map(stu => [
+        escapeCSVString(stu.name),
+        escapeCSVString(stu.email),
+        escapeCSVString(stu.totalTests),
+        escapeCSVString(stu.quizCount),
+        escapeCSVString(stu.workbookCount),
+        escapeCSVString(stu.averageGradeFormatted),
+        escapeCSVString(stu.latestSubmission?.Voto_Suggerito || ""),
+        escapeCSVString(stu.latestDate ? new Date(stu.latestDate).toLocaleString("it-IT") : ""),
+        escapeCSVString(stu.uniquePins.join("; ")),
+        escapeCSVString(stu.totalTabSwitches),
+        escapeCSVString(stu.totalPasteAttempts)
+      ]);
+
+      const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `elenco_studenti_prove_fatte_${dateFormatted}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
+      return;
+    }
+
+    // Branch B: Aggregated Exams Export
+    if (submissionViewMode === "by_exam") {
+      if (filteredExamSummaries.length === 0) {
+        alert("⚠️ Nessuna prova da esportare con i filtri attuali.");
+        return;
+      }
+      const headers = [
+        "PIN Sessione",
+        "Titolo Prova",
+        "Tipologia",
+        "Totale Consegne",
+        "Media Voti Prova",
+        "Voto Più Alto",
+        "Voto Più Basso",
+        "Sufficienti (>=6)",
+        "Insufficienti (<6)",
+        "% Sufficienza",
+        "Segnalazioni AntiCopia Totali",
+        "Data Prima Consegna",
+        "Data Ultima Consegna"
+      ];
+      const rows = filteredExamSummaries.map(ex => [
+        escapeCSVString(ex.pin),
+        escapeCSVString(ex.title),
+        escapeCSVString(ex.tipo),
+        escapeCSVString(ex.totalStudents),
+        escapeCSVString(ex.averageGradeFormatted),
+        escapeCSVString(ex.highestGrade),
+        escapeCSVString(ex.lowestGrade),
+        escapeCSVString(ex.passedCount),
+        escapeCSVString(ex.failedCount),
+        escapeCSVString(`${ex.passRate}%`),
+        escapeCSVString(ex.totalViolations),
+        escapeCSVString(ex.firstDate ? new Date(ex.firstDate).toLocaleString("it-IT") : ""),
+        escapeCSVString(ex.latestDate ? new Date(ex.latestDate).toLocaleString("it-IT") : "")
+      ]);
+
+      const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.setAttribute("download", `riepilogo_prove_esami_${dateFormatted}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
+      return;
+    }
+
+    // Branch C: Chronological Submissions Export
     if (filteredSubmissions.length === 0) {
       alert("⚠️ Nessun dato da esportare con i filtri attuali.");
       return;
@@ -1125,16 +1434,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       "Feedback Generale"
     ];
 
-    // Helper to sanitize cell values correctly
-    const escapeCSVString = (val: any) => {
-      if (val === undefined || val === null) return "";
-      let str = String(val).replace(/"/g, '""'); // Double quotes for escaping
-      if (str.includes(",") || str.includes("\n") || str.includes('\r') || str.includes('"')) {
-        return `"${str}"`;
-      }
-      return str;
-    };
-
     // Build Rows
     const rows = filteredSubmissions.map(sub => [
       escapeCSVString(sub.Nome || "Anonimo"),
@@ -1150,16 +1449,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       escapeCSVString(sub.Feedback_Generale || "")
     ]);
 
-    // Insert BOM for proper UTF-8 Excel decoding
-    const BOM = "\uFEFF";
     const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-
-    // Downloader Link creation
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = url;
-    const dateFormatted = new Date().toISOString().split('T')[0];
     link.setAttribute("download", `registro_voti_alunni_${dateFormatted}.csv`);
     document.body.appendChild(link);
     link.click();
@@ -1167,17 +1461,298 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
-
-
-  // Submissions filtered list logic
+  // Submissions filtered list logic (chronological)
   const filteredSubmissions = submissions.filter(sub => {
     const matchesSearch = 
       (sub.Nome || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (sub.Email || "").toLowerCase().includes(searchQuery.toLowerCase());
+      (sub.Email || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
+      (sub.Pin || "").toLowerCase().includes(searchQuery.toLowerCase());
     
     if (filterType === "All") return matchesSearch;
     return matchesSearch && sub.Tipo === filterType;
   });
+
+  // Aggregated submissions grouped by student
+  const studentSummaries: StudentSummary[] = React.useMemo(() => {
+    const map = new Map<string, SavedSubmission[]>();
+
+    submissions.forEach(sub => {
+      const cleanEmail = (sub.Email || "").trim().toLowerCase();
+      const cleanName = (sub.Nome || "Anonimo").trim();
+      const key = cleanEmail || cleanName;
+
+      if (!map.has(key)) {
+        map.set(key, []);
+      }
+      map.get(key)!.push(sub);
+    });
+
+    const list: StudentSummary[] = [];
+
+    map.forEach((studentSubs, key) => {
+      studentSubs.sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+
+      const latestSub = studentSubs[0];
+      const name = studentSubs.find(s => s.Nome && s.Nome !== "Anonimo" && s.Nome !== "Studente")?.Nome || latestSub.Nome || "Studente";
+      const email = studentSubs.find(s => s.Email && s.Email.includes("@"))?.Email || latestSub.Email || "";
+
+      let quizCount = 0;
+      let workbookCount = 0;
+      let numericGradesSum = 0;
+      let numericGradesCount = 0;
+      const pinsSet = new Set<string>();
+      let totalTabSwitches = 0;
+      let totalPasteAttempts = 0;
+
+      studentSubs.forEach(s => {
+        if (s.Tipo === "Quiz") quizCount++;
+        else if (s.Tipo === "Workbook") workbookCount++;
+
+        if (s.Pin) pinsSet.add(s.Pin);
+
+        totalTabSwitches += s.AntiCopia_TabSwitch || 0;
+        totalPasteAttempts += s.AntiCopia_IncollaBloccato || 0;
+
+        if (s.Voto_Suggerito) {
+          const match = String(s.Voto_Suggerito).match(/(\d+(?:[.,]\d+)?)/);
+          if (match) {
+            const num = parseFloat(match[1].replace(",", "."));
+            if (!isNaN(num) && num >= 1 && num <= 10) {
+              numericGradesSum += num;
+              numericGradesCount++;
+            }
+          }
+        }
+      });
+
+      const averageGradeNumber = numericGradesCount > 0 ? numericGradesSum / numericGradesCount : null;
+      const averageGradeFormatted = averageGradeNumber !== null ? formatItalianScholasticGrade(averageGradeNumber) : "N/D";
+
+      list.push({
+        key,
+        name,
+        email,
+        submissions: studentSubs,
+        totalTests: studentSubs.length,
+        quizCount,
+        workbookCount,
+        latestDate: latestSub.Timestamp,
+        latestSubmission: latestSub,
+        averageGradeNumber,
+        averageGradeFormatted,
+        uniquePins: Array.from(pinsSet),
+        totalTabSwitches,
+        totalPasteAttempts
+      });
+    });
+
+    return list;
+  }, [submissions]);
+
+  // Filtered and sorted students list
+  const filteredStudentSummaries = React.useMemo(() => {
+    let result = studentSummaries.filter(stu => {
+      const q = searchQuery.toLowerCase().trim();
+      const matchesSearch = !q || (
+        stu.name.toLowerCase().includes(q) ||
+        stu.email.toLowerCase().includes(q) ||
+        stu.uniquePins.some(p => p.toLowerCase().includes(q))
+      );
+
+      if (!matchesSearch) return false;
+      if (filterType === "Quiz") return stu.quizCount > 0;
+      if (filterType === "Workbook") return stu.workbookCount > 0;
+      return true;
+    });
+
+    result.sort((a, b) => {
+      if (studentSortBy === "most_tests") {
+        if (b.totalTests !== a.totalTests) return b.totalTests - a.totalTests;
+        return a.name.localeCompare(b.name);
+      }
+      if (studentSortBy === "name_asc") {
+        return a.name.localeCompare(b.name);
+      }
+      if (studentSortBy === "recent") {
+        return new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime();
+      }
+      if (studentSortBy === "highest_avg") {
+        const avgA = a.averageGradeNumber || 0;
+        const avgB = b.averageGradeNumber || 0;
+        if (avgB !== avgA) return avgB - avgA;
+        return b.totalTests - a.totalTests;
+      }
+      return 0;
+    });
+
+    return result;
+  }, [studentSummaries, searchQuery, filterType, studentSortBy]);
+
+  // Group submissions by exam / test session
+  const examSummaries: ExamSummary[] = React.useMemo(() => {
+    const map = new Map<string, SavedSubmission[]>();
+
+    submissions.forEach(sub => {
+      const pinClean = (sub.Pin || "").trim();
+      const examTitle = getSubmissionExamTitle(sub);
+      // Group primarily by PIN if available, otherwise by Title and Type
+      const key = pinClean 
+        ? `PIN_${pinClean.toUpperCase()}` 
+        : `NOPIN_${examTitle}_${sub.Tipo}`;
+
+      if (!map.has(key)) {
+        map.set(key, []);
+      }
+      map.get(key)!.push(sub);
+    });
+
+    const list: ExamSummary[] = [];
+
+    map.forEach((examSubs, key) => {
+      // Sort submissions chronologically descending
+      examSubs.sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+
+      const latestSub = examSubs[0];
+      const oldestSub = examSubs[examSubs.length - 1];
+      const pin = examSubs.find(s => s.Pin && s.Pin.trim())?.Pin || "";
+
+      // Determine most descriptive title
+      let title = "";
+      for (const s of examSubs) {
+        const t = getSubmissionExamTitle(s);
+        if (t && !t.startsWith("Prova con PIN") && !t.startsWith("Quiz Didattico") && !t.startsWith("Workbook Didattico")) {
+          title = t;
+          break;
+        }
+      }
+      if (!title) {
+        title = getSubmissionExamTitle(latestSub);
+      }
+
+      const types = new Set(examSubs.map(s => s.Tipo));
+      let tipo: "Quiz" | "Workbook" | "Misto" = "Quiz";
+      if (types.has("Quiz") && types.has("Workbook")) {
+        tipo = "Misto";
+      } else if (types.has("Workbook")) {
+        tipo = "Workbook";
+      }
+
+      let numericGradesSum = 0;
+      let numericGradesCount = 0;
+      let highestNumeric = -1;
+      let lowestNumeric = 11;
+      let highestGradeStr = "N/D";
+      let lowestGradeStr = "N/D";
+      let passedCount = 0;
+      let failedCount = 0;
+      let totalViolations = 0;
+
+      examSubs.forEach(s => {
+        totalViolations += (s.AntiCopia_TabSwitch || 0) + (s.AntiCopia_IncollaBloccato || 0);
+
+        if (s.Voto_Suggerito) {
+          const match = String(s.Voto_Suggerito).match(/(\d+(?:[.,]\d+)?)/);
+          if (match) {
+            const num = parseFloat(match[1].replace(",", "."));
+            if (!isNaN(num) && num >= 1 && num <= 10) {
+              numericGradesSum += num;
+              numericGradesCount++;
+              if (num >= 6) passedCount++;
+              else failedCount++;
+
+              if (num > highestNumeric) {
+                highestNumeric = num;
+                highestGradeStr = String(s.Voto_Suggerito);
+              }
+              if (num < lowestNumeric) {
+                lowestNumeric = num;
+                lowestGradeStr = String(s.Voto_Suggerito);
+              }
+            }
+          }
+        }
+      });
+
+      const averageGradeNumber = numericGradesCount > 0 ? numericGradesSum / numericGradesCount : null;
+      const averageGradeFormatted = averageGradeNumber !== null ? formatItalianScholasticGrade(averageGradeNumber) : "N/D";
+      const passRate = (passedCount + failedCount) > 0 ? Math.round((passedCount / (passedCount + failedCount)) * 100) : 100;
+
+      list.push({
+        key,
+        pin: pin || "—",
+        title,
+        tipo,
+        submissions: examSubs,
+        totalStudents: examSubs.length,
+        latestDate: latestSub.Timestamp,
+        firstDate: oldestSub.Timestamp,
+        averageGradeNumber,
+        averageGradeFormatted,
+        highestGrade: highestGradeStr,
+        lowestGrade: lowestGradeStr,
+        passedCount,
+        failedCount,
+        passRate,
+        totalViolations
+      });
+    });
+
+    return list;
+  }, [submissions]);
+
+  // Filtered and sorted exams list
+  const filteredExamSummaries = React.useMemo(() => {
+    let result = examSummaries.filter(ex => {
+      const q = searchQuery.toLowerCase().trim();
+      const matchesSearch = !q || (
+        ex.title.toLowerCase().includes(q) ||
+        ex.pin.toLowerCase().includes(q) ||
+        ex.submissions.some(s => 
+          (s.Nome || "").toLowerCase().includes(q) || 
+          (s.Email || "").toLowerCase().includes(q)
+        )
+      );
+
+      if (!matchesSearch) return false;
+      if (filterType === "Quiz") return ex.tipo === "Quiz" || ex.tipo === "Misto";
+      if (filterType === "Workbook") return ex.tipo === "Workbook" || ex.tipo === "Misto";
+      return true;
+    });
+
+    result.sort((a, b) => {
+      if (examSortBy === "recent") {
+        return new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime();
+      }
+      if (examSortBy === "most_students") {
+        if (b.totalStudents !== a.totalStudents) return b.totalStudents - a.totalStudents;
+        return a.title.localeCompare(b.title);
+      }
+      if (examSortBy === "pin_asc") {
+        return a.pin.localeCompare(b.pin, undefined, { numeric: true });
+      }
+      if (examSortBy === "highest_avg") {
+        const avgA = a.averageGradeNumber || 0;
+        const avgB = b.averageGradeNumber || 0;
+        if (avgB !== avgA) return avgB - avgA;
+        return b.totalStudents - a.totalStudents;
+      }
+      if (examSortBy === "highest_pass_rate") {
+        if (b.passRate !== a.passRate) return b.passRate - a.passRate;
+        return b.totalStudents - a.totalStudents;
+      }
+      return 0;
+    });
+
+    return result;
+  }, [examSummaries, searchQuery, filterType, examSortBy]);
+
+  const expandAllExams = () => {
+    setExpandedExamKeys(new Set(filteredExamSummaries.map(e => e.key)));
+  };
+
+  const collapseAllExams = () => {
+    setExpandedExamKeys(new Set());
+  };
 
   return (
     <div className="space-y-6 text-left animate-fadeIn">
@@ -1619,24 +2194,46 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         <div className="lg:col-span-2 space-y-6">
           <div className="bg-slate-900/40 border border-white/10 p-5 sm:p-6 rounded-3xl backdrop-blur-md space-y-6">
             
-            {/* Tab switch between Registro Consegne and Monitoraggio Live */}
-            <div className="flex items-center gap-2 border-b border-white/10 pb-4">
+            {/* Tab switch between Registro Consegne, Gruppo per Prove and Monitoraggio Live */}
+            <div className="flex items-center gap-2 border-b border-white/10 pb-4 overflow-x-auto scrollbar-none">
               <button
                 type="button"
-                onClick={() => setDashboardTab("submissions")}
-                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer ${
+                onClick={() => {
+                  setDashboardTab("submissions");
+                  if (submissionViewMode === "by_exam") {
+                    setSubmissionViewMode("chronological");
+                  }
+                }}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 ${
                   dashboardTab === "submissions"
                     ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                     : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
                 }`}
               >
-                <FileCode className="w-4 h-4" />
+                <FileCode className="w-4 h-4 text-indigo-300" />
                 <span>Registro Consegne ({submissions.length})</span>
               </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setDashboardTab("grouped_exams");
+                  setSubmissionViewMode("by_exam");
+                }}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 ${
+                  dashboardTab === "grouped_exams"
+                    ? "bg-purple-600 text-white shadow-md shadow-purple-600/20"
+                    : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
+                }`}
+              >
+                <Layers className="w-4 h-4 text-purple-300" />
+                <span>Gruppo per Prove ({examSummaries.length})</span>
+              </button>
+
               <button
                 type="button"
                 onClick={() => setDashboardTab("live_monitor")}
-                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer ${
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 ${
                   dashboardTab === "live_monitor"
                     ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
                     : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
@@ -1659,19 +2256,83 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               <>
                 <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4.5 border-b border-white/5 pb-4.5">
                   <div>
-                    <h3 className="text-lg font-display font-bold text-white flex items-center gap-1.5">
-                      <FileCode className="w-5 h-5 text-indigo-400" />
-                      Registro delle Consegne
+                    <h3 className="text-lg font-display font-bold text-white flex items-center gap-2">
+                      {dashboardTab === "grouped_exams" || submissionViewMode === "by_exam" ? (
+                        <>
+                          <Layers className="w-5 h-5 text-purple-400" />
+                          <span>Gruppo per Prove Didattiche</span>
+                          <span className="px-2 py-0.5 rounded-full text-xs font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30">
+                            {filteredExamSummaries.length} {filteredExamSummaries.length === 1 ? "prova" : "prove"}
+                          </span>
+                        </>
+                      ) : (
+                        <>
+                          <FileCode className="w-5 h-5 text-indigo-400" />
+                          <span>Registro delle Consegne</span>
+                        </>
+                      )}
                     </h3>
-                    <p className="text-xs text-slate-400 mt-0.5">Elenco storico degli elaborati corretti dall'IA didattica.</p>
+                    <p className="text-xs text-slate-400 mt-0.5">
+                      {dashboardTab === "grouped_exams" || submissionViewMode === "by_exam"
+                        ? "Visualizzazione aggregata per singola prova o sessione PIN: statistiche complessive, medie voti e tabellone alunni."
+                        : "Elenco storico degli elaborati e riepilogo prove per studente."}
+                    </p>
                   </div>
-                  <div className="flex items-center gap-2 w-full sm:w-auto">
+                  <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
+                    {(dashboardTab === "grouped_exams" || submissionViewMode === "by_exam") && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (expandedExamKeys.size === filteredExamSummaries.length && filteredExamSummaries.length > 0) {
+                            collapseAllExams();
+                          } else {
+                            expandAllExams();
+                          }
+                        }}
+                        className="flex items-center gap-1.5 py-1.5 px-3 bg-purple-500/15 hover:bg-purple-500/25 text-purple-300 font-semibold rounded-xl text-xs transition-colors cursor-pointer border border-purple-500/30"
+                        title={expandedExamKeys.size === filteredExamSummaries.length && filteredExamSummaries.length > 0 ? "Comprimi tutte le prove" : "Espandi tutte le prove per vedere gli studenti partecipanti"}
+                      >
+                        {expandedExamKeys.size === filteredExamSummaries.length && filteredExamSummaries.length > 0 ? (
+                          <>
+                            <ChevronUp className="w-3.5 h-3.5" />
+                            <span>Comprimi Tutte</span>
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDown className="w-3.5 h-3.5" />
+                            <span>Espandi Tutte</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      onClick={() => setShowAccessHelpModal(true)}
+                      className="flex items-center gap-1 py-1.5 px-3 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 font-semibold rounded-xl text-xs transition-colors cursor-pointer border border-amber-500/30"
+                      title="Chiarimenti tecnici su accessi Google scolastici e limiti simultanei"
+                    >
+                      <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Info Accesso Account</span>
+                    </button>
                     <button
                       onClick={handleExportCSV}
                       className="flex items-center gap-1 py-1.5 px-3 bg-teal-600 hover:bg-teal-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer shadow-md"
+                      title={
+                        submissionViewMode === "by_student" 
+                          ? "Esporta elenco studenti aggregato per prove fatte" 
+                          : submissionViewMode === "by_exam" || dashboardTab === "grouped_exams"
+                          ? "Esporta riepilogo prove didattiche aggregate" 
+                          : "Esporta tutte le singole verifiche"
+                      }
                     >
                       <Download className="w-3.5 h-3.5" />
-                      Esporta in CSV
+                      <span>
+                        {submissionViewMode === "by_student" 
+                          ? "Esporta Studenti CSV" 
+                          : submissionViewMode === "by_exam" || dashboardTab === "grouped_exams"
+                          ? "Esporta Prove CSV" 
+                          : "Esporta in CSV"}
+                      </span>
                     </button>
                     <button
                       onClick={handleLoadSubmissions}
@@ -1679,236 +2340,949 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       className="flex items-center gap-1 py-1.5 px-3 bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs transition-colors cursor-pointer disabled:opacity-40"
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${loadingSubmissions ? "animate-spin" : ""}`} />
-                      Ricarica Registro
+                      <span>Ricarica</span>
                     </button>
                   </div>
                 </div>
 
-            {/* Filter bar */}
-            <div className="flex flex-col sm:flex-row gap-3">
-              <div className="flex-1 relative">
-                <Search className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
-                <input
-                  type="text"
-                  placeholder="Cerca studente per nome o e-mail..."
-                  value={searchQuery}
-                  onChange={(e) => setSearchQuery(e.target.value)}
-                  className="w-full pl-9 pr-4 py-2 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none focus:border-indigo-500 text-xs"
-                />
-              </div>
+                {/* View Mode Switcher: Cronologico vs Per Studente vs Gruppo per Prove */}
+                <div className="flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-3 p-1.5 bg-slate-950/70 border border-white/10 rounded-2xl">
+                  <div className="flex items-center gap-1.5 flex-wrap">
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDashboardTab("submissions");
+                        setSubmissionViewMode("chronological");
+                      }}
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        submissionViewMode === "chronological" && dashboardTab === "submissions"
+                          ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/20"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Clock className="w-3.5 h-3.5" />
+                      <span>Tutte le Consegne</span>
+                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-indigo-200 font-mono">
+                        {filteredSubmissions.length}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDashboardTab("submissions");
+                        setSubmissionViewMode("by_student");
+                      }}
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        submissionViewMode === "by_student" && dashboardTab === "submissions"
+                          ? "bg-teal-600 text-white shadow-md shadow-teal-600/20"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Users className="w-3.5 h-3.5" />
+                      <span>Per Studente</span>
+                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-teal-200 font-mono">
+                        {filteredStudentSummaries.length}
+                      </span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDashboardTab("grouped_exams");
+                        setSubmissionViewMode("by_exam");
+                      }}
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        submissionViewMode === "by_exam" || dashboardTab === "grouped_exams"
+                          ? "bg-purple-600 text-white shadow-md shadow-purple-600/20"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <Layers className="w-3.5 h-3.5" />
+                      <span>Gruppo per Prove</span>
+                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-purple-200 font-mono">
+                        {filteredExamSummaries.length}
+                      </span>
+                    </button>
+                  </div>
 
-              <div className="flex gap-2 shrink-0 flex-wrap">
-                <button
-                  onClick={() => setBlindGradingMode(!blindGradingMode)}
-                  className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
-                    blindGradingMode
-                      ? "bg-amber-500/15 border-amber-500/30 text-amber-300 shadow-sm"
-                      : "bg-slate-950/50 border-white/5 text-slate-400 hover:text-white"
-                  }`}
-                  title="Attiva la modalità di correzione in cieco anonimizzando i nomi degli studenti (conforme a GDPR e Regolamento d'Istituto)"
-                >
-                  {blindGradingMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                  <span>{blindGradingMode ? "Cieco: ATTIVO" : "Correzione in Cieco"}</span>
-                </button>
-                <button
-                  onClick={() => setFilterType("All")}
-                  className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
-                    filterType === "All"
-                      ? "bg-white text-slate-950"
-                      : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
-                  }`}
-                >
-                  Tutti
-                </button>
-                <button
-                  onClick={() => setFilterType("Quiz")}
-                  className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
-                    filterType === "Quiz"
-                      ? "bg-white text-slate-950"
-                      : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
-                  }`}
-                >
-                  Quiz
-                </button>
-                <button
-                  onClick={() => setFilterType("Workbook")}
-                  className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
-                    filterType === "Workbook"
-                      ? "bg-white text-slate-950"
-                      : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
-                  }`}
-                >
-                  Workbook
-                </button>
-              </div>
-            </div>
+                  {submissionViewMode === "by_student" && (
+                    <div className="flex items-center gap-2 justify-end px-2">
+                      <span className="text-[11px] text-slate-400 shrink-0 flex items-center gap-1">
+                        <ListOrdered className="w-3 h-3 text-teal-400" />
+                        <span>Ordina:</span>
+                      </span>
+                      <select
+                        value={studentSortBy}
+                        onChange={(e) => setStudentSortBy(e.target.value as any)}
+                        className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
+                      >
+                        <option value="most_tests">Più prove fatte (decrescente)</option>
+                        <option value="name_asc">Nome Studente (A-Z)</option>
+                        <option value="recent">Ultima prova recente</option>
+                        <option value="highest_avg">Media voti più alta</option>
+                      </select>
+                    </div>
+                  )}
 
-            {deleteNotify && (
-              <div className={`p-3.5 rounded-2xl mb-4 text-xs font-semibold border ${
-                deleteNotify.type === "success" 
-                  ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/15" 
-                  : "bg-red-500/10 text-red-400 border-red-500/15"
-              } animate-fadeIn`}>
-                {deleteNotify.message}
-              </div>
-            )}
+                  {submissionViewMode === "by_exam" && (
+                    <div className="flex items-center gap-2 justify-end px-2">
+                      <span className="text-[11px] text-slate-400 shrink-0 flex items-center gap-1">
+                        <ListOrdered className="w-3 h-3 text-purple-400" />
+                        <span>Ordina:</span>
+                      </span>
+                      <select
+                        value={examSortBy}
+                        onChange={(e) => setExamSortBy(e.target.value as any)}
+                        className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
+                      >
+                        <option value="recent">Ultima somministrazione recente</option>
+                        <option value="most_students">Più studenti partecipanti</option>
+                        <option value="pin_asc">PIN sessione (crescente)</option>
+                        <option value="highest_avg">Media voti più alta</option>
+                        <option value="highest_pass_rate">Sufficienze più alte</option>
+                      </select>
+                    </div>
+                  )}
+                </div>
 
-            {/* Table layout */}
-            <div className="overflow-x-auto border border-white/5 rounded-2xl">
-              <table className="w-full text-left border-collapse text-xs">
-                <thead>
-                  <tr className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-bold text-[10px] border-b border-white/5 select-none">
-                    <th className="p-2 sm:p-3">Studente</th>
-                    <th className="p-2 sm:p-3">Tipologia</th>
-                    <th className="p-2 sm:p-3 text-center">Voto IA</th>
-                    <th className="p-2 sm:p-3 text-center">Autoval.</th>
-                    <th className="p-2 sm:p-3 text-center">Note Copia</th>
-                    <th className="p-2 sm:p-3 text-right">Azioni</th>
-                  </tr>
-                </thead>
-                <tbody className="divide-y divide-white/5 bg-slate-950/20">
-                  {loadingSubmissions ? (
-                    <tr>
-                      <td colSpan={6} className="p-8 text-center text-slate-400 text-xs">
+                {/* Filter bar */}
+                <div className="flex flex-col sm:flex-row gap-3">
+                  <div className="flex-1 relative">
+                    <Search className="w-4 h-4 text-slate-500 absolute left-3 top-3" />
+                    <input
+                      type="text"
+                      placeholder={
+                        submissionViewMode === "by_exam"
+                          ? "Cerca prova per titolo, PIN sessione o studente..."
+                          : submissionViewMode === "by_student"
+                          ? "Cerca studente per nome, e-mail o PIN prova..."
+                          : "Cerca studente per nome o e-mail..."
+                      }
+                      value={searchQuery}
+                      onChange={(e) => setSearchQuery(e.target.value)}
+                      className="w-full pl-9 pr-4 py-2 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none focus:border-indigo-500 text-xs"
+                    />
+                  </div>
+
+                  <div className="flex gap-2 shrink-0 flex-wrap">
+                    <button
+                      onClick={() => setBlindGradingMode(!blindGradingMode)}
+                      className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
+                        blindGradingMode
+                          ? "bg-amber-500/15 border-amber-500/30 text-amber-300 shadow-sm"
+                          : "bg-slate-950/50 border-white/5 text-slate-400 hover:text-white"
+                      }`}
+                      title="Attiva la modalità di correzione in cieco anonimizzando i nomi degli studenti (conforme a GDPR e Regolamento d'Istituto)"
+                    >
+                      {blindGradingMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
+                      <span>{blindGradingMode ? "Cieco: ATTIVO" : "Correzione in Cieco"}</span>
+                    </button>
+                    <button
+                      onClick={() => setFilterType("All")}
+                      className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
+                        filterType === "All"
+                          ? "bg-white text-slate-950 font-bold"
+                          : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Tutti
+                    </button>
+                    <button
+                      onClick={() => setFilterType("Quiz")}
+                      className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
+                        filterType === "Quiz"
+                          ? "bg-white text-slate-950 font-bold"
+                          : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Quiz
+                    </button>
+                    <button
+                      onClick={() => setFilterType("Workbook")}
+                      className={`px-3.5 py-2 text-xs font-semibold rounded-xl ${
+                        filterType === "Workbook"
+                          ? "bg-white text-slate-950 font-bold"
+                          : "bg-slate-950/50 border border-white/5 text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      Workbook
+                    </button>
+                  </div>
+                </div>
+
+                {deleteNotify && (
+                  <div className={`p-3.5 rounded-2xl mb-4 text-xs font-semibold border ${
+                    deleteNotify.type === "success" 
+                      ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/15" 
+                      : "bg-red-500/10 text-red-400 border-red-500/15"
+                  } animate-fadeIn`}>
+                    {deleteNotify.message}
+                  </div>
+                )}
+
+                {/* VIEW A: BY STUDENT (Grouped by student with tests count & details) */}
+                {submissionViewMode === "by_student" && (
+                  <div className="space-y-4 animate-fadeIn">
+                    
+                    {/* Summary Statistical Metric Cards */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Users className="w-3.5 h-3.5 text-teal-400" />
+                          <span>Studenti Unici</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-white mt-1">
+                          {filteredStudentSummaries.length}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <FileText className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>Prove Svolte Totali</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-indigo-300 mt-1">
+                          {submissions.length}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <BarChart2 className="w-3.5 h-3.5 text-amber-400" />
+                          <span>Media Prove / Alunno</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-amber-300 mt-1">
+                          {(submissions.length / Math.max(1, studentSummaries.length)).toFixed(1)}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Award className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Alunni Pluri-Prova (≥2)</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-emerald-300 mt-1">
+                          {filteredStudentSummaries.filter(s => s.totalTests >= 2).length}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Student Cards List */}
+                    {loadingSubmissions ? (
+                      <div className="p-12 text-center text-slate-400 text-xs bg-slate-950/20 border border-white/5 rounded-2xl">
                         <div className="flex items-center justify-center gap-2">
                           <RefreshCw className="w-4 h-4 animate-spin text-teal-400" />
-                          <span>Lettura record da database in corso...</span>
+                          <span>Aggregazione dati studenti dal registro in corso...</span>
                         </div>
-                      </td>
-                    </tr>
-                  ) : filteredSubmissions.length === 0 ? (
-                    <tr>
-                      <td colSpan={6} className="p-8 text-center text-slate-400 text-xs italic">
-                        Nessun elaborato archiviato corrisponde ai criteri impostati.
-                      </td>
-                    </tr>
-                  ) : (
-                    filteredSubmissions.map(sub => {
-                      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
-                      return (
-                        <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
-                          <td className="p-2 sm:p-3 max-w-[80px] sm:max-w-[200px]">
-                            {blindGradingMode ? (
-                              <div>
-                                <p className="font-mono font-bold text-amber-300 truncate text-[11px] sm:text-xs">
-                                  Studente #{sub.id.slice(-4).toUpperCase()}
-                                </p>
-                                <p className="hidden sm:block text-[9px] text-slate-500 font-mono italic truncate mt-0.5">
-                                  • Identità Cieca (GDPR) •
-                                </p>
-                              </div>
-                            ) : (
-                              <div>
-                                <p className="font-semibold text-white truncate text-[11px] sm:text-xs">{sub.Nome || "Anonimo"}</p>
-                                <p className="hidden sm:block text-[10px] text-slate-400 truncate mt-0.5">{sub.Email}</p>
-                              </div>
-                            )}
-                          </td>
-                          <td className="p-2 sm:p-3">
-                            <div className="flex flex-col sm:flex-row items-start sm:items-center gap-1 sm:gap-1.5 flex-wrap">
-                              <span className={`px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] uppercase font-mono font-bold ${
-                                sub.Tipo === "Quiz" 
-                                  ? "bg-teal-500/10 text-teal-400 border border-teal-500/10" 
-                                  : "bg-purple-500/10 text-purple-400 border border-purple-500/10"
-                              }`}>
-                                {sub.Tipo}
-                              </span>
-                              {sub.Pin && (
-                                <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-slate-800 text-slate-300 font-mono border border-white/5 font-semibold">
-                                  PIN: {sub.Pin}
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-[9px] sm:text-[10px] text-slate-400 mt-1 whitespace-nowrap">
-                              {new Date(sub.Timestamp).toLocaleDateString("it-IT", { month: "2-digit", day: "2-digit" })} 
-                              <span className="hidden sm:inline"> {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}</span>
-                            </p>
-                          </td>
-                          <td className="p-2 sm:p-3 text-center font-display font-extrabold text-teal-400 text-xs sm:text-sm">
-                            {sub.Voto_Suggerito || "N/A"}
-                            {hasGradeDiscrepancy(sub) && (
-                              <button
-                                onClick={(e) => {
-                                  e.stopPropagation();
-                                  handleRecalculateGrade(sub);
-                                }}
-                                disabled={recalculatingId === sub.id}
-                                className="block mx-auto mt-1 px-1.5 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[9px] rounded font-mono cursor-pointer transition-all animate-pulse"
-                                title="Discrepanza rilevata: Prova a 15 crocette con 0 domande aperte. Clicca per correggere il voto automaticamente"
+                      </div>
+                    ) : filteredStudentSummaries.length === 0 ? (
+                      <div className="p-12 text-center text-slate-400 text-xs italic bg-slate-950/20 border border-white/5 rounded-2xl">
+                        Nessuno studente corrisponde ai filtri di ricerca impostati.
+                      </div>
+                    ) : (
+                      <div className="space-y-3">
+                        {filteredStudentSummaries.map((stu) => {
+                          const isExpanded = expandedStudentKey === stu.key;
+                          const initials = (stu.name || "S")
+                            .split(" ")
+                            .map((p) => p[0])
+                            .slice(0, 2)
+                            .join("")
+                            .toUpperCase();
+
+                          return (
+                            <div 
+                              key={stu.key}
+                              className="bg-slate-950/40 border border-white/10 hover:border-teal-500/30 rounded-2xl transition-all overflow-hidden"
+                            >
+                              {/* Main Student Summary Row */}
+                              <div 
+                                onClick={() => setExpandedStudentKey(isExpanded ? null : stu.key)}
+                                className="p-3.5 sm:p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.02]"
                               >
-                                {recalculatingId === sub.id ? "..." : "⚠️ Correggi Voto"}
-                              </button>
-                            )}
-                          </td>
-                          <td className="p-2 sm:p-3 text-center font-display font-medium text-indigo-400 text-[10px] sm:text-xs">
-                            {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
-                          </td>
-                          <td className="p-2 sm:p-3 text-center">
-                            {totalViolations > 0 ? (
-                              <span className="px-1 py-0.5 sm:px-1.5 bg-yellow-500/10 border border-yellow-500/10 text-yellow-500 rounded text-[9px] sm:text-[10px] font-semibold flex flex-col items-center justify-center font-mono leading-tight">
-                                <span className="text-yellow-400 text-[10px] sm:text-[11px]">{totalViolations}</span>
-                                <span className="text-[7px] sm:text-[8px] uppercase tracking-wider">Segn.</span>
-                              </span>
-                            ) : (
-                              <span className="text-emerald-400 font-mono text-[10px] sm:text-[11px] font-bold">✓</span>
-                            )}
-                          </td>
-                          <td className="p-1 sm:p-3 text-right">
-                            <div className="flex justify-end items-center gap-2">
-                              {confirmDeleteId === sub.id ? (
-                                <div className="flex items-center gap-1.5 bg-red-950/40 border border-red-500/35 p-1 rounded-xl animate-fadeIn">
-                                  <span className="text-[10px] text-red-300 font-bold px-1.5 uppercase select-none">Eliminare?</span>
-                                  <button
-                                    onClick={() => handleDeleteSubmissionDirectly(sub.id)}
-                                    className="px-2 py-1 bg-red-500 hover:bg-red-400 text-slate-950 font-bold text-[10px] rounded-lg transition-colors cursor-pointer select-none"
-                                  >
-                                    Sì
-                                  </button>
-                                  <button
-                                    onClick={() => setConfirmDeleteId(null)}
-                                    className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-[10px] rounded-lg transition-colors cursor-pointer select-none"
-                                  >
-                                    No
-                                  </button>
+                                <div className="flex items-center gap-3">
+                                  {/* Avatar circle */}
+                                  <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-teal-500/20 to-indigo-500/20 border border-teal-500/30 text-teal-300 font-bold font-mono text-xs flex items-center justify-center shrink-0">
+                                    {blindGradingMode ? "#" : initials}
+                                  </div>
+
+                                  <div>
+                                    <div className="flex items-center gap-2">
+                                      <p className="font-bold text-white text-xs sm:text-sm">
+                                        {blindGradingMode ? `Studente #${stu.key.slice(-4).toUpperCase()}` : stu.name}
+                                      </p>
+                                      {stu.totalTests >= 2 ? (
+                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
+                                          {stu.totalTests} prove svolte
+                                        </span>
+                                      ) : (
+                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-300 border border-white/10">
+                                          1 prova svolta
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-[11px] text-slate-400 mt-0.5">
+                                      {blindGradingMode ? "• Identità anonimizzata (GDPR) •" : stu.email}
+                                    </p>
+                                  </div>
                                 </div>
-                              ) : (
-                                <div className="flex items-center gap-1.5">
-                                  <button
-                                    onClick={(e) => {
-                                      e.stopPropagation();
-                                      setPrintableSub(sub);
-                                      setShowPrintModal(true);
-                                    }}
-                                    className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
-                                    title="Stampa Scheda Valutazione A4 / PDF"
-                                  >
-                                    <Printer className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
-                                    onClick={() => setSelectedSub(sub)}
-                                    className="px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-[10px] font-bold rounded cursor-pointer"
-                                  >
-                                    Esamina
-                                  </button>
-                                  <button
-                                    onClick={() => setConfirmDeleteId(sub.id)}
-                                    className="text-red-400 hover:text-red-300 p-1.5 bg-red-500/10 hover:bg-red-500/20 rounded transition-colors cursor-pointer"
-                                    title="Elimina valutazione"
-                                  >
-                                    <Trash2 className="w-3.5 h-3.5" />
-                                  </button>
+
+                                <div className="flex items-center gap-2.5 sm:gap-4 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-white/5 pt-2 sm:pt-0">
+                                  {/* Mini pills */}
+                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                    {stu.quizCount > 0 && (
+                                      <span className="px-2 py-0.5 rounded text-[10px] bg-teal-500/10 text-teal-400 border border-teal-500/20 font-medium">
+                                        {stu.quizCount} Quiz
+                                      </span>
+                                    )}
+                                    {stu.workbookCount > 0 && (
+                                      <span className="px-2 py-0.5 rounded text-[10px] bg-purple-500/10 text-purple-400 border border-purple-500/20 font-medium">
+                                        {stu.workbookCount} Workbook
+                                      </span>
+                                    )}
+                                    {stu.uniquePins.length > 0 && (
+                                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono border border-white/5">
+                                        PIN: {stu.uniquePins.join(", ")}
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {/* Average Grade Pill */}
+                                  <div className="text-right shrink-0">
+                                    <span className="text-[10px] text-slate-400 block">Media Voti</span>
+                                    <span className="font-extrabold text-teal-400 text-xs sm:text-sm font-display">
+                                      {stu.averageGradeFormatted}
+                                    </span>
+                                  </div>
+
+                                  {/* Toggle chevron */}
+                                  <div className="p-1 rounded-lg bg-white/5 text-slate-400 hover:text-white shrink-0">
+                                    {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Accordion: Specific Tests Completed by this Student */}
+                              {isExpanded && (
+                                <div className="p-3.5 sm:p-4 bg-slate-900/60 border-t border-white/5 space-y-2.5 animate-fadeIn">
+                                  <p className="text-[10px] uppercase font-bold text-slate-400 tracking-wider flex items-center gap-1.5">
+                                    <FileCode className="w-3.5 h-3.5 text-indigo-400" />
+                                    <span>Tutte le {stu.submissions.length} prove completate da questo studente:</span>
+                                  </p>
+
+                                  <div className="grid grid-cols-1 gap-2">
+                                    {stu.submissions.map((sub, idx) => {
+                                      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                                      return (
+                                        <div 
+                                          key={sub.id}
+                                          className="p-3 bg-slate-950/80 border border-white/5 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-xs"
+                                        >
+                                          <div className="flex items-center gap-2.5 flex-wrap">
+                                            <span className="w-5 h-5 rounded-full bg-slate-800 text-slate-300 text-[10px] font-mono flex items-center justify-center font-bold">
+                                              #{idx + 1}
+                                            </span>
+                                            <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold ${
+                                              sub.Tipo === "Quiz" 
+                                                ? "bg-teal-500/10 text-teal-400 border border-teal-500/20" 
+                                                : "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                                            }`}>
+                                              {sub.Tipo}
+                                            </span>
+                                            {sub.Pin && (
+                                              <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono border border-white/5">
+                                                PIN: {sub.Pin}
+                                              </span>
+                                            )}
+                                            <span className="text-[11px] text-slate-400">
+                                              {new Date(sub.Timestamp).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric" })} alle {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+                                            </span>
+                                          </div>
+
+                                          <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-end">
+                                            <div className="text-left sm:text-right">
+                                              <span className="text-[10px] text-slate-400 block">Voto</span>
+                                              <span className="font-extrabold text-teal-400 font-mono text-xs">
+                                                {sub.Voto_Suggerito || "N/A"}
+                                              </span>
+                                            </div>
+
+                                            <div>
+                                              <span className="text-[10px] text-slate-400 block">Autoval.</span>
+                                              <span className="text-indigo-300 font-mono text-xs">
+                                                {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
+                                              </span>
+                                            </div>
+
+                                            <div>
+                                              <span className="text-[10px] text-slate-400 block text-center">Integrità</span>
+                                              {totalViolations > 0 ? (
+                                                <span className="px-1.5 py-0.2 bg-amber-500/15 text-amber-300 border border-amber-500/30 rounded text-[10px] font-mono">
+                                                  {totalViolations} segn.
+                                                </span>
+                                              ) : (
+                                                <span className="text-emerald-400 font-mono text-xs font-bold text-center block">✓</span>
+                                              )}
+                                            </div>
+
+                                            <div className="flex items-center gap-1.5 pl-2 border-l border-white/10">
+                                              <button
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  setPrintableSub(sub);
+                                                  setShowPrintModal(true);
+                                                }}
+                                                className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
+                                                title="Stampa Scheda Valutazione A4 / PDF"
+                                              >
+                                                <Printer className="w-3.5 h-3.5" />
+                                              </button>
+                                              <button
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  setSelectedSub(sub);
+                                                }}
+                                                className="px-2.5 py-1 bg-indigo-600 hover:bg-indigo-500 text-white text-[10px] font-bold rounded-lg cursor-pointer transition-colors shadow-sm"
+                                              >
+                                                Esamina
+                                              </button>
+                                              <button
+                                                onClick={(e) => {
+                                                  e.stopPropagation();
+                                                  handleExportPDF(sub);
+                                                }}
+                                                className="p-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-teal-500/20"
+                                                title="Scarica PDF Esito"
+                                              >
+                                                <Download className="w-3.5 h-3.5" />
+                                              </button>
+                                            </div>
+                                          </div>
+                                        </div>
+                                      );
+                                    })}
+                                  </div>
                                 </div>
                               )}
                             </div>
-                          </td>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* VIEW C: BY EXAM (Grouped by test / exam session) */}
+                {submissionViewMode === "by_exam" && (
+                  <div className="space-y-4 animate-fadeIn">
+                    {/* Summary Statistical Metric Cards for Exams */}
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Layers className="w-3.5 h-3.5 text-purple-400" />
+                          <span>Prove Distinte</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-white mt-1">
+                          {filteredExamSummaries.length}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Users className="w-3.5 h-3.5 text-teal-400" />
+                          <span>Consegne Totali</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-teal-300 mt-1">
+                          {submissions.length}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <BarChart2 className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>Media Alunni / Prova</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-indigo-300 mt-1">
+                          {(submissions.length / Math.max(1, examSummaries.length)).toFixed(1)}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Award className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Tasso Sufficienze Totale</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-emerald-300 mt-1">
+                          {(() => {
+                            const totalPass = examSummaries.reduce((acc, e) => acc + e.passedCount, 0);
+                            const totalGraded = examSummaries.reduce((acc, e) => acc + e.passedCount + e.failedCount, 0);
+                            return totalGraded > 0 ? `${Math.round((totalPass / totalGraded) * 100)}%` : "100%";
+                          })()}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Exams List */}
+                    {loadingSubmissions ? (
+                      <div className="p-12 text-center text-slate-400 text-xs bg-slate-950/20 border border-white/5 rounded-2xl">
+                        <div className="flex items-center justify-center gap-2">
+                          <RefreshCw className="w-4 h-4 animate-spin text-purple-400" />
+                          <span>Raggruppamento delle verifiche in corso...</span>
+                        </div>
+                      </div>
+                    ) : filteredExamSummaries.length === 0 ? (
+                      <div className="p-12 text-center text-slate-400 text-xs italic bg-slate-950/20 border border-white/5 rounded-2xl">
+                        Nessuna prova corrisponde ai filtri di ricerca impostati.
+                      </div>
+                    ) : (
+                      <div className="space-y-3.5">
+                        {filteredExamSummaries.map((exam) => {
+                          const isExpanded = expandedExamKeys.has(exam.key) || expandedExamKey === exam.key;
+
+                          return (
+                            <div 
+                              key={exam.key}
+                              className="bg-slate-950/40 border border-white/10 hover:border-purple-500/30 rounded-2xl transition-all overflow-hidden"
+                            >
+                              {/* Exam Group Header */}
+                              <div 
+                                onClick={() => toggleExamExpanded(exam.key)}
+                                className="p-4 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3.5 cursor-pointer hover:bg-white/[0.02]"
+                              >
+                                <div className="space-y-1.5 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    {exam.pin && exam.pin !== "—" ? (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => handleCopyPin(exam.pin, e)}
+                                        title="Clicca per copiare il PIN negli appunti"
+                                        className="group px-2.5 py-1 rounded-lg text-xs font-mono font-bold bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 border border-indigo-500/30 flex items-center gap-1.5 transition-all cursor-pointer"
+                                      >
+                                        <span>PIN: {exam.pin}</span>
+                                        {copiedExamPin === exam.pin ? (
+                                          <span className="flex items-center gap-1 text-[10px] text-emerald-400 font-sans">
+                                            <Check className="w-3 h-3" />
+                                            <span>Copiato!</span>
+                                          </span>
+                                        ) : (
+                                          <Copy className="w-3 h-3 opacity-60 group-hover:opacity-100" />
+                                        )}
+                                      </button>
+                                    ) : (
+                                      <span className="px-2 py-0.5 rounded-lg text-[10px] font-mono text-slate-400 bg-slate-800 border border-white/5">
+                                        Senza PIN
+                                      </span>
+                                    )}
+
+                                    <span className={`px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold ${
+                                      exam.tipo === "Quiz" 
+                                        ? "bg-teal-500/10 text-teal-400 border border-teal-500/20" 
+                                        : exam.tipo === "Workbook"
+                                        ? "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                                        : "bg-amber-500/10 text-amber-400 border border-amber-500/20"
+                                    }`}>
+                                      {exam.tipo}
+                                    </span>
+
+                                    <span className="text-[11px] text-slate-400">
+                                      Ultima consegna: {new Date(exam.latestDate).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric" })} alle {new Date(exam.latestDate).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+                                    </span>
+                                  </div>
+
+                                  <h4 className="font-bold text-white text-sm sm:text-base tracking-tight">
+                                    {exam.title}
+                                  </h4>
+                                </div>
+
+                                {/* Key Metrics on the card */}
+                                <div className="flex items-center gap-3 sm:gap-4 w-full lg:w-auto justify-between lg:justify-end border-t lg:border-t-0 border-white/5 pt-2 lg:pt-0">
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Studenti</span>
+                                    <span className="font-bold text-white text-xs sm:text-sm">
+                                      {exam.totalStudents} alunni
+                                    </span>
+                                  </div>
+
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Media Prova</span>
+                                    <span className="font-extrabold text-teal-400 text-xs sm:text-sm font-display">
+                                      {exam.averageGradeFormatted}
+                                    </span>
+                                  </div>
+
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Sufficienze</span>
+                                    <span className={`font-bold text-xs ${exam.passRate >= 70 ? 'text-emerald-400' : 'text-amber-400'}`}>
+                                      {exam.passedCount}/{exam.totalStudents} ({exam.passRate}%)
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExportSingleExamCSV(exam);
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                                      title="Esporta il tabellone completo di questa singola prova in CSV per il registro elettronico"
+                                    >
+                                      <Download className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">CSV Prova</span>
+                                    </button>
+
+                                    {/* Delete Exam Group Button with confirmation */}
+                                    {confirmDeleteExamKey === exam.key ? (
+                                      <div 
+                                        onClick={(e) => e.stopPropagation()} 
+                                        className="flex items-center gap-1.5 bg-red-950/90 border border-red-500/40 p-1 rounded-xl animate-fadeIn"
+                                      >
+                                        <span className="text-[10px] text-red-200 font-bold px-1.5 whitespace-nowrap">
+                                          Eliminare {exam.totalStudents} {exam.totalStudents === 1 ? "consegna" : "consegne"}?
+                                        </span>
+                                        <button
+                                          type="button"
+                                          disabled={isDeletingExamGroup === exam.key}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleDeleteExamGroup(exam);
+                                          }}
+                                          className="px-2 py-1 bg-red-600 hover:bg-red-500 text-white font-bold text-[10px] rounded-lg transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1 shadow-sm"
+                                        >
+                                          {isDeletingExamGroup === exam.key ? (
+                                            <RefreshCw className="w-3 h-3 animate-spin" />
+                                          ) : (
+                                            <Trash2 className="w-3 h-3" />
+                                          )}
+                                          <span>Sì, elimina</span>
+                                        </button>
+                                        <button
+                                          type="button"
+                                          disabled={isDeletingExamGroup === exam.key}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setConfirmDeleteExamKey(null);
+                                          }}
+                                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] rounded-lg transition-colors cursor-pointer"
+                                        >
+                                          Annulla
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <button
+                                        type="button"
+                                        onClick={(e) => {
+                                          e.stopPropagation();
+                                          setConfirmDeleteExamKey(exam.key);
+                                        }}
+                                        className="flex items-center gap-1 px-2.5 py-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-red-300 border border-red-500/20 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                                        title={`Elimina questa prova ("${exam.title}") e tutte le relative ${exam.totalStudents} consegne`}
+                                      >
+                                        <Trash2 className="w-3.5 h-3.5" />
+                                        <span className="hidden sm:inline">Elimina Gruppo</span>
+                                      </button>
+                                    )}
+
+                                    <div className="p-1.5 rounded-lg bg-white/5 text-slate-400 hover:text-white shrink-0">
+                                      {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {/* Expanded Roster for this Exam */}
+                              {isExpanded && (
+                                <div className="p-4 bg-slate-900/70 border-t border-white/5 space-y-3 animate-fadeIn">
+                                  <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2">
+                                    <p className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                                      <Users className="w-3.5 h-3.5 text-purple-400" />
+                                      <span>Elenco Studenti che hanno svolto questa prova ({exam.submissions.length})</span>
+                                    </p>
+                                    <div className="flex items-center gap-2 text-[10px] text-slate-400">
+                                      <span>Max: <b className="text-teal-300">{exam.highestGrade}</b></span>
+                                      <span>•</span>
+                                      <span>Min: <b className="text-amber-300">{exam.lowestGrade}</b></span>
+                                    </div>
+                                  </div>
+
+                                  <div className="overflow-x-auto border border-white/5 rounded-xl">
+                                    <table className="w-full text-left border-collapse text-xs">
+                                      <thead>
+                                        <tr className="bg-slate-950 text-slate-400 uppercase tracking-wider font-bold text-[9px] border-b border-white/5">
+                                          <th className="p-2 text-center w-8">#</th>
+                                          <th className="p-2">Studente</th>
+                                          <th className="p-2 text-center">Voto IA</th>
+                                          <th className="p-2 text-center">Autoval.</th>
+                                          <th className="p-2 text-center">Integrità</th>
+                                          <th className="p-2">Orario Consegna</th>
+                                          <th className="p-2 text-right">Azioni</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody className="divide-y divide-white/5 bg-slate-950/40">
+                                        {exam.submissions.map((sub, sIdx) => {
+                                          const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                                          return (
+                                            <tr key={sub.id} className="hover:bg-white/5 transition-colors">
+                                              <td className="p-2 text-center font-mono text-slate-500 font-bold">
+                                                {sIdx + 1}
+                                              </td>
+                                              <td className="p-2">
+                                                {blindGradingMode ? (
+                                                  <span className="font-mono font-bold text-amber-300">
+                                                    Studente #{sub.id.slice(-4).toUpperCase()}
+                                                  </span>
+                                                ) : (
+                                                  <div>
+                                                    <p className="font-semibold text-white">{sub.Nome || "Anonimo"}</p>
+                                                    <p className="text-[10px] text-slate-400 truncate">{sub.Email}</p>
+                                                  </div>
+                                                )}
+                                              </td>
+                                              <td className="p-2 text-center font-extrabold text-teal-400 font-mono text-xs sm:text-sm">
+                                                {sub.Voto_Suggerito || "N/A"}
+                                              </td>
+                                              <td className="p-2 text-center text-indigo-300 font-mono text-xs">
+                                                {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
+                                              </td>
+                                              <td className="p-2 text-center">
+                                                {violations > 0 ? (
+                                                  <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                                    {violations} segn.
+                                                  </span>
+                                                ) : (
+                                                  <span className="text-emerald-400 font-bold font-mono">✓</span>
+                                                )}
+                                              </td>
+                                              <td className="p-2 text-slate-400 text-[10px]">
+                                                {new Date(sub.Timestamp).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" })} {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+                                              </td>
+                                              <td className="p-2 text-right">
+                                                <div className="flex items-center justify-end gap-1.5">
+                                                  <button
+                                                    onClick={() => {
+                                                      setPrintableSub(sub);
+                                                      setShowPrintModal(true);
+                                                    }}
+                                                    className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
+                                                    title="Stampa Scheda Valutazione A4 / PDF"
+                                                  >
+                                                    <Printer className="w-3.5 h-3.5" />
+                                                  </button>
+                                                  <button
+                                                    onClick={() => setSelectedSub(sub)}
+                                                    className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-colors cursor-pointer"
+                                                  >
+                                                    Esamina
+                                                  </button>
+                                                  <button
+                                                    onClick={() => handleExportPDF(sub)}
+                                                    className="p-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-teal-500/20"
+                                                    title="Scarica PDF Esito"
+                                                  >
+                                                    <Download className="w-3.5 h-3.5" />
+                                                  </button>
+
+                                                  {confirmDeleteId === sub.id ? (
+                                                    <div className="flex items-center gap-1 bg-red-950/60 border border-red-500/40 p-0.5 rounded-lg animate-fadeIn">
+                                                      <button
+                                                        onClick={() => handleDeleteSubmissionDirectly(sub.id)}
+                                                        className="px-1.5 py-0.5 bg-red-500 hover:bg-red-400 text-slate-950 font-bold text-[9px] rounded transition-colors cursor-pointer select-none"
+                                                        title="Conferma eliminazione"
+                                                      >
+                                                        Sì
+                                                      </button>
+                                                      <button
+                                                        onClick={() => setConfirmDeleteId(null)}
+                                                        className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[9px] rounded transition-colors cursor-pointer select-none"
+                                                        title="Annulla"
+                                                      >
+                                                        No
+                                                      </button>
+                                                    </div>
+                                                  ) : (
+                                                    <button
+                                                      onClick={() => setConfirmDeleteId(sub.id)}
+                                                      className="p-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-white rounded-lg transition-colors cursor-pointer border border-red-500/20"
+                                                      title="Elimina questa singola consegna"
+                                                    >
+                                                      <Trash2 className="w-3.5 h-3.5" />
+                                                    </button>
+                                                  )}
+                                                </div>
+                                              </td>
+                                            </tr>
+                                          );
+                                        })}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* VIEW B: CHRONOLOGICAL (All submissions row by row) */}
+                {submissionViewMode === "chronological" && (
+                  <div className="overflow-x-auto border border-white/5 rounded-2xl">
+                    <table className="w-full text-left border-collapse text-xs">
+                      <thead>
+                        <tr className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-bold text-[10px] border-b border-white/5 select-none">
+                          <th className="p-2 sm:p-3">Studente</th>
+                          <th className="p-2 sm:p-3">Tipologia</th>
+                          <th className="p-2 sm:p-3 text-center">Voto IA</th>
+                          <th className="p-2 sm:p-3 text-center">Autoval.</th>
+                          <th className="p-2 sm:p-3 text-center">Note Copia</th>
+                          <th className="p-2 sm:p-3 text-right">Azioni</th>
                         </tr>
-                      );
-                    })
-                  )}
-                </tbody>
-              </table>
-            </div>
-            </>
+                      </thead>
+                      <tbody className="divide-y divide-white/5 bg-slate-950/20">
+                        {loadingSubmissions ? (
+                          <tr>
+                            <td colSpan={6} className="p-8 text-center text-slate-400 text-xs">
+                              <div className="flex items-center justify-center gap-2">
+                                <RefreshCw className="w-4 h-4 animate-spin text-teal-400" />
+                                <span>Lettura record da database in corso...</span>
+                              </div>
+                            </td>
+                          </tr>
+                        ) : filteredSubmissions.length === 0 ? (
+                          <tr>
+                            <td colSpan={6} className="p-8 text-center text-slate-400 text-xs italic">
+                              Nessun elaborato archiviato corrisponde ai criteri impostati.
+                            </td>
+                          </tr>
+                        ) : (
+                          filteredSubmissions.map(sub => {
+                            const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                            return (
+                              <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
+                                <td className="p-2 sm:p-3 max-w-[80px] sm:max-w-[200px]">
+                                  {blindGradingMode ? (
+                                    <div>
+                                      <p className="font-mono font-bold text-amber-300 truncate text-[11px] sm:text-xs">
+                                        Studente #{sub.id.slice(-4).toUpperCase()}
+                                      </p>
+                                      <p className="hidden sm:block text-[9px] text-slate-500 font-mono italic truncate mt-0.5">
+                                        • Identità Cieca (GDPR) •
+                                      </p>
+                                    </div>
+                                  ) : (
+                                    <div>
+                                      <p className="font-semibold text-white truncate text-[11px] sm:text-xs">{sub.Nome || "Anonimo"}</p>
+                                      <p className="hidden sm:block text-[10px] text-slate-400 truncate mt-0.5">{sub.Email}</p>
+                                    </div>
+                                  )}
+                                </td>
+                                <td className="p-2 sm:p-3">
+                                  <div className="flex flex-col sm:flex-row items-start sm:items-center gap-1 sm:gap-1.5 flex-wrap">
+                                    <span className={`px-1.5 sm:px-2 py-0.5 rounded text-[9px] sm:text-[10px] uppercase font-mono font-bold ${
+                                      sub.Tipo === "Quiz" 
+                                        ? "bg-teal-500/10 text-teal-400 border border-teal-500/10" 
+                                        : "bg-purple-500/10 text-purple-400 border border-purple-500/10"
+                                    }`}>
+                                      {sub.Tipo}
+                                    </span>
+                                    {sub.Pin && (
+                                      <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-slate-800 text-slate-300 font-mono border border-white/5 font-semibold">
+                                        PIN: {sub.Pin}
+                                      </span>
+                                    )}
+                                  </div>
+                                  <p className="text-[9px] sm:text-[10px] text-slate-400 mt-1 whitespace-nowrap">
+                                    {new Date(sub.Timestamp).toLocaleDateString("it-IT", { month: "2-digit", day: "2-digit" })} 
+                                    <span className="hidden sm:inline"> {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}</span>
+                                  </p>
+                                </td>
+                                <td className="p-2 sm:p-3 text-center font-display font-extrabold text-teal-400 text-xs sm:text-sm">
+                                  {sub.Voto_Suggerito || "N/A"}
+                                  {hasGradeDiscrepancy(sub) && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleRecalculateGrade(sub);
+                                      }}
+                                      disabled={recalculatingId === sub.id}
+                                      className="block mx-auto mt-1 px-1.5 py-0.5 bg-amber-500/20 hover:bg-amber-500/30 text-amber-300 border border-amber-500/40 text-[9px] rounded font-mono cursor-pointer transition-all animate-pulse"
+                                      title="Discrepanza rilevata: Prova a 15 crocette con 0 domande aperte. Clicca per correggere il voto automaticamente"
+                                    >
+                                      {recalculatingId === sub.id ? "..." : "⚠️ Correggi Voto"}
+                                    </button>
+                                  )}
+                                </td>
+                                <td className="p-2 sm:p-3 text-center font-display font-medium text-indigo-400 text-[10px] sm:text-xs">
+                                  {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
+                                </td>
+                                <td className="p-2 sm:p-3 text-center">
+                                  {totalViolations > 0 ? (
+                                    <span className="px-1 py-0.5 sm:px-1.5 bg-yellow-500/10 border border-yellow-500/10 text-yellow-500 rounded text-[9px] sm:text-[10px] font-semibold flex flex-col items-center justify-center font-mono leading-tight">
+                                      <span className="text-yellow-400 text-[10px] sm:text-[11px]">{totalViolations}</span>
+                                      <span className="text-[7px] sm:text-[8px] uppercase tracking-wider">Segn.</span>
+                                    </span>
+                                  ) : (
+                                    <span className="text-emerald-400 font-mono text-[10px] sm:text-[11px] font-bold">✓</span>
+                                  )}
+                                </td>
+                                <td className="p-1 sm:p-3 text-right">
+                                  <div className="flex justify-end items-center gap-2">
+                                    {confirmDeleteId === sub.id ? (
+                                      <div className="flex items-center gap-1.5 bg-red-950/40 border border-red-500/35 p-1 rounded-xl animate-fadeIn">
+                                        <span className="text-[10px] text-red-300 font-bold px-1.5 uppercase select-none">Eliminare?</span>
+                                        <button
+                                          onClick={() => handleDeleteSubmissionDirectly(sub.id)}
+                                          className="px-2 py-1 bg-red-500 hover:bg-red-400 text-slate-950 font-bold text-[10px] rounded-lg transition-colors cursor-pointer select-none"
+                                        >
+                                          Sì
+                                        </button>
+                                        <button
+                                          onClick={() => setConfirmDeleteId(null)}
+                                          className="px-2 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 font-medium text-[10px] rounded-lg transition-colors cursor-pointer select-none"
+                                        >
+                                          No
+                                        </button>
+                                      </div>
+                                    ) : (
+                                      <div className="flex items-center gap-1.5">
+                                        <button
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            setPrintableSub(sub);
+                                            setShowPrintModal(true);
+                                          }}
+                                          className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
+                                          title="Stampa Scheda Valutazione A4 / PDF"
+                                        >
+                                          <Printer className="w-3.5 h-3.5" />
+                                        </button>
+                                        <button
+                                          onClick={() => setSelectedSub(sub)}
+                                          className="px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-[10px] font-bold rounded cursor-pointer"
+                                        >
+                                          Esamina
+                                        </button>
+                                        <button
+                                          onClick={() => setConfirmDeleteId(sub.id)}
+                                          className="text-red-400 hover:text-red-300 p-1.5 bg-red-500/10 hover:bg-red-500/20 rounded transition-colors cursor-pointer"
+                                          title="Elimina valutazione"
+                                        >
+                                          <Trash2 className="w-3.5 h-3.5" />
+                                        </button>
+                                      </div>
+                                    )}
+                                  </div>
+                                </td>
+                              </tr>
+                            );
+                          })
+                        )}
+                      </tbody>
+                    </table>
+                  </div>
+                )}
+              </>
             )}
           </div>
         </div>
@@ -2307,6 +3681,90 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         submission={printableSub}
         examTitle={materia || printableSub?.Tipo}
       />
+
+      {/* Educational Access & Concurrency Help Modal */}
+      {showAccessHelpModal && (
+        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-white/10 w-full max-w-xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh] animate-fadeIn">
+            <div className="flex justify-between items-center bg-slate-950 p-5 border-b border-white/5">
+              <div className="flex items-center gap-2.5">
+                <div className="p-2 bg-amber-500/10 border border-amber-500/20 text-amber-400 rounded-xl">
+                  <HelpCircle className="w-5 h-5" />
+                </div>
+                <div>
+                  <h3 className="text-base font-bold text-white">Chiarimenti Tecnici Accesso Studenti</h3>
+                  <p className="text-[11px] text-slate-400">Guida per il docente sulla gestione delle classi e degli account Google</p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAccessHelpModal(false)}
+                className="p-1.5 rounded-xl text-slate-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+              >
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-5 sm:p-6 overflow-y-auto space-y-4 text-xs leading-relaxed text-slate-300">
+              <div className="p-3.5 bg-teal-500/10 border border-teal-500/20 rounded-2xl space-y-1">
+                <p className="font-bold text-teal-300 flex items-center gap-1.5 text-sm">
+                  <span>✓ 1. Limite di Accessi Simultanei: NON ESISTE</span>
+                </p>
+                <p className="text-teal-200/90 text-[11px]">
+                  La piattaforma e i server Cloud di Firebase supportano <b>centinaia di connessioni simultanee</b> senza alcun rallentamento o quota di utenti concorrenti. Se alcuni studenti entrano e altri no, la causa <b>non è</b> il numero di studenti collegati contemporaneamente.
+                </p>
+              </div>
+
+              <div className="p-3.5 bg-amber-500/10 border border-amber-500/20 rounded-2xl space-y-1.5">
+                <p className="font-bold text-amber-300 flex items-center gap-1.5 text-sm">
+                  <span>⚠️ 2. La Vera Causa: Policy Google Workspace per Minori (&lt;18 anni)</span>
+                </p>
+                <p className="text-slate-300 text-[11px]">
+                  Negli istituti scolastici italiani che usano Google Workspace for Education, Google ha attivato una policy di sicurezza restrittiva: per tutti gli studenti minori di 18 anni, <b>l'accesso con pulsante Google a qualsiasi applicazione web di terze parti viene bloccato</b> con il messaggio <i>"Accesso bloccato: l'amministratore della tua organizzazione non ha verificato questa app"</i> (errore <code>admin_policy_enforced</code>).
+                </p>
+                <p className="text-slate-400 text-[11px]">
+                  Gli studenti maggiorenni (es. 5ª superiore) o i docenti invece riescono ad accedere con Google perché i loro account non sono soggetti a questa restrizione.
+                </p>
+              </div>
+
+              <div className="p-3.5 bg-indigo-500/10 border border-indigo-500/20 rounded-2xl space-y-1.5">
+                <p className="font-bold text-indigo-300 flex items-center gap-1.5 text-sm">
+                  <span>📱 3. Cookie di Terze Parti e Pop-up su Smartphone</span>
+                </p>
+                <p className="text-slate-300 text-[11px]">
+                  Se gli studenti aprono il link dal cellulare su Safari (iPhone) o Chrome mobile, i browser bloccano spesso i pop-up di login o i cookie cross-origin. Inoltre, se il link viene toccato all'interno di WhatsApp o Google Classroom, Google blocca il login OAuth nel browser interno (errore <i>disallowed_useragent</i>).
+                </p>
+              </div>
+
+              <div className="p-4 bg-emerald-500/10 border border-emerald-500/20 rounded-2xl space-y-1.5">
+                <p className="font-bold text-emerald-300 flex items-center gap-1.5 text-sm">
+                  <span>💡 4. La Soluzione Garantita: Accesso Diretto Studente</span>
+                </p>
+                <p className="text-emerald-100 text-[11px] leading-relaxed">
+                  Nella schermata di benvenuto dell'app abbiamo reso predefinita la scheda <b>"Accesso Studente"</b>.
+                  <br />
+                  L'alunno inserisce semplicemente <b>Nome, Cognome, Classe</b> e la sua email <b>@ferrarisfermiclass.it</b>:
+                </p>
+                <ul className="list-disc list-inside text-emerald-200/90 text-[11px] space-y-0.5 pt-1">
+                  <li>Funziona sempre al 100% su qualsiasi computer, tablet o smartphone.</li>
+                  <li>Non richiede approvazioni di Google Workspace né sblocco di pop-up.</li>
+                  <li>Tutti i voti, risposte e note anticopia vengono registrati regolarmente a suo nome nel presente registro docente!</li>
+                </ul>
+              </div>
+            </div>
+
+            <div className="p-4 bg-slate-950 border-t border-white/5 flex justify-end">
+              <button
+                type="button"
+                onClick={() => setShowAccessHelpModal(false)}
+                className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs cursor-pointer transition-colors"
+              >
+                Ho Capito, Chiudi
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
     </div>
   );

@@ -42,18 +42,40 @@ export default function AiExamGeneratorModal({
     setGeneratedResult(null);
 
     try {
-      const resp = await fetch("/api/generate-exam", {
+      const payload = {
+        topic: topic.trim(),
+        gradeLevel,
+        examType,
+        numQuestions,
+        includeOpenEnded,
+        difficulty
+      };
+
+      let resp = await fetch("/api/generate-exam", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
+        headers: { 
+          "Content-Type": "application/json",
+          "Accept": "application/json"
+        },
+        body: JSON.stringify(payload)
+      });
+
+      // If the POST request was blocked by an iframe proxy or redirected to GET
+      if (!resp.ok && (resp.status === 404 || resp.status === 405)) {
+        console.warn(`[AI Exam Generator] POST /api/generate-exam returned ${resp.status}. Trying query fallback...`);
+        const queryParams = new URLSearchParams({
           topic: topic.trim(),
           gradeLevel,
           examType,
-          numQuestions,
-          includeOpenEnded,
+          numQuestions: String(numQuestions),
+          includeOpenEnded: String(includeOpenEnded),
           difficulty
-        })
-      });
+        });
+        resp = await fetch(`/api/generate-exam?${queryParams.toString()}`, {
+          method: "GET",
+          headers: { "Accept": "application/json" }
+        });
+      }
 
       const data = await resp.json();
       if (!resp.ok || data.error) {

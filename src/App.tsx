@@ -65,9 +65,10 @@ export default function App() {
   const [isRedirectSigningIn, setIsRedirectSigningIn] = useState(false);
 
   // Tab & Alternative login states
-  const [loginTab, setLoginTab] = useState<"google" | "direct">("google");
+  const [loginTab, setLoginTab] = useState<"direct" | "google">("direct");
   const [directName, setDirectName] = useState("");
   const [directSurname, setDirectSurname] = useState("");
+  const [directClass, setDirectClass] = useState("");
   const [directEmail, setDirectEmail] = useState("");
   const [directError, setDirectError] = useState("");
   const [showWorkspaceHelp, setShowWorkspaceHelp] = useState(false);
@@ -83,9 +84,11 @@ export default function App() {
     try {
       const savedName = localStorage.getItem("saved_student_name");
       const savedSurname = localStorage.getItem("saved_student_surname");
+      const savedClass = localStorage.getItem("saved_student_class");
       const savedEmail = localStorage.getItem("saved_student_email");
       if (savedName) setDirectName(savedName);
       if (savedSurname) setDirectSurname(savedSurname);
+      if (savedClass) setDirectClass(savedClass);
       if (savedEmail) setDirectEmail(savedEmail);
     } catch (e) {
       // Storage access blocked or restricted
@@ -287,21 +290,29 @@ export default function App() {
 
     const nome = directName.trim();
     const cognome = directSurname.trim();
-    const email = directEmail.trim().toLowerCase();
+    const classe = directClass.trim().toUpperCase();
+    let email = directEmail.trim().toLowerCase().replace(/\s+/g, "");
 
     if (!nome || !cognome) {
       setDirectError("Inserisci sia il nome che il cognome per identificare la prova.");
       return;
     }
 
-    if (!email || !email.includes("@")) {
-      setDirectError("Inserisci un indirizzo email valido.");
+    // Auto-complete domain if student typed username only (e.g. marco.rossi)
+    if (!email.includes("@")) {
+      email = `${email}@ferrarisfermiclass.it`;
+    }
+
+    if (!email.includes(".") || email.length < 5) {
+      setDirectError("Inserisci un indirizzo email valido (es. nome.cognome@ferrarisfermiclass.it).");
       return;
     }
 
-    // Must be school domain or valid educational email
+    // Must be school domain or valid educational/student email
     const isSchoolOrEdu = 
       email.endsWith("@ferrarisfermiclass.it") || 
+      email.endsWith("@ferrarisfermi.edu.it") ||
+      email.endsWith(".edu.it") ||
       email.endsWith(".it") ||
       email.endsWith("@gmail.com");
 
@@ -311,7 +322,7 @@ export default function App() {
     }
 
     const studentUser = {
-      displayName: `${nome} ${cognome}`,
+      displayName: classe ? `${nome} ${cognome} (${classe})` : `${nome} ${cognome}`,
       email: email,
       isDirectAccess: true
     };
@@ -321,6 +332,7 @@ export default function App() {
       localStorage.setItem("direct_student_user", JSON.stringify(studentUser));
       localStorage.setItem("saved_student_name", nome);
       localStorage.setItem("saved_student_surname", cognome);
+      if (classe) localStorage.setItem("saved_student_class", classe);
       localStorage.setItem("saved_student_email", email);
     } catch (e) {
       // Storage access blocked or restricted
@@ -478,18 +490,6 @@ export default function App() {
                       <div className="grid grid-cols-2 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold">
                         <button
                           type="button"
-                          onClick={() => setLoginTab("google")}
-                          className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
-                            loginTab === "google"
-                              ? "bg-teal-600 text-white shadow-md font-bold"
-                              : "text-slate-400 hover:text-white"
-                          }`}
-                        >
-                          <Globe className="w-3.5 h-3.5" />
-                          <span>Account Google</span>
-                        </button>
-                        <button
-                          type="button"
                           onClick={() => setLoginTab("direct")}
                           className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                             loginTab === "direct"
@@ -498,15 +498,124 @@ export default function App() {
                           }`}
                         >
                           <BookOpen className="w-3.5 h-3.5" />
-                          <span>Accesso Diretto Studente</span>
+                          <span>Accesso Studente</span>
+                          <span className="hidden sm:inline-block px-1.5 py-0.2 bg-emerald-500/20 text-emerald-300 text-[9px] rounded font-bold uppercase">
+                            Consigliato
+                          </span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => setLoginTab("google")}
+                          className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                            loginTab === "google"
+                              ? "bg-teal-600 text-white shadow-md font-bold"
+                              : "text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          <Globe className="w-3.5 h-3.5" />
+                          <span>Google / Docente</span>
                         </button>
                       </div>
 
-                      {/* Tab 1: Google Authentication Options */}
+                      {/* Tab 1: Direct Student Access (Zero Blockers for Minors / Google Workspace Policy) */}
+                      {loginTab === "direct" && (
+                        <form onSubmit={handleDirectStudentLogin} className="space-y-3.5 pt-1 text-left">
+                          <div className="p-3 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-[11px] text-indigo-200 leading-relaxed">
+                            💡 <b>Accesso immediato senza blocchi:</b> Non richiede autorizzazioni OAuth. Inserisci nome, cognome e classe: tutti i voti e le risposte verranno registrati nel database ufficiale del docente.
+                          </div>
+
+                          {directError && (
+                            <div className="p-2.5 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-300 text-xs flex items-center gap-1.5">
+                              <AlertCircle className="w-4 h-4 shrink-0" />
+                              <span>{directError}</span>
+                            </div>
+                          )}
+
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-2.5">
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                                Nome *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={directName}
+                                onChange={(e) => setDirectName(e.target.value)}
+                                placeholder="es. Marco"
+                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
+                              />
+                            </div>
+                            <div>
+                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                                Cognome *
+                              </label>
+                              <input
+                                type="text"
+                                required
+                                value={directSurname}
+                                onChange={(e) => setDirectSurname(e.target.value)}
+                                placeholder="es. Rossi"
+                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
+                              />
+                            </div>
+                            <div className="col-span-2 sm:col-span-1">
+                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                                Classe / Sez.
+                              </label>
+                              <input
+                                type="text"
+                                value={directClass}
+                                onChange={(e) => setDirectClass(e.target.value)}
+                                placeholder="es. 3B"
+                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs font-mono uppercase outline-none transition-all placeholder:text-slate-600"
+                              />
+                            </div>
+                          </div>
+
+                          <div>
+                            <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
+                              Email Istituzionale Scolastica *
+                            </label>
+                            <input
+                              type="text"
+                              required
+                              value={directEmail}
+                              onChange={(e) => setDirectEmail(e.target.value)}
+                              placeholder="mario.rossi@ferrarisfermiclass.it"
+                              className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs font-mono outline-none transition-all placeholder:text-slate-600"
+                            />
+                            
+                            {/* Fast domain shortcuts */}
+                            <div className="flex items-center gap-1.5 flex-wrap mt-2">
+                              <span className="text-[10px] text-slate-400">Suggerimento:</span>
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  const prefix = directEmail.split("@")[0].trim();
+                                  setDirectEmail(prefix ? `${prefix}@ferrarisfermiclass.it` : "@ferrarisfermiclass.it");
+                                }}
+                                className="px-2.5 py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-mono text-[10px] rounded-lg border border-teal-500/30 transition-colors cursor-pointer flex items-center gap-1"
+                              >
+                                <span>+ @ferrarisfermiclass.it</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          <button
+                            type="submit"
+                            className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-bold text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all shadow-md shadow-indigo-600/20"
+                          >
+                            <span>Entra nel Test come Studente</span>
+                            <ArrowRight className="w-4 h-4" />
+                          </button>
+                        </form>
+                      )}
+
+                      {/* Tab 2: Google Authentication Options */}
                       {loginTab === "google" && (
                         <div className="space-y-3 pt-1">
                           <p className="text-xs text-slate-300 leading-relaxed text-left">
-                            Accedi con il tuo Account Google scolastico. Verrà mostrato il selettore per scegliere il tuo profilo <b>@ferrarisfermiclass.it</b>.
+                            Accedi con il tuo Account Google scolastico. I docenti accedono qui per visualizzare la Dashboard.
                           </p>
 
                           <button
@@ -554,87 +663,51 @@ export default function App() {
                         </div>
                       )}
 
-                      {/* Tab 2: Direct Student Access (Zero Blockers for Minors / Google Workspace Policy) */}
-                      {loginTab === "direct" && (
-                        <form onSubmit={handleDirectStudentLogin} className="space-y-3.5 pt-1 text-left">
-                          <div className="p-3 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-[11px] text-indigo-200 leading-relaxed">
-                            💡 <b>Perché questa opzione:</b> Risolve all'istante l'accesso per gli studenti i cui account Google sono soggetti a restrizioni d'istituto per minori (&lt;18 anni) o blocchi pop-up su cellulare. Le risposte e i voti verranno registrati con il tuo nome e la tua email ufficiale.
-                          </div>
+                      {/* Educational Workspace Login Help Accordion */}
+                      <div className="pt-2 border-t border-white/5">
+                        <button
+                          type="button"
+                          onClick={() => setShowWorkspaceHelp(!showWorkspaceHelp)}
+                          className="w-full text-left text-[11px] font-semibold text-slate-400 hover:text-teal-300 flex items-center justify-between gap-1 transition-colors cursor-pointer py-1"
+                        >
+                          <span className="flex items-center gap-1.5">
+                            <ShieldAlert className="w-3.5 h-3.5 text-amber-400 shrink-0" />
+                            <span>Perché con Google alcuni studenti entrano e altri no? (Limite accessi?)</span>
+                          </span>
+                          <span className="text-[10px] text-slate-500 font-mono">
+                            {showWorkspaceHelp ? "▲ Chiudi" : "▼ Leggi"}
+                          </span>
+                        </button>
 
-                          {directError && (
-                            <div className="p-2.5 bg-rose-500/10 border border-rose-500/20 rounded-lg text-rose-300 text-xs flex items-center gap-1.5">
-                              <AlertCircle className="w-4 h-4 shrink-0" />
-                              <span>{directError}</span>
-                            </div>
-                          )}
+                        {showWorkspaceHelp && (
+                          <div className="mt-2 p-3 bg-slate-950/80 border border-white/10 rounded-xl text-[11px] text-slate-300 leading-relaxed text-left space-y-2 animate-fadeIn">
+                            <p className="font-bold text-teal-300">
+                              1. Nessun limite di accessi simultanei
+                            </p>
+                            <p className="text-slate-400">
+                              La piattaforma supporta centinaia di studenti contemporaneamente senza alcuna limitazione numerica.
+                            </p>
 
-                          <div className="grid grid-cols-2 gap-2.5">
-                            <div>
-                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
-                                Nome
-                              </label>
-                              <input
-                                type="text"
-                                required
-                                value={directName}
-                                onChange={(e) => setDirectName(e.target.value)}
-                                placeholder="es. Marco"
-                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
-                              />
-                            </div>
-                            <div>
-                              <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
-                                Cognome
-                              </label>
-                              <input
-                                type="text"
-                                required
-                                value={directSurname}
-                                onChange={(e) => setDirectSurname(e.target.value)}
-                                placeholder="es. Rossi"
-                                className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs outline-none transition-all placeholder:text-slate-600"
-                              />
-                            </div>
-                          </div>
+                            <p className="font-bold text-amber-300">
+                              2. La vera causa: Policy Google per minori (&lt;18 anni)
+                            </p>
+                            <p className="text-slate-400">
+                              In Google Workspace for Education, Google blocca per impostazione predefinita l'accesso OAuth ad app esterne per gli account contrassegnati come minori di 18 anni (errore <i>admin_policy_enforced</i>). Gli studenti maggiorenni (es. 5ª superiore) riescono ad accedere con Google, mentre i minorenni vengono respinti da Google.
+                            </p>
 
-                          <div>
-                            <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
-                              Email Istituzionale Scolastica
-                            </label>
-                            <input
-                              type="email"
-                              required
-                              value={directEmail}
-                              onChange={(e) => setDirectEmail(e.target.value)}
-                              placeholder="mario.rossi@ferrarisfermiclass.it"
-                              className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs font-mono outline-none transition-all placeholder:text-slate-600"
-                            />
-                            
-                            {/* Fast domain shortcut */}
-                            <div className="flex items-center gap-1.5 flex-wrap mt-2">
-                              <span className="text-[10px] text-slate-400">Completa dominio:</span>
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  const prefix = directEmail.split("@")[0].trim();
-                                  setDirectEmail(prefix ? `${prefix}@ferrarisfermiclass.it` : "@ferrarisfermiclass.it");
-                                }}
-                                className="px-2.5 py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-mono text-[10px] rounded-lg border border-teal-500/30 transition-colors cursor-pointer flex items-center gap-1"
-                              >
-                                <span>+ @ferrarisfermiclass.it</span>
-                              </button>
+                            <p className="font-bold text-indigo-300">
+                              3. Cookie di terze parti e pop-up su smartphone
+                            </p>
+                            <p className="text-slate-400">
+                              Su Safari (iPhone) e Chrome mobile i pop-up di Google vengono spesso soppressi dal browser.
+                            </p>
+
+                            <div className="p-2 bg-emerald-500/10 border border-emerald-500/20 rounded-lg text-emerald-200">
+                              👉 <b>Soluzione immediata:</b> Tutti gli studenti possono usare la scheda <b>"Accesso Studente"</b> inserendo nome, cognome e email scolastica: funziona sempre al 100% su qualsiasi dispositivo e registra regolarmente ogni voto nel database del docente!
                             </div>
                           </div>
-
-                          <button
-                            type="submit"
-                            className="w-full py-3 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-bold text-xs sm:text-sm rounded-xl flex items-center justify-center gap-2 cursor-pointer transition-all shadow-md shadow-indigo-600/20"
-                          >
-                            <span>Entra nel Test come Studente</span>
-                            <ArrowRight className="w-4 h-4" />
-                          </button>
-                        </form>
-                      )}
+                        )}
+                      </div>
 
                       {/* Educational Guidance Trigger for Teachers & Students */}
                       <div className="pt-2 border-t border-white/5">
