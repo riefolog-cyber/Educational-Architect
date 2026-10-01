@@ -72,6 +72,16 @@ import AiExamGeneratorModal from "./AiExamGeneratorModal";
 import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
 import PrintableReportModal from "./PrintableReportModal";
 
+export interface LiveSessionSummary {
+  pin: string;
+  title: string;
+  expiry: string | null;
+  createdAt: string | null;
+  sessionId: string;
+  active: boolean;
+  teacherEmail: string;
+}
+
 export interface ExamSummary {
   key: string;
   pin: string;
@@ -157,6 +167,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
 
+  // Live sessions opened by this teacher (used by the real-time classroom monitor)
+  const [activeSessions, setActiveSessions] = useState<LiveSessionSummary[]>([]);
+  const [monitorPin, setMonitorPin] = useState<string>("");
+  const [loadingSessions, setLoadingSessions] = useState(false);
+
   // Helper toggle for exam cards
   const toggleExamExpanded = (key: string) => {
     setExpandedExamKeys(prev => {
@@ -218,6 +233,47 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   useEffect(() => {
     handleLoadSubmissions();
   }, []);
+
+  // Load the live sessions owned by this teacher so the monitor can target the right PIN
+  const handleLoadActiveSessions = async () => {
+    if (!dbFirestore || !user?.email) return;
+    setLoadingSessions(true);
+    try {
+      const qSnap = await getDocs(
+        query(collection(dbFirestore, "active_sessions"), where("teacherEmail", "==", user.email))
+      );
+      const list: LiveSessionSummary[] = [];
+      qSnap.forEach((docSnap) => {
+        const d = docSnap.data();
+        list.push({
+          pin: docSnap.id,
+          title: d.title || "Esame attivato",
+          expiry: d.expiry || null,
+          createdAt: d.createdAt || null,
+          sessionId: d.sessionId || "",
+          active: !!d.active,
+          teacherEmail: d.teacherEmail || user.email
+        });
+      });
+      list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      setActiveSessions(list);
+    } catch (e) {
+      console.warn("Impossibile leggere le sessioni attive:", e);
+      setActiveSessions([]);
+    } finally {
+      setLoadingSessions(false);
+    }
+  };
+
+  useEffect(() => {
+    handleLoadActiveSessions();
+  }, [user?.email]);
+
+  const isSessionLive = (s: LiveSessionSummary) => {
+    if (!s.active) return false;
+    if (!s.expiry) return true;
+    return new Date(s.expiry).getTime() > Date.now();
+  };
 
   // Diagnostic checklist for JSON validation
   const validateExamJSON = (text: string): any => {
@@ -419,6 +475,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
 
+        // Purge leftovers from any previous run of this same PIN so two different
+        // classes sharing a PIN code can never be mixed inside the live monitor.
+        try {
+          const staleSnap = await getDocs(collection(dbFirestore, "active_sessions", targetPin, "live_students"));
+          if (!staleSnap.empty) {
+            const purgeBatch = writeBatch(dbFirestore);
+            staleSnap.forEach((s) => purgeBatch.delete(s.ref));
+            await purgeBatch.commit();
+          }
+        } catch (purgeErr) {
+          console.warn("Pulizia lista alunni pre-sessione non riuscita (non bloccante):", purgeErr);
+        }
+
         // Active Session with Full Details saved to Firestore
         const firestorePayload = {
           pin: targetPin,
@@ -430,6 +499,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           randomizeQuestions,
           active: true,
           createdAt: new Date().toISOString(),
+          sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim()
         };
 
@@ -446,6 +516,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata con successo! Gli studenti possono accedere.`);
         setDashboardTab("live_monitor");
+        setPin(targetPin);
+        setMonitorPin(targetPin);
+        await handleLoadActiveSessions();
         
         const friendlyScadenza = expiryDate.toLocaleString("it-IT", {
           day: "2-digit",
@@ -1231,6 +1304,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     totalPasteAttempts: number;
   }
 
+  // Fallback bucket for submissions recorded before session ids existed.
+  // Groups by calendar day so two classes that reused the same PIN on the same
+  // day remain separate instead of collapsing into one card.
+  const fallbackRunBucket = (sub: SavedSubmission, examTitle: string): string => {
+    const t = new Date(sub.Timestamp);
+    const day = isNaN(t.getTime())
+      ? "nodate"
+      : `${t.getFullYear()}${String(t.getMonth() + 1).padStart(2, "0")}${String(t.getDate()).padStart(2, "0")}`;
+    const contentSig = (sub.Domande_Esame || "").toString().length;
+    return `${day}_${examTitle.slice(0, 24)}_${contentSig}`;
+  };
+
   // Helper to extract clean exam title from a submission
   const getSubmissionExamTitle = (sub: SavedSubmission): string => {
     if (sub.Domande_Esame) {
@@ -1595,9 +1680,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     submissions.forEach(sub => {
       const pinClean = (sub.Pin || "").trim();
       const examTitle = getSubmissionExamTitle(sub);
-      // Group primarily by PIN if available, otherwise by Title and Type
-      const key = pinClean 
-        ? `PIN_${pinClean.toUpperCase()}` 
+      // Group by PIN + session run id. Reusing the same PIN for a second class
+      // creates a new session id, so the two classes never end up in one card.
+      // Legacy submissions without a session id fall back to title + day bucket.
+      const runId = (sub.Session_Id || "").trim();
+      const key = pinClean
+        ? `PIN_${pinClean.toUpperCase()}_${runId ? `RUN_${runId}` : fallbackRunBucket(sub, examTitle)}`
         : `NOPIN_${examTitle}_${sub.Tipo}`;
 
       if (!map.has(key)) {
@@ -1619,7 +1707,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       // Determine most descriptive title
       let title = "";
       for (const s of examSubs) {
-        const t = getSubmissionExamTitle(s);
+        const t = s.Session_Titolo?.trim() || getSubmissionExamTitle(s);
         if (t && !t.startsWith("Prova con PIN") && !t.startsWith("Quiz Didattico") && !t.startsWith("Workbook Didattico")) {
           title = t;
           break;
@@ -2248,9 +2336,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             </div>
 
             {dashboardTab === "live_monitor" ? (
-              <ClassroomLiveMonitor 
-                pin={pin.trim() || submissions[0]?.Pin || ""} 
-                examTitle={materia} 
+              <ClassroomLiveMonitor
+                pin={monitorPin}
+                examTitle={
+                  activeSessions.find((s) => s.pin === monitorPin)?.title || materia || undefined
+                }
+                sessions={activeSessions}
+                isSessionLive={isSessionLive}
+                loadingSessions={loadingSessions}
+                onSelectPin={(next) => {
+                  setMonitorPin(next);
+                  setPin(next);
+                }}
+                onRefreshSessions={handleLoadActiveSessions}
               />
             ) : (
               <>
@@ -2891,6 +2989,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   <h4 className="font-bold text-white text-sm sm:text-base tracking-tight">
                                     {exam.title}
                                   </h4>
+
+                                  {exam.firstDate && exam.latestDate &&
+                                    new Date(exam.firstDate).toDateString() !== new Date(exam.latestDate).toDateString() && (
+                                    <span className="text-[10px] text-amber-300/80 font-mono">
+                                        Sessione distribuita su più giorni
+                                    </span>
+                                  )}
                                 </div>
 
                                 {/* Key Metrics on the card */}

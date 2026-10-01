@@ -137,4 +137,6 @@ export interface SavedSubmission {
   Dettagli_Aperte?: any;
   Domande_Esame?: any;
   Piano_Recupero?: string;
+  Session_Id?: string;   // Unique run id of the live session (separates classes reusing the same PIN)
+  Session_Titolo?: string;
 }

@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useRef } from "react";
+import React, { useState, useEffect, useRef, useCallback } from "react";
 import { 
   ref as fbRef, 
   get as fbGet 
@@ -85,6 +85,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   
   // Current session definition
   const [sessionPin, setSessionPin] = useState("");
+  // Unique run identifier of the live session: two classes sharing the same PIN
+  // never get merged into a single exam in the teacher registry.
+  const [sessionRunId, setSessionRunId] = useState("");
   const [examType, setExamType] = useState<"quiz" | "workbook">("quiz");
   const [examData, setExamData] = useState<any>(null);
   const [expiryTime, setExpiryTime] = useState<string | null>(null);
@@ -141,6 +144,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Printable Report state
   const [showPrintModal, setShowPrintModal] = useState(false);
 
+  // BES / DSA wrapper classes actually applied to the exam workspace
+  const accessibilityClasses = [
+    dyslexicFont ? "dsa-font" : "",
+    fontSize === "large" ? "dsa-scale-115" : "",
+    fontSize === "xlarge" ? "dsa-scale-130" : ""
+  ].filter(Boolean).join(" ");
+
   // Reading ruler cursor tracker
   useEffect(() => {
     if (!readingRuler) return;
@@ -152,7 +162,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   }, [readingRuler]);
 
   // Live progress synchronization to Firestore for Teacher Dashboard
-  const syncLiveProgress = async (status: "in_progress" | "self_evaluating" | "submitted" = "in_progress") => {
+  const syncLiveProgress = useCallback(async (
+    status: "waiting" | "in_progress" | "self_evaluating" | "submitted" = "in_progress"
+  ) => {
     if (!dbFirestore || !sessionPin || !user?.email) return;
     try {
       const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -167,6 +179,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const progressPercent = Math.min(100, Math.round((answeredCount / (totalQuestions || 1)) * 100));
 
       const docRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey);
+      const joinedAt = new Date().toISOString();
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
@@ -175,23 +188,39 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         currentProgressPercent: progressPercent,
         tabSwitches: behavior.tabSwitches,
         pasteAttempts: behavior.pasteAttempts,
-        lastHeartbeat: new Date().toISOString(),
+        lastHeartbeat: joinedAt,
+        joinedAt,
+        sessionRunId,
         status
       }, { merge: true });
     } catch (err) {
       console.warn("Live progress sync skipped:", err);
     }
-  };
+  }, [dbFirestore, sessionPin, sessionRunId, user?.email, user?.displayName, examType, examData, answers, behavior.tabSwitches, behavior.pasteAttempts]);
+
+  // Keeps the latest progress data available to the periodic heartbeat without
+  // restarting the interval on every keystroke.
+  const syncLiveProgressRef = useRef(syncLiveProgress);
+  useEffect(() => {
+    syncLiveProgressRef.current = syncLiveProgress;
+  }, [syncLiveProgress]);
+
+  // Register presence as soon as the PIN is accepted, so the teacher sees the
+  // student in the classroom list even before pressing "Inizia la Prova".
+  useEffect(() => {
+    if (!sessionPin || !examData || isExamActive) return;
+    syncLiveProgressRef.current("waiting");
+  }, [sessionPin, examData, isExamActive]);
 
   // Heartbeat syncing during active exam
   useEffect(() => {
     if (!isExamActive || !sessionPin || !user?.email) return;
-    syncLiveProgress("in_progress");
+    syncLiveProgressRef.current("in_progress");
     const interval = setInterval(() => {
-      syncLiveProgress("in_progress");
-    }, 12000);
+      syncLiveProgressRef.current("in_progress");
+    }, 10000);
     return () => clearInterval(interval);
-  }, [isExamActive, sessionPin, user?.email, answers, behavior.tabSwitches, behavior.pasteAttempts]);
+  }, [isExamActive, sessionPin, user?.email]);
 
   // Ref for tracking focus/visibility lifecycle
   const wakeLockRef = useRef<any>(null);
@@ -393,6 +422,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           }
 
           setSessionPin(formattedPin);
+          setSessionRunId(sessionData.sessionId || "");
 
           let examContent = sessionData.data;
           // Anti-cheat: Randomize questions and options if enabled by teacher
@@ -937,6 +967,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Docente_Email: cleanVal(rescue.teacherEmail),
             Tipo: rescue.examType === "quiz" ? "Quiz" : "Workbook",
             Pin: cleanVal(rescue.sessionPin),
+            Session_Id: cleanVal(rescue.sessionRunId),
+            Session_Titolo: cleanVal(rescue.examTitle),
             Nome: user?.displayName || "Studente",
             Email: user?.email || "scuola.utente@scuola.it",
             Voto_Suggerito: cleanVal(finalEval.suggestedGrade),
@@ -989,6 +1021,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         if (data && data.jobId) {
           console.log("[Rescue Engine] Auto-resuming crashed/reloaded evaluation session for jobId:", data.jobId);
           setSessionPin(data.sessionPin || "");
+          setSessionRunId(data.sessionRunId || "");
           setExamType(data.examType || "quiz");
           setExamData(data.examData || null);
           setExpiryTime(data.expiryTime || null);
@@ -1164,6 +1197,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const rescuePayload = {
         jobId,
         sessionPin,
+        sessionRunId,
+        examTitle: examData?.title || "",
         examType,
         examData,
         expiryTime,
@@ -1194,6 +1229,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setActiveScreen("enter-pin");
     setPin("");
     setSessionPin("");
+    setSessionRunId("");
     setExamData(null);
     setAnswers({ mc: {}, oe: {}, wbFib: {}, wbRq: {} });
     setBehavior({ tabSwitches: 0, pasteAttempts: 0, rightClicks: 0, infractionsLog: [] });
@@ -1842,7 +1878,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             />
           )}
 
-          <div className={`p-6 sm:p-8 rounded-3xl border transition-all ${
+          <div className={`${accessibilityClasses} p-6 sm:p-8 rounded-3xl border transition-all ${
             contrastTheme === "sepia"
               ? "bg-[#faf6eb] text-[#2b251a] border-amber-900/20"
               : contrastTheme === "light"
