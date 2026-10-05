@@ -24,26 +24,21 @@ const getAiClient = () => {
   });
 };
 
+const RELIABLE_FALLBACK_MODELS = [
+  "gemini-3.1-flash-lite",
+  "gemini-2.5-flash",
+  "gemini-2.5-flash-lite",
+  "gemini-3.8-flash"
+];
+
 // Robust Generate Content Wrapper for Handling Availability issues
-async function generateWithRetry(options: any, maxRetries = 10) {
+async function generateWithRetry(options: any, maxRetries = 6) {
   let currentOptions = { ...options };
-  let modelSwapped = false;
+  const triedModels = new Set<string>();
+  if (currentOptions.model) triedModels.add(currentOptions.model);
 
   for (let i = 0; i < maxRetries; i++) {
     try {
-      // If we failed even once on gemini-3.5-flash, fall back immediately to gemini-3.1-flash-lite
-      if (i >= 1 && !modelSwapped && currentOptions.model === "gemini-3.5-flash") {
-        console.log(`[Gemini Retry] Falling back from 'gemini-3.5-flash' to 'gemini-3.1-flash-lite' due to 503/overload issues.`);
-        currentOptions.model = "gemini-3.1-flash-lite";
-        if (currentOptions.config) {
-          currentOptions.config = { ...currentOptions.config };
-          if (currentOptions.config.thinkingConfig) {
-            delete currentOptions.config.thinkingConfig;
-          }
-        }
-        modelSwapped = true;
-      }
-
       const resp = await getAiClient().models.generateContent(currentOptions);
       return resp;
     } catch (err: any) {
@@ -63,9 +58,11 @@ async function generateWithRetry(options: any, maxRetries = 10) {
                           errStr.includes("overloaded") || 
                           errStr.includes("quota") ||
                           errStr.includes("resource exhausted") ||
+                          errStr.includes("resource_exhausted") ||
                           errStr.includes("rate limit") ||
                           errStringified.includes("503") ||
                           errStringified.includes("429") ||
+                          errStringified.includes("resource_exhausted") ||
                           errStringified.includes("unavailable") ||
                           errStringified.includes("high demand") ||
                           errStringified.includes("overloaded") ||
@@ -74,12 +71,28 @@ async function generateWithRetry(options: any, maxRetries = 10) {
       console.warn(`[Gemini Try ${i+1}/${maxRetries} Failed on model '${currentOptions.model}']:`, err.message);
 
       if (isRetryable) {
-        if (i === maxRetries - 1) {
-          throw new Error("I server dell'Intelligenza Artificiale (Google Gemini) sono attualmente sovraccarichi a causa dell'elevata richiesta (Errore 503). Attendi 1-2 minuti e riprova la consegna.");
+        // Fast fallback to another reliable model in the cascade
+        const nextModel = RELIABLE_FALLBACK_MODELS.find(m => !triedModels.has(m));
+        if (nextModel) {
+          console.log(`[Gemini Fallback] Switching model from '${currentOptions.model}' to '${nextModel}' due to 503/429/quota.`);
+          currentOptions.model = nextModel;
+          triedModels.add(nextModel);
+          if (currentOptions.config) {
+            currentOptions.config = { ...currentOptions.config };
+            if (currentOptions.config.thinkingConfig) {
+              delete currentOptions.config.thinkingConfig;
+            }
+          }
+          // Immediate retry on the alternate model
+          continue;
         }
-        // Faster progressive backoff starting at 1.5s with up to 1.5s random jitter
-        const backoffTime = 1500 + Math.floor(Math.random() * 1500) + (1000 * i);
-        console.log(`[Gemini 503/429] Retrying in ${backoffTime}ms...`);
+
+        if (i === maxRetries - 1) {
+          throw new Error("I server dell'Intelligenza Artificiale (Google Gemini) sono momentaneamente sovraccarichi o la quota temporanea è limitata. Riprova tra pochi istanti.");
+        }
+        // Progressive backoff starting at 1.0s with up to 1.0s jitter
+        const backoffTime = 1000 + Math.floor(Math.random() * 1000);
+        console.log(`[Gemini 503/429] Retrying in ${backoffTime}ms on '${currentOptions.model}'...`);
         await new Promise(res => setTimeout(res, backoffTime)); 
       } else {
         throw new Error(err.message || "Errore interno durante la generazione.");
@@ -815,7 +828,7 @@ app.post("/api/evaluate", async (req, res) => {
   }
 });
 
-// API: Health probe & Docimological Analysis
+// API: Health probe & Docimological Analysis & Criteria Optimization
 app.all("/api/analyze-exam", async (req, res) => {
   if (req.method === "OPTIONS") {
     return res.status(204).end();
@@ -824,7 +837,7 @@ app.all("/api/analyze-exam", async (req, res) => {
     return res.json({ status: "ok", endpoint: "/api/analyze-exam", message: "API attiva." });
   }
 
-  const { examJson } = req.body || {};
+  const { examJson, customInstruction } = req.body || {};
 
   if (!examJson) {
     return res.status(400).json({ error: "Nessun contenuto JSON fornito per l'analisi dei criteri." });
@@ -837,24 +850,34 @@ app.all("/api/analyze-exam", async (req, res) => {
   }
 
   try {
+    const promptContents = `Esame attuale (JSON):\n${examJson}${customInstruction ? `\n\nIstruzioni / Richieste aggiuntive del docente:\n${customInstruction}` : ""}`;
+
     const response = await generateWithRetry({
-      model: "gemini-3.5-flash",
-      contents: `Esame (JSON):\n${examJson}`,
+      model: "gemini-3.1-flash-lite",
+      contents: promptContents,
       config: {
         systemInstruction: `Sei un esperto accademico e consulente senior di psicometria, progettazione didattica, docimologia scolastica e valutazione formativa della scuola media superiore italiana.
 Analizza accuratamente il test/esame scolastico in formato JSON fornito dal docente.
 
-Il tuo compito è:
-1. Valutare la chiarezza verbale, l'adeguatezza psicometria del livello di difficoltà e l'efficacia pedagogica delle domande (formulazione chiara, assenza di risposte ambigue o fuorvianti).
-2. Fornire una critica costruttiva e suggerimenti dettagliati per migliorare il test e i relativi criteri di valutazione (es. suggerimenti su rubriche di attribuzione, bilanciamento tra domande chiuse e aperte).
-3. Generare una versione ottimizzata e corretta del medesimo esame JSON che corregga eventuali ambiguità, mantenga la tipologia (Quiz o Workbook) ed i medesimi formati conformi, arricchisce i criteri di valutazione (es. fornendo suggerimenti o chiavi di risposta chiare se mancanti, migliorando le domande per renderle più significative).
+${customInstruction ? `ATTENZIONE: Il docente ha fornito queste indicazioni o richieste di miglioramento specifiche:
+"${customInstruction}"
+DEVI tassativamente tenerne conto e applicarle concretamente nell'esame ottimizzato!` : ""}
 
-Fornisci la risposta esclusivamente strutturata in formato JSON con la seguente schema:
+Il tuo compito è:
+1. Valutare la chiarezza verbale, l'adeguatezza psicometrica del livello di difficoltà e l'efficacia pedagogica delle domande (formulazione chiara, assenza di risposte ambigue o fuorvianti).
+2. Fornire una critica costruttiva e suggerimenti dettagliati per migliorare il test e i relativi criteri di valutazione (es. suggerimenti su rubriche di attribuzione, bilanciamento tra domande chiuse e aperte).
+3. GENERARE L'ESAME OTTIMIZZATO INTEGRATO (MANDATORIO):
+   CRITICO: Qualsiasi proposta o miglioramento didattico che formuli nella recensione (come ad esempio l'aggiunta di una o più domande aperte, domande di riflessione critica, rubriche di valutazione analitiche o correzione di quesiti formulati male) DEVE essere TASSATIVAMENTE INCLUSA e integrata all'interno del campo 'optimizedJson'!
+   Non limitarti a dare un consiglio teorico: se consigli di aggiungere una domanda aperta, quella domanda aperta DEVE essere fisicamente inserita nell'array 'openEnded' (o nelle 'reflectionQuestions') nell'optimizedJson con il relativo id progressivo e formulazione completa!
+4. Elencare le proposte concrete che hai applicato nell'array 'proposedAdditions', indicando chiaramente cosa è stato aggiunto/migliorato.
+
+Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente schema:
 - reviewHtml: Una sintesi approfondita della tua analisi docimologica in formato HTML pulito (senza tag <html> o <body>, solo <p>, <ol>, <li>, <strong>, etc.) con bullet points ed evidenziazione dei criteri di valutazione. Adotta un tono professionale e incoraggiante per il docente.
 - suggestions: Un array di stringhe corte (consigli pratici rapidi e immediati).
-- optimizedJson: La stringa JSON formattata e serializzata dell'esame ottimizzato con lo schema identico a quello ricevuto ma con tutte le correzioni e i miglioramenti applicati.`,
-        temperature: 0.1, // Faster stable output
-        maxOutputTokens: 2500,
+- proposedAdditions: Array di oggetti con { "type": "open_ended" | "multiple_choice" | "reflection" | "criteria" | "other", "title": string, "description": string, "preview": string } che descrivono le modifiche/aggiunte concrete che hai inserito in 'optimizedJson'.
+- optimizedJson: La stringa JSON formattata e serializzata dell'esame ottimizzato con lo schema identico a quello ricevuto, ma con tutte le domande precedenti PIÙ tutte le nuove domande proposte e i criteri migliorati integrati.`,
+        temperature: 0.15,
+        maxOutputTokens: 8192,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -863,6 +886,19 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con la seguente 
             suggestions: {
               type: Type.ARRAY,
               items: { type: Type.STRING }
+            },
+            proposedAdditions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  description: { type: Type.STRING },
+                  preview: { type: Type.STRING }
+                },
+                required: ["type", "title", "description", "preview"]
+              }
             },
             optimizedJson: { type: Type.STRING }
           },
@@ -877,11 +913,189 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con la seguente 
     }
 
     const data = parseJsonResponse(responseText);
-    return res.json({ status: "success", review: data });
+    
+    // Normalize and repair output object
+    let parsedObj: any = null;
+    if (typeof data.optimizedJson === "object" && data.optimizedJson !== null) {
+      parsedObj = data.optimizedJson;
+    } else if (typeof data.optimizedJson === "string") {
+      try {
+        parsedObj = JSON.parse(data.optimizedJson);
+      } catch (pErr) {
+        // Leave raw string
+      }
+    }
+
+    // Normalization safeguard: If exam is Quiz (no sections) and has reflectionQuestions at root, migrate them into openEnded!
+    if (parsedObj && typeof parsedObj === "object" && !parsedObj.sections) {
+      if (Array.isArray(parsedObj.reflectionQuestions) && parsedObj.reflectionQuestions.length > 0) {
+        if (!Array.isArray(parsedObj.openEnded)) parsedObj.openEnded = [];
+        for (const rq of parsedObj.reflectionQuestions) {
+          if (!parsedObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+            parsedObj.openEnded.push({
+              id: rq.id || `q_ref_${parsedObj.openEnded.length + 1}`,
+              question: rq.question,
+              criteria: rq.criteria || rq.criteri
+            });
+          }
+        }
+        delete parsedObj.reflectionQuestions;
+      }
+    }
+
+    const finalJson = parsedObj ? JSON.stringify(parsedObj, null, 2) : String(data.optimizedJson);
+
+    return res.json({ 
+      status: "success", 
+      review: {
+        reviewHtml: data.reviewHtml,
+        suggestions: data.suggestions || [],
+        proposedAdditions: data.proposedAdditions || [],
+        optimizedJson: finalJson
+      }
+    });
   } catch (error: any) {
     console.error("AI Exam analysis failed:", error);
     return res.status(500).json({ 
       error: "L'analisi dei criteri tramite Intelligenza Artificiale è fallita.", 
+      details: error.message 
+    });
+  }
+});
+
+// API: Extend an existing loaded exam JSON with new questions/sections/criteria not present in the original
+app.all("/api/extend-exam-json", async (req, res) => {
+  if (req.method === "OPTIONS") {
+    return res.status(204).end();
+  }
+  if (req.method === "GET") {
+    return res.json({ status: "ok", endpoint: "/api/extend-exam-json", message: "API attiva." });
+  }
+
+  const { examJson, instruction, additionType } = req.body || {};
+
+  if (!examJson || typeof examJson !== "string") {
+    return res.status(400).json({ error: "Nessun contenuto JSON dell'esame fornito." });
+  }
+  if (!instruction || !instruction.trim()) {
+    return res.status(400).json({ error: "Specifica cosa desideri aggiungere all'esame." });
+  }
+  if (!getApiKey()) {
+    return res.status(500).json({ 
+      error: "La chiave API di Gemini non è configurata nell'ambiente di AI Studio." 
+    });
+  }
+
+  try {
+    let parsedInput: any = null;
+    try {
+      parsedInput = JSON.parse(examJson);
+    } catch {}
+    const isInputWorkbook = !!(parsedInput && Array.isArray(parsedInput.sections));
+
+    const response = await generateWithRetry({
+      model: "gemini-3.1-flash-lite",
+      contents: `Esame attuale (JSON caricato dal docente):\n${examJson}\n\nCosa aggiungere all'esame:\n${instruction.trim()}\nTipo di contenuto preferito: ${additionType || "automatico/misto"}`,
+      config: {
+        systemInstruction: `Sei un esperto docente e progettista didattico per la scuola secondaria di secondo grado italiana.
+Ricevi l'esame scolastico attuale in formato JSON e una richiesta del docente su cosa AGGIUNGERE di nuovo all'esame che NON è contenuto nel JSON caricato.
+
+REGOLA ARCHITETTURALE FONDAMENTALE SULLA STRUTTURA:
+L'esame caricato è di tipo: ${isInputWorkbook ? "WORKBOOK (strutturato con 'sections', ciascuna con 'sintesi', 'fillInTheBlank' e 'reflectionQuestions')" : "QUIZ (strutturato con 'multipleChoice' per le domande chiuse e 'openEnded' per le domande aperte)"}
+
+${!isInputWorkbook ? `⚠️ REGOLE CRITICHE PER I QUIZ:
+1. Nei Quiz, TUTTE le domande a risposta aperta (incluse le domande di riflessione critica, argomentazione, pensiero critico o giudizio personale) DEVONO TASSATIVAMENTE ESSERE INSERITE NELL'ARRAY 'openEnded' all'interno dell'oggetto esame!
+2. NON creare un array 'reflectionQuestions' alla radice di un Quiz (questo campo è riservato solo alle sezioni dei Workbook e se messo alla radice di un Quiz non viene visualizzato agli studenti).
+3. NON aggiungere 'sections' trasformando il Quiz in Workbook.
+4. Ogni domanda aggiunta in 'openEnded' deve avere una formulazione chiara, un id progressivo (es. q3, q4) e criteri docimologici di valutazione nel campo 'criteria'.` : `⚠️ REGOLE PER I WORKBOOK:
+1. Le domande di riflessione critica vanno inserite all'interno dell'array 'reflectionQuestions' della sezione appropriata (o di una nuova sezione con 'title' e 'sintesi').
+2. I completamenti vanno inseriti in 'fillInTheBlank'.`}
+
+I tuoi compiti:
+1. MANTENERE INTATTO L'ESISTENTE: Non eliminare MAI né modificare le domande, sezioni o contenuti già presenti nell'esame. Mantieni intatti i titoli, le opzioni e i testi esistenti.
+2. GENERARE I NUOVI CONTENUTI RICHIESTI:
+   - Se il docente chiede domande aperte o di riflessione in un Quiz: inseriscile in 'openEnded' con ID progressivi e criteri.
+   - Se il docente chiede domande a scelta multipla: inseriscile in 'multipleChoice' con 4 opzioni plausibili e 'correctIndex' (da 0 a 3).
+   - Se il docente chiede domande di riflessione in un Workbook: inseriscile in 'reflectionQuestions' all'interno delle 'sections'.
+3. RESTITUIRE IL RISULTATO:
+   - summary: Una sintesi chiara di cosa è stato aggiunto (es. "Aggiunta 1 domanda a risposta aperta di riflessione critica con criteri di valutazione").
+   - addedItems: Array di oggetti descrittivi di ciascun nuovo elemento aggiunto:
+     [{ "type": "open_ended" | "multiple_choice" | "reflection" | "section" | "criteria", "title": string, "previewText": string }]
+   - extendedJson: La stringa JSON formattata e serializzata dell'intero esame aggiornato (tutto l'esame precedente + tutti i nuovi elementi perfettamente integrati nel formato corretto).`,
+        temperature: 0.2,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summary: { type: Type.STRING },
+            addedItems: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  type: { type: Type.STRING },
+                  title: { type: Type.STRING },
+                  previewText: { type: Type.STRING }
+                },
+                required: ["type", "title", "previewText"]
+              }
+            },
+            extendedJson: { type: Type.STRING }
+          },
+          required: ["summary", "addedItems", "extendedJson"]
+        }
+      }
+    });
+
+    const responseText = extractResponseText(response);
+    if (!responseText) {
+      throw new Error("Risposta vuota ricevuta da Gemini.");
+    }
+
+    const data = parseJsonResponse(responseText);
+    
+    // Normalize and repair output object
+    let parsedObj: any = null;
+    if (typeof data.extendedJson === "object" && data.extendedJson !== null) {
+      parsedObj = data.extendedJson;
+    } else if (typeof data.extendedJson === "string") {
+      try {
+        parsedObj = JSON.parse(data.extendedJson);
+      } catch (pErr) {
+        // Leave raw string
+      }
+    }
+
+    // Normalization safeguard: If exam is Quiz (no sections) and has reflectionQuestions at root, migrate them into openEnded!
+    if (parsedObj && typeof parsedObj === "object" && !parsedObj.sections) {
+      if (Array.isArray(parsedObj.reflectionQuestions) && parsedObj.reflectionQuestions.length > 0) {
+        if (!Array.isArray(parsedObj.openEnded)) parsedObj.openEnded = [];
+        for (const rq of parsedObj.reflectionQuestions) {
+          if (!parsedObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+            parsedObj.openEnded.push({
+              id: rq.id || `q_ref_${parsedObj.openEnded.length + 1}`,
+              question: rq.question,
+              criteria: rq.criteria || rq.criteri
+            });
+          }
+        }
+        delete parsedObj.reflectionQuestions;
+      }
+    }
+
+    const finalJson = parsedObj ? JSON.stringify(parsedObj, null, 2) : String(data.extendedJson);
+
+    return res.json({
+      status: "success",
+      summary: data.summary || "Contenuti aggiunti con successo all'esame.",
+      addedItems: data.addedItems || [],
+      extendedJson: finalJson
+    });
+  } catch (error: any) {
+    console.error("AI Exam extension failed:", error);
+    return res.status(500).json({ 
+      error: "Impossibile aggiungere i nuovi contenuti all'esame.", 
       details: error.message 
     });
   }

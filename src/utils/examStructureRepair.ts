@@ -473,8 +473,8 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       changes.push(`Normalizzato elenco 'veroFalso' (${vfCount} quesiti).`);
     }
 
-    // Case 4: Object with openEnded / domandeAperte / aperte
-    const rawOpen = parsed.openEnded || parsed.domandeAperte || parsed.aperte || parsed.quesitiAperti;
+    // Case 4: Object with openEnded / domandeAperte / aperte / reflectionQuestions
+    const rawOpen = parsed.openEnded || parsed.domandeAperte || parsed.aperte || parsed.quesitiAperti || parsed.reflectionQuestions || parsed.domandeRiflessione || parsed.riflessione;
     if (Array.isArray(rawOpen)) {
       rawOpen.forEach((item, idx) => processQuestionItem({ ...item, type: "openEnded" }, idx));
       if (!genericList) {

@@ -423,6 +423,29 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setSessionRunId(sessionData.sessionId || "");
 
           let examContent = sessionData.data;
+          if (typeof examContent === "string") {
+            try { examContent = JSON.parse(examContent); } catch {}
+          }
+
+          // Normalization safeguard: If examContent is a Quiz (no sections) and has reflectionQuestions at the root,
+          // migrate them into openEnded so they are rendered and evaluated seamlessly for the student!
+          if (examContent && !examContent.sections && Array.isArray(examContent.reflectionQuestions) && examContent.reflectionQuestions.length > 0) {
+            const existingOE = Array.isArray(examContent.openEnded) ? [...examContent.openEnded] : [];
+            for (const rq of examContent.reflectionQuestions) {
+              if (!existingOE.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+                existingOE.push({
+                  id: rq.id || `q_ref_${existingOE.length + 1}`,
+                  question: rq.question,
+                  criteria: rq.criteria || rq.criteri
+                });
+              }
+            }
+            examContent = {
+              ...examContent,
+              openEnded: existingOE
+            };
+          }
+
           // Anti-cheat: Randomize questions and options if enabled by teacher
           if (sessionData.randomizeQuestions && examContent?.multipleChoice) {
             const shuffledMC = examContent.multipleChoice.map((q: any) => {
@@ -2099,6 +2122,49 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 <span>Severità brevità attiva</span>
                                 <span className={wordCount >= 15 ? "text-emerald-400 font-medium" : "text-slate-500"}>
                                   {wordCount} parole {wordCount < 15 && "(minimo consigliato: 15-20 per la sufficienza)"}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
+                {/* Fallback Reflection Questions if present at root in Quiz */}
+                {examData?.reflectionQuestions && examData.reflectionQuestions.length > 0 && (
+                  <div className="space-y-6 pt-4 border-t border-white/5">
+                    <h3 className="text-xs font-bold tracking-widest text-teal-400 uppercase bg-teal-500/10 px-4 py-2 rounded-xl inline-block border border-teal-500/20">
+                      SEZIONE C: Domande di Riflessione Critica
+                    </h3>
+
+                    <div className="space-y-6 text-left">
+                      {examData.reflectionQuestions.map((q: any, qIdx: number) => {
+                        const savedValue = answers.oe[q.id] || answers.wbRq[q.id] || "";
+                        const wordCount = savedValue.trim() ? savedValue.trim().split(/\s+/).length : 0;
+                        return (
+                          <div key={q.id} className="space-y-3">
+                            <p className="font-medium text-slate-200">
+                              <span className="text-teal-400 font-bold mr-2">
+                                {((examData?.multipleChoice || []).length) + ((examData?.openEnded || []).length) + qIdx + 1}.
+                              </span>
+                              {q.question}
+                            </p>
+                            <div className="space-y-1.5">
+                              <textarea
+                                value={savedValue}
+                                onChange={(e) => {
+                                  handleInputOE(q.id, e.target.value);
+                                  handleInputRq(q.id, e.target.value);
+                                }}
+                                placeholder="Scrivi qui la tua riflessione personale..."
+                                className="w-full min-h-[140px] p-4 bg-slate-950/60 border border-teal-500/20 rounded-2xl text-white placeholder-slate-600 focus:outline-none focus:border-teal-500 transition-colors text-sm line-relaxed"
+                              />
+                              <div className="flex justify-between items-center text-xs text-slate-500 px-1">
+                                <span>Riflessione critica personale</span>
+                                <span className={wordCount >= 15 ? "text-teal-400 font-medium" : "text-slate-500"}>
+                                  {wordCount} parole
                                 </span>
                               </div>
                             </div>

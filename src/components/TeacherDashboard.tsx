@@ -56,7 +56,9 @@ import {
   Layers,
   ListOrdered,
   Copy,
-  Check
+  Check,
+  PlusCircle,
+  Undo2
 } from "lucide-react";
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
@@ -130,10 +132,34 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
+  const [aiCustomInstruction, setAiCustomInstruction] = useState("");
+  const [showAiCustomInput, setShowAiCustomInput] = useState(false);
   const [aiAnalysis, setAiAnalysis] = useState<{
     reviewHtml: string;
     suggestions: string[];
+    proposedAdditions?: Array<{
+      type: string;
+      title: string;
+      description: string;
+      preview: string;
+    }>;
     optimizedJson: string;
+  } | null>(null);
+
+  // Extend / Add content to exam state ("Aggiungi altro all'esame con l'IA")
+  const [showExtendCard, setShowExtendCard] = useState(false);
+  const [extendPrompt, setExtendPrompt] = useState("");
+  const [isExtending, setIsExtending] = useState(false);
+  const [lastExtensionResult, setLastExtensionResult] = useState<{
+    summary: string;
+    addedItems: Array<{ type: string; title: string; previewText: string }>;
+  } | null>(null);
+
+  // Backup for easy undo of AI optimizations and additions
+  const [previousJsonBackup, setPreviousJsonBackup] = useState<{
+    json: string;
+    title: string;
+    reason: string;
   } | null>(null);
 
   // Submissions state
@@ -292,12 +318,29 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       const isWorkbook = data.sections && Array.isArray(data.sections);
-      const isQuiz = (data.multipleChoice && Array.isArray(data.multipleChoice)) || (data.openEnded && Array.isArray(data.openEnded));
+      const isQuiz = (data.multipleChoice && Array.isArray(data.multipleChoice)) || 
+                     (data.openEnded && Array.isArray(data.openEnded)) ||
+                     (!isWorkbook && data.reflectionQuestions && Array.isArray(data.reflectionQuestions));
 
       if (!isWorkbook && !isQuiz) {
         setValidationError("Struttura non riconosciuta. Mancano 'sections' (Workbook) o liste di domande 'multipleChoice'/'openEnded' (Quiz).");
         setCanAutoRepair(canAutoCorrectStructure(text));
         return null;
+      }
+
+      // Normalization safeguard: if it's a Quiz and has reflectionQuestions at root, migrate them into openEnded
+      if (!isWorkbook && Array.isArray(data.reflectionQuestions) && data.reflectionQuestions.length > 0) {
+        if (!data.openEnded) data.openEnded = [];
+        for (const rq of data.reflectionQuestions) {
+          if (!data.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+            data.openEnded.push({
+              id: rq.id || `q_ref_${data.openEnded.length + 1}`,
+              question: rq.question,
+              criteria: rq.criteria || rq.criteri
+            });
+          }
+        }
+        delete data.reflectionQuestions;
       }
 
       if (isWorkbook) {
@@ -419,6 +462,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     if (!examObj) {
       alert("⚠️ Correggi la sintassi JSON o applica la correzione automatica della struttura prima dell'attivazione.");
       return;
+    }
+
+    // Normalization safeguard before Firestore activation:
+    if (!examObj.sections && Array.isArray(examObj.reflectionQuestions) && examObj.reflectionQuestions.length > 0) {
+      if (!Array.isArray(examObj.openEnded)) examObj.openEnded = [];
+      for (const rq of examObj.reflectionQuestions) {
+        if (!examObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+          examObj.openEnded.push({
+            id: rq.id || `q_ref_${examObj.openEnded.length + 1}`,
+            question: rq.question,
+            criteria: rq.criteria || rq.criteri
+          });
+        }
+      }
+      delete examObj.reflectionQuestions;
     }
     
     if (materia.trim()) {
@@ -554,7 +612,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const response = await fetch("/api/analyze-exam", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ examJson: jsonText }),
+        body: JSON.stringify({ 
+          examJson: jsonText,
+          customInstruction: aiCustomInstruction.trim() || undefined
+        }),
       });
       if (!response.ok) {
         const errData = await response.json();
@@ -577,18 +638,112 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleApplyOptimizedCode = () => {
     if (aiAnalysis && aiAnalysis.optimizedJson) {
       try {
+        // Save current as backup for undo
+        setPreviousJsonBackup({
+          json: jsonText,
+          title: materia,
+          reason: "Prima dell'ottimizzazione IA"
+        });
+
         // Format it nicely
-        const formatted = JSON.stringify(JSON.parse(aiAnalysis.optimizedJson), null, 2);
+        const parsed = JSON.parse(aiAnalysis.optimizedJson);
+        const formatted = JSON.stringify(parsed, null, 2);
         setJsonText(formatted);
         validateExamJSON(formatted);
+        if (parsed.title && !materia.trim()) {
+          setMateria(parsed.title);
+        }
+
+        const countAdded = (aiAnalysis.proposedAdditions || []).length;
+        setLastExtensionResult({
+          summary: countAdded > 0 
+            ? `Applicate con successo ${countAdded} integrazioni e criteri ottimizzati dall'IA!`
+            : "Configurazione dell'esame e criteri ottimizzati con successo!",
+          addedItems: (aiAnalysis.proposedAdditions || []).map(p => ({
+            type: p.type,
+            title: p.title,
+            previewText: p.preview || p.description
+          }))
+        });
+
         setAiAnalysis(null);
-        alert("✅ Configurazione dell'esame ed i criteri sono stati ottimizzati con successo! Controlla i dettagli prima di attivarla.");
       } catch (err) {
+        setPreviousJsonBackup({
+          json: jsonText,
+          title: materia,
+          reason: "Prima dell'ottimizzazione IA"
+        });
         setJsonText(aiAnalysis.optimizedJson);
         validateExamJSON(aiAnalysis.optimizedJson);
         setAiAnalysis(null);
       }
     }
+  };
+
+  // Extend / Add content to existing loaded exam with AI
+  const handleExtendExam = async (customInstructionOverride?: string, additionType?: string) => {
+    const promptToSend = (customInstructionOverride || extendPrompt).trim();
+    if (!promptToSend) {
+      alert("⚠️ Scrivi cosa desideri aggiungere all'esame oppure seleziona uno dei suggerimenti rapidi.");
+      return;
+    }
+    if (!jsonText.trim()) {
+      alert("⚠️ Carica o incolla prima la struttura JSON dell'esame.");
+      return;
+    }
+
+    setIsExtending(true);
+    try {
+      setPreviousJsonBackup({
+        json: jsonText,
+        title: materia,
+        reason: "Prima dell'aggiunta di contenuti con IA"
+      });
+
+      const res = await fetch("/api/extend-exam-json", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          examJson: jsonText,
+          instruction: promptToSend,
+          additionType: additionType || "custom"
+        })
+      });
+
+      if (!res.ok) {
+        const errData = await res.json().catch(() => ({}));
+        throw new Error(errData.details || errData.error || "Errore durante l'integrazione");
+      }
+
+      const data = await res.json();
+      if (data.status === "success" && data.extendedJson) {
+        setJsonText(data.extendedJson);
+        validateExamJSON(data.extendedJson);
+        setLastExtensionResult({
+          summary: data.summary || "Contenuti aggiunti con successo all'esame!",
+          addedItems: data.addedItems || []
+        });
+        setExtendPrompt("");
+        setShowExtendCard(true);
+      } else {
+        throw new Error("Risposta non valida dal server");
+      }
+    } catch (err: any) {
+      console.error("Extend error:", err);
+      alert(`❌ Errore durante l'aggiunta di contenuti: ${err.message}`);
+    } finally {
+      setIsExtending(false);
+    }
+  };
+
+  // Undo / Revert back to previous JSON
+  const handleUndoPreviousJson = () => {
+    if (!previousJsonBackup) return;
+    setJsonText(previousJsonBackup.json);
+    if (previousJsonBackup.title) setMateria(previousJsonBackup.title);
+    validateExamJSON(previousJsonBackup.json);
+    setPreviousJsonBackup(null);
+    setLastExtensionResult(null);
   };
 
 
@@ -2152,6 +2307,170 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </div>
                 )}
 
+                {/* Undo / Changes Applied Notice Banner */}
+                {(lastExtensionResult || previousJsonBackup) && (
+                  <div className="p-3.5 bg-emerald-950/40 border border-emerald-500/35 rounded-xl text-left space-y-2.5 animate-fadeIn shadow-md">
+                    <div className="flex items-start justify-between gap-2 border-b border-emerald-500/20 pb-2">
+                      <div className="flex items-center gap-2">
+                        <CheckCircle className="w-4 h-4 text-emerald-400 shrink-0" />
+                        <div>
+                          <span className="text-xs font-bold text-emerald-300">
+                            {lastExtensionResult?.summary || "Modifiche applicate all'esame con successo!"}
+                          </span>
+                          {previousJsonBackup && (
+                            <p className="text-[10px] text-slate-400 mt-0.5">
+                              Stato salvato ({previousJsonBackup.reason}). Puoi annullare la modifica in qualsiasi momento.
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                      {previousJsonBackup && (
+                        <button
+                          type="button"
+                          onClick={handleUndoPreviousJson}
+                          className="px-2.5 py-1 bg-slate-800 hover:bg-slate-700 text-amber-300 border border-amber-500/30 rounded-lg text-[10px] font-bold flex items-center gap-1 cursor-pointer transition-colors shadow-sm shrink-0"
+                          title="Annulla l'ultima modifica e ripristina la versione precedente dell'esame"
+                        >
+                          <Undo2 className="w-3 h-3" />
+                          <span>Annulla Modifica</span>
+                        </button>
+                      )}
+                    </div>
+
+                    {lastExtensionResult?.addedItems && lastExtensionResult.addedItems.length > 0 && (
+                      <div className="space-y-1.5 pt-0.5">
+                        <span className="text-[10px] uppercase font-bold text-emerald-400/90 tracking-wider">
+                          Elementi Nuovi Integrati ({lastExtensionResult.addedItems.length}):
+                        </span>
+                        <div className="space-y-1 max-h-[140px] overflow-y-auto pr-1">
+                          {lastExtensionResult.addedItems.map((item, itIdx) => (
+                            <div key={itIdx} className="p-2 rounded-lg bg-black/40 border border-emerald-500/20 text-xs text-slate-200">
+                              <div className="flex items-center gap-1.5 font-bold text-emerald-300">
+                                <span className="w-1.5 h-1.5 rounded-full bg-emerald-400"></span>
+                                <span>{item.title}</span>
+                              </div>
+                              {item.previewText && (
+                                <p className="text-[11px] text-slate-300 mt-1 line-clamp-3 italic">
+                                  &quot;{item.previewText}&quot;
+                                </p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                )}
+
+                {/* OPTION: Add other content not contained in the loaded JSON with AI */}
+                {jsonText.trim() && (
+                  <div className="p-3.5 bg-gradient-to-br from-indigo-950/40 via-purple-950/25 to-slate-950/60 border border-indigo-500/25 rounded-2xl text-left space-y-3 shadow-lg">
+                    <div className="flex items-center justify-between gap-2 border-b border-indigo-500/15 pb-2">
+                      <div className="flex items-center gap-1.5 text-indigo-300 font-bold text-xs">
+                        <PlusCircle className="w-4 h-4 text-indigo-400" />
+                        <span>Aggiungi Altro all'Esame con l'IA</span>
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 font-mono font-semibold">
+                          Non presente nel JSON
+                        </span>
+                      </div>
+                      <button
+                        type="button"
+                        onClick={() => setShowExtendCard(!showExtendCard)}
+                        className="text-[10px] text-indigo-400 hover:text-indigo-200 font-semibold cursor-pointer"
+                      >
+                        {showExtendCard ? "Riduci ▲" : "Espandi opzioni ▼"}
+                      </button>
+                    </div>
+
+                    <p className="text-[11px] text-slate-300 leading-relaxed">
+                      Vuoi arricchire l'esame con domande o sezioni non presenti nel file caricato? L'IA genererà i nuovi quesiti e li integrerà direttamente nel tuo JSON mantenendo intatte tutte le domande attuali.
+                    </p>
+
+                    {/* Quick One-Click Chips */}
+                    <div className="space-y-1.5">
+                      <span className="text-[10px] uppercase font-bold text-slate-400">Aggiunte Rapide Consigliate:</span>
+                      <div className="flex flex-wrap gap-1.5">
+                        <button
+                          type="button"
+                          disabled={isExtending}
+                          onClick={() => handleExtendExam("Aggiungi 1 domanda a risposta aperta stimolante e articolata, con criteri di valutazione analitici (rubrica per la correzione automatica IA).", "open_ended")}
+                          className="px-2.5 py-1 bg-indigo-500/15 hover:bg-indigo-500/30 text-indigo-300 hover:text-white border border-indigo-500/30 text-[11px] rounded-lg font-medium transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1 shadow-sm"
+                        >
+                          <span>📝 + 1 Domanda Aperta (con Criteri IA)</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isExtending}
+                          onClick={() => handleExtendExam("Aggiungi 2 nuove domande a risposta multipla (4 alternative plausibili ciascuna con una sola corretta ed id progressivo) coerenti con l'argomento dell'esame.", "multiple_choice")}
+                          className="px-2.5 py-1 bg-purple-500/15 hover:bg-purple-500/30 text-purple-300 hover:text-white border border-purple-500/30 text-[11px] rounded-lg font-medium transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1 shadow-sm"
+                        >
+                          <span>🔘 + 2 Domande a Crocette</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isExtending}
+                          onClick={() => {
+                            const isWorkbook = jsonText.includes('"sections"');
+                            if (isWorkbook) {
+                              handleExtendExam("Aggiungi una domanda di riflessione critica all'interno delle sezioni del Workbook con criteri di valutazione.", "reflection");
+                            } else {
+                              handleExtendExam("Aggiungi 1 domanda a risposta aperta di riflessione critica e personale collegata all'esperienza o all'attualità per stimolare il giudizio autonomo dello studente, inserendola nell'array 'openEnded' con criteri di correzione.", "open_ended");
+                            }
+                          }}
+                          className="px-2.5 py-1 bg-teal-500/15 hover:bg-teal-500/30 text-teal-300 hover:text-white border border-teal-500/30 text-[11px] rounded-lg font-medium transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1 shadow-sm"
+                        >
+                          <span>💡 + 1 Domanda di Riflessione Critica</span>
+                        </button>
+                        <button
+                          type="button"
+                          disabled={isExtending}
+                          onClick={() => handleExtendExam("Arricchisci i criteri di valutazione docimologici dell'esame aggiungendo rubriche di valutazione analitiche sia per le domande aperte che per le riflessioni, per guidare con massima equità la correzione automatica dell'IA.", "criteria")}
+                          className="px-2.5 py-1 bg-amber-500/15 hover:bg-amber-500/30 text-amber-300 hover:text-white border border-amber-500/30 text-[11px] rounded-lg font-medium transition-colors cursor-pointer disabled:opacity-50 flex items-center gap-1 shadow-sm"
+                        >
+                          <span>🎯 + Arricchisci Criteri & Rubriche IA</span>
+                        </button>
+                      </div>
+                    </div>
+
+                    {/* Custom prompt input */}
+                    <div className="pt-2 border-t border-indigo-500/15 space-y-2">
+                      <div className="flex gap-2">
+                        <input
+                          type="text"
+                          value={extendPrompt}
+                          onChange={(e) => setExtendPrompt(e.target.value)}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter" && !e.shiftKey) {
+                              e.preventDefault();
+                              handleExtendExam();
+                            }
+                          }}
+                          placeholder="Oppure descrivi cosa aggiungere (es: 'Aggiungi una domanda aperta sulle cause storiche e 2 quesiti a scelta multipla')..."
+                          className="flex-1 px-3 py-1.5 bg-slate-950/80 border border-white/10 rounded-xl text-white text-xs placeholder:text-slate-500 outline-none focus:border-indigo-400 font-sans"
+                        />
+                        <button
+                          type="button"
+                          disabled={isExtending || !extendPrompt.trim()}
+                          onClick={() => handleExtendExam()}
+                          className="px-3.5 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs rounded-xl transition-all cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed flex items-center gap-1.5 shadow-md shrink-0"
+                        >
+                          {isExtending ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Integrazione in corso...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-3.5 h-3.5" />
+                              <span>Genera & Aggiungi</span>
+                            </>
+                          )}
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                )}
+
                 {validationOk && (
                   <div className="space-y-2.5">
                     <p className="p-2 rounded-lg bg-emerald-500/5 text-emerald-400 border border-emerald-500/10 text-[11px] flex items-center gap-1.5">
@@ -2159,15 +2478,38 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       <span>Struttura JSON valida rilevata ✓</span>
                     </p>
 
-                    <button
-                      type="button"
-                      onClick={handleAIAnalyzeExam}
-                      disabled={isAnalyzing}
-                      className="w-full py-2 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 hover:text-indigo-200 disabled:bg-slate-900 disabled:text-slate-500 font-semibold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-lg"
-                    >
-                      <Sparkles className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
-                      {isAnalyzing ? "Analisi Docimologica & Criteri in corso..." : "✨ Analizza & Ottimizza Criteri con l'IA"}
-                    </button>
+                    {/* AI Optimization section */}
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between">
+                        <button
+                          type="button"
+                          onClick={() => setShowAiCustomInput(!showAiCustomInput)}
+                          className="text-[10px] text-indigo-400 hover:text-indigo-300 font-semibold flex items-center gap-1 cursor-pointer"
+                        >
+                          <span>{showAiCustomInput ? "Nascondi indicazioni personalizzate ▲" : "+ Aggiungi indicazioni specifiche per l'ottimizzazione ▼"}</span>
+                        </button>
+                      </div>
+
+                      {showAiCustomInput && (
+                        <input
+                          type="text"
+                          value={aiCustomInstruction}
+                          onChange={(e) => setAiCustomInstruction(e.target.value)}
+                          placeholder="Opzionale: es. 'Proponi e aggiungi una domanda aperta sul capitolo 3', 'Rafforza i criteri per la sufficienza a 6'..."
+                          className="w-full px-3 py-1.5 bg-slate-950/80 border border-indigo-500/30 rounded-xl text-white text-xs placeholder:text-slate-500 outline-none focus:border-indigo-400 font-sans"
+                        />
+                      )}
+
+                      <button
+                        type="button"
+                        onClick={handleAIAnalyzeExam}
+                        disabled={isAnalyzing}
+                        className="w-full py-2 bg-indigo-500/15 hover:bg-indigo-500/25 border border-indigo-500/30 text-indigo-300 hover:text-indigo-200 disabled:bg-slate-900 disabled:text-slate-500 font-semibold rounded-xl text-xs flex items-center justify-center gap-1.5 transition-all cursor-pointer shadow-lg"
+                      >
+                        <Sparkles className="w-3.5 h-3.5 text-indigo-400 animate-pulse" />
+                        {isAnalyzing ? "Analisi Docimologica & Integrazione Criteri in corso..." : "✨ Analizza & Ottimizza Criteri con l'IA"}
+                      </button>
+                    </div>
                   </div>
                 )}
 
@@ -2203,19 +2545,45 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       </div>
                     )}
 
+                    {/* Integrated proposals and additions ready to apply */}
+                    {aiAnalysis.proposedAdditions && aiAnalysis.proposedAdditions.length > 0 && (
+                      <div className="space-y-2 border-t border-indigo-500/15 pt-2.5">
+                        <div className="flex items-center gap-1.5 text-emerald-400 font-bold text-[11px]">
+                          <CheckCircle className="w-3.5 h-3.5" />
+                          <span>Modifiche e Quesiti Proposti (Già integrati nell'esame ottimizzato):</span>
+                        </div>
+                        <div className="space-y-1.5">
+                          {aiAnalysis.proposedAdditions.map((item, idx) => (
+                            <div key={idx} className="p-2 rounded-lg bg-emerald-500/10 border border-emerald-500/20 text-xs">
+                              <span className="font-bold text-emerald-300 block">{item.title}</span>
+                              {item.description && <p className="text-[11px] text-slate-300 mt-0.5">{item.description}</p>}
+                              {item.preview && (
+                                <p className="text-[10px] text-slate-400 font-mono italic mt-1 bg-black/30 p-1.5 rounded">
+                                  &quot;{item.preview}&quot;
+                                </p>
+                              )}
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+
                     {aiAnalysis.optimizedJson && (
                       <div className="pt-2.5 border-t border-indigo-500/15 flex flex-col gap-2">
-                        <div className="flex items-center justify-between">
-                          <span className="text-[10px] text-indigo-300 uppercase font-bold">Esame Ottimizzato Raccomandato:</span>
+                        <div className="flex items-center justify-between flex-wrap gap-2">
+                          <span className="text-[10px] text-indigo-300 uppercase font-bold">
+                            Esame Ottimizzato Raccomandato (con tutte le modifiche):
+                          </span>
                           <button
                             type="button"
                             onClick={handleApplyOptimizedCode}
-                            className="px-2.5 py-1 bg-indigo-500 hover:bg-indigo-400 text-white font-bold text-[10px] rounded-lg transition-all"
+                            className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl transition-all cursor-pointer shadow-md flex items-center gap-1"
                           >
-                            Applica Modifiche Ottimizzate ✓
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Applica Modifiche Ottimizzate ✓</span>
                           </button>
                         </div>
-                        <pre className="p-2.5 bg-slate-950/80 border border-white/5 rounded-lg text-[9px] font-mono text-emerald-400 max-h-[150px] overflow-y-auto whitespace-pre-wrap">
+                        <pre className="p-2.5 bg-slate-950/80 border border-white/5 rounded-lg text-[9px] font-mono text-emerald-400 max-h-[160px] overflow-y-auto whitespace-pre-wrap">
                           {aiAnalysis.optimizedJson}
                         </pre>
                       </div>
