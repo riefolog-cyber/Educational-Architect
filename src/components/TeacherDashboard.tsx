@@ -2618,14 +2618,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   <input
                     type="text"
                     readOnly
-                    value={typeof window !== "undefined" ? window.location.origin : ""}
+                    value={typeof window !== "undefined" ? window.location.origin.replace("ais-dev-", "ais-pre-") : ""}
                     className="flex-1 bg-slate-950/80 border border-white/10 rounded-xl px-2.5 py-1.5 text-[11px] font-mono text-teal-200 outline-none select-all"
                   />
                   <button
                     type="button"
                     onClick={() => {
                       if (typeof window !== "undefined") {
-                        navigator.clipboard.writeText(window.location.origin);
+                        const targetUrl = window.location.origin.replace("ais-dev-", "ais-pre-");
+                        navigator.clipboard.writeText(targetUrl);
                         setLinkCopied(true);
                         setTimeout(() => setLinkCopied(false), 3000);
                       }
@@ -2635,9 +2636,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     {linkCopied ? "Copiato ✓" : "Copia Link"}
                   </button>
                 </div>
-                <p className="text-[10px] text-amber-300/90 leading-normal border-t border-teal-500/10 pt-1.5">
-                  ⚠️ <b>Non condividere il link di AI Studio</b> (<code>aistudio.google.com</code>): gli alunni minorenni verrebbero bloccati da Google Workspace. Condividi questo link web dell'app.
-                </p>
+                <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl space-y-1.5 text-[11px]">
+                  <p className="font-bold text-rose-300 flex items-center gap-1.5">
+                    <span>📱 iPhone: Perché Android entra e molti iPhone no?</span>
+                  </p>
+                  <p className="text-slate-300 leading-normal text-[11px]">
+                    Su Android, Chrome permette i cookie di sicurezza senza problemi. Su iPhone, invece, <b>Safari ha attiva per default la protezione Apple ITP ("Blocca cookie tra siti")</b>, che blocca il caricamento e attiva la schermata Google Admin.
+                  </p>
+                  <div className="pt-1 space-y-1">
+                    <p className="text-[10px] font-bold text-rose-200 uppercase tracking-wide">3 Soluzioni immediate per gli alunni con iPhone:</p>
+                    <ul className="list-disc list-inside text-rose-200/90 space-y-1 pl-1 text-[10px]">
+                      <li><b>Opzione 1 (Più veloce):</b> Aprire il link nell'app <b>Google Chrome</b> su iPhone invece di Safari.</li>
+                      <li><b>Opzione 2 (In Safari):</b> Su iPhone andare in <i>Impostazioni &rarr; Safari</i> e disattivare la levetta <b>"Blocca cookie tra siti"</b> (o <i>"Impedisci tracciamento tra siti"</i>), poi ricaricare la pagina.</li>
+                      <li><b>Opzione 3:</b> Aprire Safari in modalità <b>Scheda Privata (Anonima)</b> e incollare il link.</li>
+                    </ul>
+                  </div>
+                </div>
               </div>
             </div>
 
@@ -4223,6 +4237,31 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   <li>Non richiede approvazioni di Google Workspace né sblocco di pop-up.</li>
                   <li>Tutti i voti, risposte e note anticopia vengono registrati regolarmente a suo nome nel presente registro docente!</li>
                 </ul>
+              </div>
+
+              <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl space-y-2">
+                <p className="font-bold text-rose-300 flex items-center gap-1.5 text-sm">
+                  <span>📱 5. Errore "Non disponi dell'accesso a AI Studio" (Google Admin su iPhone)</span>
+                </p>
+                <p className="text-slate-300 text-[11px] leading-relaxed">
+                  Se compare la schermata bianca con logo Google Admin <i>"Spiacenti, non disponi dell'accesso a AI Studio. Il tuo account è gestito da un'organizzazione che ha disattivato questo servizio"</i>:
+                </p>
+                <div className="space-y-1.5 text-[11px] text-slate-200">
+                  <p><b>Perché accade su iPhone anche con account personale?</b></p>
+                  <p className="text-slate-400">
+                    Safari su iPhone memorizza l'account scolastico con cui lo studente fa i compiti su Classroom/Drive e lo invia in automatico ai server Google. Anche se prova ad accedere con un account personale, Google intercetta la sessione della scuola e mostra il blocco.
+                  </p>
+                  <p><b>Come far entrare subito gli studenti da iPhone (3 opzioni):</b></p>
+                  <ol className="list-decimal list-inside text-rose-200/90 space-y-1.5 pl-1">
+                    <li><b>Aprire con Google Chrome per iOS:</b> Se lo studente ha l'app Chrome su iPhone, il link si apre direttamente senza blocchi.</li>
+                    <li><b>Disattivare "Blocca cookie tra siti" in Safari:</b> Su iPhone andare in <i>Impostazioni &rarr; Safari</i> e disattivare la spunta su <i>"Blocca cookie tra siti"</i> (o <i>"Impedisci tracciamento tra siti"</i>), quindi ricaricare il link.</li>
+                    <li><b>Scheda Privata (Anonima) in Safari:</b> Aprire Safari, toccare l'icona schede in basso a destra, scegliere <i>"Privata"</i> e incollare il link della prova.</li>
+                  </ol>
+                  <p className="pt-1"><b>Per sbloccare definitivamente gli account scolastici:</b></p>
+                  <p className="text-slate-400">
+                    L'amministratore Google Workspace dell'istituto deve andare su <code>admin.google.com</code> &rarr; <i>Applicazioni</i> &rarr; <i>Servizi Google aggiuntivi</i> &rarr; <b>Google AI Studio</b> e impostare lo stato su <b>"ATTIVO per tutti"</b> (o per l'Unità Organizzativa degli Studenti).
+                  </p>
+                </div>
               </div>
             </div>
 
