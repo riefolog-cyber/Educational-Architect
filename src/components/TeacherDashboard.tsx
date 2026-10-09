@@ -108,6 +108,49 @@ interface TeacherDashboardProps {
   onBack: () => void;
 }
 
+export function parseSubmissionNumericGrade(val: any): number {
+  if (val === null || val === undefined) return -1;
+  const s = String(val).trim();
+  if (!s || s === "N/D" || s === "N/A" || s === "—" || s === "-" || s.toLowerCase() === "null") return -1;
+
+  const clean = s.replace(",", ".");
+
+  // Check 10 e lode / lode
+  if (clean.toLowerCase().includes("lode")) {
+    return 10.5;
+  }
+
+  // Check for range like "7-8", "7 - 8", "7/8"
+  const rangeMatch = clean.match(/^(\d+(?:\.\d+)?)\s*[-–/]\s*(\d+(?:\.\d+)?)/);
+  if (rangeMatch) {
+    const n1 = parseFloat(rangeMatch[1]);
+    const n2 = parseFloat(rangeMatch[2]);
+    // If it's 8/10 or 7.5/10, the second number is 10 (the scale), so it's n1
+    if (rangeMatch[0].includes("/") && n2 === 10) {
+      return n1;
+    }
+    if (!isNaN(n1) && !isNaN(n2) && n2 > n1 && n2 <= 10) {
+      return (n1 + n2) / 2;
+    }
+  }
+
+  const match = clean.match(/(\d+(?:\.\d+)?)/);
+  if (!match) return -1;
+
+  let num = parseFloat(match[1]);
+  if (isNaN(num)) return -1;
+
+  if (s.includes("½") || s.toLowerCase().includes("mezzo") || s.toLowerCase().includes("mezza")) {
+    num += 0.5;
+  } else if (s.includes("+")) {
+    num += 0.25;
+  } else if (s.match(/\d\s*-\s*$/) || s.endsWith("-")) {
+    num -= 0.25;
+  }
+
+  return num;
+}
+
 export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps) {
   // Config state
   const backendType = "ai-studio";
@@ -170,8 +213,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // View mode: "chronological" (individual submissions), "by_student" (aggregated by student), or "by_exam" (grouped by test/session)
   const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam">("chronological");
-  const [studentSortBy, setStudentSortBy] = useState<"most_tests" | "name_asc" | "recent" | "highest_avg">("most_tests");
-  const [examSortBy, setExamSortBy] = useState<"recent" | "most_students" | "pin_asc" | "highest_avg" | "highest_pass_rate">("recent");
+  const [studentSortBy, setStudentSortBy] = useState<"highest_avg" | "lowest_avg" | "most_tests" | "name_asc" | "recent">("highest_avg");
+  const [examSortBy, setExamSortBy] = useState<"highest_avg" | "recent" | "most_students" | "pin_asc" | "highest_pass_rate">("highest_avg");
+  const [chronologicalSortBy, setChronologicalSortBy] = useState<"grade_desc" | "grade_asc" | "recent" | "name_asc" | "violations_desc">("grade_desc");
+  const [examRosterSort, setExamRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("grade_desc");
   const [expandedStudentKey, setExpandedStudentKey] = useState<string | null>(null);
   const [expandedExamKey, setExpandedExamKey] = useState<string | null>(null);
   const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
@@ -1701,16 +1746,44 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setTimeout(() => URL.revokeObjectURL(url), 100);
   };
 
-  // Submissions filtered list logic (chronological)
-  const filteredSubmissions = submissions.filter(sub => {
-    const matchesSearch = 
-      (sub.Nome || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (sub.Email || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-      (sub.Pin || "").toLowerCase().includes(searchQuery.toLowerCase());
-    
-    if (filterType === "All") return matchesSearch;
-    return matchesSearch && sub.Tipo === filterType;
-  });
+  // Submissions filtered list logic (chronological) with multi-sorting
+  const filteredSubmissions = React.useMemo(() => {
+    let result = submissions.filter(sub => {
+      const matchesSearch = 
+        (sub.Nome || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (sub.Email || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
+        (sub.Pin || "").toLowerCase().includes(searchQuery.toLowerCase());
+      
+      if (filterType === "All") return matchesSearch;
+      return matchesSearch && sub.Tipo === filterType;
+    });
+
+    result.sort((a, b) => {
+      if (chronologicalSortBy === "grade_desc") {
+        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        if (gradeB !== gradeA) return gradeB - gradeA;
+        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+      }
+      if (chronologicalSortBy === "grade_asc") {
+        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        if (gradeA !== gradeB) return gradeA - gradeB;
+        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+      }
+      if (chronologicalSortBy === "name_asc") {
+        return (a.Nome || "").localeCompare(b.Nome || "");
+      }
+      if (chronologicalSortBy === "violations_desc") {
+        const vA = (a.AntiCopia_TabSwitch || 0) + (a.AntiCopia_IncollaBloccato || 0);
+        const vB = (b.AntiCopia_TabSwitch || 0) + (b.AntiCopia_IncollaBloccato || 0);
+        if (vB !== vA) return vB - vA;
+      }
+      return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+    });
+
+    return result;
+  }, [submissions, searchQuery, filterType, chronologicalSortBy]);
 
   // Aggregated submissions grouped by student
   const studentSummaries: StudentSummary[] = React.useMemo(() => {
@@ -1806,6 +1879,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     result.sort((a, b) => {
+      if (studentSortBy === "highest_avg") {
+        const avgA = a.averageGradeNumber !== null ? a.averageGradeNumber : -1;
+        const avgB = b.averageGradeNumber !== null ? b.averageGradeNumber : -1;
+        if (avgB !== avgA) return avgB - avgA;
+        return b.totalTests - a.totalTests;
+      }
+      if (studentSortBy === "lowest_avg") {
+        const avgA = a.averageGradeNumber !== null ? a.averageGradeNumber : 99;
+        const avgB = b.averageGradeNumber !== null ? b.averageGradeNumber : 99;
+        if (avgA !== avgB) return avgA - avgB;
+        return b.totalTests - a.totalTests;
+      }
       if (studentSortBy === "most_tests") {
         if (b.totalTests !== a.totalTests) return b.totalTests - a.totalTests;
         return a.name.localeCompare(b.name);
@@ -1815,12 +1900,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
       if (studentSortBy === "recent") {
         return new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime();
-      }
-      if (studentSortBy === "highest_avg") {
-        const avgA = a.averageGradeNumber || 0;
-        const avgB = b.averageGradeNumber || 0;
-        if (avgB !== avgA) return avgB - avgA;
-        return b.totalTests - a.totalTests;
       }
       return 0;
     });
@@ -1852,11 +1931,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const list: ExamSummary[] = [];
 
     map.forEach((examSubs, key) => {
-      // Sort submissions chronologically descending
-      examSubs.sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+      // Capture oldest and latest submission chronologically
+      const chronologicallySorted = [...examSubs].sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+      const latestSub = chronologicallySorted[0];
+      const oldestSub = chronologicallySorted[chronologicallySorted.length - 1];
 
-      const latestSub = examSubs[0];
-      const oldestSub = examSubs[examSubs.length - 1];
+      // Sort submissions by AI grade descending (highest to lowest) by default
+      examSubs.sort((a, b) => {
+        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        if (gradeB !== gradeA) return gradeB - gradeA;
+        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+      });
+
       const pin = examSubs.find(s => s.Pin && s.Pin.trim())?.Pin || "";
 
       // Determine most descriptive title
@@ -2884,6 +2971,26 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     </button>
                   </div>
 
+                  {submissionViewMode === "chronological" && (
+                    <div className="flex items-center gap-2 justify-end px-2">
+                      <span className="text-[11px] text-slate-400 shrink-0 flex items-center gap-1">
+                        <ListOrdered className="w-3 h-3 text-indigo-400" />
+                        <span>Ordina per:</span>
+                      </span>
+                      <select
+                        value={chronologicalSortBy}
+                        onChange={(e) => setChronologicalSortBy(e.target.value as any)}
+                        className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
+                      >
+                        <option value="grade_desc">🏆 Voto IA decrescente (10 ➔ 1)</option>
+                        <option value="grade_asc">📉 Voto IA crescente (1 ➔ 10)</option>
+                        <option value="recent">🕒 Consegna più recente</option>
+                        <option value="name_asc">🔤 Nome Studente (A-Z)</option>
+                        <option value="violations_desc">⚠️ Più segnalazioni anticopia</option>
+                      </select>
+                    </div>
+                  )}
+
                   {submissionViewMode === "by_student" && (
                     <div className="flex items-center gap-2 justify-end px-2">
                       <span className="text-[11px] text-slate-400 shrink-0 flex items-center gap-1">
@@ -2895,10 +3002,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         onChange={(e) => setStudentSortBy(e.target.value as any)}
                         className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
                       >
-                        <option value="most_tests">Più prove fatte (decrescente)</option>
-                        <option value="name_asc">Nome Studente (A-Z)</option>
-                        <option value="recent">Ultima prova recente</option>
-                        <option value="highest_avg">Media voti più alta</option>
+                        <option value="highest_avg">🏆 Voto IA decrescente (Media 10 ➔ 1)</option>
+                        <option value="lowest_avg">📉 Voto IA crescente (Media 1 ➔ 10)</option>
+                        <option value="most_tests">📚 Più prove fatte (decrescente)</option>
+                        <option value="name_asc">🔤 Nome Studente (A-Z)</option>
+                        <option value="recent">🕒 Ultima prova recente</option>
                       </select>
                     </div>
                   )}
@@ -2914,11 +3022,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         onChange={(e) => setExamSortBy(e.target.value as any)}
                         className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
                       >
-                        <option value="recent">Ultima somministrazione recente</option>
-                        <option value="most_students">Più studenti partecipanti</option>
-                        <option value="pin_asc">PIN sessione (crescente)</option>
-                        <option value="highest_avg">Media voti più alta</option>
-                        <option value="highest_pass_rate">Sufficienze più alte</option>
+                        <option value="highest_avg">🏆 Media Voti IA decrescente (più alta)</option>
+                        <option value="recent">🕒 Ultima somministrazione recente</option>
+                        <option value="most_students">👥 Più studenti partecipanti</option>
+                        <option value="pin_asc">🔢 PIN sessione (crescente)</option>
+                        <option value="highest_pass_rate">📈 Sufficienze più alte</option>
                       </select>
                     </div>
                   )}
@@ -2944,6 +3052,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </div>
 
                   <div className="flex gap-2 shrink-0 flex-wrap">
+                    <button
+                      onClick={() => {
+                        setChronologicalSortBy("grade_desc");
+                        setStudentSortBy("highest_avg");
+                        setExamRosterSort("grade_desc");
+                        setExamSortBy("highest_avg");
+                      }}
+                      className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
+                        (submissionViewMode === "chronological" && chronologicalSortBy === "grade_desc") ||
+                        (submissionViewMode === "by_student" && studentSortBy === "highest_avg") ||
+                        (submissionViewMode === "by_exam" && examRosterSort === "grade_desc")
+                          ? "bg-teal-500/20 border-teal-500/40 text-teal-300 shadow-sm font-bold"
+                          : "bg-slate-950/50 border-white/10 text-slate-400 hover:text-white"
+                      }`}
+                      title="Ordina l'elenco studenti per Voto IA decrescente (10 ➔ 1)"
+                    >
+                      <Award className="w-3.5 h-3.5 text-teal-400" />
+                      <span>🏆 Voto IA Decrescente</span>
+                    </button>
                     <button
                       onClick={() => setBlindGradingMode(!blindGradingMode)}
                       className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
@@ -3060,7 +3187,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       </div>
                     ) : (
                       <div className="space-y-3">
-                        {filteredStudentSummaries.map((stu) => {
+                        {filteredStudentSummaries.map((stu, sIdx) => {
                           const isExpanded = expandedStudentKey === stu.key;
                           const initials = (stu.name || "S")
                             .split(" ")
@@ -3080,16 +3207,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                 className="p-3.5 sm:p-4 flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 cursor-pointer hover:bg-white/[0.02]"
                               >
                                 <div className="flex items-center gap-3">
-                                  {/* Avatar circle */}
+                                  {/* Avatar circle with ranking */}
                                   <div className="w-9 h-9 rounded-xl bg-gradient-to-br from-teal-500/20 to-indigo-500/20 border border-teal-500/30 text-teal-300 font-bold font-mono text-xs flex items-center justify-center shrink-0">
-                                    {blindGradingMode ? "#" : initials}
+                                    {studentSortBy === "highest_avg" ? (
+                                      sIdx === 0 ? "🥇" : sIdx === 1 ? "🥈" : sIdx === 2 ? "🥉" : (blindGradingMode ? `#${sIdx + 1}` : initials)
+                                    ) : (
+                                      blindGradingMode ? "#" : initials
+                                    )}
                                   </div>
 
                                   <div>
-                                    <div className="flex items-center gap-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
                                       <p className="font-bold text-white text-xs sm:text-sm">
                                         {blindGradingMode ? `Studente #${stu.key.slice(-4).toUpperCase()}` : stu.name}
                                       </p>
+                                      {studentSortBy === "highest_avg" && sIdx < 3 && (
+                                        <span className="px-1.5 py-0.5 rounded-full text-[9px] font-extrabold font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                          {sIdx === 0 ? "🥇 1° Posto Voto IA" : sIdx === 1 ? "🥈 2° Posto Voto IA" : "🥉 3° Posto Voto IA"}
+                                        </span>
+                                      )}
                                       {stu.totalTests >= 2 ? (
                                         <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
                                           {stu.totalTests} prove svolte
@@ -3150,7 +3286,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   </p>
 
                                   <div className="grid grid-cols-1 gap-2">
-                                    {stu.submissions.map((sub, idx) => {
+                                    {[...stu.submissions]
+                                      .sort((a, b) => {
+                                        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+                                        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                        if (gradeB !== gradeA) return gradeB - gradeA;
+                                        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                      })
+                                      .map((sub, idx) => {
                                       const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
                                       return (
                                         <div 
@@ -3479,39 +3622,115 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                               {/* Expanded Roster for this Exam */}
                               {isExpanded && (
                                 <div className="p-4 bg-slate-900/70 border-t border-white/5 space-y-3 animate-fadeIn">
-                                  <div className="flex items-center justify-between gap-2 border-b border-white/5 pb-2">
-                                    <p className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
-                                      <Users className="w-3.5 h-3.5 text-purple-400" />
-                                      <span>Elenco Studenti che hanno svolto questa prova ({exam.submissions.length})</span>
-                                    </p>
-                                    <div className="flex items-center gap-2 text-[10px] text-slate-400">
-                                      <span>Max: <b className="text-teal-300">{exam.highestGrade}</b></span>
-                                      <span>•</span>
-                                      <span>Min: <b className="text-amber-300">{exam.lowestGrade}</b></span>
+                                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-white/5 pb-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <p className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                                        <Users className="w-3.5 h-3.5 text-purple-400" />
+                                        <span>Elenco Studenti che hanno svolto questa prova ({exam.submissions.length})</span>
+                                      </p>
+                                      {examRosterSort === "grade_desc" && (
+                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold font-mono bg-teal-500/15 text-teal-300 border border-teal-500/30 flex items-center gap-1">
+                                          <span>🏆 Ordinati per Voto IA decrescente (10 ➔ 1)</span>
+                                        </span>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-3 text-[10px] flex-wrap justify-between sm:justify-end">
+                                      <div className="flex items-center gap-1.5">
+                                        <span className="text-slate-400">Ordina:</span>
+                                        <select
+                                          value={examRosterSort}
+                                          onChange={(e) => setExamRosterSort(e.target.value as any)}
+                                          className="bg-slate-950 border border-white/10 text-white text-[10px] rounded-lg px-2 py-0.5 outline-none font-medium cursor-pointer"
+                                        >
+                                          <option value="grade_desc">🏆 Voto IA decrescente (10 ➔ 1)</option>
+                                          <option value="grade_asc">📉 Voto IA crescente (1 ➔ 10)</option>
+                                          <option value="name_asc">🔤 Nome Studente (A-Z)</option>
+                                          <option value="recent">🕒 Consegna recente</option>
+                                        </select>
+                                      </div>
+                                      <div className="flex items-center gap-2 text-slate-400 border-l border-white/10 pl-3">
+                                        <span>Max: <b className="text-teal-300">{exam.highestGrade}</b></span>
+                                        <span>•</span>
+                                        <span>Min: <b className="text-amber-300">{exam.lowestGrade}</b></span>
+                                      </div>
                                     </div>
                                   </div>
 
                                   <div className="overflow-x-auto border border-white/5 rounded-xl">
                                     <table className="w-full text-left border-collapse text-xs">
                                       <thead>
-                                        <tr className="bg-slate-950 text-slate-400 uppercase tracking-wider font-bold text-[9px] border-b border-white/5">
-                                          <th className="p-2 text-center w-8">#</th>
-                                          <th className="p-2">Studente</th>
-                                          <th className="p-2 text-center">Voto IA</th>
+                                        <tr className="bg-slate-950 text-slate-400 uppercase tracking-wider font-bold text-[9px] border-b border-white/5 select-none">
+                                          <th className="p-2 text-center w-12">#</th>
+                                          <th 
+                                            onClick={() => setExamRosterSort(prev => prev === "name_asc" ? "grade_desc" : "name_asc")}
+                                            className="p-2 cursor-pointer hover:text-white transition-colors"
+                                            title="Clicca per ordinare per nome studente"
+                                          >
+                                            <span className="inline-flex items-center gap-1">
+                                              <span>Studente</span>
+                                              {examRosterSort === "name_asc" && <span className="text-teal-400 font-bold">↓</span>}
+                                            </span>
+                                          </th>
+                                          <th 
+                                            onClick={() => setExamRosterSort(prev => prev === "grade_desc" ? "grade_asc" : "grade_desc")}
+                                            className="p-2 text-center cursor-pointer hover:text-teal-300 transition-colors"
+                                            title="Clicca per invertire ordinamento Voto IA"
+                                          >
+                                            <span className="inline-flex items-center gap-1 justify-center">
+                                              <span>Voto IA</span>
+                                              {examRosterSort === "grade_desc" && <span className="text-teal-400 font-bold">↓</span>}
+                                              {examRosterSort === "grade_asc" && <span className="text-teal-400 font-bold">↑</span>}
+                                            </span>
+                                          </th>
                                           <th className="p-2 text-center">Autoval.</th>
                                           <th className="p-2 text-center">Integrità</th>
-                                          <th className="p-2">Orario Consegna</th>
+                                          <th 
+                                            onClick={() => setExamRosterSort("recent")}
+                                            className="p-2 cursor-pointer hover:text-white transition-colors"
+                                            title="Clicca per ordinare per orario di consegna"
+                                          >
+                                            <span className="inline-flex items-center gap-1">
+                                              <span>Orario Consegna</span>
+                                              {examRosterSort === "recent" && <span className="text-teal-400 font-bold">↓</span>}
+                                            </span>
+                                          </th>
                                           <th className="p-2 text-right">Azioni</th>
                                         </tr>
                                       </thead>
                                       <tbody className="divide-y divide-white/5 bg-slate-950/40">
-                                        {exam.submissions.map((sub, sIdx) => {
-                                          const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
-                                          return (
-                                            <tr key={sub.id} className="hover:bg-white/5 transition-colors">
-                                              <td className="p-2 text-center font-mono text-slate-500 font-bold">
-                                                {sIdx + 1}
-                                              </td>
+                                        {[...exam.submissions]
+                                          .sort((a, b) => {
+                                            if (examRosterSort === "grade_desc") {
+                                              const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+                                              const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                              if (gradeB !== gradeA) return gradeB - gradeA;
+                                              return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                            }
+                                            if (examRosterSort === "grade_asc") {
+                                              const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
+                                              const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                              if (gradeA !== gradeB) return gradeA - gradeB;
+                                              return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                            }
+                                            if (examRosterSort === "name_asc") {
+                                              return (a.Nome || "").localeCompare(b.Nome || "");
+                                            }
+                                            return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                          })
+                                          .map((sub, sIdx) => {
+                                            const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                                            return (
+                                              <tr key={sub.id} className="hover:bg-white/5 transition-colors">
+                                                <td className="p-2 text-center font-mono font-bold text-xs">
+                                                  {examRosterSort === "grade_desc" ? (
+                                                    sIdx === 0 ? <span className="text-amber-300 font-extrabold" title="1° Posto">🥇 1</span> :
+                                                    sIdx === 1 ? <span className="text-slate-300 font-extrabold" title="2° Posto">🥈 2</span> :
+                                                    sIdx === 2 ? <span className="text-amber-600 font-extrabold" title="3° Posto">🥉 3</span> :
+                                                    <span className="text-slate-500">{sIdx + 1}</span>
+                                                  ) : (
+                                                    <span className="text-slate-500">{sIdx + 1}</span>
+                                                  )}
+                                                </td>
                                               <td className="p-2">
                                                 {blindGradingMode ? (
                                                   <span className="font-mono font-bold text-amber-300">
@@ -3614,40 +3833,100 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
                 {/* VIEW B: CHRONOLOGICAL (All submissions row by row) */}
                 {submissionViewMode === "chronological" && (
-                  <div className="overflow-x-auto border border-white/5 rounded-2xl">
-                    <table className="w-full text-left border-collapse text-xs">
-                      <thead>
-                        <tr className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-bold text-[10px] border-b border-white/5 select-none">
-                          <th className="p-2 sm:p-3">Studente</th>
-                          <th className="p-2 sm:p-3">Tipologia</th>
-                          <th className="p-2 sm:p-3 text-center">Voto IA</th>
-                          <th className="p-2 sm:p-3 text-center">Autoval.</th>
-                          <th className="p-2 sm:p-3 text-center">Note Copia</th>
-                          <th className="p-2 sm:p-3 text-right">Azioni</th>
-                        </tr>
-                      </thead>
-                      <tbody className="divide-y divide-white/5 bg-slate-950/20">
-                        {loadingSubmissions ? (
-                          <tr>
-                            <td colSpan={6} className="p-8 text-center text-slate-400 text-xs">
-                              <div className="flex items-center justify-center gap-2">
-                                <RefreshCw className="w-4 h-4 animate-spin text-teal-400" />
-                                <span>Lettura record da database in corso...</span>
-                              </div>
-                            </td>
+                  <div className="space-y-3 animate-fadeIn">
+                    {chronologicalSortBy === "grade_desc" && (
+                      <div className="flex items-center justify-between px-3.5 py-2 bg-teal-500/10 border border-teal-500/20 rounded-xl text-teal-300 text-xs font-semibold">
+                        <span className="flex items-center gap-2">
+                          <Award className="w-4 h-4 text-teal-400" />
+                          <span>Elenco studenti ordinato per <b>Voto IA decrescente (10 ➔ 1)</b></span>
+                        </span>
+                        <span className="text-[11px] text-teal-400/80 font-mono">
+                          {filteredSubmissions.length} {filteredSubmissions.length === 1 ? "elaborato" : "elaborati"}
+                        </span>
+                      </div>
+                    )}
+                    <div className="overflow-x-auto border border-white/5 rounded-2xl">
+                      <table className="w-full text-left border-collapse text-xs">
+                        <thead>
+                          <tr className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-bold text-[10px] border-b border-white/5 select-none">
+                            <th className="p-2 sm:p-3 text-center w-12">#</th>
+                            <th 
+                              onClick={() => setChronologicalSortBy(prev => prev === "name_asc" ? "grade_desc" : "name_asc")}
+                              className="p-2 sm:p-3 cursor-pointer hover:text-white transition-colors"
+                              title="Clicca per ordinare per nome studente (A-Z)"
+                            >
+                              <span className="inline-flex items-center gap-1">
+                                <span>Studente</span>
+                                {chronologicalSortBy === "name_asc" && <span className="text-teal-400 font-bold">↓</span>}
+                              </span>
+                            </th>
+                            <th 
+                              onClick={() => setChronologicalSortBy("recent")}
+                              className="p-2 sm:p-3 cursor-pointer hover:text-white transition-colors"
+                              title="Clicca per ordinare per data consegna più recente"
+                            >
+                              <span className="inline-flex items-center gap-1">
+                                <span>Tipologia</span>
+                                {chronologicalSortBy === "recent" && <span className="text-teal-400 font-bold">↓</span>}
+                              </span>
+                            </th>
+                            <th 
+                              onClick={() => setChronologicalSortBy(prev => prev === "grade_desc" ? "grade_asc" : "grade_desc")}
+                              className="p-2 sm:p-3 text-center cursor-pointer hover:text-teal-300 transition-colors"
+                              title="Clicca per invertire ordinamento Voto IA (Decrescente 10➔1 / Crescente 1➔10)"
+                            >
+                              <span className="inline-flex items-center gap-1 justify-center">
+                                <span>Voto IA</span>
+                                {chronologicalSortBy === "grade_desc" && <span className="text-teal-400 font-bold">↓</span>}
+                                {chronologicalSortBy === "grade_asc" && <span className="text-teal-400 font-bold">↑</span>}
+                              </span>
+                            </th>
+                            <th className="p-2 sm:p-3 text-center">Autoval.</th>
+                            <th 
+                              onClick={() => setChronologicalSortBy(prev => prev === "violations_desc" ? "grade_desc" : "violations_desc")}
+                              className="p-2 sm:p-3 text-center cursor-pointer hover:text-amber-300 transition-colors"
+                              title="Clicca per ordinare per note anticopia"
+                            >
+                              <span className="inline-flex items-center gap-1 justify-center">
+                                <span>Note Copia</span>
+                                {chronologicalSortBy === "violations_desc" && <span className="text-amber-400 font-bold">↓</span>}
+                              </span>
+                            </th>
+                            <th className="p-2 sm:p-3 text-right">Azioni</th>
                           </tr>
-                        ) : filteredSubmissions.length === 0 ? (
-                          <tr>
-                            <td colSpan={6} className="p-8 text-center text-slate-400 text-xs italic">
-                              Nessun elaborato archiviato corrisponde ai criteri impostati.
-                            </td>
-                          </tr>
-                        ) : (
-                          filteredSubmissions.map(sub => {
-                            const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
-                            return (
-                              <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
-                                <td className="p-2 sm:p-3 max-w-[80px] sm:max-w-[200px]">
+                        </thead>
+                        <tbody className="divide-y divide-white/5 bg-slate-950/20">
+                          {loadingSubmissions ? (
+                            <tr>
+                              <td colSpan={7} className="p-8 text-center text-slate-400 text-xs">
+                                <div className="flex items-center justify-center gap-2">
+                                  <RefreshCw className="w-4 h-4 animate-spin text-teal-400" />
+                                  <span>Lettura record da database in corso...</span>
+                                </div>
+                              </td>
+                            </tr>
+                          ) : filteredSubmissions.length === 0 ? (
+                            <tr>
+                              <td colSpan={7} className="p-8 text-center text-slate-400 text-xs italic">
+                                Nessun elaborato archiviato corrisponde ai criteri impostati.
+                              </td>
+                            </tr>
+                          ) : (
+                            filteredSubmissions.map((sub, sIdx) => {
+                              const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                              return (
+                                <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
+                                  <td className="p-2 sm:p-3 text-center font-mono font-bold text-xs">
+                                    {chronologicalSortBy === "grade_desc" ? (
+                                      sIdx === 0 ? <span className="text-amber-300 font-extrabold" title="1° Posto Voto IA">🥇 1</span> :
+                                      sIdx === 1 ? <span className="text-slate-300 font-extrabold" title="2° Posto Voto IA">🥈 2</span> :
+                                      sIdx === 2 ? <span className="text-amber-600 font-extrabold" title="3° Posto Voto IA">🥉 3</span> :
+                                      <span className="text-slate-500">{sIdx + 1}</span>
+                                    ) : (
+                                      <span className="text-slate-500">{sIdx + 1}</span>
+                                    )}
+                                  </td>
+                                  <td className="p-2 sm:p-3 max-w-[80px] sm:max-w-[200px]">
                                   {blindGradingMode ? (
                                     <div>
                                       <p className="font-mono font-bold text-amber-300 truncate text-[11px] sm:text-xs">
@@ -3768,6 +4047,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       </tbody>
                     </table>
                   </div>
+                </div>
                 )}
               </>
             )}
