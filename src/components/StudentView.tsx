@@ -923,6 +923,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let isFirstPoll = true;
       let pollAttempts = 0;
       const MAX_POLL_ATTEMPTS = 160; // Max ~2 minutes polling timeout
+      let currentJobId = jobId;
+      let reenqueues = 0;
+      const MAX_REENQUEUES = 3; // Survive server restarts transparently
       while (true) {
         pollAttempts++;
         if (pollAttempts > MAX_POLL_ATTEMPTS) {
@@ -934,8 +937,35 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         }
         isFirstPoll = false;
 
-        const statusResp = await fetch(`/api/evaluate/status/${jobId}`);
+        const statusResp = await fetch(`/api/evaluate/status/${currentJobId}`);
         if (!statusResp.ok) {
+          if (statusResp.status === 404 && rescue.payload && reenqueues < MAX_REENQUEUES) {
+            // Job lost (server restarted): re-enqueue the same payload automatically
+            reenqueues++;
+            setSavingStatus(`Il server si è riavviato: riconsegna automatica in corso (tentativo ${reenqueues} di ${MAX_REENQUEUES})...`);
+            try {
+              const reEnqueueResp = await fetch("/api/evaluate/enqueue", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(rescue.payload)
+              });
+              if (reEnqueueResp.ok) {
+                const reEnqueueData = await reEnqueueResp.json();
+                if (reEnqueueData.jobId) {
+                  currentJobId = reEnqueueData.jobId;
+                  rescue.jobId = currentJobId;
+                  try {
+                    localStorage.setItem("active_eval_rescue", JSON.stringify(rescue));
+                  } catch {}
+                  pollAttempts = 0;
+                  isFirstPoll = true;
+                  continue;
+                }
+              }
+            } catch (reErr) {
+              console.warn("Riaccodamento automatico fallito:", reErr);
+            }
+          }
           if (statusResp.status === 404) {
             throw new Error("La sessione di correzione sul server è scaduta o il server è stato riavviato. Riprova a consegnare.");
           }
@@ -1221,9 +1251,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
       const jobId = enqueueData.jobId;
 
-      // Persist the rescue anchor state in case of connection drop or refreshes
+      // Persist the rescue anchor state in case of connection drop or refreshes.
+      // Includes the full server payload so a lost job can be re-enqueued
+      // automatically if the server restarts (Render free tier).
       const rescuePayload = {
         jobId,
+        payload,
         sessionPin,
         sessionRunId,
         examTitle: examData?.title || "",
