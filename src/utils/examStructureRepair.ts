@@ -16,32 +16,424 @@ export interface ExamCorrectionResult {
  */
 export function cleanRawJsonText(rawText: string): string {
   if (!rawText) return "";
-  let text = rawText.trim();
+  // Remove BOM if present
+  let text = rawText.replace(/^\uFEFF/, "").trim();
 
-  // Remove markdown code fences like ```json ... ``` or ``` ... ```
-  if (text.startsWith("```")) {
+  // If the model/UI wrapped the JSON in markdown fences, extract the largest
+  // fenced block. Handles ```json ... ``` or ``` ... ``` even with prose around.
+  const fenceRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+  const blocks: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = fenceRegex.exec(text)) !== null) {
+    if (m[1] && m[1].trim()) blocks.push(m[1].trim());
+  }
+  if (blocks.length > 0) {
+    // Prefer the longest block (most likely the real JSON)
+    text = blocks.sort((a, b) => b.length - a.length)[0].trim();
+  } else if (text.startsWith("```")) {
     text = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "").trim();
   }
 
   return text;
 }
 
+function getErrorPosition(errMessage: string): number | null {
+  const m = /position\s+(\d+)/i.exec(errMessage)
+    || /column\s+(\d+)/i.exec(errMessage)
+    || /at\s+position\s+(\d+)/i.exec(errMessage);
+  if (m) {
+    const n = parseInt(m[1], 10);
+    return isNaN(n) ? null : n;
+  }
+  return null;
+}
+
+export function describeJsonError(errMessage: string, text: string): string {
+  const pos = getErrorPosition(errMessage);
+  if (pos === null || !text) return errMessage;
+  const window = 90;
+  const start = Math.max(0, pos - window);
+  const end = Math.min(text.length, pos + window);
+  const snippet = text.slice(start, end).replace(/\n/g, "\\n");
+  const pointerOffset = Math.min(pos - start, snippet.length);
+  const pointer = " ".repeat(Math.max(0, pointerOffset)) + "^";
+  // Compute line/col for friendlier message
+  const uptoPos = text.slice(0, Math.min(pos, text.length));
+  const line = (uptoPos.match(/\n/g) || []).length + 1;
+  const col = pos - (uptoPos.lastIndexOf("\n") + 1) + 1;
+  return `${errMessage} (riga ${line}, col ${col}). Contesto: "...${snippet}..." ${pointer}`;
+}
+
+/** Extract outermost { ... } or [ ... ] when prose surrounds the JSON. */
+function extractOutermostJson(text: string): string {
+  const firstBrace = text.indexOf("{");
+  const firstBracket = text.indexOf("[");
+  let start = -1;
+  if (firstBrace !== -1 && firstBracket !== -1) start = Math.min(firstBrace, firstBracket);
+  else start = firstBrace !== -1 ? firstBrace : firstBracket;
+  if (start === -1) return text;
+  const lastBrace = text.lastIndexOf("}");
+  const lastBracket = text.lastIndexOf("]");
+  const end = Math.max(lastBrace, lastBracket);
+  if (end === -1 || end <= start) return text;
+  const candidate = text.slice(start, end + 1);
+  // Only use extraction if it looks plausible (balanced-ish, decent length)
+  if (candidate.length > 20) return candidate.trim();
+  return text;
+}
+
+function normalizeSmartQuotes(text: string): string {
+  return text
+    .replace(/[\u201C\u201D\u201E\u00AB\u00BB]/g, '"')
+    .replace(/[\u2018\u2019\u201A\u2032]/g, "'")
+    .replace(/\u00A0/g, " ");
+}
+
+/** Remove // and block comments that appear outside JSON strings. */
+function stripCommentsOutsideStrings(text: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    const next = text[i + 1] || "";
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "/" && next === "/") {
+      // Skip to end of line
+      while (i < text.length && text[i] !== "\n") i++;
+      if (i < text.length) out += "\n";
+      continue;
+    }
+    if (c === "/" && next === "*") {
+      i += 2;
+      while (i < text.length && !(text[i] === "*" && text[i + 1] === "/")) i++;
+      i++; // skip closing '/'
+      out += " ";
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** Quote unquoted object keys: { title: ... } -> { "title": ... } (outside strings). */
+function quoteUnquotedKeys(text: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  let token = "";
+  const flushToken = () => {
+    // token holds consecutive word chars outside strings; handled inline below
+    out += token;
+    token = "";
+  };
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (inStr) {
+      out += c;
+      if (esc) esc = false;
+      else if (c === "\\") esc = true;
+      else if (c === '"') inStr = false;
+      continue;
+    }
+    if (c === '"') {
+      flushToken();
+      inStr = true;
+      out += c;
+      continue;
+    }
+    if (c === "'") {
+      // Convert single-quoted string to double-quoted (common paste error).
+      // Find closing single quote on same logical segment.
+      let j = i + 1;
+      let inner = "";
+      let found = false;
+      while (j < text.length) {
+        if (text[j] === "\\" && j + 1 < text.length) {
+          inner += text[j] + text[j + 1];
+          j += 2;
+          continue;
+        }
+        if (text[j] === "'") { found = true; break; }
+        if (text[j] === "\n" && text.slice(j, j + 1) === "\n" && inner.length > 300) break;
+        inner += text[j];
+        j++;
+        if (j - i > 5000) break;
+      }
+      if (found) {
+        const escapedInner = inner.replace(/(?<!\\)"/g, '\\"').replace(/\n/g, "\\n");
+        out += `"${escapedInner}"`;
+        i = j;
+        continue;
+      }
+      out += c;
+      continue;
+    }
+    // Detect unquoted key: word chars directly followed by optional spaces + colon
+    if (/[A-Za-z_]/.test(c)) {
+      let j = i;
+      let word = "";
+      while (j < text.length && /[A-Za-z0-9_]/.test(text[j])) {
+        word += text[j];
+        j++;
+      }
+      let k = j;
+      while (k < text.length && /\s/.test(text[k])) k++;
+      if (text[k] === ":" && (out.length === 0 || /[{,\s]/.test(out[out.length - 1]) || out.trimEnd().endsWith("{") || out.trimEnd().endsWith(","))) {
+        // Check previous non-space char is { or , or start (avoid matching true/false/null inside values)
+        if (!["true", "false", "null"].includes(word)) {
+          out += `"${word}"`;
+          i = j - 1;
+          continue;
+        }
+      }
+      out += c;
+      continue;
+    }
+    out += c;
+  }
+  flushToken();
+  return out;
+}
+
+/** Escape literal newlines/tabs inside JSON strings. */
+function escapeLiteralControls(text: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!inStr) {
+      if (c === '"') inStr = true;
+      out += c;
+      continue;
+    }
+    // inside string
+    if (esc) {
+      out += c;
+      esc = false;
+      continue;
+    }
+    if (c === "\\") {
+      out += c;
+      esc = true;
+      continue;
+    }
+    if (c === '"') {
+      inStr = false;
+      out += c;
+      continue;
+    }
+    if (c === "\n") { out += "\\n"; continue; }
+    if (c === "\r") { out += "\\r"; continue; }
+    if (c === "\t") { out += "\\t"; continue; }
+    out += c;
+  }
+  return out;
+}
+
 /**
- * Tries to parse JSON with fallback for common syntax mistakes (e.g. trailing commas)
+ * Escape inner unescaped quotes: a " inside a string is a terminator only if
+ * followed (after optional spaces) by one of : , } ]. Otherwise escape it.
+ * This fixes: "question": "Cosa significa "ciao"?" -> valid JSON.
+ */
+function escapeInnerQuotes(text: string): string {
+  let out = "";
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < text.length; i++) {
+    const c = text[i];
+    if (!inStr) {
+      out += c;
+      if (c === '"') inStr = true;
+      continue;
+    }
+    if (esc) {
+      out += c;
+      esc = false;
+      continue;
+    }
+    if (c === "\\") {
+      out += c;
+      esc = true;
+      continue;
+    }
+    if (c === '"') {
+      // Look ahead past spaces/tabs/newlines
+      let j = i + 1;
+      while (j < text.length && /[ \t\r\n]/.test(text[j])) j++;
+      const next = text[j] || "";
+      // A real terminator is followed by : , } ] or end-of-text.
+      // (Colon covers end-of-key; comma/brackets cover end-of-value.)
+      if (next === ":" || next === "," || next === "}" || next === "]" || next === "") {
+        out += c;
+        inStr = false;
+      } else if (next === '"') {
+        // Ambiguous: either a missing comma before the next key/value
+        // (e.g. {"title":"T" "multipleChoice": []} or ["a" "b"]) or an
+        // inner quote directly followed by the real terminator
+        // (e.g. "Scegli "A" o "B"", where the inner closing " is adjacent
+        // to the terminating "). Disambiguate by checking whether the
+        // upcoming quoted segment is followed by a structural delimiter.
+        const rest = text.slice(j, j + 220);
+        const looksLikeNextToken = /^"[^"\n]{0,200}"\s*[:,}\]]/.test(rest);
+        if (looksLikeNextToken) {
+          // Missing comma case: this " really ends the current string;
+          // insertMissingCommas() below will add the comma.
+          out += c;
+          inStr = false;
+        } else {
+          // Inner quote adjacent to terminator: escape and stay in string.
+          out += '\\"';
+        }
+      } else {
+        // Inner quote -> escape it and stay inside the string
+        out += '\\"';
+      }
+      continue;
+    }
+    out += c;
+  }
+  return out;
+}
+
+/** Insert missing commas between properties/items (outside strings). */
+function insertMissingCommas(text: string): string {
+  // value followed by "key":  -> value, "key":
+  // e.g. {"a": 1 "b": 2} or "foo" "bar": (missing comma before next key)
+  let res = text.replace(/([0-9\]\}"])\s+("[^"]*"\s*:)/g, "$1, $2");
+  // } {  or ] [ or } [  (array/object adjacency without comma)
+  res = res.replace(/([\}\]])\s+([\{\[])/g, "$1, $2");
+  // "string" whitespace "string" where second starts a new value without colon context?
+  // Conservative: only inside arrays, "a" "b" -> "a", "b"
+  // We apply only when it doesn't already contain , or : between them.
+  res = res.replace(/("[^"\n]*")\s+("[^"\n]*"\s*[\,\]\}])/g, "$1, $2");
+  return res;
+}
+
+function removeTrailingCommas(text: string): string {
+  return text.replace(/,\s*([\]}])/g, "$1");
+}
+
+/** Close an unclosed string and balance unmatched { [. */
+function balanceBrackets(text: string): string {
+  let candidate = text;
+  // Close unclosed string
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < candidate.length; i++) {
+    const char = candidate[i];
+    if (char === "\\" && !escaped) { escaped = true; continue; }
+    if (char === '"' && !escaped) inString = !inString;
+    escaped = false;
+  }
+  if (inString) candidate += '"';
+  candidate = candidate.replace(/,\s*("[^"]*"\s*:\s*)?$/, "");
+  const stack: string[] = [];
+  let inStr = false;
+  let esc = false;
+  for (let i = 0; i < candidate.length; i++) {
+    const char = candidate[i];
+    if (char === "\\" && !esc) { esc = true; continue; }
+    if (char === '"' && !esc) inStr = !inStr;
+    if (!inStr) {
+      if (char === "{") stack.push("}");
+      else if (char === "[") stack.push("]");
+      else if (char === "}" || char === "]") {
+        if (stack.length > 0 && stack[stack.length - 1] === char) stack.pop();
+      }
+    }
+    esc = false;
+  }
+  while (stack.length > 0) candidate += stack.pop();
+  return candidate.replace(/,\s*([\]}])/g, "$1");
+}
+
+/** Full syntax-level repair pipeline (no structural normalization). */
+function repairJsonSyntax(text: string): string {
+  let r = text;
+  r = normalizeSmartQuotes(r);
+  r = stripCommentsOutsideStrings(r);
+  r = quoteUnquotedKeys(r);
+  r = escapeLiteralControls(r);
+  r = escapeInnerQuotes(r);
+  r = insertMissingCommas(r);
+  r = removeTrailingCommas(r);
+  return r;
+}
+
+/**
+ * Tries to parse JSON with fallback for common syntax mistakes
+ * (trailing commas, markdown fences, smart quotes, comments,
+ * unescaped inner quotes, missing commas, truncated output).
  */
 export function tolerantJsonParse(rawText: string): any {
   const cleaned = cleanRawJsonText(rawText);
+  const errors: any[] = [];
+  const tryParse = (candidate: string) => JSON.parse(candidate);
+
+  // 1. Direct parse
   try {
-    return JSON.parse(cleaned);
-  } catch (initialErr) {
-    // Attempt to remove trailing commas before } or ]
+    return tryParse(cleaned);
+  } catch (e) { errors.push(e); }
+
+  // 2. Trailing commas only (fast path, preserves original behaviour)
+  try {
+    return tryParse(removeTrailingCommas(cleaned));
+  } catch (e) { errors.push(e); }
+
+  // 3. Extract outermost JSON when prose surrounds it
+  const extracted = extractOutermostJson(cleaned);
+  if (extracted !== cleaned) {
     try {
-      const fixedCommas = cleaned.replace(/,\s*([\]}])/g, "$1");
-      return JSON.parse(fixedCommas);
-    } catch {
-      throw initialErr;
-    }
+      return tryParse(extracted);
+    } catch (e) { errors.push(e); }
+    try {
+      return tryParse(removeTrailingCommas(extracted));
+    } catch (e) { errors.push(e); }
   }
+
+  // 4. Full syntax repair (smart quotes, comments, inner quotes, missing commas...)
+  try {
+    return tryParse(repairJsonSyntax(cleaned));
+  } catch (e) { errors.push(e); }
+
+  if (extracted !== cleaned) {
+    try {
+      return tryParse(repairJsonSyntax(extracted));
+    } catch (e) { errors.push(e); }
+  }
+
+  // 5. Repair + balance (truncated output: unclosed string/brackets)
+  try {
+    return tryParse(balanceBrackets(repairJsonSyntax(cleaned)));
+  } catch (e) { errors.push(e); }
+
+  // 6. Prune to last complete object `},` and close (truncated arrays)
+  try {
+    const lastObjectEnd = cleaned.lastIndexOf("},");
+    if (lastObjectEnd !== -1) {
+      const pruned = balanceBrackets(repairJsonSyntax(cleaned.substring(0, lastObjectEnd + 1)));
+      return tryParse(pruned);
+    }
+  } catch (e) { errors.push(e); }
+
+  const initialErr: any = errors[0];
+  const enriched = new Error(describeJsonError(initialErr?.message || String(initialErr), cleaned));
+  // Preserve original position info for callers that parse it
+  (enriched as any).cause = initialErr;
+  throw enriched;
 }
 
 /**

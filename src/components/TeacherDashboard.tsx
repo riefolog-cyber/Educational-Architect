@@ -4527,9 +4527,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   Se compare la schermata bianca con logo Google Admin <i>"Spiacenti, non disponi dell'accesso a AI Studio. Il tuo account è gestito da un'organizzazione che ha disattivato questo servizio"</i>:
                 </p>
                 <div className="space-y-1.5 text-[11px] text-slate-200">
-                  <p><b>Perché accade su iPhone anche con account personale?</b></p>
+                  <p><b>Perché accade su iPhone (anche quando con lo stesso account su Android si entra)?</b></p>
                   <p className="text-slate-400">
-                    Safari su iPhone memorizza l'account scolastico con cui lo studente fa i compiti su Classroom/Drive e lo invia in automatico ai server Google. Anche se prova ad accedere con un account personale, Google intercetta la sessione della scuola e mostra il blocco.
+                    Se con lo stesso account scolastico su Android l'accesso riesce e su iPhone no, <b>non è un problema di permessi dell'account</b>: è il browser di Apple che blocca i cookie di sessione di AI Studio (protezione ITP anti-tracciamento). Inoltre Safari su iPhone memorizza l'account scolastico usato per Classroom/Drive e lo invia in automatico ai server Google, che mostrano il blocco anche se si prova con un account diverso.
                   </p>
                   <p><b>Come far entrare subito gli studenti da iPhone (3 opzioni):</b></p>
                   <ol className="list-decimal list-inside text-rose-200/90 space-y-1.5 pl-1">

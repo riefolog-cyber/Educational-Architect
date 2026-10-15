@@ -42,6 +42,21 @@ import StudentView from "./components/StudentView";
 import TeacherDashboard from "./components/TeacherDashboard";
 import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
 
+// Helper to detect Apple mobile devices (iPhone/iPad), where Safari ITP
+// blocks third-party cookies inside the AI Studio iframe and Google shows
+// the "Non disponi dell'accesso a AI Studio" admin screen.
+function checkIsAppleMobile(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || navigator.vendor || (window as any).opera || "";
+  if (/iPhone|iPod|iPad/i.test(ua)) return true;
+  // iPadOS 13+ reports as Macintosh: detect via touch support
+  return (
+    /Macintosh/i.test(ua) &&
+    typeof document !== "undefined" &&
+    "ontouchend" in document
+  );
+}
+
 // Helper to detect if user opened the link inside an in-app browser (WebView like WhatsApp, Classroom, etc.)
 function checkIsInAppBrowser(): boolean {
   if (typeof window === "undefined" || typeof navigator === "undefined") return false;
@@ -76,9 +91,11 @@ export default function App() {
   const [activePane, setActivePane] = useState<"home" | "student" | "teacher">("home");
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
   const [inAppBrowserDetected, setInAppBrowserDetected] = useState(false);
+  const [appleMobileDetected, setAppleMobileDetected] = useState(false);
 
   useEffect(() => {
     setInAppBrowserDetected(checkIsInAppBrowser());
+    setAppleMobileDetected(checkIsAppleMobile());
 
     // Pre-fill student fields from previous session if present
     try {
@@ -431,6 +448,24 @@ export default function App() {
                       <p className="text-[11px] font-semibold text-white bg-amber-900/40 p-2 rounded-xl border border-amber-500/20">
                         👉 <b>Cosa fare:</b> Tocca i tre puntini <b>⋮</b> in alto a destra e scegli <b>"Apri in Chrome"</b> o <b>"Apri in Safari"</b>, oppure utilizza la scheda <b>"Accesso Diretto Studente"</b> qui sotto per entrare all'istante con la tua email scolastica.
                       </p>
+                    </div>
+                  )}
+
+                  {/* Apple mobile (iPhone/iPad) AI Studio access guidance */}
+                  {appleMobileDetected && !inAppBrowserDetected && (
+                    <div className="bg-rose-950/50 border border-rose-500/30 p-4 rounded-2xl text-left text-xs leading-relaxed text-rose-100 space-y-2 shadow-lg">
+                      <div className="flex items-center gap-2 font-bold text-rose-200">
+                        <Smartphone className="w-4 h-4 shrink-0" />
+                        <span>Usi un iPhone/iPad? Leggi qui se Google mostra "Non disponi dell'accesso a AI Studio"</span>
+                      </div>
+                      <p className="text-[11px] text-rose-100/90 leading-relaxed">
+                        Se con lo <b>stesso account scolastico</b> su Android entri e su iPhone no, <b>non è un problema di permessi</b>: è Safari che blocca i cookie di sessione di AI Studio (protezione anti-tracciamento di Apple). Prova in ordine:
+                      </p>
+                      <ol className="text-[11px] text-rose-100/90 leading-relaxed list-decimal list-inside space-y-1 pl-1">
+                        <li><b>Apri il link in Chrome per iOS</b> (se installato) oppure in Safari, non dentro WhatsApp/Classroom.</li>
+                        <li>In Safari: <i>Impostazioni &rarr; Safari</i> &rarr; disattiva <b>"Blocca cookie tra siti"</b> / <b>"Impedisci tracciamento tra siti"</b>, poi ricarica. In alternativa usa una <b>scheda Privata</b>.</li>
+                        <li>Oppure entra subito qui sotto con <b>"Accesso Studente"</b> (nome, cognome ed email scolastica): funziona sempre e il voto viene registrato regolarmente.</li>
+                      </ol>
                     </div>
                   )}
 

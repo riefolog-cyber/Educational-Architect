@@ -8,7 +8,7 @@ import dotenv from "dotenv";
 dotenv.config();
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 // Helper for lazy loading Gemini
 const getApiKey = () => process.env.educationaarch || process.env.GEMINI_API_KEY;
@@ -127,8 +127,125 @@ function extractResponseText(response: any): string {
   return "";
 }
 
+const repairJsonSyntaxServer = (input: string): string => {
+  let r = input
+    .replace(/[“”„«»]/g, '"')
+    .replace(/[‘’‚´]/g, "'")
+    .replace(/ /g, " ");
+
+  // Strip // and /* */ comments outside strings
+  let noComments = "";
+  {
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < r.length; i++) {
+      const c = r[i];
+      const next = r[i + 1] || "";
+      if (inStr) {
+        noComments += c;
+        if (esc) esc = false;
+        else if (c === "\\") esc = true;
+        else if (c === '"') inStr = false;
+        continue;
+      }
+      if (c === '"') { inStr = true; noComments += c; continue; }
+      if (c === "/" && next === "/") {
+        while (i < r.length && r[i] !== "\n") i++;
+        if (i < r.length) noComments += "\n";
+        continue;
+      }
+      if (c === "/" && next === "*") {
+        i += 2;
+        while (i < r.length && !(r[i] === "*" && r[i + 1] === "/")) i++;
+        i++;
+        noComments += " ";
+        continue;
+      }
+      noComments += c;
+    }
+  }
+  r = noComments;
+
+  // Escape literal newlines/tabs inside strings
+  {
+    let out = "";
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < r.length; i++) {
+      const c = r[i];
+      if (!inStr) {
+        if (c === '"') inStr = true;
+        out += c;
+        continue;
+      }
+      if (esc) { out += c; esc = false; continue; }
+      if (c === "\\") { out += c; esc = true; continue; }
+      if (c === '"') { inStr = false; out += c; continue; }
+      if (c === "\n") { out += "\\n"; continue; }
+      if (c === "\r") { out += "\\r"; continue; }
+      if (c === "\t") { out += "\\t"; continue; }
+      out += c;
+    }
+    r = out;
+  }
+
+  // Escape inner unescaped quotes: only a " followed by : , } ] ends the string
+  {
+    let out = "";
+    let inStr = false;
+    let esc = false;
+    for (let i = 0; i < r.length; i++) {
+      const c = r[i];
+      if (!inStr) {
+        out += c;
+        if (c === '"') inStr = true;
+        continue;
+      }
+      if (esc) { out += c; esc = false; continue; }
+      if (c === "\\") { out += c; esc = true; continue; }
+      if (c === '"') {
+        let j = i + 1;
+        while (j < r.length && /[ \t\r\n]/.test(r[j])) j++;
+        const next = r[j] || "";
+        if (next === ":" || next === "," || next === "}" || next === "]" || next === "") {
+          out += c;
+          inStr = false;
+        } else if (next === '"') {
+          const rest = r.slice(j, j + 220);
+          if (/^"[^"\n]{0,200}"\s*[:,}\]]/.test(rest)) {
+            out += c;
+            inStr = false;
+          } else {
+            out += '\\"';
+          }
+        } else {
+          out += '\\"';
+        }
+        continue;
+      }
+      out += c;
+    }
+    r = out;
+  }
+
+  // Missing commas between properties/items
+  r = r.replace(/([0-9\]\}"])\s+("[^"]*"\s*:)/g, "$1, $2");
+  r = r.replace(/([\}\]])\s+([\{\[])/g, "$1, $2");
+  // Trailing commas
+  r = r.replace(/,\s*([\]}])/g, "$1");
+  return r;
+};
+
 const parseJsonResponse = (text: string) => {
-  let cleanedText = text.trim();
+  const fenceRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
+  const blocks: string[] = [];
+  let mm: RegExpExecArray | null;
+  while ((mm = fenceRegex.exec(text)) !== null) {
+    if (mm[1] && mm[1].trim()) blocks.push(mm[1].trim());
+  }
+  let cleanedText = (blocks.length > 0
+    ? blocks.sort((a, b) => b.length - a.length)[0]
+    : text).trim().replace(/^﻿/, "");
   if (cleanedText.startsWith("```json")) {
     cleanedText = cleanedText.replace(/^```json\s*/i, "").replace(/\s*```$/, "").trim();
   } else if (cleanedText.startsWith("```")) {
@@ -143,6 +260,14 @@ const parseJsonResponse = (text: string) => {
     try {
       const fixedCommas = cleanedText.replace(/,\s*([\]}])/g, "$1");
       return JSON.parse(fixedCommas);
+    } catch {}
+
+    // 2b. Syntax repair: smart quotes, comments, inner quotes, missing commas
+    try {
+      const repairedSyntax = repairJsonSyntaxServer(cleanedText);
+      const parsed = JSON.parse(repairedSyntax);
+      console.warn("[JSON Parser] Successfully repaired JSON syntax (quotes/commas/comments)!");
+      return parsed;
     } catch {}
 
     // 3. Resilient repair for truncated JSON outputs (e.g. unterminated strings / cut-off tokens)
@@ -206,6 +331,43 @@ const parseJsonResponse = (text: string) => {
       console.warn("[JSON Parser] Successfully repaired truncated JSON response from model!");
       return repaired;
     } catch (repairErr) {
+      // 3b. Combined syntax-repair + balance (e.g. inner quotes + truncated tail)
+      try {
+        const syntaxFixed = repairJsonSyntaxServer(cleanedText);
+        let candidate2 = syntaxFixed;
+        let inString2 = false;
+        let escaped2 = false;
+        for (let i = 0; i < candidate2.length; i++) {
+          const ch = candidate2[i];
+          if (ch === "\\" && !escaped2) { escaped2 = true; continue; }
+          if (ch === '"' && !escaped2) inString2 = !inString2;
+          escaped2 = false;
+        }
+        if (inString2) candidate2 += '"';
+        candidate2 = candidate2.replace(/,\s*("[^"]*"\s*:\s*)?$/, "");
+        const stack2: string[] = [];
+        let inS2 = false;
+        let e2 = false;
+        for (let i = 0; i < candidate2.length; i++) {
+          const ch = candidate2[i];
+          if (ch === "\\" && !e2) { e2 = true; continue; }
+          if (ch === '"' && !e2) inS2 = !inS2;
+          if (!inS2) {
+            if (ch === "{") stack2.push("}");
+            else if (ch === "[") stack2.push("]");
+            else if (ch === "}" || ch === "]") {
+              if (stack2.length > 0 && stack2[stack2.length - 1] === ch) stack2.pop();
+            }
+          }
+          e2 = false;
+        }
+        while (stack2.length > 0) candidate2 += stack2.pop();
+        candidate2 = candidate2.replace(/,\s*([\]}])/g, "$1");
+        const repaired2 = JSON.parse(candidate2);
+        console.warn("[JSON Parser] Successfully repaired JSON with combined syntax+truncation fix!");
+        return repaired2;
+      } catch {}
+
       // 4. Fallback: Trim back to the last complete item delimiter `},` or `}` and close
       try {
         const lastObjectEnd = cleanedText.lastIndexOf("},");

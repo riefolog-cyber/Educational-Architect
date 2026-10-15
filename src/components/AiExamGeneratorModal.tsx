@@ -1,5 +1,6 @@
-import React, { useState } from "react";
-import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2 } from "lucide-react";
+import React, { useState, useRef } from "react";
+import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2 } from "lucide-react";
+import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS, type TranscriptFormat } from "../utils/transcriptParser";
 
 interface AiExamGeneratorModalProps {
   isOpen: boolean;
@@ -21,6 +22,15 @@ export default function AiExamGeneratorModal({
 
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [sourceTab, setSourceTab] = useState<"topic" | "transcript">("topic");
+  const [transcriptFileName, setTranscriptFileName] = useState<string | null>(null);
+  const [transcriptMeta, setTranscriptMeta] = useState<{
+    format: TranscriptFormat;
+    cues: number;
+    chars: number;
+  } | null>(null);
+  const [transcriptNotice, setTranscriptNotice] = useState<string | null>(null);
+  const transcriptInputRef = useRef<HTMLInputElement | null>(null);
   const [generatedResult, setGeneratedResult] = useState<{
     title: string;
     formattedJson: string;
@@ -31,9 +41,48 @@ export default function AiExamGeneratorModal({
 
   if (!isOpen) return null;
 
+  const handleTranscriptFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    // Allow re-selecting the same file
+    e.target.value = "";
+    if (!file) return;
+    setError(null);
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const raw = String(event.target?.result || "");
+        const parsed = parseTranscriptFile(file.name, raw);
+        if (!parsed.text) {
+          setError(parsed.notice || "Impossibile estrarre testo dal file selezionato.");
+          return;
+        }
+        setTopic(parsed.text);
+        setTranscriptFileName(file.name);
+        setTranscriptMeta({ format: parsed.format, cues: parsed.cues, chars: parsed.chars });
+        setTranscriptNotice(parsed.notice);
+        setGeneratedResult(null);
+      } catch (err: any) {
+        setError("Lettura del file non riuscita: " + (err?.message || "formato non supportato."));
+      }
+    };
+    reader.onerror = () => setError("Lettura del file non riuscita. Riprova con un altro file.");
+    reader.readAsText(file);
+  };
+
+  const handleRemoveTranscript = () => {
+    setTranscriptFileName(null);
+    setTranscriptMeta(null);
+    setTranscriptNotice(null);
+    setTopic("");
+  };
+
   const handleGenerate = async () => {
     if (!topic.trim()) {
-      setError("Inserisci un argomento o incolla degli appunti/testo didattico per continuare.");
+      setError(
+        sourceTab === "transcript"
+          ? "Carica prima un file di trascrizione (.srt, .vtt o .txt) oppure incolla il testo nel campo qui sotto."
+          : "Inserisci un argomento o incolla degli appunti/testo didattico per continuare."
+      );
       return;
     }
 
@@ -143,10 +192,106 @@ export default function AiExamGeneratorModal({
 
           {!generatedResult ? (
             <>
+              {/* Source selection: topic/text vs video transcript */}
+              <div className="grid grid-cols-2 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold">
+                <button
+                  type="button"
+                  onClick={() => setSourceTab("topic")}
+                  className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                    sourceTab === "topic"
+                      ? "bg-indigo-600 text-white shadow-md font-bold"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  <BookOpen className="w-3.5 h-3.5" />
+                  <span>Argomento / Testo</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setSourceTab("transcript")}
+                  className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                    sourceTab === "transcript"
+                      ? "bg-teal-600 text-white shadow-md font-bold"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  <Clapperboard className="w-3.5 h-3.5" />
+                  <span>Trascrizione video (SRT/TXT)</span>
+                </button>
+              </div>
+
+              {sourceTab === "transcript" && (
+                <div className="p-3.5 rounded-2xl bg-teal-950/30 border border-teal-500/20 space-y-2.5">
+                  <input
+                    ref={transcriptInputRef}
+                    type="file"
+                    accept=".srt,.vtt,.txt,text/plain"
+                    onChange={handleTranscriptFile}
+                    className="hidden"
+                  />
+                  {!transcriptFileName ? (
+                    <button
+                      type="button"
+                      onClick={() => transcriptInputRef.current?.click()}
+                      className="w-full py-4 px-3 rounded-xl border-2 border-dashed border-teal-500/40 hover:border-teal-400 hover:bg-teal-500/10 text-teal-200 text-xs font-semibold flex flex-col items-center gap-1.5 cursor-pointer transition-all"
+                    >
+                      <FileUp className="w-5 h-5" />
+                      <span>Carica trascrizione (.srt, .vtt o .txt)</span>
+                      <span className="text-[10px] font-normal text-teal-300/70">
+                        Timestamp e doppioni vengono rimossi in automatico
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="space-y-2">
+                      <div className="flex items-center justify-between gap-2 p-2.5 bg-slate-950/60 border border-white/10 rounded-xl">
+                        <div className="flex items-center gap-2 min-w-0">
+                          <FileText className="w-4 h-4 text-teal-400 shrink-0" />
+                          <div className="min-w-0">
+                            <p className="text-white text-xs font-semibold truncate">{transcriptFileName}</p>
+                            {transcriptMeta && (
+                              <p className="text-[10px] text-slate-400 font-mono">
+                                {transcriptMeta.format.toUpperCase()}
+                                {transcriptMeta.cues > 0 && ` • ${transcriptMeta.cues} battute`}
+                                {` • ${transcriptMeta.chars.toLocaleString("it-IT")} caratteri`}
+                              </p>
+                            )}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => transcriptInputRef.current?.click()}
+                            className="px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600/30 text-teal-200 text-[11px] font-bold rounded-lg border border-teal-500/30 cursor-pointer transition-colors"
+                          >
+                            Cambia
+                          </button>
+                          <button
+                            type="button"
+                            onClick={handleRemoveTranscript}
+                            title="Rimuovi trascrizione"
+                            className="p-1.5 text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
+                          >
+                            <Trash2 className="w-4 h-4" />
+                          </button>
+                        </div>
+                      </div>
+                      {transcriptNotice && (
+                        <p className="text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 leading-relaxed">
+                          ⚠️ {transcriptNotice}
+                        </p>
+                      )}
+                      <p className="text-[10px] text-slate-500">
+                        Testo estratto qui sotto: puoi modificarlo o tagliarlo prima di generare (max {MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri).
+                      </p>
+                    </div>
+                  )}
+                </div>
+              )}
+
               {/* Topic / Prompt text */}
               <div className="space-y-1.5">
                 <label className="font-bold uppercase tracking-wider text-slate-400 text-[10px] flex items-center justify-between">
-                  <span>Argomento della Verifica o Testo Didattico *</span>
+                  <span>{sourceTab === "transcript" ? "Testo della trascrizione (modificabile) *" : "Argomento della Verifica o Testo Didattico *"}</span>
                   <span className="text-slate-500 font-normal">Italiano, Storia, Scienze, Diritto, ecc.</span>
                 </label>
                 <textarea
