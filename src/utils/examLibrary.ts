@@ -1,13 +1,13 @@
-import {
-  collection,
-  getDocs,
-  query,
-  where,
-  addDoc,
-  deleteDoc,
-  doc,
-} from "firebase/firestore";
-import type { Firestore } from "firebase/firestore";
+/**
+ * Exam library stored in the browser (localStorage).
+ *
+ * NOTE: Firestore would allow cross-device sync, but the AI Studio
+ * base-level project does not expose the Rules editor, so a new
+ * collection cannot be authorized from the console. The browser library
+ * needs no console changes and works per-teacher on each device.
+ * (firestore.rules in the repo already contains the future server-side
+ *  rule for when the project is migrated/upgraded.)
+ */
 
 export type LibraryExamType = "Quiz" | "Workbook";
 
@@ -34,7 +34,32 @@ export interface NewLibraryExam {
   questionCount: number;
 }
 
-const COLLECTION = "exam_library";
+const keyFor = (teacherEmail: string) =>
+  `exam_library_${(teacherEmail || "anon").toLowerCase().trim()}`;
+
+function readAll(teacherEmail: string): ExamLibraryItem[] {
+  try {
+    const raw = localStorage.getItem(keyFor(teacherEmail));
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? parsed : [];
+  } catch {
+    return [];
+  }
+}
+
+function writeAll(teacherEmail: string, items: ExamLibraryItem[]): void {
+  try {
+    localStorage.setItem(keyFor(teacherEmail), JSON.stringify(items));
+  } catch (e: any) {
+    if (e?.name === "QuotaExceededError") {
+      throw new Error(
+        "Spazio locale esaurito: elimina qualche vecchia verifica dalla libreria per far posto."
+      );
+    }
+    throw e;
+  }
+}
 
 /** Counts answerable items (MC + open, or workbook sections content). */
 export function countLibraryQuestions(examObj: any): { type: LibraryExamType; count: number } {
@@ -50,39 +75,24 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
   return { type: "Quiz", count: mc + oe };
 }
 
-export async function listLibraryExams(
-  db: Firestore,
-  teacherEmail: string
-): Promise<ExamLibraryItem[]> {
-  const q = query(
-    collection(db, COLLECTION),
-    where("teacherEmail", "==", teacherEmail)
-  );
-  const snap = await getDocs(q);
-  const items: ExamLibraryItem[] = snap.docs.map((d) => ({
-    id: d.id,
-    ...(d.data() as Omit<ExamLibraryItem, "id">),
-  }));
-  // Client-side sort (avoids composite index): newest first
+export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
+  const items = readAll(teacherEmail);
   items.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
   return items;
 }
 
-export async function saveLibraryExam(
-  db: Firestore,
-  item: NewLibraryExam
-): Promise<string> {
+export async function saveLibraryExam(item: NewLibraryExam): Promise<string> {
   const now = new Date().toISOString();
-  const ref = await addDoc(collection(db, COLLECTION), {
-    ...item,
-    createdAt: now,
-    updatedAt: now,
-  });
-  return ref.id;
+  const id = `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const items = readAll(item.teacherEmail);
+  items.unshift({ ...item, id, createdAt: now, updatedAt: now });
+  writeAll(item.teacherEmail, items);
+  return id;
 }
 
-export async function deleteLibraryExam(db: Firestore, id: string): Promise<void> {
-  await deleteDoc(doc(db, COLLECTION, id));
+export async function deleteLibraryExam(teacherEmail: string, id: string): Promise<void> {
+  const items = readAll(teacherEmail).filter((it) => it.id !== id);
+  writeAll(teacherEmail, items);
 }
 
 export function formatLibraryDate(iso: string): string {

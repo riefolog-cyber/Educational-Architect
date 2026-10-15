@@ -468,12 +468,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // ---- Exam library (Firestore): save / load / delete reusable exams ----
+  // ---- Exam library (browser localStorage): save / load / delete reusable exams ----
   const loadLibrary = async () => {
-    if (!dbFirestore || !user?.email) return;
+    if (!user?.email) return;
     setLibraryLoading(true);
     try {
-      const items = await listLibraryExams(dbFirestore, user.email);
+      const items = await listLibraryExams(user.email);
       setLibrary(items);
     } catch (e: any) {
       console.warn("Libreria verifiche non caricata:", e);
@@ -488,7 +488,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   }, [user?.email]);
 
   const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
-    if (!dbFirestore || !user?.email) {
+    if (!user?.email) {
       alert("⚠️ Devi aver effettuato l'accesso come docente per salvare in libreria.");
       return;
     }
@@ -520,7 +520,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         null,
         2
       );
-      await saveLibraryExam(dbFirestore, {
+      await saveLibraryExam({
         teacherEmail: user.email,
         title,
         examType: type,
@@ -529,9 +529,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         questionCount: count,
       });
       await loadLibrary();
-      setLibraryMsg(`✅ "${title}" salvata in libreria (${count} quesiti). La ritrovi qui per riusarla con altre classi.`);
+      setLibraryMsg(`✅ "${title}" salvata in libreria su questo browser (${count} quesiti). La ritrovi qui per riusarla con altre classi.`);
     } catch (e: any) {
-      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "errore di permessi/database"}.`);
+      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "spazio locale esaurito"}.`);
     } finally {
       setLibrarySaving(false);
     }
@@ -545,14 +545,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
-    if (!dbFirestore) return;
+    if (!user?.email) return;
     if (!window.confirm(`Eliminare definitivamente "${item.title}" dalla libreria?`)) return;
     try {
-      await deleteLibraryExam(dbFirestore, item.id);
+      await deleteLibraryExam(user.email, item.id);
       await loadLibrary();
       setLibraryMsg(`🗑️ "${item.title}" eliminata dalla libreria.`);
     } catch (e: any) {
-      setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore di permessi/database"}.`);
+      setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore locale"}.`);
     }
   };
 
@@ -2811,7 +2811,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </button>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-normal">
-                  Riusa una verifica già creata (anche da trascrizione SRT) per altre classi o sessioni di prova: caricala, cambia PIN e scadenza, avvia.
+                  Riusa una verifica già creata (anche da trascrizione SRT) per altre classi o sessioni di prova: caricala, cambia PIN e scadenza, avvia. Salvate in questo browser.
                 </p>
                 {libraryMsg && (
                   <p className="text-[11px] text-amber-100/90 bg-black/30 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
