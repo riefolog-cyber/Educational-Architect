@@ -2236,7 +2236,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-300 leading-normal">
-                  Non hai pronto il file JSON? Genera una verifica completa (Quiz o Workbook) partendo da qualsiasi argomento o testo.
+                  Non hai pronto il file JSON? Genera una verifica completa (Quiz o Workbook) partendo da qualsiasi argomento, testo o trascrizione video (SRT/TXT).
                 </p>
                 <button
                   type="button"
@@ -2244,7 +2244,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   className="w-full py-2 px-3 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.99] text-white font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition-all shadow-md shadow-indigo-600/20 cursor-pointer"
                 >
                   <Sparkles className="w-3.5 h-3.5" />
-                  <span>✨ Crea Verifica con IA (da Argomento)</span>
+                  <span>✨ Crea Verifica con IA (da Argomento o Video)</span>
                 </button>
               </div>
 
