@@ -16,7 +16,7 @@ export interface ParsedTranscript {
 }
 
 /** Max characters forwarded to the AI generator (keeps latency/costs sane). */
-export const MAX_TRANSCRIPT_CHARS = 20000;
+export const MAX_TRANSCRIPT_CHARS = 60000;
 
 const TIMESTAMP_LINE =
   /^\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3}.*$/;
@@ -114,8 +114,8 @@ export function parseTranscriptFile(fileName: string, rawText: string): ParsedTr
     text = text.slice(0, MAX_TRANSCRIPT_CHARS).trim();
     truncated = true;
     notice =
-      `Trascrizione molto lunga: inviati all'IA i primi ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri. ` +
-      `Per coprire anche la parte finale, dividi il file in due parti e genera due verifiche.`;
+      `Trascrizione molto lunga (oltre un'ora di parlato): inviati all'IA i primi ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri in un unico test. ` +
+      `Se il file è ancora più lungo, dividi la parte eccedente in un secondo file per una seconda verifica.`;
   }
   if (!text) {
     notice =

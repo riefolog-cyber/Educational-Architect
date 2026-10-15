@@ -1375,7 +1375,7 @@ REGOLE ESSENZIALI:
 
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
-      contents: `Argomento o testo della verifica didattica:\n${topic}`,
+      contents: `Argomento o testo della verifica didattica:\n${topic}${topic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}`,
       config: {
         systemInstruction: promptSystem,
         temperature: 0.2,

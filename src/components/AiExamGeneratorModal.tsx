@@ -486,7 +486,7 @@ export default function AiExamGeneratorModal({
                 {isLoading ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>Elaborazione didattica in corso...</span>
+                    <span>{topic.trim().length > 15000 ? "Testo lungo: elaborazione in corso, può richiedere qualche minuto..." : "Elaborazione didattica in corso..."}</span>
                   </>
                 ) : (
                   <>
