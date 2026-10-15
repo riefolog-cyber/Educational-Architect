@@ -64,12 +64,20 @@ import {
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
 import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade } from "../utils";
-import { 
-  autoCorrectExamJSON, 
-  canAutoCorrectStructure, 
-  tolerantJsonParse, 
-  ExamCorrectionResult 
+import {
+  autoCorrectExamJSON,
+  canAutoCorrectStructure,
+  tolerantJsonParse,
+  ExamCorrectionResult
 } from "../utils/examStructureRepair";
+import {
+  listLibraryExams,
+  saveLibraryExam,
+  deleteLibraryExam,
+  countLibraryQuestions,
+  formatLibraryDate,
+  ExamLibraryItem
+} from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
 import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
 import PrintableReportModal from "./PrintableReportModal";
@@ -172,6 +180,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [pinStatus, setPinStatus] = useState("");
   const [autoCorrectionNotice, setAutoCorrectionNotice] = useState<ExamCorrectionResult | null>(null);
   const [canAutoRepair, setCanAutoRepair] = useState<boolean>(false);
+
+  // Exam library (saved exams reusable across classes/sessions)
+  const [library, setLibrary] = useState<ExamLibraryItem[]>([]);
+  const [libraryLoading, setLibraryLoading] = useState(false);
+  const [librarySaving, setLibrarySaving] = useState(false);
+  const [libraryMsg, setLibraryMsg] = useState<string | null>(null);
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -451,6 +465,94 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         alert(`⚠️ Correzione automatica non riuscita: ${result.summaryNotice}`);
       }
       return false;
+    }
+  };
+
+  // ---- Exam library (Firestore): save / load / delete reusable exams ----
+  const loadLibrary = async () => {
+    if (!dbFirestore || !user?.email) return;
+    setLibraryLoading(true);
+    try {
+      const items = await listLibraryExams(dbFirestore, user.email);
+      setLibrary(items);
+    } catch (e: any) {
+      console.warn("Libreria verifiche non caricata:", e);
+    } finally {
+      setLibraryLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    loadLibrary();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [user?.email]);
+
+  const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
+    if (!dbFirestore || !user?.email) {
+      alert("⚠️ Devi aver effettuato l'accesso come docente per salvare in libreria.");
+      return;
+    }
+    const raw = (jsonOverride ?? jsonText).trim();
+    const title = (titleOverride ?? materia).trim() || "Verifica senza titolo";
+    if (!raw) {
+      alert("⚠️ Niente da salvare: l'editor è vuoto.");
+      return;
+    }
+    let parsed: any = null;
+    try {
+      parsed = tolerantJsonParse(raw);
+    } catch (e: any) {
+      alert(`⚠️ JSON non valido, impossibile salvare in libreria: ${e.message}`);
+      return;
+    }
+    if (!parsed || typeof parsed !== "object") {
+      alert("⚠️ Il contenuto non è un esame valido.");
+      return;
+    }
+    setLibrarySaving(true);
+    setLibraryMsg(null);
+    try {
+      const { type, count } = countLibraryQuestions(parsed);
+      const formatted = JSON.stringify(
+        parsed.sections
+          ? { title: parsed.title || title, sections: parsed.sections }
+          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [] },
+        null,
+        2
+      );
+      await saveLibraryExam(dbFirestore, {
+        teacherEmail: user.email,
+        title,
+        examType: type,
+        examJson: formatted,
+        source,
+        questionCount: count,
+      });
+      await loadLibrary();
+      setLibraryMsg(`✅ "${title}" salvata in libreria (${count} quesiti). La ritrovi qui per riusarla con altre classi.`);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "errore di permessi/database"}.`);
+    } finally {
+      setLibrarySaving(false);
+    }
+  };
+
+  const handleLoadLibraryItem = (item: ExamLibraryItem) => {
+    setJsonText(item.examJson);
+    if (item.title) setMateria(item.title);
+    validateExamJSON(item.examJson);
+    setLibraryMsg(`📥 "${item.title}" caricata nell'editor: imposta PIN e scadenza e premi Avvia Sessione Live.`);
+  };
+
+  const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
+    if (!dbFirestore) return;
+    if (!window.confirm(`Eliminare definitivamente "${item.title}" dalla libreria?`)) return;
+    try {
+      await deleteLibraryExam(dbFirestore, item.id);
+      await loadLibrary();
+      setLibraryMsg(`🗑️ "${item.title}" eliminata dalla libreria.`);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore di permessi/database"}.`);
     }
   };
 
@@ -2253,15 +2355,27 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   <label className="uppercase font-bold text-slate-500 text-[10px]">Carica File JSON Esame</label>
                   <div className="flex items-center gap-3">
                     {jsonText.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleAutoCorrect(true)}
-                        title="Verifica e correggi automaticamente la struttura del file JSON"
-                        className="text-[10px] text-amber-400 hover:text-amber-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
-                      >
-                        <Wand2 className="w-3 h-3" />
-                        <span>Correggi Struttura</span>
-                      </button>
+                      <>
+                        <button
+                          type="button"
+                          onClick={() => handleSaveToLibrary("Editor")}
+                          disabled={librarySaving}
+                          title="Salva questa verifica nella libreria per riusarla con altre classi"
+                          className="text-[10px] text-emerald-400 hover:text-emerald-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50"
+                        >
+                          <PlusCircle className="w-3 h-3" />
+                          <span>{librarySaving ? "Salvataggio..." : "Salva in libreria"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => handleAutoCorrect(true)}
+                          title="Verifica e correggi automaticamente la struttura del file JSON"
+                          className="text-[10px] text-amber-400 hover:text-amber-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <Wand2 className="w-3 h-3" />
+                          <span>Correggi Struttura</span>
+                        </button>
+                      </>
                     )}
                     <label className="cursor-pointer text-[10px] text-teal-400 hover:underline">
                       Sfoglia...
@@ -2675,6 +2789,86 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         </pre>
                       </div>
                     )}
+                  </div>
+                )}
+              </div>
+
+              {/* Exam library: saved exams reusable across classes/sessions */}
+              <div className="p-3.5 bg-amber-950/30 border border-amber-500/25 rounded-2xl space-y-2.5">
+                <div className="flex items-center justify-between gap-2">
+                  <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
+                    <BookOpen className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Libreria verifiche salvate ({library.length})</span>
+                  </span>
+                  <button
+                    type="button"
+                    onClick={loadLibrary}
+                    disabled={libraryLoading}
+                    title="Ricarica libreria"
+                    className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50"
+                  >
+                    <RefreshCw className={`w-3.5 h-3.5 ${libraryLoading ? "animate-spin" : ""}`} />
+                  </button>
+                </div>
+                <p className="text-[10px] text-slate-400 leading-normal">
+                  Riusa una verifica già creata (anche da trascrizione SRT) per altre classi o sessioni di prova: caricala, cambia PIN e scadenza, avvia.
+                </p>
+                {libraryMsg && (
+                  <p className="text-[11px] text-amber-100/90 bg-black/30 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
+                    {libraryMsg}
+                  </p>
+                )}
+                {libraryLoading ? (
+                  <p className="text-[11px] text-slate-400">Caricamento libreria...</p>
+                ) : library.length === 0 ? (
+                  <p className="text-[11px] text-slate-500 italic">
+                    Ancora vuota: genera una verifica con l'IA o premi "Salva in libreria" nell'editor.
+                  </p>
+                ) : (
+                  <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
+                    {library.map((item) => (
+                      <div
+                        key={item.id}
+                        className="p-2.5 bg-slate-950/60 border border-white/10 rounded-xl space-y-1.5"
+                      >
+                        <div className="flex items-start justify-between gap-2">
+                          <div className="min-w-0">
+                            <p className="text-xs font-bold text-white truncate">{item.title}</p>
+                            <p className="text-[10px] text-slate-400 font-mono">
+                              {item.examType} • {item.questionCount} quesiti • {formatLibraryDate(item.updatedAt)}
+                            </p>
+                            {item.source && (
+                              <p className="text-[10px] text-slate-500 italic">Origine: {item.source}</p>
+                            )}
+                          </div>
+                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0 ${
+                            item.examType === "Workbook"
+                              ? "bg-teal-500/15 text-teal-300 border-teal-500/30"
+                              : "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
+                          }`}>
+                            {item.examType === "Workbook" ? "Workbook" : "Quiz"}
+                          </span>
+                        </div>
+                        <div className="flex items-center gap-1.5">
+                          <button
+                            type="button"
+                            onClick={() => handleLoadLibraryItem(item)}
+                            className="flex-1 py-1.5 px-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 font-bold text-[11px] rounded-lg flex items-center justify-center gap-1 cursor-pointer transition-colors"
+                          >
+                            <Check className="w-3.5 h-3.5" />
+                            <span>Carica</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleDeleteLibraryItem(item)}
+                            title={`Elimina "${item.title}" dalla libreria`}
+                            className="p-1.5 text-slate-500 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
@@ -4435,6 +4629,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           setJsonText(generatedJson);
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
+          // Keep a history copy so it can be reused for other classes
+          handleSaveToLibrary("Generatore IA", generatedJson, newTitle);
         }}
       />
 
