@@ -31,6 +31,16 @@ const RELIABLE_FALLBACK_MODELS = [
   "gemini-3.8-flash"
 ];
 
+// Per-attempt timeout so a hung upstream request can never trap a queue
+// worker forever (would leak 1 of 5 slots until restart).
+const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
+  Promise.race([
+    p,
+    new Promise<T>((_, reject) =>
+      setTimeout(() => reject(new Error(`Timeout IA (${ms / 1000}s): risposta non arrivata in tempo dal modello.`)), ms)
+    ),
+  ]);
+
 // Robust Generate Content Wrapper for Handling Availability issues
 async function generateWithRetry(options: any, maxRetries = 6) {
   let currentOptions = { ...options };
@@ -39,7 +49,10 @@ async function generateWithRetry(options: any, maxRetries = 6) {
 
   for (let i = 0; i < maxRetries; i++) {
     try {
-      const resp = await getAiClient().models.generateContent(currentOptions);
+      const resp = await withAttemptTimeout(
+        getAiClient().models.generateContent(currentOptions),
+        110000
+      );
       return resp;
     } catch (err: any) {
       const errStr = (err.message || "").toLowerCase();
@@ -59,7 +72,9 @@ async function generateWithRetry(options: any, maxRetries = 6) {
                           errStr.includes("quota") ||
                           errStr.includes("resource exhausted") ||
                           errStr.includes("resource_exhausted") ||
-                          errStr.includes("rate limit") ||
+                           errStr.includes("rate limit") ||
+                           errStr.includes("timeout") ||
+                           errStr.includes("timed out") ||
                           errStringified.includes("503") ||
                           errStringified.includes("429") ||
                           errStringified.includes("resource_exhausted") ||

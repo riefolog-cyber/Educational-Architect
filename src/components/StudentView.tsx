@@ -922,14 +922,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let finalEval: Evaluation;
       let isFirstPoll = true;
       let pollAttempts = 0;
-      const MAX_POLL_ATTEMPTS = 160; // Max ~2 minutes polling timeout
+      const MAX_POLL_ATTEMPTS = 320; // Max ~4 minutes polling timeout
       let currentJobId = jobId;
       let reenqueues = 0;
       const MAX_REENQUEUES = 3; // Survive server restarts transparently
       while (true) {
         pollAttempts++;
         if (pollAttempts > MAX_POLL_ATTEMPTS) {
-          throw new Error("Il tempo di attesa per la correzione è scaduto (timeout di 2 minuti). Le tue risposte sono state salvate nella bozza locale: puoi riprovare a consegnare.");
+          throw new Error("Il tempo di attesa per la correzione è scaduto (timeout di 4 minuti). Le tue risposte sono state salvate nella bozza locale: puoi riprovare a consegnare.");
         }
 
         if (!isFirstPoll) {
@@ -1058,6 +1058,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     } catch (err: any) {
       console.error("Polling evaluation failed:", err);
       alert(`Poller ripristinato: ${err.message}.\n\nSe i server dell'IA sono momentaneamente carichi, prova a ricaricare la pagina tra un minuto per riprendere la correzione automaticamente!`);
+      // Don't strand the student on the spinner: back to self-assessment
+      // with all answers intact so they can submit again immediately.
+      setActiveScreen("self-assessment");
     } finally {
       setIsSubmitting(false);
     }
