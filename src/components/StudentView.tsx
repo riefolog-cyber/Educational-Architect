@@ -913,7 +913,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   // OPTIMIZATION 3: Poll evaluation queue and save final results permanently on completion
-  const pollJobStatusAndSave = async (jobId: string, rescue: any) => {
+  const pollJobStatusAndSave = async (jobId: string, rescue: any, isBackgroundResume = false) => {
     try {
       setIsSubmitting(true);
       setActiveScreen("evaluating");
@@ -967,6 +967,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             }
           }
           if (statusResp.status === 404) {
+            // Legacy rescue without payload (saved by an older app version):
+            // the job is gone for good — drop the stale token so refreshes
+            // stop re-polling it. Answers remain safe in the per-PIN draft.
+            if (!rescue.payload && rescue.jobId === currentJobId) {
+              try { localStorage.removeItem("active_eval_rescue"); } catch {}
+            }
             throw new Error("La sessione di correzione sul server è scaduta o il server è stato riavviato. Riprova a consegnare.");
           }
           throw new Error(`Errore di rete durante la verifica dello stato (HTTP ${statusResp.status}).`);
@@ -1057,6 +1063,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     } catch (err: any) {
       console.error("Polling evaluation failed:", err);
+      if (isBackgroundResume) {
+        // Background resume of a dead session on page load: don't scare the
+        // user with an alert — just go home. Drafts are intact for resubmit.
+        setActiveScreen("enter-pin");
+        return;
+      }
       alert(`Poller ripristinato: ${err.message}.\n\nSe i server dell'IA sono momentaneamente carichi, prova a ricaricare la pagina tra un minuto per riprendere la correzione automaticamente!`);
       // Don't strand the student on the spinner: back to self-assessment
       // with all answers intact so they can submit again immediately.
@@ -1073,6 +1085,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       try {
         const data = JSON.parse(rescued);
         if (data && data.jobId) {
+          // Discard ancient rescue tokens: their server-side job is long gone
+          // (each Render restart wipes the in-memory queue).
+          const ageMs = Date.now() - (data.savedAt || 0);
+          if (!data.savedAt || ageMs > 30 * 60 * 1000) {
+            console.log("[Rescue Engine] Discarding stale rescue token, jobId:", data.jobId);
+            localStorage.removeItem("active_eval_rescue");
+            return;
+          }
           console.log("[Rescue Engine] Auto-resuming crashed/reloaded evaluation session for jobId:", data.jobId);
           setSessionPin(data.sessionPin || "");
           setSessionRunId(data.sessionRunId || "");
@@ -1087,7 +1107,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setActiveScreen("evaluating");
           setIsSubmitting(true);
           
-          pollJobStatusAndSave(data.jobId, data);
+          pollJobStatusAndSave(data.jobId, data, true);
         }
       } catch (err) {
         console.error("[Rescue Engine] Failed to restore rescue session:", err);
@@ -1260,6 +1280,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const rescuePayload = {
         jobId,
         payload,
+        savedAt: Date.now(),
         sessionPin,
         sessionRunId,
         examTitle: examData?.title || "",
