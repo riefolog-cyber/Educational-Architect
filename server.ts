@@ -41,11 +41,57 @@ const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
     ),
   ]);
 
+// Automatic per-task model selection: ordered preference per task type.
+// The wrapper tries the first model and automatically falls through the
+// list on overload/quota/timeout — or when a model is unavailable (404) —
+// then through the global reliable cascade. To retune, just reorder these
+// lists: no other code changes needed.
+const TASK_MODEL_PREFERENCE: Record<string, string[]> = {
+  // Long structured generation: most capable flash model first
+  "generate-exam": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  // Grading: fast deterministic models
+  "evaluate": ["gemini-3.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite"],
+  // Analysis / extension: light tasks, lite models first
+  "analyze-exam": ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"],
+  "extend-exam": ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"],
+  // Free prose: balanced default
+  "recovery-plan": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+};
+
 // Robust Generate Content Wrapper for Handling Availability issues
 async function generateWithRetry(options: any, maxRetries = 6) {
+  // Build ordered candidate list: caller preference first, then global cascade
+  const taskModels: string[] = Array.isArray(options.models) && options.models.length > 0
+    ? [...options.models]
+    : (options.model ? [options.model] : []);
+  for (const m of RELIABLE_FALLBACK_MODELS) {
+    if (!taskModels.includes(m)) taskModels.push(m);
+  }
+  const onModelUsed = typeof options.onModelUsed === "function" ? options.onModelUsed : null;
+
   let currentOptions = { ...options };
-  const triedModels = new Set<string>();
-  if (currentOptions.model) triedModels.add(currentOptions.model);
+  delete currentOptions.models;
+  delete currentOptions.onModelUsed;
+  if (!taskModels[0]) {
+    throw new Error("Nessun modello IA configurato per questo task.");
+  }
+  currentOptions.model = taskModels[0];
+  const triedModels = new Set<string>([currentOptions.model]);
+
+  const switchToNextModel = (reason: string): boolean => {
+    const nextModel = taskModels.find(m => !triedModels.has(m));
+    if (!nextModel) return false;
+    console.log(`[Gemini Fallback] Switching model from '${currentOptions.model}' to '${nextModel}' due to ${reason}.`);
+    currentOptions.model = nextModel;
+    triedModels.add(nextModel);
+    if (currentOptions.config) {
+      currentOptions.config = { ...currentOptions.config };
+      if (currentOptions.config.thinkingConfig) {
+        delete currentOptions.config.thinkingConfig;
+      }
+    }
+    return true;
+  };
 
   for (let i = 0; i < maxRetries; i++) {
     try {
@@ -53,6 +99,9 @@ async function generateWithRetry(options: any, maxRetries = 6) {
         getAiClient().models.generateContent(currentOptions),
         110000
       );
+      if (onModelUsed) {
+        try { onModelUsed(currentOptions.model); } catch {}
+      }
       return resp;
     } catch (err: any) {
       const errStr = (err.message || "").toLowerCase();
@@ -85,19 +134,22 @@ async function generateWithRetry(options: any, maxRetries = 6) {
 
       console.warn(`[Gemini Try ${i+1}/${maxRetries} Failed on model '${currentOptions.model}']:`, err.message);
 
+      const errStatus = err.status ?? err.statusCode ?? err.code;
+      const isModelMissing = errStatus === 404 ||
+        (/not[ -]?found/.test(errStr) && errStr.includes("model")) ||
+        (/model[^.]{0,40}not (found|supported|available)/.test(errStr));
+
+      if (isModelMissing) {
+        // Retired/unknown model name: fail over immediately, no backoff
+        if (switchToNextModel("model unavailable (404)")) {
+          continue;
+        }
+        throw new Error(err.message || "Modello IA non disponibile.");
+      }
+
       if (isRetryable) {
-        // Fast fallback to another reliable model in the cascade
-        const nextModel = RELIABLE_FALLBACK_MODELS.find(m => !triedModels.has(m));
-        if (nextModel) {
-          console.log(`[Gemini Fallback] Switching model from '${currentOptions.model}' to '${nextModel}' due to 503/429/quota.`);
-          currentOptions.model = nextModel;
-          triedModels.add(nextModel);
-          if (currentOptions.config) {
-            currentOptions.config = { ...currentOptions.config };
-            if (currentOptions.config.thinkingConfig) {
-              delete currentOptions.config.thinkingConfig;
-            }
-          }
+        // Fast fallback to the next model in the task preference cascade
+        if (switchToNextModel("503/429/quota/timeout")) {
           // Immediate retry on the alternate model
           continue;
         }
@@ -573,6 +625,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
 
       const response = await generateWithRetry({
         model: "gemini-3.5-flash",
+        models: TASK_MODEL_PREFERENCE["evaluate"],
         contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
         config: {
           systemInstruction,
@@ -633,6 +686,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
 
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
+      models: TASK_MODEL_PREFERENCE["evaluate"],
       contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
       config: {
         systemInstruction,
@@ -695,6 +749,7 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
 
       const response = await generateWithRetry({
         model: "gemini-3.5-flash",
+        models: TASK_MODEL_PREFERENCE["evaluate"],
         contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
         config: {
           systemInstruction,
@@ -753,6 +808,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
 
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
+      models: TASK_MODEL_PREFERENCE["evaluate"],
       contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
       config: {
         systemInstruction,
@@ -974,6 +1030,7 @@ Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
 
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
+      models: TASK_MODEL_PREFERENCE["recovery-plan"],
       contents: prompt,
       config: {
         temperature: 0.7,
@@ -1031,6 +1088,7 @@ app.all("/api/analyze-exam", async (req, res) => {
 
     const response = await generateWithRetry({
       model: "gemini-3.1-flash-lite",
+      models: TASK_MODEL_PREFERENCE["analyze-exam"],
       contents: promptContents,
       config: {
         systemInstruction: `Sei un esperto accademico e consulente senior di psicometria, progettazione didattica, docimologia scolastica e valutazione formativa della scuola media superiore italiana.
@@ -1172,6 +1230,7 @@ app.all("/api/extend-exam-json", async (req, res) => {
 
     const response = await generateWithRetry({
       model: "gemini-3.1-flash-lite",
+      models: TASK_MODEL_PREFERENCE["extend-exam"],
       contents: `Esame attuale (JSON caricato dal docente):\n${examJson}\n\nCosa aggiungere all'esame:\n${instruction.trim()}\nTipo di contenuto preferito: ${additionType || "automatico/misto"}`,
       config: {
         systemInstruction: `Sei un esperto docente e progettista didattico per la scuola secondaria di secondo grado italiana.
@@ -1388,8 +1447,11 @@ REGOLE ESSENZIALI:
 3. Genera solo JSON valido conforme.`;
     }
 
+    let modelUsed = TASK_MODEL_PREFERENCE["generate-exam"][0];
     const response = await generateWithRetry({
-      model: "gemini-3.5-flash",
+      model: TASK_MODEL_PREFERENCE["generate-exam"][0],
+      models: TASK_MODEL_PREFERENCE["generate-exam"],
+      onModelUsed: (m: string) => { modelUsed = m; },
       contents: `Argomento o testo della verifica didattica:\n${topic}${topic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}`,
       config: {
         systemInstruction: promptSystem,
@@ -1421,6 +1483,7 @@ REGOLE ESSENZIALI:
       examType: isWorkbook ? "workbook" : "quiz",
       recommendedDurationMinutes: generatedData.recommendedDurationMinutes || 45,
       summaryDescription: generatedData.summaryDescription || "",
+      modelUsed,
       examObj: JSON.parse(formattedJson),
       formattedJson
     });

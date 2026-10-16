@@ -36,6 +36,7 @@ export default function AiExamGeneratorModal({
     formattedJson: string;
     recommendedDurationMinutes: number;
     summaryDescription: string;
+    modelUsed?: string;
     examObj: any;
   } | null>(null);
 
@@ -136,6 +137,7 @@ export default function AiExamGeneratorModal({
         formattedJson: data.formattedJson,
         recommendedDurationMinutes: data.recommendedDurationMinutes || 45,
         summaryDescription: data.summaryDescription || "",
+        modelUsed: data.modelUsed || "",
         examObj: data.examObj
       });
     } catch (err: any) {
@@ -165,7 +167,7 @@ export default function AiExamGeneratorModal({
               <h3 className="text-base font-bold text-white flex items-center gap-2">
                 <span>Generatore Verifiche Assistito da IA</span>
                 <span className="text-[10px] uppercase font-bold tracking-wider px-2 py-0.5 rounded-full bg-indigo-500/20 text-indigo-300 border border-indigo-500/30">
-                  Gemini 3.5 Flash
+                  Selezione automatica
                 </span>
               </h3>
               <p className="text-xs text-slate-400">
@@ -430,6 +432,11 @@ export default function AiExamGeneratorModal({
                   <p className="text-slate-400 text-[11px]">
                     Tempo consigliato per gli studenti: ~{generatedResult.recommendedDurationMinutes} minuti.
                     {generatedResult.summaryDescription && ` ${generatedResult.summaryDescription}`}
+                    {generatedResult.modelUsed && (
+                      <span className="block mt-1 font-mono text-[10px] text-indigo-300/80">
+                        Modello utilizzato: {generatedResult.modelUsed}
+                      </span>
+                    )}
                   </p>
                 </div>
               </div>

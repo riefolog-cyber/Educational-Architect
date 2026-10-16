@@ -2334,7 +2334,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     <span>Creazione Assistita da IA</span>
                   </span>
                   <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-500/30">
-                    Gemini 3.5 Flash
+                    Modello automatico
                   </span>
                 </div>
                 <p className="text-[11px] text-slate-300 leading-normal">
