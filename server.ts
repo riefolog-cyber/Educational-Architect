@@ -723,7 +723,13 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
     const evaluation = parseJsonResponse(responseText);
-    const oeScores = (evaluation.openEndedDetails || []).map((item: any) => Number(item.score) || 0);
+    // Teacher-like guard: per-question scores are whole numbers 0-10.
+    // Clamp rogue model outputs (e.g. 11, -1, 7.5) before averaging.
+    const oeScores = (evaluation.openEndedDetails || []).map((item: any) => {
+      const n = Number(item.score);
+      if (isNaN(n)) return 0;
+      return Math.min(10, Math.max(0, Math.round(n)));
+    });
     evaluation.suggestedGrade = calculateQuizGrade(mcScore, mcCount, oeScores);
     return evaluation;
 
@@ -844,7 +850,11 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
     if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
     const evaluation = parseJsonResponse(responseText);
-    const rqScores = (evaluation.reflectionDetails || []).map((item: any) => Number(item.score) || 0);
+    const rqScores = (evaluation.reflectionDetails || []).map((item: any) => {
+      const n = Number(item.score);
+      if (isNaN(n)) return 0;
+      return Math.min(10, Math.max(0, Math.round(n)));
+    });
     evaluation.suggestedGrade = calculateWorkbookGrade(fibScore, fibCount, rqScores);
     evaluation.fibScore = fibScore;
     return evaluation;

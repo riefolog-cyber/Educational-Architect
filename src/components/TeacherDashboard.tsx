@@ -63,7 +63,7 @@ import {
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect } from "../utils";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
@@ -1132,14 +1132,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           // Pure fill-in-the-blank workbook
           let correctFib = 0;
           fibList.forEach((fib: any) => {
-            const userAns = (ansObj.wbFib?.[fib.id] || "").trim().toLowerCase();
-            const correctAnswers = (fib.answer || "").split(",").map((s: string) => s.trim().toLowerCase());
-            const isCorrect = correctAnswers.some(ans => {
-              if (ans === userAns) return true;
-              if (userAns.length >= 4 && ans.includes(userAns)) return true;
-              return false;
-            });
-            if (isCorrect) correctFib++;
+            // Same teacher-like verdict as live scoring (accents, articles,
+            // small typos tolerated; incomplete terms rejected)
+            if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer)) correctFib++;
           });
 
           if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
@@ -1555,14 +1550,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             fibList.forEach((fib: any, fIdx: number) => {
               const ansDict = ansObj.wbFib?.[fib.id] || {};
               const parts = fib.sentence.split(/\[\.\.\.\]/);
-              const correctAnswers = fib.answer.split(',').map((a: string) => a.trim().toLowerCase());
               
               const textOutputParts: string[] = [];
               parts.forEach((part: string, pIdx: number) => {
                 textOutputParts.push(part);
                 if (pIdx < parts.length - 1) {
                   const val = ansDict[pIdx] || "____";
-                  const isCorrect = correctAnswers.includes(val.trim().toLowerCase());
+                  const isCorrect = isFibAnswerCorrect(val, fib.answer);
                   textOutputParts.push(` [Inserito: ${val} (${isCorrect ? "Corretto" : "Errato"})] `);
                 }
               });
@@ -4608,12 +4602,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         {fibList.map((fib: any, fIdx: number) => {
                                           const ansDict = ansObj.wbFib?.[fib.id] || {};
                                           const parts = fib.sentence.split(/\[\.\.\.\]/);
-                                          const correctAnswers = fib.answer.split(',').map((a: string) => a.trim().toLowerCase());
                                           
                                           const reconstructed = parts.map((part: string, pIdx: number) => {
                                             if (pIdx === parts.length - 1) return <span key={pIdx}>{part}</span>;
                                             const val = ansDict[pIdx] || "";
-                                            const isCorrect = correctAnswers.includes(val.trim().toLowerCase());
+                                            const isCorrect = isFibAnswerCorrect(val, fib.answer);
                                             return (
                                               <span key={pIdx}>
                                                 {part}

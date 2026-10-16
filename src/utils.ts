@@ -282,3 +282,78 @@ export function isAppFullScreen(): boolean {
   );
 }
 
+// ---- Teacher-like fill-in-the-blank grading ----
+// Normalizes a fill-in-the-blank answer the way a human teacher reads it:
+// case, accents, punctuation and leading articles don't change the meaning.
+export function normalizeFibAnswer(raw: string | undefined | null): string {
+  let s = (raw || "").toLowerCase().trim();
+  if (!s) return "";
+  // "l'acqua" -> "acqua" (handle elision before stripping punctuation)
+  s = s.replace(/^l'/, "").replace(/\bl'/g, " ");
+  // Strip accents/diacritics: "città" -> "citta", "perché" -> "perche"
+  s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+  // Remove punctuation but keep letters, digits and spaces
+  s = s.replace(/[^a-z0-9à-ÿ\s]/gi, " ");
+  // Collapse whitespace
+  s = s.replace(/\s+/g, " ").trim();
+  // Drop a single leading article: "il mitocondrio" -> "mitocondrio"
+  s = s.replace(/^(il|lo|la|i|gli|le|un|uno|una)\s+/i, "");
+  return s.trim();
+}
+
+// Small edit-distance helper for typo tolerance ("fotosintesi" vs "fotonsintesi")
+function fibLevenshtein(a: string, b: string): number {
+  if (a === b) return 0;
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = new Array<number>(n + 1);
+  let curr = new Array<number>(n + 1);
+  for (let j = 0; j <= n; j++) prev[j] = j;
+  for (let i = 1; i <= m; i++) {
+    curr[0] = i;
+    for (let j = 1; j <= n; j++) {
+      curr[j] = Math.min(prev[j] + 1, curr[j - 1] + 1, prev[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    }
+    const tmp = prev;
+    prev = curr;
+    curr = tmp;
+  }
+  return prev[n];
+}
+
+function isPureNumericFib(s: string): boolean {
+  return /^[0-9]+(?:[.,][0-9]+)?$/.test(s.trim());
+}
+
+// Teacher-like verdict: exact match after normalization, plus a narrow typo
+// tolerance for genuine words (never for pure numbers like "12" vs "13").
+// NOTE: an incomplete answer ("costituzione" for "costituzione italiana")
+// is NOT correct — a partial word is not the required term.
+export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer: string | undefined | null): boolean {
+  const user = normalizeFibAnswer(userAns);
+  if (!user) return false;
+  // Legacy "," plus "|" and ";" as alternative-answer separators
+  // ("/" is intentionally NOT a separator: it appears in fractions like "1/2")
+  const alternatives = String(fibAnswer || "")
+    .split(/[,|;]/)
+    .map((s) => normalizeFibAnswer(s))
+    .filter((s) => s.length > 0);
+  if (alternatives.length === 0) return false;
+
+  for (const ans of alternatives) {
+    if (user === ans) return true;
+    // Typo tolerance: single slip in a real word (length >= 5), two slips
+    // only for long terms (length >= 9). Numbers must match exactly.
+    if (!isPureNumericFib(user) && !isPureNumericFib(ans)) {
+      const minLen = Math.min(user.length, ans.length);
+      if (minLen >= 5) {
+        const allowed = minLen >= 9 ? 2 : 1;
+        if (fibLevenshtein(user, ans) <= allowed) return true;
+      }
+    }
+  }
+  return false;
+}
+

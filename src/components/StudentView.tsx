@@ -51,14 +51,15 @@ import PrintableReportModal from "./PrintableReportModal";
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SAMPLE_QUIZ, SAMPLE_WORKBOOK } from "../data";
 import { Answers, Behavior, SessionData, Evaluation, Infraction } from "../types";
-import { 
-  formatMarkdown, 
-  detectGibberish, 
-  fetchWithRetry, 
-  detectSplitScreenStatus, 
-  requestAppFullScreen, 
-  isAppFullScreen, 
-  SplitScreenDetection 
+import {
+  formatMarkdown,
+  detectGibberish,
+  fetchWithRetry,
+  detectSplitScreenStatus,
+  requestAppFullScreen,
+  isAppFullScreen,
+  isFibAnswerCorrect,
+  SplitScreenDetection
 } from "../utils";
 
 interface StudentViewProps {
@@ -224,8 +225,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const wakeLockRef = useRef<any>(null);
   // Anti-cheat tuning refs (false-positive guards, see triggerInfraction/checkScreen)
   const lastInfractionAtRef = useRef<Record<string, number>>({});
+  const lastModalAtRef = useRef<number>(0);
+  const [infractionToastMsg, setInfractionToastMsg] = useState<string | null>(null);
   const splitHitsRef = useRef(0);
   const lastOrientationRef = useRef(0);
+
+  // Non-blocking repeat warnings auto-dismiss
+  useEffect(() => {
+    if (!infractionToastMsg) return;
+    const t = setTimeout(() => setInfractionToastMsg(null), 4000);
+    return () => clearTimeout(t);
+  }, [infractionToastMsg]);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const elapsedRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
@@ -534,7 +544,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       uscita_schermo_intero: details || "Attenzione! Sei uscito dalla modalità a schermo intero. La sessione d'esame richiede la visualizzazione a tutto schermo."
     };
 
-    setInfractionModalMsg(messages[type] || "Rilevato comportamento non consentito.");
+    // Invasiveness guard: the full-screen blocking overlay appears at most
+    // once every 30s; repeats become a small auto-dismissing toast so the
+    // student is warned without breaking concentration mid-exam.
+    const fullMsg = messages[type] || "Rilevato comportamento non consentito.";
+    if (Date.now() - (lastModalAtRef.current || 0) > 30000) {
+      lastModalAtRef.current = Date.now();
+      setInfractionToastMsg(null);
+      setInfractionModalMsg(fullMsg);
+    } else {
+      setInfractionToastMsg(fullMsg);
+    }
   };
 
   // Real-time continuous split-screen and multi-window monitoring
@@ -630,6 +650,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         clearTimeout(graceTimer);
         graceTimer = null;
       }
+      // Re-acquire screen wake lock on return (iOS may have dropped it,
+      // letting the display auto-lock mid-exam on the next idle period).
+      try {
+        const nav: any = navigator as any;
+        if (nav && "wakeLock" in nav && !wakeLockRef.current) {
+          nav.wakeLock.request("screen").then((wl: any) => {
+            wakeLockRef.current = wl;
+          }).catch(() => {});
+        }
+      } catch {}
       handleReturn();
     };
 
@@ -685,8 +715,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
 
     const handleContextMenu = (e: MouseEvent) => {
+      // iPhone text editing relies on long-press (cursor loupe, selection):
+      // inside answer fields just block the menu silently, no infraction.
+      const target = e.target as HTMLElement | null;
+      const inField = !!target?.closest?.('input, textarea, [contenteditable="true"]');
       e.preventDefault();
-      triggerInfraction("tasto_destro");
+      if (!inField) {
+        triggerInfraction("tasto_destro");
+      }
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -1201,14 +1237,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         if (sec.fillInTheBlank) {
           sec.fillInTheBlank.forEach((fib: any) => {
             totalFIB++;
-            const userAns = (answers.wbFib[fib.id] || "").trim().toLowerCase();
-            const correctAnswers = (fib.answer || "").split(",").map((s: string) => s.trim().toLowerCase());
-            const isCorrect = correctAnswers.some(ans => {
-              if (ans === userAns) return true;
-              if (userAns.length >= 4 && ans.includes(userAns)) return true;
-              return false;
-            });
-            if (isCorrect) calculatedFIBScore++;
+            // Teacher-like verdict: accents, case, articles and small typos
+            // don't change the meaning; incomplete terms don't count.
+            if (isFibAnswerCorrect(answers.wbFib[fib.id], fib.answer)) calculatedFIBScore++;
           });
         }
       });
@@ -2956,6 +2987,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           >
             Ho Capito, riprendo il test
           </button>
+        </div>
+      )}
+
+      {/* Non-blocking repeat warning toast (see triggerInfraction) */}
+      {infractionToastMsg && (
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[9998] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
+          ⚠️ {infractionToastMsg}
         </div>
       )}
 
