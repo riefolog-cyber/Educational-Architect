@@ -76,6 +76,10 @@ import {
   deleteLibraryExam,
   countLibraryQuestions,
   formatLibraryDate,
+  libraryFilename,
+  downloadTextFile,
+  buildLibraryBackup,
+  parseLibraryBackup,
   ExamLibraryItem
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
@@ -186,6 +190,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [librarySaving, setLibrarySaving] = useState(false);
   const [libraryMsg, setLibraryMsg] = useState<string | null>(null);
+  const libraryImportRef = useRef<HTMLInputElement | null>(null);
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -554,6 +559,51 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     } catch (e: any) {
       setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore locale"}.`);
     }
+  };
+
+  // ---- Exam library export to disk (single exam / full backup) + import ----
+  const handleExportLibraryItem = (item: ExamLibraryItem) => {
+    try {
+      downloadTextFile(libraryFilename(item.title), item.examJson);
+      setLibraryMsg(`💾 "${item.title}" esportata su file: la ritrovi nei Download, pronta da archiviare o ricaricare con Sfoglia.`);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Export non riuscito: ${e.message || "errore browser"}.`);
+    }
+  };
+
+  const handleExportLibraryBackup = () => {
+    if (library.length === 0) {
+      setLibraryMsg("ℹ️ Libreria vuota: niente da esportare.");
+      return;
+    }
+    try {
+      downloadTextFile("libreria-verifiche-backup.json", buildLibraryBackup(library));
+      setLibraryMsg(`💾 Backup di ${library.length} verifiche esportato: importalo con "Ripristina" su un altro PC.`);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Export non riuscito: ${e.message || "errore browser"}.`);
+    }
+  };
+
+  const handleImportLibraryBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file || !user?.email) return;
+    const reader = new FileReader();
+    reader.onload = async (event) => {
+      try {
+        const raw = String(event.target?.result || "");
+        const incoming = parseLibraryBackup(raw, user.email);
+        for (const entry of incoming) {
+          await saveLibraryExam(entry);
+        }
+        await loadLibrary();
+        setLibraryMsg(`📥 Importate ${incoming.length} verifiche dal backup "${file.name}".`);
+      } catch (err: any) {
+        setLibraryMsg(`❌ Import non riuscito: ${err.message || "file non valido"}.`);
+      }
+    };
+    reader.onerror = () => setLibraryMsg("❌ Lettura del file non riuscita.");
+    reader.readAsText(file);
   };
 
   // Upload file helper
@@ -2800,15 +2850,43 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     <BookOpen className="w-3.5 h-3.5 text-amber-400" />
                     <span>Libreria verifiche salvate ({library.length})</span>
                   </span>
-                  <button
-                    type="button"
-                    onClick={loadLibrary}
-                    disabled={libraryLoading}
-                    title="Ricarica libreria"
-                    className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50"
-                  >
-                    <RefreshCw className={`w-3.5 h-3.5 ${libraryLoading ? "animate-spin" : ""}`} />
-                  </button>
+                  <div className="flex items-center gap-1">
+                    <input
+                      ref={libraryImportRef}
+                      type="file"
+                      accept=".json,application/json"
+                      onChange={handleImportLibraryBackup}
+                      className="hidden"
+                    />
+                    <button
+                      type="button"
+                      onClick={handleExportLibraryBackup}
+                      disabled={libraryLoading || library.length === 0}
+                      title="Esporta tutta la libreria in un file di backup"
+                      className="px-2 py-1 text-[10px] font-bold text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 rounded-lg cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1"
+                    >
+                      <Download className="w-3 h-3" />
+                      <span>Backup</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => libraryImportRef.current?.click()}
+                      disabled={libraryLoading}
+                      title="Ripristina un backup esportato da un altro PC"
+                      className="px-2 py-1 text-[10px] font-bold text-teal-300 hover:text-teal-200 bg-teal-500/10 hover:bg-teal-500/20 border border-teal-500/30 rounded-lg cursor-pointer transition-colors disabled:opacity-50"
+                    >
+                      <span>Ripristina</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={loadLibrary}
+                      disabled={libraryLoading}
+                      title="Ricarica libreria"
+                      className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50"
+                    >
+                      <RefreshCw className={`w-3.5 h-3.5 ${libraryLoading ? "animate-spin" : ""}`} />
+                    </button>
+                  </div>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-normal">
                   Riusa una verifica già creata (anche da trascrizione SRT) per altre classi o sessioni di prova: caricala, cambia PIN e scadenza, avvia. Salvate in questo browser.
@@ -2857,6 +2935,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           >
                             <Check className="w-3.5 h-3.5" />
                             <span>Carica</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleExportLibraryItem(item)}
+                            title={`Esporta "${item.title}" su file`}
+                            className="p-1.5 text-slate-500 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg cursor-pointer transition-colors"
+                          >
+                            <Download className="w-3.5 h-3.5" />
                           </button>
                           <button
                             type="button"

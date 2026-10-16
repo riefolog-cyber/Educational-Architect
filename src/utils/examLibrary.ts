@@ -95,8 +95,7 @@ export async function deleteLibraryExam(teacherEmail: string, id: string): Promi
   writeAll(teacherEmail, items);
 }
 
-export function formatLibraryDate(iso: string): string {
-  try {
+export function formatLibraryDate(iso: string): string {  try {
     const d = new Date(iso);
     if (isNaN(d.getTime())) return "";
     return d.toLocaleString("it-IT", {
@@ -109,4 +108,84 @@ export function formatLibraryDate(iso: string): string {
   } catch {
     return "";
   }
+}
+
+/** Safe filename from an exam title. */
+export function libraryFilename(title: string, ext = "json"): string {
+  const base = (title || "verifica")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-zA-Z0-9-_]+/g, "_")
+    .replace(/_+/g, "_")
+    .replace(/^_|_$/g, "")
+    .slice(0, 60) || "verifica";
+  return `${base}.${ext}`;
+}
+
+/** Triggers a browser download of a text file (export to disk). */
+export function downloadTextFile(filename: string, text: string, mime = "application/json"): void {
+  const blob = new Blob([text], { type: `${mime};charset=utf-8` });
+  const url = URL.createObjectURL(blob);
+  try {
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = filename;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 2000);
+  }
+}
+
+/** Full-library backup payload (re-importable on another PC). */
+export function buildLibraryBackup(items: ExamLibraryItem[]): string {
+  return JSON.stringify(
+    {
+      app: "EducationalArchitect",
+      kind: "exam-library-backup",
+      version: 1,
+      exportedAt: new Date().toISOString(),
+      items: items.map(({ id, ...rest }) => rest),
+    },
+    null,
+    2
+  );
+}
+
+function makeImportedId(): string {
+  return `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+}
+
+/** Parses a backup file; throws a human-readable (Italian) error if invalid. */
+export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibraryExam[] {
+  let data: any;
+  try {
+    data = JSON.parse(raw);
+  } catch {
+    throw new Error("Il file non è un JSON valido.");
+  }
+  const arr = Array.isArray(data) ? data : data.items;
+  if (!Array.isArray(arr) || arr.length === 0) {
+    throw new Error("Nessuna verifica trovata nel file di backup.");
+  }
+  return arr.map((it: any, idx: number) => {
+    if (!it || typeof it.examJson !== "string" || !it.examJson.trim()) {
+      throw new Error(`Voce ${idx + 1} del backup senza esame valido.`);
+    }
+    // Validate it's parseable JSON (exam schema checked on load anyway)
+    try {
+      JSON.parse(it.examJson);
+    } catch {
+      throw new Error(`Voce ${idx + 1} ("${it.title || "?"}") con JSON esame non valido.`);
+    }
+    return {
+      teacherEmail,
+      title: String(it.title || `Verifica importata ${idx + 1}`),
+      examType: it.examType === "Workbook" ? "Workbook" : "Quiz",
+      examJson: it.examJson,
+      source: String(it.source || "Backup importato"),
+      questionCount: Number(it.questionCount) || 0,
+    } as NewLibraryExam;
+  });
 }
