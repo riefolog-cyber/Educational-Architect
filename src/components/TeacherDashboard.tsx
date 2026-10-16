@@ -152,12 +152,19 @@ export function parseSubmissionNumericGrade(val: any): number {
   let num = parseFloat(match[1]);
   if (isNaN(num)) return -1;
 
-  if (s.includes("½") || s.toLowerCase().includes("mezzo") || s.toLowerCase().includes("mezza")) {
-    num += 0.5;
-  } else if (s.includes("+")) {
-    num += 0.25;
-  } else if (s.match(/\d\s*-\s*$/) || s.endsWith("-")) {
-    num -= 0.25;
+  // Symbol adjustments (+ / - / ½) apply ONLY to bare notations like "7+",
+  // "8-" or "6½" (e.g. manual teacher overrides). When the grade already
+  // carries its exact decimal — e.g. "6.5 (6½)", "7.8 (8-)" — the number is
+  // complete and must NOT be shifted again.
+  const hasDecimal = match[1].includes(".");
+  if (!hasDecimal) {
+    if (s.includes("½") || s.toLowerCase().includes("mezzo") || s.toLowerCase().includes("mezza")) {
+      num += 0.5;
+    } else if (s.includes("+")) {
+      num += 0.25;
+    } else if (s.match(/\d\s*-\s*$/) || s.endsWith("-")) {
+      num -= 0.25;
+    }
   }
 
   return num;
@@ -1979,13 +1986,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         totalPasteAttempts += s.AntiCopia_IncollaBloccato || 0;
 
         if (s.Voto_Suggerito) {
-          const match = String(s.Voto_Suggerito).match(/(\d+(?:[.,]\d+)?)/);
-          if (match) {
-            const num = parseFloat(match[1].replace(",", "."));
-            if (!isNaN(num) && num >= 1 && num <= 10) {
-              numericGradesSum += num;
-              numericGradesCount++;
-            }
+          // Single source of truth: same parser used for sorting (handles
+          // "7,5 (8-)", "6½", "10 (Eccellente)", bare "7+" notations)
+          const num = parseSubmissionNumericGrade(s.Voto_Suggerito);
+          if (!isNaN(num) && num >= 1 && num <= 10.5) {
+            numericGradesSum += num;
+            numericGradesCount++;
           }
         }
       });
@@ -2133,23 +2139,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         totalViolations += (s.AntiCopia_TabSwitch || 0) + (s.AntiCopia_IncollaBloccato || 0);
 
         if (s.Voto_Suggerito) {
-          const match = String(s.Voto_Suggerito).match(/(\d+(?:[.,]\d+)?)/);
-          if (match) {
-            const num = parseFloat(match[1].replace(",", "."));
-            if (!isNaN(num) && num >= 1 && num <= 10) {
-              numericGradesSum += num;
-              numericGradesCount++;
-              if (num >= 6) passedCount++;
-              else failedCount++;
+          const num = parseSubmissionNumericGrade(s.Voto_Suggerito);
+          if (!isNaN(num) && num >= 1 && num <= 10.5) {
+            numericGradesSum += num;
+            numericGradesCount++;
+            if (num >= 6) passedCount++;
+            else failedCount++;
 
-              if (num > highestNumeric) {
-                highestNumeric = num;
-                highestGradeStr = String(s.Voto_Suggerito);
-              }
-              if (num < lowestNumeric) {
-                lowestNumeric = num;
-                lowestGradeStr = String(s.Voto_Suggerito);
-              }
+            if (num > highestNumeric) {
+              highestNumeric = num;
+              highestGradeStr = String(s.Voto_Suggerito);
+            }
+            if (num < lowestNumeric) {
+              lowestNumeric = num;
+              lowestGradeStr = String(s.Voto_Suggerito);
             }
           }
         }

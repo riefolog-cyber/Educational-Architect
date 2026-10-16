@@ -222,6 +222,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   // Ref for tracking focus/visibility lifecycle
   const wakeLockRef = useRef<any>(null);
+  // Anti-cheat tuning refs (false-positive guards, see triggerInfraction/checkScreen)
+  const lastInfractionAtRef = useRef<Record<string, number>>({});
+  const splitHitsRef = useRef(0);
+  const lastOrientationRef = useRef(0);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const elapsedRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
@@ -492,16 +496,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // Allow logging split screen infractions even right before activating or during start
     if (!isExamActive && type !== "schermo_diviso") return;
 
+    // Time-based dedup: same type within 4s is one episode (ms timestamps,
+    // correct across minute boundaries unlike the old seconds-of-minute check).
+    const nowMs = Date.now();
+    if (nowMs - (lastInfractionAtRef.current[type] || 0) < 4000) return;
+    lastInfractionAtRef.current[type] = nowMs;
+
     const timeStr = new Date().toLocaleTimeString("it-IT");
     const newInfraction: Infraction = { time: timeStr, type, details };
 
     setBehavior(prev => {
-      const isDuplicate = prev.infractionsLog.some(inf => 
-        inf.type === type && 
-        Math.abs(new Date().getSeconds() - parseInt(inf.time.split(":")[2] || "0")) < 2
-      );
-      if (isDuplicate) return prev;
-
       let switches = prev.tabSwitches;
       let pasteVal = prev.pasteAttempts;
       let rightC = prev.rightClicks;
@@ -534,25 +538,51 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   // Real-time continuous split-screen and multi-window monitoring
+  // False-positive guards: a split must persist ~1.8s (3 consecutive checks)
+  // before flagging, and checks are suspended 2s after device rotation.
+  // This ignores transient resize frames during rotation animation on iPhone.
   useEffect(() => {
+    const onOrientation = () => {
+      lastOrientationRef.current = Date.now();
+      splitHitsRef.current = 0;
+    };
+    window.addEventListener("orientationchange", onOrientation);
+
     const checkScreen = () => {
       const status = detectSplitScreenStatus();
       setSplitScreenInfo(status);
 
-      if (isExamActive) {
-        if (status.isSplit) {
+      if (!isExamActive) {
+        setIsSplitScreenBlocked(false);
+        return;
+      }
+      // Rotation grace: intermediate animation frames have odd dimensions
+      if (Date.now() - lastOrientationRef.current < 2000) {
+        return;
+      }
+
+      if (status.isSplit) {
+        splitHitsRef.current += 1;
+        if (splitHitsRef.current === 3) {
+          // First confirmation of a persistent split: single log per episode
           setIsSplitScreenBlocked(true);
           triggerInfraction("schermo_diviso", status.reason);
-        } else {
-          setIsSplitScreenBlocked(false);
+        } else if (splitHitsRef.current > 3) {
+          setIsSplitScreenBlocked(true);
         }
+      } else {
+        splitHitsRef.current = 0;
+        setIsSplitScreenBlocked(false);
       }
     };
 
     checkScreen();
 
+    let resizeTimer: ReturnType<typeof setTimeout> | null = null;
     const handleResize = () => {
-      checkScreen();
+      // Debounced: rotation fires resize bursts; the 600ms interval re-checks anyway
+      if (resizeTimer) clearTimeout(resizeTimer);
+      resizeTimer = setTimeout(checkScreen, 300);
     };
 
     window.addEventListener("resize", handleResize);
@@ -564,10 +594,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const intervalId = setInterval(checkScreen, 600);
 
     return () => {
+      window.removeEventListener("orientationchange", onOrientation);
       window.removeEventListener("resize", handleResize);
       if (window.visualViewport) {
         window.visualViewport.removeEventListener("resize", handleResize);
       }
+      if (resizeTimer) clearTimeout(resizeTimer);
       clearInterval(intervalId);
     };
   }, [isExamActive]);
@@ -576,14 +608,33 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   useEffect(() => {
     if (!isExamActive) return;
 
-    // Visibility & Focus tracking
+    // Visibility & Focus tracking with grace period.
+    // iOS fires blur/hidden for benign transient UI (notification peek, Control
+    // Center, incoming-call banner, Shake-to-Undo sheet, screenshot): only a
+    // loss lasting longer than GRACE_MS counts as leaving the exam.
     let leaveTime: number | null = null;
+    let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    const GRACE_MS = 3000;
 
-    const handleLeave = (reason: string) => {
-      if (!leaveTime) {
+    const scheduleLeave = (reason: string) => {
+      if (leaveTime || graceTimer) return;
+      graceTimer = setTimeout(() => {
+        graceTimer = null;
         leaveTime = Date.now();
         triggerInfraction("abbandono_pagina", reason);
+      }, GRACE_MS);
+    };
+
+    const cancelLeave = () => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
       }
+      handleReturn();
+    };
+
+    const handleLeave = (reason: string) => {
+      scheduleLeave(reason);
     };
 
     const handleReturn = () => {
@@ -608,7 +659,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (document.hidden) {
         handleLeave("Cambio scheda o finestra minimizzata");
       } else {
-        handleReturn();
+        cancelLeave();
       }
     };
 
@@ -618,7 +669,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
 
     const handleWindowFocus = () => {
-      handleReturn();
+      cancelLeave();
     };
 
     // Fullscreen change listener
@@ -666,6 +717,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
 
     return () => {
+      if (graceTimer) {
+        clearTimeout(graceTimer);
+        graceTimer = null;
+      }
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", handleWindowFocus);
@@ -1853,7 +1908,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </li>
               <li className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
-                <span><b>Uscita da schermo intero / Cambio Tab / Perdita Focus</b>: Ogni passaggio ad altre app o tocco su notifiche/finestre esterne archivia una violazione temporale con durata.</span>
+                <span><b>Uscita da schermo intero / Cambio Tab / Perdita Focus</b>: Solo un allontanamento di oltre 3 secondi archivia una violazione con durata. Brevi interruzioni di sistema (notifiche, scuotimento accidentale, rotazione schermo) vengono ignorate.</span>
               </li>
               <li className="flex items-center gap-2">
                 <span className="w-1.5 h-1.5 bg-red-400 rounded-full shrink-0" />
