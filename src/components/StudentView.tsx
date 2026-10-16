@@ -59,6 +59,12 @@ import {
   requestAppFullScreen,
   isAppFullScreen,
   isFibAnswerCorrect,
+  mcWeightedScore,
+  fibWeightedScore,
+  SEVERITY_PRESETS,
+  normalizeSeverityPreset,
+  isAppleMobile,
+  type SeverityPreset,
   SplitScreenDetection
 } from "../utils";
 
@@ -66,6 +72,31 @@ interface StudentViewProps {
   user: any;
   onLogout: () => void;
   onBack?: () => void;
+}
+
+// Didactic meta under a question: key-question weight badge + grading criteria.
+// Shown only when the exam defines them; silent otherwise (legacy exams).
+function QuestionMeta({ q, tone }: { q: any; tone?: "amber" | "teal" }) {
+  if (!q) return null;
+  const weight = Number(q?.weight);
+  const criteria = typeof q?.criteria === "string" ? q.criteria.trim() : "";
+  if (!(weight > 1) && !criteria) return null;
+  const badge =
+    tone === "teal"
+      ? "text-teal-300 border-teal-500/30 bg-teal-500/10"
+      : "text-amber-300 border-amber-500/30 bg-amber-500/10";
+  return (
+    <span className="block mt-1 space-y-1">
+      {weight > 1 && (
+        <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full border ${badge}`}>
+          ★ Domanda fondamentale · peso {weight}
+        </span>
+      )}
+      {criteria && (
+        <span className="block text-[11px] text-slate-400 italic">Criteri di valutazione: {criteria}</span>
+      )}
+    </span>
+  );
 }
 
 export default function StudentView({ user, onLogout, onBack }: StudentViewProps) {
@@ -229,6 +260,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [infractionToastMsg, setInfractionToastMsg] = useState<string | null>(null);
   const splitHitsRef = useRef(0);
   const lastOrientationRef = useRef(0);
+  // Anti-cheat strictness chosen by the teacher at session activation
+  const [severityPreset, setSeverityPreset] = useState<SeverityPreset>("normale");
+  const sev = SEVERITY_PRESETS[severityPreset];
+  // First warning of the session gets a didactic (non-punitive) preamble
+  const firstInfractionShownRef = useRef(false);
 
   // Non-blocking repeat warnings auto-dismiss
   useEffect(() => {
@@ -485,6 +521,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setExpiryTime(sessionData.expiry || null);
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
+          setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
           
           loadDraft(formattedPin);
           setActiveScreen("warning");
@@ -513,6 +550,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     lastInfractionAtRef.current[type] = nowMs;
 
     const timeStr = new Date().toLocaleTimeString("it-IT");
+    // 'abbandono_pagina' is logged pending: severity + counter are decided at
+    // return time from the actual absence duration (brief = avviso lieve).
     const newInfraction: Infraction = { time: timeStr, type, details };
 
     setBehavior(prev => {
@@ -521,10 +560,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let rightC = prev.rightClicks;
       let splitAttempts = prev.splitScreenAttempts || 0;
 
-      if (type === "abbandono_pagina") switches++;
       if (type === "copia_incolla") pasteVal++;
       if (type === "tasto_destro") rightC++;
       if (type === "schermo_diviso" || type === "uscita_schermo_intero") splitAttempts++;
+      if (type !== "abbandono_pagina") {
+        newInfraction.severity = "grave";
+      }
 
       return {
         tabSwitches: switches,
@@ -547,7 +588,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // Invasiveness guard: the full-screen blocking overlay appears at most
     // once every 30s; repeats become a small auto-dismissing toast so the
     // student is warned without breaking concentration mid-exam.
-    const fullMsg = messages[type] || "Rilevato comportamento non consentito.";
+    // The very first warning ever is didactic, not punitive.
+    let fullMsg = messages[type] || "Rilevato comportamento non consentito.";
+    if (!firstInfractionShownRef.current) {
+      firstInfractionShownRef.current = true;
+      fullMsg = `📌 Prima segnalazione (promemoria, niente panico): ${fullMsg}`;
+    }
     if (Date.now() - (lastModalAtRef.current || 0) > 30000) {
       lastModalAtRef.current = Date.now();
       setInfractionToastMsg(null);
@@ -577,17 +623,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         return;
       }
       // Rotation grace: intermediate animation frames have odd dimensions
-      if (Date.now() - lastOrientationRef.current < 2000) {
+      if (Date.now() - lastOrientationRef.current < sev.orientationBlackoutMs) {
         return;
       }
 
       if (status.isSplit) {
         splitHitsRef.current += 1;
-        if (splitHitsRef.current === 3) {
+        if (splitHitsRef.current === sev.splitHitsNeeded) {
           // First confirmation of a persistent split: single log per episode
           setIsSplitScreenBlocked(true);
           triggerInfraction("schermo_diviso", status.reason);
-        } else if (splitHitsRef.current > 3) {
+        } else if (splitHitsRef.current > sev.splitHitsNeeded) {
           setIsSplitScreenBlocked(true);
         }
       } else {
@@ -622,7 +668,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (resizeTimer) clearTimeout(resizeTimer);
       clearInterval(intervalId);
     };
-  }, [isExamActive]);
+  }, [isExamActive, severityPreset]);
 
   // Set up listeners for browser-level cheating during active exam
   useEffect(() => {
@@ -634,7 +680,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // loss lasting longer than GRACE_MS counts as leaving the exam.
     let leaveTime: number | null = null;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
-    const GRACE_MS = 3000;
+    const GRACE_MS = sev.graceMs;
 
     const scheduleLeave = (reason: string) => {
       if (leaveTime || graceTimer) return;
@@ -671,16 +717,28 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (leaveTime) {
         const duration = Math.round((Date.now() - leaveTime) / 1000);
         leaveTime = null;
-        
+
+        // Two-tier severity: brief absences are mild warnings (log only),
+        // longer ones are real violations (counter++).
+        const isGrave = duration >= sev.avvisoMaxSec;
         setBehavior(prev => {
           const logs = [...prev.infractionsLog];
           for (let i = logs.length - 1; i >= 0; i--) {
             if (logs[i].type === "abbandono_pagina" && logs[i].durationSeconds === undefined) {
-              logs[i].durationSeconds = duration;
+              logs[i] = {
+                ...logs[i],
+                durationSeconds: duration,
+                severity: isGrave ? "grave" : "lieve",
+                details: (logs[i].details || "") + (isGrave ? "" : " (avviso lieve: assenza breve, senza penalità contatore)"),
+              };
               break;
             }
           }
-          return { ...prev, infractionsLog: logs };
+          return {
+            ...prev,
+            tabSwitches: isGrave ? prev.tabSwitches + 1 : prev.tabSwitches,
+            infractionsLog: logs,
+          };
         });
       }
     };
@@ -770,7 +828,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         wakeLockRef.current.release().then(() => { wakeLockRef.current = null; });
       }
     };
-  }, [isExamActive]);
+  }, [isExamActive, severityPreset]);
 
   // Exam Countdown clock setup
   useEffect(() => {
@@ -1219,30 +1277,29 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setActiveScreen("evaluating");
     setSavingStatus("Generazione della valutazione tramite IA e registrazione sessione...");
 
-    // Quiz evaluation scores math pre-calculation
+    // Quiz evaluation scores math pre-calculation (count + didactic weights)
     let calculatedMCScore = 0;
+    let mcWeightedCorrect = 0;
+    let mcWeightedTotal = 0;
     if (examType === "quiz" && examData?.multipleChoice) {
-      examData.multipleChoice.forEach((q: any) => {
-        if (answers.mc[q.id] === q.correctIndex) {
-          calculatedMCScore++;
-        }
-      });
+      const mc = mcWeightedScore(examData.multipleChoice, answers.mc);
+      calculatedMCScore = mc.correct;
+      mcWeightedCorrect = mc.weightedCorrect;
+      mcWeightedTotal = mc.weightedTotal;
     }
 
-    // Workbook FIB scores math pre-calculation
+    // Workbook FIB scores math pre-calculation (count + didactic weights)
     let calculatedFIBScore = 0;
     let totalFIB = 0;
+    let fibWeightedCorrect = 0;
+    let fibWeightedTotal = 0;
     if (examType === "workbook" && examData?.sections) {
-      examData.sections.forEach((sec: any) => {
-        if (sec.fillInTheBlank) {
-          sec.fillInTheBlank.forEach((fib: any) => {
-            totalFIB++;
-            // Teacher-like verdict: accents, case, articles and small typos
-            // don't change the meaning; incomplete terms don't count.
-            if (isFibAnswerCorrect(answers.wbFib[fib.id], fib.answer)) calculatedFIBScore++;
-          });
-        }
-      });
+      const allFib = examData.sections.flatMap((sec: any) => sec.fillInTheBlank || []);
+      const fib = fibWeightedScore(allFib, answers.wbFib, isFibAnswerCorrect);
+      calculatedFIBScore = fib.correct;
+      totalFIB = fib.total;
+      fibWeightedCorrect = fib.weightedCorrect;
+      fibWeightedTotal = fib.weightedTotal;
     }
 
     // Creating sanitized payload filtering out gibberish or empty values
@@ -1317,7 +1374,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         punteggioMC: calculatedMCScore,
         punteggioFIB: calculatedFIBScore,
         totaleFIB: totalFIB,
-        autovalutazione: studentSelfGrade
+        autovalutazione: studentSelfGrade,
+        // Didactic weights (only meaningful when the exam uses them;
+        // the server falls back to plain counts otherwise)
+        punteggioMCPesato: mcWeightedCorrect,
+        pesoMCTotale: mcWeightedTotal,
+        punteggioFIBPesato: fibWeightedCorrect,
+        pesoFIBTotale: fibWeightedTotal,
       }
     };
 
@@ -1985,14 +2048,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   <button
                     type="button"
                     onClick={async () => {
-                      await requestAppFullScreen();
+                      // iPhone Safari has no Fullscreen API: just re-check after
+                      // the student closes the other app via the iOS app switcher
+                      if (!isAppleMobile()) await requestAppFullScreen();
                       const next = detectSplitScreenStatus();
                       setSplitScreenInfo(next);
                     }}
                     className="w-full sm:w-auto px-4 py-2 bg-red-600 hover:bg-red-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer active:scale-95"
                   >
                     <Maximize2 className="w-3.5 h-3.5" />
-                    <span>Espandi a Schermo Intero</span>
+                    <span>{isAppleMobile() ? "Ho chiuso l'altra app: ricontrolla" : "Espandi a Schermo Intero"}</span>
                   </button>
                 </div>
               </div>
@@ -2205,6 +2270,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
+                              <QuestionMeta q={q} />
                             </p>
                             <div className="grid grid-cols-1 gap-2.5 pl-2">
                               {q.options.map((opt: string, optIdx: number) => (
@@ -2253,6 +2319,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {((examData?.multipleChoice || []).length) + qIdx + 1}.
                               </span>
                               {q.question}
+                              <QuestionMeta q={q} />
                             </p>
                             <div className="space-y-1.5">
                               <textarea
@@ -2293,6 +2360,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {((examData?.multipleChoice || []).length) + ((examData?.openEnded || []).length) + qIdx + 1}.
                               </span>
                               {q.question}
+                              <QuestionMeta q={q} tone="teal" />
                             </p>
                             <div className="space-y-1.5">
                               <textarea
@@ -2380,6 +2448,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     )}
                                   </React.Fragment>
                                 ))}
+                                <QuestionMeta q={fib} tone="teal" />
                               </div>
                             );
                           })}
@@ -2401,6 +2470,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               <div key={rq.id} className="space-y-2">
                                 <p className="text-xs font-semibold text-slate-300">
                                   {rIdx + 1}. {rq.question}
+                                  <QuestionMeta q={rq} tone="teal" />
                                 </p>
                                 <textarea
                                   value={rqValue}
@@ -2954,7 +3024,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           </div>
           <button
             onClick={async () => {
-              await requestAppFullScreen();
+              if (!isAppleMobile()) await requestAppFullScreen();
               const next = detectSplitScreenStatus();
               setSplitScreenInfo(next);
               if (!next.isSplit) {
@@ -2964,7 +3034,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             className="px-6 py-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer active:scale-95"
           >
             <Maximize2 className="w-4 h-4" />
-            <span>Espandi a Tutto Schermo</span>
+            <span>{isAppleMobile() ? "Ho sistemato: ricontrolla" : "Espandi a Tutto Schermo"}</span>
           </button>
         </div>
       )}

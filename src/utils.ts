@@ -156,6 +156,117 @@ export interface SplitScreenDetection {
   mode?: "vertical" | "horizontal" | "floating";
 }
 
+// ---- Anti-cheat severity presets (chosen by the teacher at session activation) ----
+export type SeverityPreset = "tollerante" | "normale" | "rigido";
+
+export interface SeverityConfig {
+  /** Focus-loss grace before anything is logged (ms) */
+  graceMs: number;
+  /** Absence episodes shorter than this are "avvisi lievi" (logged, no counter) */
+  avvisoMaxSec: number;
+  /** Consecutive positive split checks (~600ms each) required to flag */
+  splitHitsNeeded: number;
+  /** Split checks suspended after device rotation (ms) */
+  orientationBlackoutMs: number;
+}
+
+export const SEVERITY_PRESETS: Record<SeverityPreset, SeverityConfig> = {
+  tollerante: { graceMs: 5000, avvisoMaxSec: 15, splitHitsNeeded: 4, orientationBlackoutMs: 2500 },
+  normale: { graceMs: 3000, avvisoMaxSec: 10, splitHitsNeeded: 3, orientationBlackoutMs: 2000 },
+  rigido: { graceMs: 2000, avvisoMaxSec: 3, splitHitsNeeded: 2, orientationBlackoutMs: 1500 },
+};
+
+export function normalizeSeverityPreset(v: any): SeverityPreset {
+  return v === "tollerante" || v === "rigido" ? v : "normale";
+}
+
+/** Detects iPhone/iPad (no Fullscreen API, aggressive ITP, shake-to-undo blur). */
+export function isAppleMobile(): boolean {
+  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
+  const ua = navigator.userAgent || (navigator as any).vendor || "";
+  if (/iPhone|iPod|iPad/i.test(ua)) return true;
+  return /Macintosh/i.test(ua) && typeof document !== "undefined" && "ontouchend" in document;
+}
+
+// ---- Didactic (weighted) scoring helpers ----
+// Every item defaults to weight 1, so legacy exams behave exactly as before.
+function itemWeight(it: any): number {
+  const w = Number(it?.weight);
+  return isNaN(w) || w <= 0 ? 1 : w;
+}
+
+/** Multiple-choice: count-based + weight-based score in one pass. */
+export function mcWeightedScore(
+  mcList: any[],
+  answersMc: Record<string, number>
+): { correct: number; total: number; weightedCorrect: number; weightedTotal: number } {
+  let correct = 0;
+  let weightedCorrect = 0;
+  let weightedTotal = 0;
+  for (const q of mcList || []) {
+    const w = itemWeight(q);
+    weightedTotal += w;
+    if (answersMc?.[q.id] === q.correctIndex) {
+      correct++;
+      weightedCorrect += w;
+    }
+  }
+  return { correct, total: (mcList || []).length, weightedCorrect, weightedTotal };
+}
+
+/** Fill-in-the-blank: count-based + weight-based score (verdict via isFibAnswerCorrect). */
+export function fibWeightedScore(
+  fibList: any[],
+  answersWbFib: Record<string, string>,
+  isCorrect: (userAns: any, fibAnswer: any) => boolean
+): { correct: number; total: number; weightedCorrect: number; weightedTotal: number } {
+  let correct = 0;
+  let weightedCorrect = 0;
+  let weightedTotal = 0;
+  for (const fib of fibList || []) {
+    const w = itemWeight(fib);
+    weightedTotal += w;
+    if (isCorrect(answersWbFib?.[fib.id], fib.answer)) {
+      correct++;
+      weightedCorrect += w;
+    }
+  }
+  return { correct, total: (fibList || []).length, weightedCorrect, weightedTotal };
+}
+
+/**
+ * Weighted average of per-question 0-10 scores, matched by question id.
+ * Falls back to the plain mean when no weights are present.
+ */
+export function weightedOpenAverage(
+  details: Array<{ questionId?: string; id?: string; score: any }>,
+  questions: any[]
+): number {
+  const list = details || [];
+  if (list.length === 0) return 0;
+  const weightById = new Map<string, number>();
+  for (const q of questions || []) {
+    if (q?.id) weightById.set(String(q.id), itemWeight(q));
+  }
+  let hasCustom = false;
+  for (const w of weightById.values()) {
+    if (w !== 1) { hasCustom = true; break; }
+  }
+  const clamp = (n: number) => (isNaN(n) ? 0 : Math.min(10, Math.max(0, Math.round(n))));
+  if (!hasCustom) {
+    return list.reduce((a, d) => a + clamp(Number(d.score)), 0) / list.length;
+  }
+  let wSum = 0;
+  let total = 0;
+  for (const d of list) {
+    const key = String(d.questionId ?? d.id ?? "");
+    const w = weightById.get(key) ?? 1;
+    wSum += w;
+    total += clamp(Number(d.score)) * w;
+  }
+  return wSum > 0 ? total / wSum : 0;
+}
+
 // Robust split-screen and multi-window detection across mobile (Android/iOS) and desktop
 export function detectSplitScreenStatus(): SplitScreenDetection {
   if (typeof window === "undefined" || typeof screen === "undefined") {

@@ -63,7 +63,7 @@ import {
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission, SessionData } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore } from "../utils";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
@@ -170,6 +170,69 @@ export function parseSubmissionNumericGrade(val: any): number {
   return num;
 }
 
+function parseInfractionClock(t: any): number | null {
+  const m = String(t || "").match(/(\d{1,2}):(\d{2})(?::(\d{2}))?/);
+  if (!m) return null;
+  return (+m[1]) * 3600 + (+m[2]) * 60 + (+(m[3] || 0));
+}
+
+// Structured-part accuracy (MC or FIB, weight-aware) for borderline detection
+function submissionStructuredAccuracy(sub: SavedSubmission): number | null {
+  try {
+    const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
+    const ans = typeof sub.Risposte_Studente === "string" ? JSON.parse(sub.Risposte_Studente) : sub.Risposte_Studente;
+    if (sub.Tipo === "Quiz") {
+      const mcList = domande?.multipleChoice || [];
+      if (mcList.length === 0) return null;
+      const mcs = mcWeightedScore(mcList, ans?.mc || {});
+      return mcs.weightedTotal > 0 ? mcs.weightedCorrect / mcs.weightedTotal : null;
+    }
+    const fibList = (domande?.sections || []).flatMap((s: any) => s.fillInTheBlank || []);
+    if (fibList.length === 0) return null;
+    const fibs = fibWeightedScore(fibList, ans?.wbFib || {}, isFibAnswerCorrect);
+    return fibs.weightedTotal > 0 ? fibs.weightedCorrect / fibs.weightedTotal : null;
+  } catch {
+    return null;
+  }
+}
+
+// Borderline case: math grade in [5.5, 6) but solid structured part (>=70%).
+// The final call belongs to the teacher, never to an automatic bump.
+export function isBorderlineSubmission(sub: SavedSubmission): boolean {
+  const n = parseSubmissionNumericGrade(sub.Voto_Suggerito);
+  if (isNaN(n) || n < 5.5 || n >= 6) return false;
+  const acc = submissionStructuredAccuracy(sub);
+  return acc !== null && acc >= 0.7;
+}
+
+// Suspicious-pattern hint: bursts of 3+ episodes within 2 minutes suggest// real external consultation; isolated brief episodes are physiological
+// (notifications, rotation, shake). Returns a hint string or null.
+export function clusterInfractionsHint(log: any[]): string | null {
+  const times = (log || [])
+    .map((inf) => parseInfractionClock(inf?.time))
+    .filter((t): t is number => t !== null)
+    .sort((a, b) => a - b);
+  if (times.length < 3) return null;
+  let bursts = 0;
+  let maxBurst = 1;
+  let cur = 1;
+  for (let i = 1; i < times.length; i++) {
+    let gap = times[i] - times[i - 1];
+    if (gap < 0) gap += 86400; // midnight wrap
+    if (gap <= 120) {
+      cur++;
+    } else {
+      if (cur >= 3) bursts++;
+      maxBurst = Math.max(maxBurst, cur);
+      cur = 1;
+    }
+  }
+  if (cur >= 3) bursts++;
+  maxBurst = Math.max(maxBurst, cur);
+  if (bursts === 0) return null;
+  return `⚠️ ${maxBurst} episodi ravvicinati${bursts > 1 ? ` in ${bursts} raffiche` : ""}: schema compatibile con consultazione esterna. Episodi isolati e brevi restano fisiologici (notifiche, rotazione schermo).`;
+}
+
 export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps) {
   // Config state
   const backendType = "ai-studio";
@@ -179,6 +242,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
+  // Anti-cheat strictness for this session (read by StudentView at PIN check)
+  const [severityPreset, setSeverityPreset] = useState<string>("normale");
   const [expiryTime, setExpiryTime] = useState(() => {
     const d = new Date();
     d.setHours(d.getHours() + 2);
@@ -250,6 +315,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [showAccessHelpModal, setShowAccessHelpModal] = useState<boolean>(false);
 
   const [selectedSub, setSelectedSub] = useState<SavedSubmission | null>(null);
+  // Manual teacher grade retouch (audit trail via Voto_Originale_IA)
+  const [gradeEditOpen, setGradeEditOpen] = useState(false);
+  const [gradeEditValue, setGradeEditValue] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmDeleteExamKey, setConfirmDeleteExamKey] = useState<string | null>(null);
   const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
@@ -714,6 +782,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       teacherEmail: user?.email || "docente_sandbox@scuola.it",
       backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim(),
       randomizeQuestions,
+      severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
       active: true,
       createdAt: new Date().toISOString()
     };
@@ -759,6 +828,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           teacherId: user?.uid || "mock_teacher",
           data: examObj,
           randomizeQuestions,
+          severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
           active: true,
           createdAt: new Date().toISOString(),
           sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -1108,7 +1178,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
 
           updatedPunteggioMC = correctCount;
-          newGrade = calculateQuizGrade(correctCount, mcList.length, []);
+          // Didactic weights: if the exam marks key questions, the grade
+          // follows the weighted fraction (counts stay as plain display).
+          const mcAnsNorm: Record<string, number> = {};
+          for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
+          const mcs = mcWeightedScore(mcList, mcAnsNorm);
+          newGrade = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0)
+            ? calculateQuizGrade((mcs.weightedCorrect / mcs.weightedTotal) * 10, 10, [])
+            : calculateQuizGrade(correctCount, mcList.length, []);
 
           evalObj.openEndedDetails = [];
           evalObj.suggestedGrade = newGrade;
@@ -1142,7 +1219,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
 
           updatedPunteggioFIB = correctFib;
-          newGrade = calculateWorkbookGrade(correctFib, fibList.length, []);
+          const fibs = fibWeightedScore(fibList, ansObj.wbFib || {}, isFibAnswerCorrect);
+          newGrade = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0)
+            ? calculateWorkbookGrade((fibs.weightedCorrect / fibs.weightedTotal) * 10, 10, [])
+            : calculateWorkbookGrade(correctFib, fibList.length, []);
           evalObj.reflectionDetails = [];
           evalObj.suggestedGrade = newGrade;
           evalObj.overallFeedback = `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
@@ -1181,6 +1261,38 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       alert(`Errore durante il ricalcolo: ${err.message}`);
     } finally {
       setRecalculatingId(null);
+    }
+  };
+
+  // Manual teacher retouch of the suggested grade (borderline cases).
+  // The first retouch preserves the original AI grade for audit trail.
+  const handleManualGrade = async (sub: SavedSubmission) => {
+    if (!dbFirestore) {
+      alert("⚠️ Database scolastico non disponibile.");
+      return;
+    }
+    const num = parseSubmissionNumericGrade(gradeEditValue);
+    if (isNaN(num) || num < 1 || num > 10.5) {
+      alert("⚠️ Inserisci un voto valido (es. 6, 6+, 7½, 8).");
+      return;
+    }
+    try {
+      const formatted = formatItalianScholasticGrade(Math.min(10, num));
+      const payload: any = { Voto_Suggerito: formatted };
+      if (!sub.Voto_Originale_IA) payload.Voto_Originale_IA = sub.Voto_Suggerito;
+      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), payload);
+      const updated = { ...sub, ...payload };
+      setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
+      setSelectedSub(updated);
+      setGradeEditOpen(false);
+      setGradeEditValue("");
+      setDeleteNotify({
+        type: "success",
+        message: `✅ Voto ritoccato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
+      });
+      setTimeout(() => setDeleteNotify(null), 5000);
+    } catch (err: any) {
+      alert(`Errore salvataggio voto: ${err.message}`);
     }
   };
 
@@ -1652,6 +1764,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     latestSubmission: SavedSubmission;
     averageGradeNumber: number | null;
     averageGradeFormatted: string;
+    // Trend: first vs latest numeric grade (needs >= 2 valid grades)
+    trend: { dir: "up" | "down" | "same"; delta: number } | null;
     uniquePins: string[];
     totalTabSwitches: number;
     totalPasteAttempts: number;
@@ -1993,6 +2107,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const averageGradeNumber = numericGradesCount > 0 ? numericGradesSum / numericGradesCount : null;
       const averageGradeFormatted = averageGradeNumber !== null ? formatItalianScholasticGrade(averageGradeNumber) : "N/D";
 
+      // Trend: chronological first vs latest valid grade (>= 0.5 point = movement)
+      let trend: StudentSummary["trend"] = null;
+      {
+        const chrono = [...studentSubs].sort(
+          (a, b) => new Date(a.Timestamp).getTime() - new Date(b.Timestamp).getTime()
+        );
+        const valid = chrono
+          .map((s) => parseSubmissionNumericGrade(s.Voto_Suggerito))
+          .filter((n) => !isNaN(n) && n >= 1 && n <= 10.5);
+        if (valid.length >= 2) {
+          const delta = Math.round((valid[valid.length - 1] - valid[0]) * 10) / 10;
+          trend = {
+            dir: delta >= 0.5 ? "up" : delta <= -0.5 ? "down" : "same",
+            delta,
+          };
+        }
+      }
+
       list.push({
         key,
         name,
@@ -2005,6 +2137,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         latestSubmission: latestSub,
         averageGradeNumber,
         averageGradeFormatted,
+        trend,
         uniquePins: Array.from(pinsSet),
         totalTabSwitches,
         totalPasteAttempts
@@ -2285,6 +2418,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   onChange={(e) => setPin(e.target.value)}
                   className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none uppercase tracking-wider font-bold"
                 />
+              </div>
+
+              <div className="space-y-1">
+                <label className="uppercase font-bold text-slate-500 text-[10px]">Severità Anti-Copia</label>
+                <select
+                  value={severityPreset}
+                  onChange={(e) => setSeverityPreset(e.target.value)}
+                  className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none text-xs font-semibold"
+                >
+                  <option value="tollerante">Tollerante — verifiche formative (grazia 5s, solo assenze lunghe)</option>
+                  <option value="normale">Normale — consigliata (grazia 3s)</option>
+                  <option value="rigido">Rigido — esami finali (grazia 2s)</option>
+                </select>
               </div>
 
               <div className="space-y-2 bg-slate-900/90 p-3.5 rounded-2xl border border-indigo-500/30 shadow-lg">
@@ -3544,6 +3690,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                     <span className="text-[10px] text-slate-400 block">Media Voti</span>
                                     <span className="font-extrabold text-teal-400 text-xs sm:text-sm font-display">
                                       {stu.averageGradeFormatted}
+                                      {stu.trend && stu.trend.dir !== "same" && (
+                                        <span
+                                          title={`Andamento: ${stu.trend.delta > 0 ? "+" : ""}${stu.trend.delta.toFixed(1)} rispetto alla prima prova`}
+                                          className={`ml-1 text-[11px] font-bold ${stu.trend.dir === "up" ? "text-emerald-400" : "text-rose-400"}`}
+                                        >
+                                          {stu.trend.dir === "up" ? "▲" : "▼"}
+                                        </span>
+                                      )}
                                     </span>
                                   </div>
 
@@ -4411,12 +4565,61 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
                   <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">Voto Assegnato dall'A.I.</p>
                   <p className="text-3xl font-display font-bold text-teal-400 mt-1">{selectedSub.Voto_Suggerito}</p>
+                  {selectedSub.Voto_Originale_IA && (
+                    <p className="text-[10px] text-slate-500 mt-1">
+                      Originale IA: {selectedSub.Voto_Originale_IA} (ritoccato dal docente)
+                    </p>
+                  )}
                 </div>
                 <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
                   <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">Autovalutazione Studente</p>
                   <p className="text-3xl font-display font-medium text-indigo-400 mt-1">{selectedSub.Autovalutazione}/10</p>
                 </div>
               </div>
+
+              {isBorderlineSubmission(selectedSub) && (
+                <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-[11px] text-amber-200 leading-relaxed">
+                  ⚠️ <b>Caso limite:</b> la matematica dice 5.5–5.9 ma la parte strutturata è solida (≥70%).
+                  L'arrotondamento non è automatico: la decisione finale spetta a te, docente.
+                </div>
+              )}
+
+              {!gradeEditOpen ? (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setGradeEditValue(selectedSub.Voto_Suggerito || "");
+                    setGradeEditOpen(true);
+                  }}
+                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
+                >
+                  ✏️ Ritocca voto (decisione docente)
+                </button>
+              ) : (
+                <div className="flex items-center gap-2 p-3 bg-slate-950/60 border border-white/10 rounded-xl">
+                  <input
+                    type="text"
+                    value={gradeEditValue}
+                    onChange={(e) => setGradeEditValue(e.target.value)}
+                    placeholder="es. 6, 6+, 7½"
+                    className="flex-1 px-3 py-2 bg-slate-900 border border-white/10 rounded-lg text-white text-sm font-mono outline-none focus:border-amber-400"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => handleManualGrade(selectedSub)}
+                    className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs cursor-pointer transition-colors"
+                  >
+                    Salva
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setGradeEditOpen(false)}
+                    className="px-3 py-2 text-slate-400 hover:text-white text-xs cursor-pointer transition-colors"
+                  >
+                    Annulla
+                  </button>
+                </div>
+              )}
 
               {/* Anticopy statistics */}
               <div className="bg-yellow-500/5 border border-yellow-500/20 p-4 rounded-xl space-y-2">
@@ -4433,7 +4636,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 {selectedSub.AntiCopia_InfractionsLog && (
                   <div className="mt-2 text-[10px] text-slate-400 font-mono">
                     <p className="font-bold uppercase text-yellow-500/80">Cronologia Completa:</p>
-                    <div className="max-h-24 overflow-y-auto mt-1 space-y-1">
+                    {(() => {
+                      try {
+                        const _parsed = JSON.parse(selectedSub.AntiCopia_InfractionsLog);
+                        const _hint = clusterInfractionsHint(Array.isArray(_parsed) ? _parsed : []);
+                        return _hint ? (
+                          <p className="mt-1 p-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-200 text-[10px] font-sans leading-relaxed">
+                            {_hint}
+                          </p>
+                        ) : null;
+                      } catch {
+                        return null;
+                      }
+                    })()}
+                    <div className="max-h-28 overflow-y-auto mt-1 space-y-0 pr-1">
                       {JSON.parse(selectedSub.AntiCopia_InfractionsLog).map((inf: any, idx: number) => {
                         let label = inf.type.replace(/_/g, " ");
                         if (inf.type === "schermo_diviso") label = "Schermo Diviso (Multi-Window)";
@@ -4444,11 +4660,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         else if (inf.type === "tasto_vietato") label = "Scorciatoia / Ispezione";
 
                         return (
-                          <p key={idx}>
-                            • [{inf.time}] <span className="font-bold text-slate-300">{label}</span>
-                            {inf.durationSeconds ? ` (${inf.durationSeconds}s fuori app)` : ""}
-                            {inf.details ? ` - ${inf.details}` : ""}
-                          </p>
+                          <div key={idx} className="flex items-start gap-1.5 py-0.5 border-l-2 border-white/10 pl-2">
+                            <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${
+                              inf.severity === "lieve" ? "bg-amber-400" : inf.severity === "grave" ? "bg-rose-400" : "bg-slate-500"
+                            }`} />
+                            <p>
+                              • [{inf.time}] <span className="font-bold text-slate-300">{label}</span>
+                              {inf.severity === "lieve" && (
+                                <span className="ml-1 px-1 py-px rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold">avviso</span>
+                              )}
+                              {inf.severity === "grave" && (
+                                <span className="ml-1 px-1 py-px rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">violazione</span>
+                              )}
+                              {inf.durationSeconds ? ` (${inf.durationSeconds}s fuori app)` : ""}
+                              {inf.details ? ` - ${inf.details}` : ""}
+                            </p>
+                          </div>
                         );
                       })}
                     </div>

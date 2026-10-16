@@ -12,10 +12,27 @@ export interface ExamCorrectionResult {
 }
 
 /**
+ * Preserves didactic metadata (weight, grading criteria) through
+ * normalization. Weight 1 (default) is omitted to keep JSON lean.
+ */
+function preservedDidacticFields(q: any): { weight?: number; criteria?: string } {
+  const out: { weight?: number; criteria?: string } = {};
+  const w = Number(q?.weight ?? q?.peso);
+  if (!isNaN(w) && w > 0 && w !== 1) out.weight = w;
+  const c =
+    typeof q?.criteria === "string" && q.criteria.trim()
+      ? q.criteria.trim()
+      : typeof q?.criteri === "string" && q.criteri.trim()
+        ? q.criteri.trim()
+        : "";
+  if (c) out.criteria = c;
+  return out;
+}
+
+/**
  * Strips markdown fences, quotes, and common formatting artifacts
  */
-export function cleanRawJsonText(rawText: string): string {
-  if (!rawText) return "";
+export function cleanRawJsonText(rawText: string): string {  if (!rawText) return "";
   // Remove BOM if present
   let text = rawText.replace(/^\uFEFF/, "").trim();
 
@@ -568,6 +585,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
             id: item.id || `fib_${sIdx + 1}_${fIdx + 1}`,
             sentence: item.sentence || item.frase || item.testo || item.prompt || "",
             answer: item.answer || item.risposta || item.soluzione || "",
+            ...preservedDidacticFields(item),
           }))
         : [];
 
@@ -577,6 +595,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
         ? rawRef.map((item: any, rIdx: number) => ({
             id: item.id || `ref_${sIdx + 1}_${rIdx + 1}`,
             question: typeof item === "string" ? item : (item.question || item.domanda || item.testo || item.prompt || ""),
+            ...preservedDidacticFields(item),
           }))
         : [];
 
@@ -755,6 +774,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
         options: optionsArray,
         correctIndex: correctIdx,
         ...(explanation ? { explanation } : {}),
+        ...preservedDidacticFields(q),
       });
       return;
     }
@@ -810,6 +830,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
         options: optionsArray,
         correctIndex: correctIdx,
         ...(explanation ? { explanation } : {}),
+        ...preservedDidacticFields(q),
       });
       return;
     }
@@ -820,6 +841,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       openList.push({
         id: q.id || `q_open_${openList.length + 1}`,
         question: questionText,
+        ...preservedDidacticFields(q),
       });
       return;
     }

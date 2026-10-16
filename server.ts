@@ -537,6 +537,8 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
   return formatItalianScholasticGrade(finalGrade);
 };
 
+import { weightedOpenAverage } from "./src/utils";
+
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
   id: string;
@@ -588,6 +590,16 @@ async function runEvaluationCore(reqBody: any) {
     const oeList = report.domande?.openEnded || [];
     const oeCount = oeList.length;
 
+    // Didactic weights: prefer the client-computed weighted fraction when
+    // available (identical to plain counts when all weights are 1).
+    const mcWScore = Number(report.punteggioMCPesato);
+    const mcWTotal = Number(report.pesoMCTotale);
+    const useWeightedMC = !isNaN(mcWScore) && !isNaN(mcWTotal) && mcWTotal > 0;
+    const gradeMcScore = useWeightedMC
+      ? Math.min(1, Math.max(0, mcWScore / mcWTotal)) * 10
+      : mcScore;
+    const gradeMcCount = useWeightedMC ? 10 : mcCount;
+
     // CASE 1: QUIZ WITH ONLY MULTIPLE CHOICE QUESTIONS (No open-ended questions in exam)
     if (oeCount === 0) {
       const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
@@ -603,7 +615,7 @@ async function runEvaluationCore(reqBody: any) {
         }
       });
 
-      const mathGrade = calculateQuizGrade(mcScore, mcCount, []);
+      const mathGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
 
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova è un Quiz composto ESCLUSIVAMENTE da domande a scelta multipla (crocette). In questo esame NON sono presenti domande aperte.
@@ -687,7 +699,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
       models: TASK_MODEL_PREFERENCE["evaluate"],
-      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
       config: {
         systemInstruction,
         temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
@@ -725,12 +737,12 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const evaluation = parseJsonResponse(responseText);
     // Teacher-like guard: per-question scores are whole numbers 0-10.
     // Clamp rogue model outputs (e.g. 11, -1, 7.5) before averaging.
-    const oeScores = (evaluation.openEndedDetails || []).map((item: any) => {
-      const n = Number(item.score);
-      if (isNaN(n)) return 0;
-      return Math.min(10, Math.max(0, Math.round(n)));
-    });
-    evaluation.suggestedGrade = calculateQuizGrade(mcScore, mcCount, oeScores);
+    // Weighted mean by question weight (plain mean when all weights are 1),
+    // scaled as a single-element array for the grade helper.
+    const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
+    const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
+    const oeScores = hasOeDetails ? [oeMean * 10] : [];
+    evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
     return evaluation;
 
   } else if (normalizedTipo === "workbook") {
@@ -741,9 +753,18 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
     const rqCount = rqList.length;
 
+    // Didactic weights (identical to plain counts when all weights are 1)
+    const fibWScore = Number(report.punteggioFIBPesato);
+    const fibWTotal = Number(report.pesoFIBTotale);
+    const useWeightedFIB = !isNaN(fibWScore) && !isNaN(fibWTotal) && fibWTotal > 0;
+    const gradeFibScore = useWeightedFIB
+      ? Math.min(1, Math.max(0, fibWScore / fibWTotal)) * 10
+      : fibScore;
+    const gradeFibCount = useWeightedFIB ? 10 : fibCount;
+
     // CASE 1: WORKBOOK WITH ONLY FILL-IN-THE-BLANK (No reflection questions)
     if (rqCount === 0) {
-      const mathGrade = formatItalianScholasticGrade(fibCount > 0 ? (fibScore / fibCount) * 10 : 0);
+      const mathGrade = formatItalianScholasticGrade(gradeFibCount > 0 ? (gradeFibScore / gradeFibCount) * 10 : 0);
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova di Workbook è composta ESCLUSIVAMENTE da completamenti terminologici (Fill-in-the-blank / frasi da completare). NON sono presenti domande di riflessione aperta.
 L'alunno ha completato correttamente ${fibScore} frasi su ${fibCount} (voto matematico: ${mathGrade}).
@@ -815,7 +836,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
     const response = await generateWithRetry({
       model: "gemini-3.5-flash",
       models: TASK_MODEL_PREFERENCE["evaluate"],
-      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
       config: {
         systemInstruction,
         temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
@@ -850,12 +871,10 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
     if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
     const evaluation = parseJsonResponse(responseText);
-    const rqScores = (evaluation.reflectionDetails || []).map((item: any) => {
-      const n = Number(item.score);
-      if (isNaN(n)) return 0;
-      return Math.min(10, Math.max(0, Math.round(n)));
-    });
-    evaluation.suggestedGrade = calculateWorkbookGrade(fibScore, fibCount, rqScores);
+    const hasRqDetails = (evaluation.reflectionDetails || []).length > 0;
+    const rqMean = hasRqDetails ? weightedOpenAverage(evaluation.reflectionDetails, rqList) : 0;
+    const rqScores = hasRqDetails ? [rqMean * 10] : [];
+    evaluation.suggestedGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, rqScores);
     evaluation.fibScore = fibScore;
     return evaluation;
   }
@@ -1411,7 +1430,8 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
       "reflectionQuestions": [
         {
           "id": "rq_1",
-          "question": "Quesito aperto di riflessione critica, argomentazione o applicazione pratica personale (es. 'Spiega per quale motivo...')"
+          "question": "Quesito aperto di riflessione critica, argomentazione o applicazione pratica personale (es. 'Spiega per quale motivo...')",
+          "criteria": "2-3 criteri essenziali di valutazione (es. 'Pertinenza alla consegna; profondità argomentativa; collegamenti personali')"
         }
       ]
     }
@@ -1421,6 +1441,7 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
 }
 
 Ogni sezione DEVE contenere da 2 a 4 frasi fillInTheBlank e 1 domanda di riflessione (reflectionQuestions).
+Per le 1-2 frasi più importanti di tutto il workbook aggiungi il campo "weight": 2 (domanda fondamentale, vale doppio); tutte le altre omettono il campo (peso 1 implicito).
 Genera solo JSON valido conforme allo schema.`;
     } else {
       promptSystem = `Sei un docente esperto e autore di verifiche scolastiche per la scuola italiana (${schoolLevel}).
@@ -1444,7 +1465,8 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
   "openEnded": ${includeOpenEnded ? `[
     {
       "id": "oe_1",
-      "question": "[Domanda di argomentazione critica aperta coerente con il livello scolastico]"
+      "question": "[Domanda di argomentazione critica aperta coerente con il livello scolastico]",
+      "criteria": "2-3 criteri essenziali di valutazione (es. 'Correttezza dei contenuti; uso del lessico specifico; coerenza argomentativa')"
     }
   ]` : `[]`},
   "recommendedDurationMinutes": ${Math.round(qCount * 3 + (includeOpenEnded ? 15 : 0))},
@@ -1454,7 +1476,8 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
 REGOLE ESSENZIALI:
 1. Le 4 opzioni di ciascuna domanda a scelta multipla devono essere plausibili e grammaticalmente omogenee (nessun distrattore banale).
 2. L'indice 'correctIndex' deve corrispondere rigorosamente all'opzione esatta. Distribuisci le risposte corrette tra gli indici 0, 1, 2, 3 senza concentrarle tutte su una sola lettera.
-3. Genera solo JSON valido conforme.`;
+3. Per le 1-2 domande a scelta multipla più importanti (nodi concettuali fondamentali) aggiungi il campo "weight": 2 (vale doppio nel voto); tutte le altre omettono il campo (peso 1 implicito).
+4. Genera solo JSON valido conforme.`;
     }
 
     let modelUsed = TASK_MODEL_PREFERENCE["generate-exam"][0];

@@ -8,11 +8,17 @@ export interface MultipleChoiceQuestion {
   options: string[];
   correctIndex: number;
   explanation?: string;
+  /** Didactic weight (default 1). Key questions may carry weight 2. */
+  weight?: number;
 }
 
 export interface OpenEndedQuestion {
   id: string;
   question: string;
+  /** Grading rubric shown to the student and used by the AI grader. */
+  criteria?: string;
+  /** Didactic weight (default 1). */
+  weight?: number;
 }
 
 export interface QuizExam {
@@ -25,11 +31,17 @@ export interface FillInTheBlank {
   id: string;
   sentence: string;
   answer: string; // Comma separated list of acceptable correct answers
+  /** Didactic weight (default 1). */
+  weight?: number;
 }
 
 export interface ReflectionQuestion {
   id: string;
   question: string;
+  /** Grading rubric shown to the student and used by the AI grader. */
+  criteria?: string;
+  /** Didactic weight (default 1). */
+  weight?: number;
 }
 
 export interface WorkbookSection {
@@ -70,6 +82,8 @@ export interface Infraction {
   type: 'abbandono_pagina' | 'tasto_vietato' | 'copia_incolla' | 'tasto_destro' | 'schermo_diviso' | 'uscita_schermo_intero';
   durationSeconds?: number;
   details?: string;
+  /** 'lieve' = brief episode, logged only (no counter). 'grave' = real violation. */
+  severity?: 'lieve' | 'grave';
 }
 
 export interface Behavior {
@@ -123,6 +137,8 @@ export interface SavedSubmission {
   Nome: string;
   Email: string;
   Voto_Suggerito: string;
+  /** Original AI grade before a manual teacher retouch (audit trail). */
+  Voto_Originale_IA?: string;
   Autovalutazione: string;
   AntiCopia_TabSwitch: number;
   AntiCopia_IncollaBloccato: number;
