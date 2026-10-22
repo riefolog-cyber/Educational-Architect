@@ -368,14 +368,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       studentDocRef,
       (snap) => {
         const remoteId = snap.data()?.remoteUnlockId;
-        if (!remoteId) return;
+        const currentId = remoteId ? String(remoteId) : "";
         if (remoteUnlockSeenRef.current === null) {
-          remoteUnlockSeenRef.current = String(remoteId);
+          // First snapshot: record the baseline (field present OR absent) without
+          // acting. With the old logic a first snapshot carrying remoteId was
+          // treated as "initial state" and swallowed — so a teacher pressing
+          // "Sblocca" while the doc had no prior remoteUnlockId (the normal
+          // case) never released the lock.
+          remoteUnlockSeenRef.current = currentId;
           return;
         }
-        if (String(remoteId) !== remoteUnlockSeenRef.current) {
-          remoteUnlockSeenRef.current = String(remoteId);
-          if (lockedRef.current) releaseExamLockRef.current("remote");
+        if (currentId !== remoteUnlockSeenRef.current) {
+          remoteUnlockSeenRef.current = currentId;
+          if (currentId && lockedRef.current) releaseExamLockRef.current("remote");
         }
       },
       (err) => console.warn("Ascolto sblocco docente non disponibile:", err)
@@ -591,6 +596,33 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               setPinLoading(false);
               return;
             }
+          }
+
+          // One attempt only: if this student already submitted for this session,
+          // re-entry (and a second attempt) is not allowed.
+          try {
+            const attemptsQuery = query(
+              collection(dbFirestore, "valutazioni"),
+              where("Pin", "==", formattedPin),
+              where("Email", "==", user?.email || "")
+            );
+            const attemptsSnap = await getDocs(attemptsQuery);
+            const currentRunId = String(sessionData.sessionId || "");
+            const alreadySubmitted = attemptsSnap.docs.some(d => {
+              const row = d.data() as any;
+              const rowRunId = String(row.Session_Id || "");
+              // Matching run: same session launch. Legacy rows without Session_Id
+              // are treated conservatively (block) — the teacher can still free
+              // a second attempt by deleting the submission in the dashboard.
+              return currentRunId && rowRunId ? rowRunId === currentRunId : true;
+            });
+            if (alreadySubmitted) {
+              setPinError("⛔ Hai già consegnato questa prova: la consegna è una sola. Se il docente vuole concedere un nuovo tentativo, cancella la consegna dal registro e comunica il PIN.");
+              setPinLoading(false);
+              return;
+            }
+          } catch (dupErr) {
+            console.warn("Verifica consegne precedente non riuscita, prosigo:", dupErr);
           }
 
           setSessionPin(formattedPin);
