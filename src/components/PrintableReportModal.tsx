@@ -1,5 +1,5 @@
 import React, { useRef } from "react";
-import { Printer, X, Download, ShieldCheck, GraduationCap, Award, CheckCircle2, AlertTriangle } from "lucide-react";
+import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
 
 interface PrintableReportModalProps {
   isOpen: boolean;

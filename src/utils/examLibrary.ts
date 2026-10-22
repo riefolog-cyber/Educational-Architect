@@ -153,10 +153,6 @@ export function buildLibraryBackup(items: ExamLibraryItem[]): string {
   );
 }
 
-function makeImportedId(): string {
-  return `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-}
-
 /** Parses a backup file; throws a human-readable (Italian) error if invalid. */
 export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibraryExam[] {
   let data: any;

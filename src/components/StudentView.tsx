@@ -17,7 +17,6 @@ import {
 } from "firebase/firestore";
 import { 
   Play, 
-  Radio, 
   FileText, 
   Timer, 
   AlertTriangle, 
@@ -36,24 +35,15 @@ import {
   History,
   Award,
   Maximize2,
-  Minimize2,
-  Split,
   Printer,
   Eye,
-  Type,
-  Sliders,
-  Sun,
-  Moon,
-  HelpCircle,
-  Shuffle,
   GraduationCap
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
-import { SAMPLE_QUIZ, SAMPLE_WORKBOOK } from "../data";
-import { Answers, Behavior, SessionData, Evaluation, Infraction } from "../types";
+import { Answers, Behavior, Evaluation, Infraction } from "../types";
 import {
   formatMarkdown,
   detectGibberish,
@@ -165,7 +155,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   // Self assessment state
   const [studentSelfGrade, setStudentSelfGrade] = useState("");
-  const [isSubmitting, setIsSubmitting] = useState(false);
 
   // Final Evaluation state
   const [evaluation, setEvaluation] = useState<Evaluation | null>(null);
@@ -1205,10 +1194,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return missing;
   };
 
-  const checkValidation = (): boolean => {
-    return getMissingQuestions().length === 0;
-  };
-
   const handleSubmitQuizPrompt = () => {
     const missing = getMissingQuestions();
     if (missing.length > 0) {
@@ -1228,7 +1213,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // OPTIMIZATION 3: Poll evaluation queue and save final results permanently on completion
   const pollJobStatusAndSave = async (jobId: string, rescue: any, isBackgroundResume = false) => {
     try {
-      setIsSubmitting(true);
       setActiveScreen("evaluating");
       setSavingStatus("Connessione e verifica dello stato della correzione...");
 
@@ -1386,8 +1370,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       // Don't strand the student on the spinner: back to self-assessment
       // with all answers intact so they can submit again immediately.
       setActiveScreen("self-assessment");
-    } finally {
-      setIsSubmitting(false);
     }
   };
 
@@ -1418,8 +1400,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setBehavior(data.behavior || { tabSwitches: 0, pasteAttempts: 0, rightClicks: 0, infractionsLog: [] });
           setStudentSelfGrade(data.studentSelfGrade || "");
           setActiveScreen("evaluating");
-          setIsSubmitting(true);
-          
+
           pollJobStatusAndSave(data.jobId, data, true);
         }
       } catch (err) {
@@ -1437,7 +1418,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
 
     setIsExamActive(false); // Disable timers & monitoring
-    setIsSubmitting(true);
     setActiveScreen("evaluating");
     setSavingStatus("Generazione della valutazione tramite IA e registrazione sessione...");
 
@@ -1618,8 +1598,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       console.error("Submission failed:", err);
       alert(`Errore critico durante la valutazione: ${err.message}.\n\n(Suggerimento: Se i server dell'IA sono momentaneamente carichi, le tue risposte non sono andate perse!)`);
       setActiveScreen("exam-space");
-    } finally {
-      setIsSubmitting(false);
     }
   };
 

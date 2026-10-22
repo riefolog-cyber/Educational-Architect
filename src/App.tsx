@@ -4,16 +4,13 @@ import {
   signInWithPopup, 
   signInWithRedirect,
   getRedirectResult,
-  signOut, 
-  User 
+  signOut
 } from "firebase/auth";
 import { 
   getDocs, 
   query, 
   collection, 
-  where,
-  doc,
-  setDoc
+  where
 } from "firebase/firestore";
 import { 
   GraduationCap, 
@@ -23,16 +20,12 @@ import {
   Sparkles, 
   ShieldAlert, 
   LogIn,
-  Layers,
   ChevronRight,
-  MonitorPlay,
   HelpCircle,
   Smartphone,
   Globe,
   AlertCircle,
   ArrowRight,
-  ShieldCheck,
-  CheckCircle2,
   X
 } from "lucide-react";
 

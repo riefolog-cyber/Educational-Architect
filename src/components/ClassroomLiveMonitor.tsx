@@ -8,9 +8,7 @@ import {
   Search, 
   ShieldAlert,
   RefreshCw,
-  Sparkles,
   Wifi,
-  ChevronDown,
   Lock,
   Unlock,
   KeyRound

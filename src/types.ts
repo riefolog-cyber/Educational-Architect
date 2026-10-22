@@ -117,17 +117,6 @@ export interface Evaluation {
   fibTotal?: number; // Total blanks
 }
 
-export interface SessionData {
-  pin: string;
-  data: any; // Raw JSON matching Quiz or Workbook
-  expiry: string; // ISO String
-  teacherId: string;
-  teacherEmail: string;
-  backendUrl: string;
-  active: boolean;
-  createdAt: string;
-}
-
 export interface SavedSubmission {
   id: string;
   Timestamp: string;

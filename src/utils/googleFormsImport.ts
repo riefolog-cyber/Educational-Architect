@@ -54,12 +54,6 @@ function compact(value: string): string {
   return norm(value).replace(/[^a-z0-9]/g, "");
 }
 
-function letterIndex(token: string): number {
-  const m = /^([a-h])(?:[).\-\s]|$)/i.exec(token.trim());
-  if (!m) return -1;
-  return m[1].toLowerCase().charCodeAt(0) - 97;
-}
-
 // ---------------------------------------------------------------------------
 // CSV / TSV
 // ---------------------------------------------------------------------------

@@ -9,49 +9,38 @@ import {
   query, 
   where,
   deleteDoc,
-  addDoc,
   updateDoc,
   writeBatch
 } from "firebase/firestore";
 import { 
   ref as fbRef, 
-  set as fbSet,
-  get as fbGet
+  set as fbSet
 } from "firebase/database";
 import { 
   Sparkles, 
-  Key, 
   FileCode, 
   AlertCircle, 
   CheckCircle, 
   Search, 
   Trash2, 
   Download, 
-  UserPlus, 
   Clock, 
   ArrowLeft,
   X,
   FileText,
   ShieldCheck,
-  TrendingUp,
-  User,
-  ExternalLink,
   RefreshCw,
-  Settings,
   Eye,
   EyeOff,
-  Shield,
   Wand2,
   Printer,
   Shuffle,
-  Activity,
   Users,
   ChevronDown,
   ChevronUp,
   Award,
   BarChart2,
   BookOpen,
-  Filter,
   HelpCircle,
   Layers,
   ListOrdered,
@@ -62,8 +51,8 @@ import {
   FileUp
 } from "lucide-react";
 
-import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
-import { SavedSubmission, SessionData } from "../types";
+import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
+import { SavedSubmission } from "../types";
 import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore } from "../utils";
 import {
   autoCorrectExamJSON,
@@ -241,7 +230,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Config state
   const backendType = "ai-studio";
   const gasUrl = "";
-  const [saveStatus, setSaveStatus] = useState("");
 
   // Session config state
   const [materia, setMateria] = useState("");
@@ -313,7 +301,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [chronologicalSortBy, setChronologicalSortBy] = useState<"grade_desc" | "grade_asc" | "recent" | "name_asc" | "violations_desc">("grade_desc");
   const [examRosterSort, setExamRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("grade_desc");
   const [expandedStudentKey, setExpandedStudentKey] = useState<string | null>(null);
-  const [expandedExamKey, setExpandedExamKey] = useState<string | null>(null);
   const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
   const [copiedExamPin, setCopiedExamPin] = useState<string | null>(null);
   const [showAccessHelpModal, setShowAccessHelpModal] = useState<boolean>(false);
@@ -327,7 +314,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [blindGradingMode, setBlindGradingMode] = useState(false);
-  const [linkCopied, setLinkCopied] = useState(false);
 
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
@@ -3134,57 +3120,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   {pinStatus}
                 </div>
               )}
-
-              {/* Official Student Web Link Sharing Box */}
-              <div className="p-3.5 bg-teal-950/40 border border-teal-500/30 rounded-2xl text-left space-y-2 shadow-md">
-                <div className="flex items-center gap-2 text-teal-300 font-bold text-xs">
-                  <ExternalLink className="w-3.5 h-3.5 text-teal-400" />
-                  <span>Link da Condividere con gli Alunni</span>
-                </div>
-                <p className="text-[11px] text-slate-300 leading-relaxed">
-                  Invia <b>questo link web</b> agli studenti (su Classroom, registro o chat) insieme al PIN della prova:
-                </p>
-                <div className="flex items-center gap-2">
-                  <input
-                    type="text"
-                    readOnly
-                    value={typeof window !== "undefined" ? window.location.origin.replace("ais-dev-", "ais-pre-") : ""}
-                    className="flex-1 bg-slate-950/80 border border-white/10 rounded-xl px-2.5 py-1.5 text-[11px] font-mono text-teal-200 outline-none select-all"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => {
-                      if (typeof window !== "undefined") {
-                        const targetUrl = window.location.origin.replace("ais-dev-", "ais-pre-");
-                        navigator.clipboard.writeText(targetUrl);
-                        setLinkCopied(true);
-                        setTimeout(() => setLinkCopied(false), 3000);
-                      }
-                    }}
-                    className="px-3 py-1.5 bg-teal-600 hover:bg-teal-500 text-white font-bold text-xs rounded-xl transition-all cursor-pointer shrink-0"
-                  >
-                    {linkCopied ? "Copiato ✓" : "Copia Link"}
-                  </button>
-                </div>
-                <div className="p-3 bg-rose-500/10 border border-rose-500/20 rounded-xl space-y-1.5 text-[11px]">
-                  <p className="font-bold text-rose-300 flex items-center gap-1.5">
-                    <span>📱 iPhone: Perché Android entra e molti iPhone no?</span>
-                  </p>
-                  <p className="text-slate-300 leading-normal text-[11px]">
-                    Su Android, Chrome permette i cookie di sicurezza senza problemi. Su iPhone, invece, <b>Safari ha attiva per default la protezione Apple ITP ("Blocca cookie tra siti")</b>, che blocca il caricamento e attiva la schermata Google Admin.
-                  </p>
-                  <div className="pt-1 space-y-1">
-                    <p className="text-[10px] font-bold text-rose-200 uppercase tracking-wide">3 Soluzioni immediate per gli alunni con iPhone:</p>
-                    <ul className="list-disc list-inside text-rose-200/90 space-y-1 pl-1 text-[10px]">
-                      <li><b>Opzione 1 (Più veloce):</b> Aprire il link nell'app <b>Google Chrome</b> su iPhone invece di Safari.</li>
-                      <li><b>Opzione 2 (In Safari):</b> Su iPhone andare in <i>Impostazioni &rarr; Safari</i> e disattivare la levetta <b>"Blocca cookie tra siti"</b> (o <i>"Impedisci tracciamento tra siti"</i>), poi ricaricare la pagina.</li>
-                      <li><b>Opzione 3:</b> Aprire Safari in modalità <b>Scheda Privata (Anonima)</b> e incollare il link.</li>
-                    </ul>
-                  </div>
-                </div>
-              </div>
             </div>
-
 
           </div>
 
@@ -3911,7 +3847,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     ) : (
                       <div className="space-y-3.5">
                         {filteredExamSummaries.map((exam) => {
-                          const isExpanded = expandedExamKeys.has(exam.key) || expandedExamKey === exam.key;
+                          const isExpanded = expandedExamKeys.has(exam.key);
 
                           return (
                             <div 

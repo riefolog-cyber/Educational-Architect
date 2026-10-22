@@ -942,7 +942,7 @@ async function processQueue() {
 }
 
 // Queue API Endpoints
-app.get("/api/evaluate/warmup", (req, res) => {
+app.get("/api/evaluate/warmup", (_req, res) => {
   res.json({ warmedUp: true, message: "Connection warmed up and cookies verified successfully." });
 });
 
@@ -1079,16 +1079,6 @@ Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
       error: "La generazione del piano di recupero tramite IA ha riscontrato un errore.", 
       details: error.message 
     });
-  }
-});
-
-// Vecchio API per retrocompatiblità o test
-app.post("/api/evaluate", async (req, res) => {
-  try {
-    const result = await runEvaluationCore(req.body);
-    return res.json({ status: "success", evaluation: result });
-  } catch (error: any) {
-    return res.status(500).json({ error: "Valutazione fallita.", details: error.message });
   }
 });
 
@@ -1532,7 +1522,7 @@ REGOLE ESSENZIALI:
 });
 
 // Global error handler for JSON parsing and other synchronous middleware errors
-app.use((err: any, req: any, res: any, next: any) => {
+app.use((err: any, _req: any, res: any, _next: any) => {
   console.error('[EXPRESS ERROR]:', err);
   if (err instanceof SyntaxError && 'body' in err) {
     return res.status(400).json({ error: "Richiesta JSON non valida" });
@@ -1798,7 +1788,7 @@ async function startServer() {
     app.use(express.static(distPath));
     
     // Explicit API catch-all BEFORE SPA fallback so APIs never return index.html
-    app.get("*", (req, res) => {
+    app.get("*", (_req, res) => {
       res.sendFile(path.join(distPath, "index.html"));
     });
     

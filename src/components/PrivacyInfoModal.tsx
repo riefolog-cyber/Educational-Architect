@@ -1,15 +1,10 @@
-import { useState } from "react";
-import { 
-  ShieldCheck, 
-  EyeOff, 
-  Lock, 
-  Sparkles, 
-  UserCheck, 
-  ArrowRight, 
-  CheckCircle2, 
-  X, 
-  FileText, 
-  Cpu, 
+import {
+  ShieldCheck,
+  Lock,
+  ArrowRight,
+  CheckCircle2,
+  X,
+  Cpu,
   GraduationCap,
   Scale
 } from "lucide-react";

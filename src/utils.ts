@@ -35,15 +35,6 @@ export function formatMarkdown(text: string | undefined): string {
   return formatted;
 }
 
-// Debounce helper for auto-saving drafts without blocking UI rendering
-export function debounce<T extends (...args: any[]) => void>(func: T, wait: number): (...args: Parameters<T>) => void {
-  let timeout: NodeJS.Timeout | null = null;
-  return function(...args: Parameters<T>) {
-    if (timeout) clearTimeout(timeout);
-    timeout = setTimeout(() => func(...args), wait);
-  };
-}
-
 // Custom simple parser to detect junk entries
 export function detectGibberish(str: string | undefined): boolean {
   if (!str) return true;
