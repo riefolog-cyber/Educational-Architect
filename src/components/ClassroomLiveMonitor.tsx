@@ -10,9 +10,12 @@ import {
   RefreshCw,
   Sparkles,
   Wifi,
-  ChevronDown
+  ChevronDown,
+  Lock,
+  Unlock,
+  KeyRound
 } from "lucide-react";
-import { collection, onSnapshot, deleteDoc, doc } from "firebase/firestore";
+import { collection, onSnapshot, deleteDoc, doc, updateDoc } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
 import type { LiveSessionSummary } from "./TeacherDashboard";
 
@@ -28,6 +31,9 @@ export interface LiveStudentData {
   lastHeartbeat: string;
   status: "waiting" | "in_progress" | "self_evaluating" | "submitted" | "offline";
   joinedAt?: string;
+  /** True while the student is stuck on the "prova bloccata" screen. */
+  locked?: boolean;
+  lockReason?: string;
 }
 
 interface ClassroomLiveMonitorProps {
@@ -38,6 +44,8 @@ interface ClassroomLiveMonitorProps {
   loadingSessions?: boolean;
   onSelectPin?: (pin: string) => void;
   onRefreshSessions?: () => void;
+  /** Code the teacher dictates to a student to unlock the exam locally. */
+  unlockCode?: string;
 }
 
 // A student is considered truly "in exam" only while the heartbeat keeps flowing
@@ -50,7 +58,8 @@ export default function ClassroomLiveMonitor({
   isSessionLive,
   loadingSessions = false,
   onSelectPin,
-  onRefreshSessions
+  onRefreshSessions,
+  unlockCode
 }: ClassroomLiveMonitorProps) {
   const [students, setStudents] = useState<LiveStudentData[]>([]);
   const [loading, setLoading] = useState(true);
@@ -59,6 +68,7 @@ export default function ClassroomLiveMonitor({
   const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts">("in_progress");
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
+  const [unlockingId, setUnlockingId] = useState<string | null>(null);
 
   // Update clock every 5s to refresh relative time ("10s fa")
   useEffect(() => {
@@ -94,7 +104,9 @@ export default function ClassroomLiveMonitor({
             pasteAttempts: Number(data.pasteAttempts) || 0,
             lastHeartbeat: data.lastHeartbeat || new Date().toISOString(),
             status: data.status || "in_progress",
-            joinedAt: data.joinedAt
+            joinedAt: data.joinedAt,
+            locked: !!data.locked,
+            lockReason: data.lockReason || ""
           });
         });
 
@@ -199,6 +211,25 @@ export default function ClassroomLiveMonitor({
     }
   };
 
+  // Remote unlock: the student app listens for a new remoteUnlockId on its own
+  // live_students document and drops the blocking overlay as soon as it changes.
+  const handleRemoteUnlock = async (studentId: string) => {
+    if (!dbFirestore || !pin || unlockingId) return;
+    setUnlockingId(studentId);
+    try {
+      await updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId), {
+        remoteUnlockId: `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        lockState: "unlocked",
+        locked: false,
+        unlockedAt: new Date().toISOString()
+      });
+    } catch (err) {
+      console.warn("Sblocco remoto non riuscito:", err);
+    } finally {
+      setUnlockingId(null);
+    }
+  };
+
   const liveSessions = sessions.filter((s) => (isSessionLive ? isSessionLive(s) : s.active));
 
   return (
@@ -300,7 +331,14 @@ export default function ClassroomLiveMonitor({
           </p>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <div
+            className="px-3 py-1.5 rounded-xl bg-amber-500/10 border border-amber-500/30 text-xs font-mono text-amber-200 flex items-center gap-1.5"
+            title="Codice da dettare allo studente la cui prova è bloccata dopo un'uscita dalla pagina"
+          >
+            <KeyRound className="w-3.5 h-3.5 text-amber-300" />
+            <span>Codice sblocco: <b>{unlockCode || "—"}</b></span>
+          </div>
           <div className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-xs font-mono text-slate-300 flex items-center gap-1.5">
             <Wifi className="w-3.5 h-3.5 text-emerald-400" />
             <span>Feed Real-time Attivo</span>
@@ -484,6 +522,15 @@ export default function ClassroomLiveMonitor({
                             In attesa di inizio
                           </span>
                         )}
+                        {student.locked && !isOffline && (
+                          <span
+                            className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-red-500/20 text-red-200 border border-red-500/40 flex items-center gap-1"
+                            title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
+                          >
+                            <Lock className="w-3 h-3" />
+                            Prova bloccata
+                          </span>
+                        )}
                         {isOffline && (
                           <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300 border border-slate-500/30">
                             Non connesso
@@ -520,6 +567,18 @@ export default function ClassroomLiveMonitor({
 
                   {/* Anti-cheat report */}
                   <div className="flex items-center gap-2">
+                    {student.locked && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoteUnlock(student.id)}
+                        disabled={unlockingId === student.id}
+                        className="px-2.5 py-1 rounded-xl bg-emerald-500/15 hover:bg-emerald-500/25 border border-emerald-500/40 text-emerald-200 text-[11px] font-bold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                        title="Sblocca la prova di questo studente da remoto"
+                      >
+                        <Unlock className="w-3.5 h-3.5" />
+                        <span>{unlockingId === student.id ? "Sblocco..." : "Sblocca"}</span>
+                      </button>
+                    )}
                     {hasAlerts ? (
                       <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
                         <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />

@@ -58,7 +58,8 @@ import {
   Copy,
   Check,
   PlusCircle,
-  Undo2
+  Undo2,
+  FileUp
 } from "lucide-react";
 
 import { db, dbFirestore, auth, handleFirestoreError, OperationType } from "../firebase";
@@ -83,6 +84,7 @@ import {
   ExamLibraryItem
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
+import GoogleFormsImportModal from "./GoogleFormsImportModal";
 import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
 import PrintableReportModal from "./PrintableReportModal";
 
@@ -94,6 +96,8 @@ export interface LiveSessionSummary {
   sessionId: string;
   active: boolean;
   teacherEmail: string;
+  /** 6-digit code the teacher gives to a student whose exam was locked. */
+  unlockCode?: string;
 }
 
 export interface ExamSummary {
@@ -328,6 +332,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
+  const [showFormsModal, setShowFormsModal] = useState<boolean>(false);
   const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
@@ -417,7 +422,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           createdAt: d.createdAt || null,
           sessionId: d.sessionId || "",
           active: !!d.active,
-          teacherEmail: d.teacherEmail || user.email
+          teacherEmail: d.teacherEmail || user.email,
+          unlockCode: d.unlockCode || ""
         });
       });
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
@@ -775,6 +781,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       expiryDate.setHours(expiryDate.getHours() + 2);
     }
 
+    // 6-digit unlock code: a student whose exam got locked after leaving the
+    // page must enter it (or be unlocked from the live monitor) to resume.
+    const unlockCode = String(Math.floor(100000 + Math.random() * 900000));
+
     const sessionPayload = {
       data: examObj,
       expiry: expiryDate.toISOString(),
@@ -783,6 +793,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim(),
       randomizeQuestions,
       severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
+      unlockCode,
       active: true,
       createdAt: new Date().toISOString()
     };
@@ -829,6 +840,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           data: examObj,
           randomizeQuestions,
           severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
+          unlockCode,
           active: true,
           createdAt: new Date().toISOString(),
           sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -846,7 +858,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
 
-        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata con successo! Gli studenti possono accedere.`);
+        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata! Codice di sblocco docente: ${unlockCode} (serve allo studente se la prova si blocca dopo un'uscita dalla pagina).`);
         setDashboardTab("live_monitor");
         setPin(targetPin);
         setMonitorPin(targetPin);
@@ -2541,6 +2553,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   <Sparkles className="w-3.5 h-3.5" />
                   <span>✨ Crea Verifica con IA (da Argomento o Video)</span>
                 </button>
+                <button
+                  type="button"
+                  onClick={() => setShowFormsModal(true)}
+                  className="w-full py-2 px-3 bg-slate-950/70 hover:bg-teal-600/25 border border-teal-500/40 text-teal-200 font-bold text-xs rounded-xl flex items-center justify-center gap-2 transition-all cursor-pointer"
+                >
+                  <FileUp className="w-3.5 h-3.5" />
+                  <span>Importa da Google Moduli (testo o CSV)</span>
+                </button>
               </div>
 
               <div className="space-y-2">
@@ -3235,6 +3255,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 }
                 sessions={activeSessions}
                 isSessionLive={isSessionLive}
+                unlockCode={activeSessions.find((s) => s.pin === monitorPin)?.unlockCode}
                 loadingSessions={loadingSessions}
                 onSelectPin={(next) => {
                   setMonitorPin(next);
@@ -4940,6 +4961,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           validateExamJSON(generatedJson);
           // Keep a history copy so it can be reused for other classes
           handleSaveToLibrary("Generatore IA", generatedJson, newTitle);
+        }}
+      />
+
+      {/* Google Forms Import Modal */}
+      <GoogleFormsImportModal
+        isOpen={showFormsModal}
+        onClose={() => setShowFormsModal(false)}
+        defaultTitle={materia.trim() || undefined}
+        onApplyExam={(importedJson, importedTitle) => {
+          setJsonText(importedJson);
+          if (importedTitle) setMateria(importedTitle);
+          validateExamJSON(importedJson);
+          handleSaveToLibrary("Google Moduli", importedJson, importedTitle);
         }}
       />
 
