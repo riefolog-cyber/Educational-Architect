@@ -22,6 +22,17 @@
  * 7. Nel registro (Esecuzioni) trovi il link al CSV creato su Drive: scaricalo e
  *    caricalo nella finestra "Importa da Google Moduli" dell'app.
  *
+ * MODALITÀ "WEB APP" (consigliata: risposte corrette automatiche)
+ * Se il modulo è in modalità Quiz con le chiavi impostate, puoi collegare
+ * direttamente l'app senza passare dal CSV:
+ * 1. In editor: Distribuisci -> Nuova distribuzione -> tipo "Applicazione web".
+ * 2. Esegui come: "Me". Chi ha accesso: "Chiunque". Distribuisci e autorizza.
+ * 3. Copia l'URL che termina con /exec e incollalo nel riquadro "Script
+ *    privato (Web App)" della finestra "Importa da Google Moduli": l'app
+ *    leggerà domande, opzioni E risposte corrette in una volta sola.
+ * L'URL si può riusare per sempre: cambia modulo solo con ?form=ID (l'app lo
+ * fa da sola se includi l'ID del modulo nell'apposito campo).
+ *
  * Il CSV generato usa le intestazioni riconosciute dall'app:
  * Tipo; Sezione; Domanda; Opzione A..H; Corretta; Punti; Criteri
  */
@@ -277,4 +288,186 @@ function csvCell(value, delimiter) {
     return '"' + text.replace(/"/g, '""') + '"';
   }
   return text;
+}
+
+// ---------------------------------------------------------------------------
+// WEB APP: doGet restituisce il modulo in JSON (domande + risposte corrette).
+// Distribuisci -> Nuova distribuzione -> "Applicazione web",
+// "Esegui come: Me", "Chi ha accesso: Chiunque", poi usa l'URL /exec.
+// ---------------------------------------------------------------------------
+
+/** Risposta JSON uniforme, sia per errori che per successo. */
+function jsonOutput(payload) {
+  return ContentService.createTextOutput(JSON.stringify(payload))
+    .setMimeType(ContentService.MimeType.JSON);
+}
+
+/**
+ * Punto d'ingresso del Web App. Parametro opzionale ?form=ID per leggere un
+ * modulo diverso da quello collegato allo script.
+ */
+function doGet(e) {
+  var formId = "";
+  try {
+    if (e && e.parameter && e.parameter.form) {
+      formId = safeText(e.parameter.form).replace(/^entry_/, "");
+    }
+  } catch (paramsErr) {
+    formId = "";
+  }
+
+  try {
+    if (/^1FAIpQLS/.test(formId)) {
+      throw new Error(
+        "Hai incollato l'ID del link \"pubblico\" (/e/1FAIpQLS…): quello non si usa qui. Passa l'ID del link di MODIFICA, quello in https://docs.google.com/forms/d/…/edit."
+      );
+    }
+    var form = formId ? FormApp.openById(formId) : FormApp.getActiveForm();
+    if (!form) {
+      throw new Error(
+        "Nessun modulo: passa ?form=ID nel link oppure apri lo script da dentro il modulo."
+      );
+    }
+    return jsonOutput({ ok: true, form: costruisciJsonModulo(form) });
+  } catch (err) {
+    return jsonOutput({ ok: false, error: String(err && err.message ? err.message : err) });
+  }
+}
+
+/** Genera lo stesso payload float che l'app consuma: domande, opzioni, corrette. */
+function costruisciJsonModulo(form) {
+  var questions = [];
+  var skipped = [];
+  var section = "";
+
+  var items = form.getItems();
+  for (var i = 0; i < items.length; i++) {
+    var item = items[i];
+    var type = item.getType();
+
+    if (type === FormApp.ItemType.PAGE_BREAK || type === FormApp.ItemType.SECTION_HEADER) {
+      section = safeText(item.getTitle());
+      continue;
+    }
+
+    if (type === FormApp.ItemType.IMAGE || type === FormApp.ItemType.VIDEO || type === FormApp.ItemType.FILE_UPLOAD) {
+      skipped.push('Elemento non testuale ignorato: "' + safeText(item.getTitle()) + '"');
+      continue;
+    }
+
+    var question = {
+      id: safeText(item.getId()) || "item_" + (i + 1),
+      kind: "open",
+      question: safeText(item.getTitle()),
+      options: [],
+      required: hasRequiredProperty(item)
+    };
+    if (!question.question) continue;
+    if (section) question.section = section;
+
+    var correctIndexes = [];
+
+    if (type === FormApp.ItemType.MULTIPLE_CHOICE) {
+      question.kind = "mc";
+      question.options = readChoiceValues(item.asMultipleChoiceItem().getChoices(), correctIndexes);
+    } else if (type === FormApp.ItemType.LIST) {
+      question.kind = "mc";
+      question.options = readChoiceValues(item.asListItem().getChoices(), correctIndexes);
+    } else if (type === FormApp.ItemType.CHECKBOX) {
+      question.kind = "checkbox";
+      question.options = readChoiceValues(item.asCheckboxItem().getChoices(), correctIndexes);
+    } else if (type === FormApp.ItemType.SCALE) {
+      question.kind = "scale";
+      var scale = item.asScaleItem();
+      question.note = "Scala da " + scale.getLowerBound() + " a " + scale.getUpperBound();
+    } else if (type === FormApp.ItemType.GRID || type === FormApp.ItemType.CHECKBOX_GRID) {
+      // Le griglie si perdono come chiave: diventano domande aperte riga per
+      // riga, esattamente come le esporta il CSV.
+      var grid = type === FormApp.ItemType.GRID ? item.asGridItem() : item.asCheckboxGridItem();
+      var gridRows = grid.getRows() || [];
+      var gridCols = (grid.getColumns() || []).join(" | ");
+      var variety = type === FormApp.ItemType.GRID ? "singola" : "multipla";
+      for (var gr = 0; gr < gridRows.length; gr++) {
+        questions.push({
+          id: (question.id) + "_r" + gr,
+          kind: "open",
+          question: question.question + " — " + safeText(gridRows[gr]),
+          options: [],
+          required: false,
+          ...(section ? { section: section } : {}),
+          note: "Griglia a scelta " + variety + ". Colonne: " + gridCols
+        });
+      }
+      continue;
+    } else if (
+      type === FormApp.ItemType.TEXT ||
+      type === FormApp.ItemType.PARAGRAPH_TEXT ||
+      type === FormApp.ItemType.DATE ||
+      type === FormApp.ItemType.TIME ||
+      type === FormApp.ItemType.DATETIME ||
+      type === FormApp.ItemType.DURATION
+    ) {
+      question.kind = "open";
+    } else {
+      skipped.push('Tipo di domanda non gestito (' + type + '): "' + question.question + '"');
+      continue;
+    }
+
+    if (correctIndexes.length === 1) {
+      question.correctIndex = correctIndexes[0];
+    } else if (correctIndexes.length > 1) {
+      // L'app corregge una risposta alla volta: la prima è la chiave, le altre
+      // restano indicatene nella nota.
+      question.correctIndex = correctIndexes[0];
+      var accettate = [];
+      for (var c = 0; c < correctIndexes.length; c++) {
+        accettate.push(LETTERS[correctIndexes[c]]);
+      }
+      question.note = "Risposte accettate nel modulo: " + accettate.join(", ");
+    }
+
+    var points = questionPoints(item);
+    if (points > 0) question.points = points;
+
+    questions.push(question);
+  }
+
+  if (questions.length === 0) {
+    throw new Error("Il modulo non contiene domande importabili.");
+  }
+
+  return {
+    title: safeText(form.getTitle()),
+    description: safeText(form.getDescription()),
+    questions: questions,
+    skipped: skipped,
+    sourceUrl: String(form.getPublishedUrl() || (form.getEditUrl() || "").replace("/edit", "/viewform"))
+  };
+}
+
+function readChoiceValues(choices, correctIndexes) {
+  // Filtra gli indici PRIMA di segnare le corrette: un'etichetta vuota non
+  // deve mai alterare la corrispondenza lettera -> posizione.
+  var values = [];
+  var correctFlags = [];
+  for (var i = 0; i < choices.length && i < MAX_OPTIONS; i++) {
+    var value = safeText(choices[i].getValue());
+    if (!value) continue;
+    values.push(value);
+    correctFlags.push(isCorrectChoice(choices[i]));
+  }
+  for (var k = 0; k < correctFlags.length; k++) {
+    if (correctFlags[k]) correctIndexes.push(k);
+  }
+  return values;
+}
+
+/** isRequired() esiste solo su alcuni tipi di item. */
+function hasRequiredProperty(item) {
+  try {
+    if (typeof item.isRequired === "function") return item.isRequired() === true;
+  } catch (requiredErr) {
+    // Tipi senza obbligo (griglie, immagini, ...).
+  }
+  return false;
 }

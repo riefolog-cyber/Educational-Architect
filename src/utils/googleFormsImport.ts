@@ -615,28 +615,3 @@ export function parseGoogleFormsImport(
     warnings,
   };
 }
-
-/** Placeholder shown in the empty import textarea. */
-export const GOOGLE_FORMS_SAMPLE = `1. Qual è la capitale d'Italia?
-A) Roma *
-B) Milano
-C) Napoli
-2. Descrivi brevemente il ciclo dell'acqua.`;
-
-/**
- * Clean, valid example loaded by the "Carica esempio" button: it parses without
- * warnings and can be edited in place by the teacher.
- */
-export const GOOGLE_FORMS_PASTE_EXAMPLE = `1. Qual è la capitale d'Italia?
-A) Roma *
-B) Milano
-C) Napoli
-2. Quale di queste è una regione italiana?
-A) Baviera
-B) Toscana *
-C) Provenza
-3. Spiega in due righe perché le foglie sono verdi.
-4. Quale gas assorbono le piante durante la fotosintesi?
-A) Ossigeno
-B) Anidride carbonica *
-C) Azoto`;

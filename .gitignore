@@ -6,3 +6,6 @@ coverage/
 *.log
 .env*
 !.env.example
+
+# Note private del docente: contiene l'URL della Web App di Google Apps Script
+link webapp google script.txt

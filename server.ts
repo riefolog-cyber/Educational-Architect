@@ -538,6 +538,7 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
 };
 
 import { weightedOpenAverage } from "./src/utils";
+import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
@@ -1540,6 +1541,217 @@ app.use((err: any, req: any, res: any, next: any) => {
     return res.status(413).json({ error: "Payload troppo grande" });
   }
   res.status(500).json({ error: "Errore interno del server", details: err.message });
+});
+
+// ---------------------------------------------------------------------------
+// Google Forms import from the public link of the module
+// ---------------------------------------------------------------------------
+const FORM_PAGE_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+  "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+};
+
+class FormImportError extends Error {
+  status: number;
+  constructor(message: string, status = 400) {
+    super(message);
+    this.status = status;
+  }
+}
+
+/** Fetches the form page following short-link redirects only inside Google. */
+async function fetchFormPage(startUrl: string): Promise<{ html: string; finalUrl: string }> {
+  let current = startUrl;
+
+  for (let hop = 0; hop < 4; hop++) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 15000);
+    let response: Response;
+    try {
+      response = await fetch(current, {
+        redirect: "manual",
+        signal: controller.signal,
+        headers: FORM_PAGE_HEADERS,
+      });
+    } catch (err: any) {
+      const aborted = err?.name === "AbortError";
+      throw new FormImportError(
+        aborted
+          ? "Google Moduli non ha risposto in tempo. Riprova tra qualche istante."
+          : "Non riesco a raggiungere Google Moduli: controlla la connessione del server e riprova.",
+        502
+      );
+    } finally {
+      clearTimeout(timer);
+    }
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        throw new FormImportError("Il link del modulo non è valido: reindirizzamento senza destinazione.");
+      }
+      const next = new URL(location, current).toString();
+      if (!isAllowedFormHost(next)) {
+        throw new FormImportError("Il link rimanda a un sito diverso da Google Moduli.");
+      }
+      current = next;
+      continue;
+    }
+
+    if (response.status === 404) {
+      throw new FormImportError("Modulo non trovato (404): controlla il link o il suo ID.", 404);
+    }
+    if (response.status === 401 || response.status === 403) {
+      throw new FormImportError(
+        "Il modulo non è pubblico: richiede l'accesso con un account Google, quindi la pagina pubblica non esiste. In Google Moduli apri “Invia” → “Chiunque abbia il link” e riprova, oppure usa il CSV dello script (funziona anche sui moduli riservati all'istituto).",
+        403
+      );
+    }
+    if (!response.ok) {
+      throw new FormImportError(
+        `Google Moduli ha risposto con un errore (${response.status}). Riprova tra poco.`,
+        502
+      );
+    }
+
+    const html = await response.text();
+    return { html, finalUrl: response.url || current };
+  }
+
+  throw new FormImportError(
+    "Troppi reindirizzamenti: usa il link diretto del modulo (docs.google.com/forms/...)."
+  );
+}
+
+/** Fetches a JSON URL with a timeout; returns null on any failure. */
+async function fetchJsonQuietly(url: string, headers: Record<string, string> = {}): Promise<{ status: number; data: unknown } | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 15000);
+  try {
+    const response = await fetch(url, { signal: controller.signal, headers: { Accept: "application/json", ...headers } });
+    let data: unknown = null;
+    try {
+      data = await response.json();
+    } catch {
+      return { status: response.status, data: null };
+    }
+    return { status: response.status, data };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+app.get("/api/forms-import", async (req, res) => {
+  try {
+    const formUrl = buildFormViewUrl(String(req.query.url || ""));
+    const { html, finalUrl } = await fetchFormPage(formUrl);
+    let form = parseFormHtml(html, finalUrl);
+
+    // Optional enrichment: the official Forms API can see the quiz answer key
+    // (options flagged as correct, points, expected short answers). The public
+    // page never contains it, so this is the only fully automatic source.
+    const formsApiKey = String(process.env.FORMS_API_KEY || "").trim();
+    if (formsApiKey) {
+      const formId = extractFormIdFromUrl(finalUrl);
+      if (formId) {
+        const apiUrl = `https://forms.googleapis.com/v1/forms/${encodeURIComponent(formId)}?key=${encodeURIComponent(formsApiKey)}`;
+        const apiResult = await fetchJsonQuietly(apiUrl);
+        if (apiResult && apiResult.status === 200 && apiResult.data) {
+          form = applyFormDataAnswerKey(form, apiResult.data, "api");
+          console.log(
+            form.keySource === "api"
+              ? `[Forms Import] Chiave risposte letta via Forms API (${form.keyedCount} domande).`
+              : "[Forms Import] Forms API raggiunta ma nessuna risposta corretta corrispondente (modulo non in modalità Quiz?)."
+          );
+        } else {
+          console.warn(`[Forms Import] Forms API non disponibile (stato ${apiResult ? apiResult.status : "network/timeout"}): continuo senza chiave risposte.`);
+        }
+      }
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, form });
+  } catch (err: any) {
+    const status = err instanceof FormImportError ? err.status : 400;
+    const message = err?.message || "Importazione dal link non riuscita.";
+    console.warn("[Forms Import]", message);
+    res.status(status).json({ error: message });
+  }
+});
+
+// -----------------------------------------------------------------------------
+// Google Forms import through an Apps Script Web App (works also for private
+// forms): the shared google-forms-export.gs exposes a doGet that returns the
+// form payload as JSON, correct answers included.
+// -----------------------------------------------------------------------------
+app.get("/api/forms-script", async (req, res) => {
+  try {
+    const endpoint = normalizeAppsScriptExecUrl(String(req.query.app || ""));
+    if (!endpoint) {
+      throw new FormImportError(
+        "Incolla l'URL del Web App di Apps Script (script.google.com/macros/s/…/exec).",
+        400
+      );
+    }
+
+    const formParam = String(req.query.form || "").trim();
+    let formId = "";
+    if (formParam) {
+      // Accetta sia l'URL completo del modulo (/edit o /viewform) che l'ID nudo.
+      const extracted = extractFormIdFromUrl(formParam) || (/^[A-Za-z0-9_-]{20,}$/.test(formParam) ? formParam : "");
+      if (!extracted) {
+        throw new FormImportError(
+          "Il campo “Link del modulo” non è valido: incolla il link docs.google.com/forms/… del modulo da leggere.",
+          400
+        );
+      }
+      // Solo l'ID interno (quello del link /edit): lo script lo usa con FormApp.openById.
+      formId = extracted.split("?")[0];
+    }
+
+    const target = formId
+      ? `${endpoint}${endpoint.includes("?") ? "&" : "?"}form=${encodeURIComponent(formId)}`
+      : endpoint;
+
+    const scriptResult = await fetchJsonQuietly(target);
+    if (!scriptResult) {
+      throw new FormImportError(
+        "Lo script Apps Script non ha risposto in tempo: controlla la connessione del server.",
+        502
+      );
+    }
+    if (scriptResult.status !== 200) {
+      throw new FormImportError(
+        `Lo script ha risposto con errore ${scriptResult.status}. Controlla che il deployment sia "Esegui come me" e accessibile a "Chiunque". Riesegui anche la funzione doGet in editor per vedere l'errore reale.`,
+        502
+      );
+    }
+
+    const data = scriptResult.data as { ok?: boolean; error?: string; form?: unknown };
+    if (data && data.ok === false && data.error) {
+      throw new FormImportError(`Lo script segnala: ${data.error}`, 502);
+    }
+
+    const form = normalizeLinkedFormPayload(data?.form ?? data);
+    if (!form) {
+      throw new FormImportError(
+        "Lo script non ha restituito domande leggibili. Assicurati di usare la versione aggiornata di google-forms-export.gs (con la funzione doGet).",
+        502
+      );
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    res.json({ ok: true, form });
+  } catch (err: any) {
+    const status = err instanceof FormImportError ? err.status : 502;
+    const message = err?.message || "Importazione dallo script non riuscita.";
+    console.warn("[Forms Script]", message);
+    res.status(status).json({ error: message });
+  }
 });
 
 // Configure Vite or Static Assets handling
