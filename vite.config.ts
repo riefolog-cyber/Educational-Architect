@@ -11,6 +11,22 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    build: {
+      rollupOptions: {
+        output: {
+          // Split vendor libraries into stable chunks: parallel downloads and
+          // browser cache that survives between releases.
+          manualChunks(id: string) {
+            if (!id.includes('node_modules')) return undefined;
+            if (id.includes('firebase') || id.includes('@firebase')) return 'vendor-firebase';
+            if (id.includes('jspdf') || id.includes('html2canvas') || id.includes('purify')) return 'vendor-pdf';
+            if (id.includes('lucide-react')) return 'vendor-icons';
+            if (id.includes('motion') || id.includes('framer-motion')) return 'vendor-motion';
+            return 'vendor';
+          },
+        },
+      },
+    },
     server: {
       // HMR is disabled in AI Studio via DISABLE_HMR env var.
       // Do not modifyâfile watching is disabled to prevent flickering during agent edits.

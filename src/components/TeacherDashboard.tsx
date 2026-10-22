@@ -227,10 +227,6 @@ export function clusterInfractionsHint(log: any[]): string | null {
 }
 
 export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps) {
-  // Config state
-  const backendType = "ai-studio";
-  const gasUrl = "";
-
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
@@ -776,7 +772,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       expiry: expiryDate.toISOString(),
       teacherId: user?.uid || "mock_teacher",
       teacherEmail: user?.email || "docente_sandbox@scuola.it",
-      backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim(),
+      backendUrl: "AI_STUDIO_GENAI_INTEGRATA",
       randomizeQuestions,
       severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
       unlockCode,
@@ -830,7 +826,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           active: true,
           createdAt: new Date().toISOString(),
           sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-          backendUrl: backendType === "ai-studio" ? "AI_STUDIO_GENAI_INTEGRATA" : gasUrl.trim()
+          backendUrl: "AI_STUDIO_GENAI_INTEGRATA"
         };
 
         await setDoc(docRef, firestorePayload);

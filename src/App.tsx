@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, Suspense, lazy } from "react";
 import { 
   onAuthStateChanged, 
   signInWithPopup, 
@@ -31,8 +31,9 @@ import {
 
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
-import StudentView from "./components/StudentView";
-import TeacherDashboard from "./components/TeacherDashboard";
+// Code splitting: students load only the student bundle, teachers only the (much larger) dashboard bundle.
+const StudentView = lazy(() => import("./components/StudentView"));
+const TeacherDashboard = lazy(() => import("./components/TeacherDashboard"));
 import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
 
 // Helper to detect Apple mobile devices (iPhone/iPad), where Safari ITP
@@ -58,6 +59,16 @@ function checkIsInAppBrowser(): boolean {
     /FBAN|FBAV|Instagram|WhatsApp|Line|Twitter|Snapchat|Kakaotalk|GSA|musical_ly|BytedanceWebview/i.test(ua) ||
     (ua.includes("wv") && ua.includes("Android")) ||
     (/iPhone|iPod|iPad/i.test(ua) && ua.includes("Mobile") && !ua.includes("Safari") && !ua.includes("CriOS"))
+  );
+}
+
+// Fallback shown while the lazy role bundles load
+function LoadingScreen() {
+  return (
+    <div className="min-h-[60vh] flex flex-col items-center justify-center gap-3 text-slate-400">
+      <div className="w-10 h-10 border-2 border-indigo-500/30 border-t-indigo-400 rounded-full animate-spin" />
+      <p className="text-sm font-medium">Caricamento…</p>
+    </div>
   );
 }
 
@@ -866,11 +877,13 @@ export default function App() {
                   transition={{ duration: 0.25, ease: "easeInOut" }}
                   className="w-full"
                 >
-                  <StudentView 
-                    user={user} 
-                    onLogout={handleSignOut}
-                    onBack={() => setActivePane("home")}
-                  />
+                  <Suspense fallback={<LoadingScreen />}>
+                    <StudentView
+                      user={user}
+                      onLogout={handleSignOut}
+                      onBack={() => setActivePane("home")}
+                    />
+                  </Suspense>
                 </motion.div>
               )}
 
@@ -884,10 +897,12 @@ export default function App() {
                   transition={{ duration: 0.25, ease: "easeInOut" }}
                   className="w-full"
                 >
-                  <TeacherDashboard 
-                    user={user}
-                    onBack={() => setActivePane("home")}
-                  />
+                  <Suspense fallback={<LoadingScreen />}>
+                    <TeacherDashboard
+                      user={user}
+                      onBack={() => setActivePane("home")}
+                    />
+                  </Suspense>
                 </motion.div>
               )}
             </AnimatePresence>
