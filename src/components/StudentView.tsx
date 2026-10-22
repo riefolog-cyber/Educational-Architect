@@ -334,6 +334,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setLockError("");
     persistExamLock(false);
     void syncLockState(false, "");
+    // Back to fullscreen as soon as the block is lifted (unlock-code submission
+    // counts as a user gesture; on remote unlock the guard effect covers it).
+    if (!isAppleMobile()) void requestAppFullScreen();
     setInfractionToastMsg(
       via === "remote"
         ? "🔓 Il docente ha sbloccato la prova dal monitor d'aula."
@@ -949,6 +952,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const handleFullscreenChange = () => {
       if (!isAppFullScreen()) {
         triggerInfraction("uscita_schermo_intero", "Uscita dalla modalità a schermo intero");
+        // The exam must always go back to fullscreen: try immediately.
+        // Chrome allows a programmatic re-entry right after an exit
+        // ("fullscreen re-entry allowance"); if the browser refuses,
+        // the gesture-based guard below re-acquires it at the first tap.
+        void requestAppFullScreen();
       }
     };
 
@@ -1014,6 +1022,25 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
     };
   }, [isExamActive, severityPreset]);
+
+  // "Always fullscreen" guard: while the exam is active, the student's first
+  // tap or key press brings the exam back to fullscreen. Browsers refuse a
+  // programmatic fullscreen request without a user gesture, so if the instant
+  // re-entry attempt fails, this gesture-based catch-all guarantees recovery.
+  useEffect(() => {
+    if (!isExamActive) return;
+    const regain = () => {
+      if (!isAppFullScreen()) {
+        void requestAppFullScreen();
+      }
+    };
+    document.addEventListener("pointerdown", regain, true);
+    document.addEventListener("keydown", regain, true);
+    return () => {
+      document.removeEventListener("pointerdown", regain, true);
+      document.removeEventListener("keydown", regain, true);
+    };
+  }, [isExamActive]);
 
   // Exam Countdown clock setup
   useEffect(() => {
