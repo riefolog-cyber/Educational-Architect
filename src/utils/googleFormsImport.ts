@@ -11,6 +11,8 @@
  * AI) instead of silently using a random option as "correct".
  */
 
+import { stripQuestionNumbering } from "./questionText";
+
 export interface GoogleFormsImportOptions {
   fallbackTitle?: string;
 }
@@ -449,7 +451,7 @@ function buildQuiz(rows: ParsedRow[], title: string, warnings: string[]): {
       } else {
         const item: Record<string, unknown> = {
           id: `gf_mc_${multipleChoice.length + 1}`,
-          question: row.question,
+          question: stripQuestionNumbering(row.question),
           options: row.options,
           correctIndex,
         };
@@ -461,7 +463,7 @@ function buildQuiz(rows: ParsedRow[], title: string, warnings: string[]): {
 
     const item: Record<string, unknown> = {
       id: `gf_oe_${openEnded.length + 1}`,
-      question: row.question,
+      question: stripQuestionNumbering(row.question),
     };
     if (row.kind === "fib" && row.answer) {
       item.criteria = `Risposta attesa: ${row.answer}`;

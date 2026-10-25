@@ -21,7 +21,11 @@ Questa guida spiega come portare in "Educational Architect" un **Google Modulo**
 | va aggiorato quando | mai (URL permanente) | ogni volta che cambia il modulo |
 
 Entrambe leggono la **chiave del Quiz** (`isCorrectAnswer`): moltissime crocette arrivano
-pre-segnate nell'app. I punti del Quiz diventano peso (`weight`) della domanda nel punteggio
+pre-segnate nell'app. Il numero iniziale del titolo («12. Qual è…») viene rimosso, perché l'app
+numera già le domande da sé: senza questa pulizia si leggerebbe «12. 12. Qual è…».
+
+Segue: restano intatti i titoli che iniziano con una data o un numero diverso da un elenco
+(«12 marzo 2020», «2024. Bilancio»). I punti del Quiz diventano peso (`weight`) della domanda nel punteggio
 pesato; le opzioni multiple corrette usano la prima e le altre finiscono in nota.
 Le crocette **senza** chiave impostata nel modulo arrivano senza corretta (si segnano a
 mano nel riepilogo, o restano domande aperte).

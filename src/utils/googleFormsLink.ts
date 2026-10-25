@@ -15,6 +15,7 @@
  */
 
 import type { GoogleFormsImportResult } from "./googleFormsImport";
+import { stripQuestionNumbering } from "./questionText";
 
 export type LinkedQuestionKind = "mc" | "checkbox" | "open" | "scale" | "grid";
 
@@ -582,7 +583,10 @@ export function buildExamFromLinkedForm(
 
   form.questions.forEach((q, index) => {
     const number = index + 1;
-    const shortName = q.question.length > 60 ? `${q.question.slice(0, 60)}...` : q.question;
+    // Il numero del titolo ("12. …") è già reso dall'app: qui si toglie per non
+    // vedere "12. 12. …" nella prova dello studente.
+    const questionText = stripQuestionNumbering(q.question);
+    const shortName = questionText.length > 60 ? `${questionText.slice(0, 60)}...` : questionText;
     // Teacher override wins; the automatically read key is the fallback.
     const chosen = correctIndexById[q.id] ?? q.correctIndex;
     const hasOptions = q.options.length >= 2;
@@ -596,7 +600,7 @@ export function buildExamFromLinkedForm(
       }
       multipleChoice.push({
         id,
-        question: q.question,
+        question: questionText,
         options: q.options,
         correctIndex: chosen,
         ...(q.points !== undefined && q.points !== 1 ? { weight: q.points } : {}),
@@ -628,7 +632,7 @@ export function buildExamFromLinkedForm(
     }
     openEnded.push({
       id: openId,
-      question: q.question,
+      question: questionText,
       ...(criteria ? { criteria } : {}),
     });
   });
