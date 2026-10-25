@@ -67,6 +67,7 @@ export interface WorkbookExam {
   title: string;
   sections: WorkbookSection[];
   answerKey?: WorkbookAnswerKey;
+  images?: Record<string, string>;
 }
 
 export interface Exam {

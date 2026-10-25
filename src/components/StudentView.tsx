@@ -150,6 +150,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   const [isExamActive, setIsExamActive] = useState(false);
   const [infractionModalMsg, setInfractionModalMsg] = useState<string | null>(null);
+  const [submitWarningMsg, setSubmitWarningMsg] = useState<string | null>(null);
+  const [appAlert, setAppAlert] = useState<{ msg: string; onOk?: () => void } | null>(null);
   
   // Real-time split screen and display integrity state
   const [splitScreenInfo, setSplitScreenInfo] = useState<SplitScreenDetection>(() => detectSplitScreenStatus());
@@ -543,7 +545,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
     } catch (err: any) {
       console.error("Generazione piano fallita:", err);
-      alert(`⚠️ Errore durante la generazione del piano di recupero tramite IA: ${err.message}`);
+      setAppAlert({ msg: `⚠️ Errore durante la generazione del piano di recupero tramite IA: ${err.message}` });
     } finally {
       setGeneratingPlan(false);
     }
@@ -1097,8 +1099,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setIsExamActive(false);
           
           // Force redirection to self-assessment when timer expires!
-          alert("⏱️ Il tempo a disposizione impostato dal docente per questa sessione d'esame è scaduto!\n\nTutti i tuoi testi e le risposte fornite finora sono stati salvati come bozza. Verrai ora reindirizzato al pannello di autovalutazione metacognitiva per completare l'invio ufficiale.");
-          setActiveScreen("self-assessment");
+          setAppAlert({ msg: "⏱️ Il tempo a disposizione impostato dal docente per questa sessione d'esame è scaduto!\n\nTutti i tuoi testi e le risposte fornite finora sono stati salvati come bozza. Verrai ora reindirizzato al pannello di autovalutazione metacognitiva per completare l'invio ufficiale.", onOk: () => setActiveScreen("self-assessment") });
           return;
         }
 
@@ -1159,13 +1160,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         infractionsLog: [...prev.infractionsLog, infraction]
       }));
 
-      alert(
-        `⚠️ VIOLAZIONE INTEGRITÀ RILEVATA: SCHERMO DIVISO ATTIVO!\n\n` +
-        `${currentStatus.reason || "È stata rilevata la modalità split-screen / multi-finestra con un'altra app aperta."}\n\n` +
-        `È severamente vietato svolgere l'esame affiancando altre applicazioni (es. WhatsApp, app di messaggistica, browser).\n\n` +
-        `Per sbloccare e iniziare la prova devi prima chiudere l'altra applicazione ed espandere questa schermata a tutto schermo.\n\n` +
-        `Il tentativo di inizio con schermo diviso è stato registrato nel log d'esame per il docente.`
-      );
+      setAppAlert({ msg: `⚠️ VIOLAZIONE INTEGRITÀ RILEVATA: SCHERMO DIVISO ATTIVO!\n\n${currentStatus.reason || "È stata rilevata la modalità split-screen / multi-finestra con un'altra app aperta."}\n\nÈ severamente vietato svolgere l'esame affiancando altre applicazioni (es. WhatsApp, app di messaggistica, browser).\n\nPer sbloccare e iniziare la prova devi prima chiudere l'altra applicazione ed espandere questa schermata a tutto schermo.\n\nIl tentativo di inizio con schermo diviso è stato registrato nel log d'esame per il docente.` });
       return;
     }
 
@@ -1180,7 +1175,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // MCQ handler
   const handleSelectMC = (qId: string, optIndex: number) => {
     if (!isExamActive || isTimeCurrentlyExpired()) {
-      alert("⚠️ Impossibile modificare le risposte: il tempo d'esame è scaduto o inattivo.");
+      setAppAlert({ msg: "⚠️ Impossibile modificare le risposte: il tempo d'esame è scaduto o inattivo." });
       return;
     }
     const updatedAnswers = {
@@ -1274,7 +1269,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (remainingCount > 0) {
         msg += `\n...e altre ${remainingCount} domande`;
       }
-      alert(msg);
+      setSubmitWarningMsg(msg);
       return;
     }
     setActiveScreen("self-assessment");
@@ -1437,7 +1432,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         setActiveScreen("enter-pin");
         return;
       }
-      alert(`Poller ripristinato: ${err.message}.\n\nSe i server dell'IA sono momentaneamente carichi, prova a ricaricare la pagina tra un minuto per riprendere la correzione automaticamente!`);
+      setAppAlert({ msg: `Poller ripristinato: ${err.message}.\n\nSe i server dell'IA sono momentaneamente carichi, prova a ricaricare la pagina tra un minuto per riprendere la correzione automaticamente!` });
       // Don't strand the student on the spinner: back to self-assessment
       // with all answers intact so they can submit again immediately.
       setActiveScreen("self-assessment");
@@ -1484,7 +1479,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Real submission routine to Backend APIs
   const handleFinalSubmit = async () => {
     if (!studentSelfGrade) {
-      alert("⚠️ Scegli un voto di autovalutazione prima di procedere.");
+      setAppAlert({ msg: "⚠️ Scegli un voto di autovalutazione prima di procedere." });
       return;
     }
 
@@ -1667,7 +1662,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     } catch (err: any) {
       console.error("Submission failed:", err);
-      alert(`Errore critico durante la valutazione: ${err.message}.\n\n(Suggerimento: Se i server dell'IA sono momentaneamente carichi, le tue risposte non sono andate perse!)`);
+      setAppAlert({ msg: `Errore critico durante la valutazione: ${err.message}.\n\n(Suggerimento: Se i server dell'IA sono momentaneamente carichi, le tue risposte non sono andate perse!)` });
       setActiveScreen("exam-space");
     }
   };
@@ -3006,7 +3001,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         }
                       } catch (err: any) {
                         console.error("Generazione piano immediato fallita:", err);
-                        alert(`⚠️ Errore di generazione: ${err.message}`);
+                        setAppAlert({ msg: `⚠️ Errore di generazione: ${err.message}` });
                       } finally {
                         setGeneratingPlan(false);
                       }
@@ -3344,7 +3339,43 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         </div>
       )}
 
-      {/* Non-blocking repeat warning toast (see triggerInfraction) */}
+      {/* Submit warning (unanswered questions) - in-app, avoids exiting fullscreen */}
+      {submitWarningMsg && (
+        <div className="fixed inset-0 bg-slate-950/80 z-[9999] flex flex-col justify-center items-center p-6 text-center leading-relaxed">
+          <div className="bg-slate-900 border border-amber-500/40 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+            <div className="flex justify-center mb-4">
+              <AlertTriangle className="w-10 h-10 text-amber-400" />
+            </div>
+            <h2 className="text-xl font-display font-medium text-white mb-3 uppercase tracking-wide">
+              Domande non completate
+            </h2>
+            <p className="text-sm text-amber-100 max-w-md mb-6 whitespace-pre-line text-left">
+              {submitWarningMsg}
+            </p>
+            <button
+              onClick={() => setSubmitWarningMsg(null)}
+              className="px-8 py-3 bg-amber-500 text-slate-950 font-bold hover:bg-amber-400 rounded-xl max-w-xs transition-colors shadow-lg active:scale-95"
+            >
+              Ho capito, torno al test
+            </button>
+          </div>
+        </div>
+      )}
+      {appAlert && (
+        <div className="fixed inset-0 bg-slate-950/80 z-[9999] flex flex-col justify-center items-center p-6 text-center leading-relaxed">
+          <div className="bg-slate-900 border border-white/10 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+            <p className="text-sm text-slate-100 max-w-md mb-6 whitespace-pre-line text-left">
+              {appAlert.msg}
+            </p>
+            <button
+              onClick={() => { appAlert.onOk?.(); setAppAlert(null); }}
+              className="px-8 py-3 bg-white text-slate-950 font-bold hover:bg-slate-100 rounded-xl max-w-xs transition-colors shadow-lg active:scale-95"
+            >
+              OK
+            </button>
+          </div>
+        </div>
+      )}
       {infractionToastMsg && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[9998] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
           ⚠️ {infractionToastMsg}

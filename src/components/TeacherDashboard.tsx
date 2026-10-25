@@ -583,8 +583,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const { type, count } = countLibraryQuestions(parsed);
       const formatted = JSON.stringify(
         parsed.sections
-          ? { title: parsed.title || title, sections: parsed.sections }
-          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [] },
+          ? { title: parsed.title || title, sections: parsed.sections, ...(parsed.images ? { images: parsed.images } : {}) }
+          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [], ...(parsed.images ? { images: parsed.images } : {}) },
         null,
         2
       );
