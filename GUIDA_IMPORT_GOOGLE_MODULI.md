@@ -129,6 +129,55 @@ finché non lo ridistribuisci.
 
 ---
 
+## 🆕 Script con account personale (consigliato per le immagini)
+
+Se la scuola blocca l'abilitazione della Forms API o la creazione del progetto Cloud, usa un
+**account Google personale** (Gmail). Lo script gira "Esegui come: Me", quindi legge solo i moduli
+a cui quell'account ha accesso: per questo va condiviso il modulo scolastico.
+
+### 1. Condividi il modulo con l'account personale
+In Google Moduli (account scuola): apri il modulo → ⋮ → **Aggiungi collaboratori** → inserisci
+l'indirizzo Gmail personale → ruolo **Editor** (o "Visualizzatore" basta per leggere). Salva.
+
+### 2. Crea lo script con l'account personale
+1. Apri https://script.google.com **con l'account personale** → **Nuovo progetto**.
+2. Cancella il contenuto di `Code.gs` e incolla tutto `google-forms-export.gs` → **Ctrl+S**.
+3. (Facoltativo) Imposta `var FORM_ID = "ID_DEL_MODULO";` se vuoi un progetto dedicato a un modulo.
+
+### 3. Abilita la Google Forms API (per le immagini dentro le domande)
+1. In editor: ⚙️ **Impostazioni progetto** → spunta **"Mostra il file `appsscript.json` nell'editor"**.
+2. Apri `appsscript.json` e assicurati che contenga:
+   ```json
+   "oauthScopes": [
+     "https://www.googleapis.com/auth/forms.currentonly",
+     "https://www.googleapis.com/auth/forms",
+     "https://www.googleapis.com/auth/script.external_request",
+     "https://www.googleapis.com/auth/drive",
+     "https://www.googleapis.com/auth/forms.body.readonly"
+   ]
+   ```
+3. ⚙️ **Impostazioni progetto** → **Progetto Google Cloud Platform** → clicca il numero progetto
+   → si apre la Console Cloud → **API e servizi → Libreria** → cerca **"Google Forms API"** → **Abilita**.
+   (Con account personale non ci sono blocchi amministrativi.)
+
+### 4. Distribuisci come App Web
+1. **Distribuisci → Nuova distribuzione** → ⚙️ → **Applicazione web**.
+2. Esegui come: **Me** (account personale). Chi ha accesso: **Chiunque**. Distribuisci → autorizza.
+3. Copia l'URL `/exec`.
+
+### 5. Usa nell'app
+Nel modal **Importa da Google Moduli** → riquadro "Script privato (Web App)" → incolla l'URL `/exec`
+→ incolla il **link del modulo** → **Leggi dallo script**.
+
+Ora le immagini messe *dentro* le domande vengono lette automaticamente (via Forms API) e
+compaiono nel riepilogo. Se un'immagine non si carica, l'avviso indicherà la causa (scope/API
+disabilitata); in quel caso ripeti i passi 3 e ridistribuisci.
+
+> ⚠️ L'URL `/exec` è legato all'account personale: non condividerlo pubblicamente. Chi usa lo
+> stesso PC dopo di te ridimensiona il proprio URL in 10 secondi.
+
+---
+
 ## 🅱️ CSV: export manuale (piano B)
 
 1. In editor: imposta `var FORM_ID = "ID_DEL_MODULO";` (riga ~34) → **Ctrl+S**.
