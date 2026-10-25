@@ -1591,6 +1591,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
             currentY += 1;
 
+            const mcImg = domandeObj?.images?.[q.id];
+            if (mcImg) {
+              checkPageBreak(70);
+              try {
+                const mfmt = mcImg.includes("image/png") ? "PNG" : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
+
             if (isCorrect) {
               writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
             } else {
@@ -1620,6 +1630,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             checkPageBreak(25);
             writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
             currentY += 1;
+
+            const oeImg = domandeObj?.images?.[questionRef?.id];
+            if (oeImg) {
+              checkPageBreak(70);
+              try {
+                const ofmt = oeImg.includes("image/png") ? "PNG" : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
 
             // Student input box
             const displayAnsText = ansText === "[VUOTO]" ? "Risposta non compilata o lasciata vuota (scena muta)" : ansText;
@@ -1722,30 +1742,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             currentY += 4;
           });
         }
-      }
-
-      // 7b. FIGURE DELLA PROVA (se presenti nell'esame)
-      const examImages = domandeObj?.images;
-      if (examImages && typeof examImages === "object" && Object.keys(examImages).length > 0) {
-        checkPageBreak(20);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(11);
-        doc.setTextColor(15, 23, 42);
-        doc.text("Figure della Prova", 15, currentY);
-        currentY += 6;
-        Object.entries(examImages).forEach(([qid, src]) => {
-          if (typeof src !== "string" || !src) return;
-          checkPageBreak(70);
-          try {
-            const fmt = src.includes("image/png") ? "PNG" : src.includes("image/jpeg") || src.includes("image/jpg") ? "JPEG" : "PNG";
-            doc.addImage(src, fmt, 15, currentY, 170, 90);
-            currentY += 95;
-          } catch (imgErr) {
-            writeText(`[Figura ${qid} non renderizzabile nel PDF]`, 8, false, [148, 163, 184], 15);
-            currentY += 4;
-          }
-        });
-        currentY += 4;
       }
 
       // 7. FOOTER PAGE SIGNATURE
