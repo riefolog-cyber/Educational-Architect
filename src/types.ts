@@ -25,6 +25,12 @@ export interface QuizExam {
   title?: string;
   multipleChoice?: MultipleChoiceQuestion[];
   openEnded?: OpenEndedQuestion[];
+  /**
+   * Figure per domanda: id della domanda -> data URL (importata dallo script o
+   * allegata dal docente) oppure URL https. Restano fuori dalle domande per non
+   * rendere illeggibile il JSON dell'editor.
+   */
+  images?: Record<string, string>;
 }
 
 export interface FillInTheBlank {

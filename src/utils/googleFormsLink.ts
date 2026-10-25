@@ -35,11 +35,34 @@ export interface LinkedFormQuestion {
   correctIndex?: number;
   /** Points of the question when the form is a Quiz; drives the exam weight. */
   points?: number;
+  /** Figure of the question (data URL from the script/upload, or https URL). */
+  image?: string;
+}
+
+/** Hard cap for one image carried inside the payload (base64 characters). */
+export const MAX_IMAGE_CHARS = 1_200_000;
+
+/**
+ * Only self-contained data URLs (script/upload) and plain https links are
+ * accepted: anything else would not render for the student or would be a
+ * vector for injecting markup.
+ */
+export function normalizeQuestionImage(value: unknown): string {
+  if (typeof value !== "string") return "";
+  const src = value.trim();
+  if (!src) return "";
+  if (/^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]+$/i.test(src)) {
+    return src.length <= MAX_IMAGE_CHARS ? src : "";
+  }
+  if (/^https:\/\/[^\s"'<>]+$/i.test(src)) return src;
+  return "";
 }
 
 export interface LinkedFormPayload {
   title: string;
   description?: string;
+  /** Dichiarata da google-forms-export.gs: assente = deployment vecchio. */
+  scriptVersion?: string;
   questions: LinkedFormQuestion[];
   /** Items that could not be imported (file upload, images, ...). */
   skipped: string[];
@@ -499,6 +522,7 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
 
     const points = Number.isFinite(Number(q.points)) && Number(q.points) > 0 ? Number(q.points) : undefined;
     const section = cleanFormText(q.section);
+    const image = normalizeQuestionImage(q.image);
 
     questions.push({
       id,
@@ -509,6 +533,7 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
       ...(section ? { section } : {}),
       ...(correctIndex !== undefined ? { correctIndex } : {}),
       ...(points !== undefined ? { points } : {}),
+      ...(image ? { image } : {}),
       ...(cleanFormText(q.note) ? { note: cleanFormText(q.note) } : {}),
     });
   });
@@ -526,6 +551,7 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
     ...(description ? { description } : {}),
     questions,
     skipped,
+    ...(cleanFormText(raw.scriptVersion) ? { scriptVersion: cleanFormText(raw.scriptVersion) } : {}),
     sourceUrl: cleanFormText(raw.sourceUrl),
     ...(keyed > 0 ? { keySource: "script" as LinkedFormKeySource, keyedCount: keyed } : {}),
   };
@@ -549,6 +575,10 @@ export function buildExamFromLinkedForm(
   const warnings: string[] = [...form.skipped];
   const multipleChoice: Record<string, unknown>[] = [];
   const openEnded: Record<string, unknown>[] = [];
+  // Figures live in one map at the root: the questions stay readable in the
+  // JSON editor instead of carrying kilobytes of base64 each.
+  const images: Record<string, string> = {};
+  let imageCount = 0;
 
   form.questions.forEach((q, index) => {
     const number = index + 1;
@@ -559,8 +589,13 @@ export function buildExamFromLinkedForm(
     const hasAnswer = typeof chosen === "number" && chosen >= 0 && chosen < q.options.length;
 
     if ((q.kind === "mc" || q.kind === "checkbox") && hasOptions && hasAnswer) {
+      const id = `gf_mc_${multipleChoice.length + 1}`;
+      if (q.image) {
+        images[id] = q.image;
+        imageCount++;
+      }
       multipleChoice.push({
-        id: `gf_mc_${multipleChoice.length + 1}`,
+        id,
         question: q.question,
         options: q.options,
         correctIndex: chosen,
@@ -586,18 +621,31 @@ export function buildExamFromLinkedForm(
         ? `Opzioni del modulo: ${q.options.map((o, i) => `${optionLetter(i)}) ${o}`).join(" · ")}`
         : undefined);
 
+    const openId = `gf_oe_${openEnded.length + 1}`;
+    if (q.image) {
+      images[openId] = q.image;
+      imageCount++;
+    }
     openEnded.push({
-      id: `gf_oe_${openEnded.length + 1}`,
+      id: openId,
       question: q.question,
       ...(criteria ? { criteria } : {}),
     });
   });
 
+  if (imageCount > 0) {
+    warnings.push(`Immagini incluse nel quiz: ${imageCount}. Controlla nel riepilogo che ogni figura sia sopra la domanda giusta.`);
+  }
+
   if (multipleChoice.length === 0 && openEnded.length === 0) {
     throw new Error("Nessuna domanda valida trovata nel modulo.");
   }
 
-  const examJson = JSON.stringify({ title, multipleChoice, openEnded }, null, 2);
+  const examJson = JSON.stringify(
+    { title, multipleChoice, openEnded, ...(imageCount > 0 ? { images } : {}) },
+    null,
+    2
+  );
 
   return {
     examJson,

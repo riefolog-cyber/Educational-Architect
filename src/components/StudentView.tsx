@@ -92,6 +92,18 @@ function QuestionMeta({ q, tone }: { q: any; tone?: "amber" | "teal" }) {
   );
 }
 
+/** Figura della domanda (importata da Google Moduli o allegata dal docente). */
+function QuestionFigure({ src }: { src?: string }) {
+  if (!src) return null;
+  return (
+    <img
+      src={src}
+      alt="Figura della domanda"
+      className="block max-h-64 w-auto max-w-full rounded-xl border border-white/10 bg-white p-2 object-contain"
+    />
+  );
+}
+
 export default function StudentView({ user, onLogout, onBack }: StudentViewProps) {
   // State
   const [pin, setPin] = useState("");
@@ -1991,6 +2003,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     <span className="font-bold text-sm">{isCorrect ? "✅" : "❌"}</span>
                                     <div>
                                       <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
+                                      <QuestionFigure src={parsedExamData?.images?.[q.id]} />
                                       <p className="mt-1">
                                         La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                                       </p>
@@ -2028,6 +2041,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                       DOMANDA APERTA {((parsedExamData?.multipleChoice || []).length) + iIdx + 1}
                                     </p>
                                     <p className="font-semibold text-slate-200 text-sm leading-relaxed">{q.question}</p>
+                                    <QuestionFigure src={parsedExamData?.images?.[q.id]} />
                                     <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
                                       &ldquo;{displayAnswer}&rdquo;
                                     </div>
@@ -2482,6 +2496,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               {q.question}
                               <QuestionMeta q={q} />
                             </p>
+                            <QuestionFigure src={examData?.images?.[q.id]} />
                             <div className="grid grid-cols-1 gap-2.5 pl-2">
                               {q.options.map((opt: string, optIdx: number) => (
                                 <button
@@ -2531,6 +2546,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               {q.question}
                               <QuestionMeta q={q} />
                             </p>
+                            <QuestionFigure src={examData?.images?.[q.id]} />
                             <div className="space-y-1.5">
                               <textarea
                                 value={savedValue}
@@ -3062,6 +3078,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         <span className="font-bold text-sm">{isCorrect ? "✅" : "❌"}</span>
                         <div>
                           <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
+                          <QuestionFigure src={examData?.images?.[q.id]} />
                           <p className="mt-1">
                             La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                           </p>
@@ -3105,6 +3122,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           DOMANDA APERTA {((examData?.multipleChoice || []).length) + iIdx + 1}
                         </p>
                         <p className="font-semibold text-slate-200 text-sm leading-relaxed">{q.question}</p>
+                        <QuestionFigure src={examData?.images?.[q.id]} />
                         <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5 line-clamp-3">
                           &ldquo;{displayAnswer}&rdquo;
                         </div>

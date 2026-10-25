@@ -9,7 +9,8 @@ import {
   Trash2,
   Link2,
   Loader2,
-  ClipboardPaste
+  ClipboardPaste,
+  Image as ImageIcon
 } from "lucide-react";
 import { parseGoogleFormsImport, type GoogleFormsImportResult } from "../utils/googleFormsImport";
 import {
@@ -17,6 +18,7 @@ import {
   type LinkedFormPayload,
   type LinkedFormQuestion
 } from "../utils/googleFormsLink";
+import { compressImageSource, fileToExamImage } from "../utils/imageData";
 
 interface GoogleFormsImportModalProps {
   isOpen: boolean;
@@ -65,9 +67,73 @@ export default function GoogleFormsImportModal({
   });
   const [loadingScript, setLoadingScript] = useState(false);
 
+  // Figura della domanda: il file scelto viene compresso e appeso alla domanda
+  // indicata (serve per le immagini messe DENTRO la domanda su Google Moduli,
+  // che lo script non può leggere).
+  const [imageTarget, setImageTarget] = useState<string | null>(null);
+  const [imageBusy, setImageBusy] = useState(false);
+
   const fileInputRef = useRef<HTMLInputElement | null>(null);
+  const imageInputRef = useRef<HTMLInputElement | null>(null);
 
   if (!isOpen) return null;
+
+  /** Le immagini importate vengono ricodificate subito: il quiz deve restare leggero. */
+  const withCompressedImages = async (form: LinkedFormPayload): Promise<LinkedFormPayload> => {
+    const questions = await Promise.all(
+      form.questions.map(async (q) =>
+        q.image ? { ...q, image: await compressImageSource(q.image) } : q
+      )
+    );
+    return { ...form, questions };
+  };
+
+  const pickImageFor = (questionId: string) => {
+    setImageTarget(questionId);
+    imageInputRef.current?.click();
+  };
+
+  const handleImageChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    const target = imageTarget;
+    setImageTarget(null);
+    if (!file || !target) return;
+    setImageBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const src = await fileToExamImage(file);
+      setLinked((prev) =>
+        prev
+          ? {
+              ...prev,
+              questions: prev.questions.map((q) => (q.id === target ? { ...q, image: src } : q))
+            }
+          : prev
+      );
+    } catch (err: any) {
+      setError(err?.message || "Immagine non importata.");
+    } finally {
+      setImageBusy(false);
+    }
+  };
+
+  const removeImage = (questionId: string) => {
+    setResult(null);
+    setLinked((prev) =>
+      prev
+        ? {
+            ...prev,
+            questions: prev.questions.map((q) => {
+              if (q.id !== questionId) return q;
+              const { image, ...rest } = q;
+              return rest as LinkedFormQuestion;
+            })
+          }
+        : prev
+    );
+  };
 
   /** Correct options already read automatically (Forms API / Apps Script). */
   const answersFromForm = (form: LinkedFormPayload): Record<string, number> => {
@@ -140,7 +206,7 @@ export default function GoogleFormsImportModal({
       if (!form || !Array.isArray(form.questions) || form.questions.length === 0) {
         throw new Error("Il modulo non contiene domande importabili.");
       }
-      setLinked(form);
+      setLinked(await withCompressedImages(form));
       setAnswers(answersFromForm(form));
     } catch (e: any) {
       setError(e?.message || "Lettura del modulo non riuscita.");
@@ -184,7 +250,7 @@ export default function GoogleFormsImportModal({
       } catch {
         // Navigazione privata senza storage: funziona comunque, solo non memorizza.
       }
-      setLinked(form);
+      setLinked(await withCompressedImages(form));
       setAnswers(answersFromForm(form));
     } catch (e: any) {
       setError(e?.message || "Lettura dallo script non riuscita.");
@@ -259,6 +325,14 @@ export default function GoogleFormsImportModal({
         </div>
 
         <div className="p-5 space-y-4">
+          <input
+            ref={imageInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
+            onChange={handleImageChosen}
+            className="hidden"
+          />
+
           {/* Link import: the primary path */}
           <div className="rounded-2xl bg-slate-950/50 border border-white/10 p-3 space-y-2.5">
             <p className="text-[10px] uppercase font-bold tracking-wider text-slate-400 flex items-center gap-1.5">
@@ -322,6 +396,11 @@ export default function GoogleFormsImportModal({
                   <p className="text-[11px] font-bold text-teal-200 truncate">{linked.title}</p>
                   <p className="text-[10px] text-slate-400">
                     {linked.questions.length} domande lette
+                    {linked.questions.some((q) => q.image) ? (
+                      <span className="ml-1 text-sky-300">
+                        · 🖼 {linked.questions.filter((q) => q.image).length} immagini
+                      </span>
+                    ) : null}
                     {linked.keySource && linked.keyedCount ? (
                       <span className="ml-1 font-semibold text-emerald-400">
                         · ✅ {linked.keyedCount} corrette lette da {linked.keySource === "api" ? "API Google" : "Apps Script"}
@@ -340,6 +419,30 @@ export default function GoogleFormsImportModal({
                 </button>
               </div>
 
+              {!linked.scriptVersion && (
+                <p className="text-[10px] text-amber-200/90 bg-amber-500/5 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
+                  Lo script non dichiara la sua versione: il deployment sta eseguendo una copia vecchia del codice.
+                  In Apps Script fai <b className="text-amber-100">Distribuisci → Gestisci distribuzioni → ✏️ →
+                  “Nuova versione” → Distribuisci</b>.
+                </p>
+              )}
+
+              {!linked.questions.some((q) => q.image) && (
+                <p className="text-[10px] text-amber-200/90 bg-amber-500/10 border border-amber-500/25 rounded-xl p-2 leading-relaxed">
+                  Nessuna immagine letta dal modulo. Se le figure sono messe <i>dentro</i> una domanda,
+                  Apps Script non le vede: premi <b className="text-amber-100">Immagine</b> sulla domanda e allega il
+                  file (vale anche per i moduli privati).
+                </p>
+              )}
+
+              {linked.skipped.length > 0 && (
+                <ul className="text-[10px] text-amber-200/80 bg-amber-500/5 border border-amber-500/20 rounded-xl p-2 pl-6 list-disc space-y-0.5">
+                  {linked.skipped.slice(0, 6).map((s, i) => (
+                    <li key={i}>{s}</li>
+                  ))}
+                </ul>
+              )}
+
               <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1">
                 {linked.questions.map((q, i) => {
                   const isChoice = (q.kind === "mc" || q.kind === "checkbox") && q.options.length >= 2;
@@ -352,6 +455,48 @@ export default function GoogleFormsImportModal({
                           {KIND_LABEL[q.kind]}
                         </span>
                       </div>
+
+                      {q.image ? (
+                        <div className="flex items-start gap-2 pl-4">
+                          <img
+                            src={q.image}
+                            alt="Figura della domanda"
+                            className="max-h-24 w-auto max-w-full rounded-lg border border-white/10 bg-white p-1 object-contain"
+                          />
+                          <div className="flex flex-col gap-1 shrink-0">
+                            <button
+                              type="button"
+                              onClick={() => pickImageFor(q.id)}
+                              disabled={imageBusy}
+                              className="text-[10px] px-1.5 py-1 rounded-lg border border-white/10 text-slate-400 hover:text-teal-300 hover:border-teal-500/40 cursor-pointer disabled:opacity-40"
+                            >
+                              Sostituisci
+                            </button>
+                            <button
+                              type="button"
+                              onClick={() => removeImage(q.id)}
+                              className="text-[10px] px-1.5 py-1 rounded-lg border border-white/10 text-slate-400 hover:text-red-300 hover:border-red-500/40 cursor-pointer"
+                            >
+                              Rimuovi
+                            </button>
+                          </div>
+                        </div>
+                      ) : (
+                        <button
+                          type="button"
+                          onClick={() => pickImageFor(q.id)}
+                          disabled={imageBusy}
+                          title="Allega la figura di questa domanda (pittogramma, schema, immagine)"
+                          className="ml-4 inline-flex items-center gap-1 text-[10px] px-1.5 py-1 rounded-lg border border-white/10 text-slate-400 hover:text-teal-300 hover:border-teal-500/40 cursor-pointer disabled:opacity-40"
+                        >
+                          {imageBusy && imageTarget === q.id ? (
+                            <Loader2 className="w-3 h-3 animate-spin" />
+                          ) : (
+                            <ImageIcon className="w-3 h-3" />
+                          )}
+                          Immagine
+                        </button>
+                      )}
 
                       {isChoice && (
                         <div className="flex flex-wrap gap-1 pl-4">
@@ -410,6 +555,11 @@ export default function GoogleFormsImportModal({
                 <li><b className="text-slate-300">Distribuisci → Nuova distribuzione → Applicazione Web</b>: “Esegui come me”, “Chiunque”, Distribuisci.</li>
                 <li>Copia qui l'<b className="text-slate-300">URL /exec</b> che ti fornisce e premi <b className="text-slate-300">Leggi dallo script</b>.</li>
               </ol>
+              <p className="text-[10px] text-amber-200/80 leading-relaxed">
+                Se hai già distribuito lo script in passato, dopo aver incollato il codice serve
+                <b className="text-amber-100"> Distribuisci → Gestisci distribuzioni → ✏️ → “Nuova versione”</b>:
+                salvare il codice non aggiorna l'URL /exec, che continua a eseguire la versione vecchia (senza doGet).
+              </p>
 
               <div className="flex flex-col sm:flex-row gap-2">
                 <input
@@ -445,6 +595,12 @@ export default function GoogleFormsImportModal({
               <p className="text-[10px] text-slate-500">
                 L'URL si riusa per tutti i tuoi moduli: è l'app a passare l'ID del modulo allo script. L'URL deve terminare con <code>/exec</code> o <code>/dev</code>.
                 Una volta riusata una lettura, l'URL viene <b>memorizzato nel browser</b> e ti si ripropone già compilato.
+              </p>
+              <p className="text-[10px] text-slate-500 leading-relaxed">
+                <b className="text-slate-300">Immagini:</b> le figure aggiunte come elemento a sé (icona immagine
+                della barra laterale) arrivano da sole, agganciate alla domanda che le segue. Le immagini messe
+                <i>dentro</i> una domanda non sono leggibili da Apps Script: dopo la lettura, allega il file con il
+                pulsante <b className="text-slate-300">Immagine</b> accanto alla domanda nel riepilogo.
               </p>
             </div>
           </details>
@@ -560,6 +716,12 @@ export default function GoogleFormsImportModal({
                   <p className="font-bold text-white">{result.questionCount}</p>
                 </div>
               </div>
+              {result.examJson.length > 600000 && (
+                <p className="text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 leading-relaxed">
+                  Il quiz con le immagini pesa circa {Math.round(result.examJson.length / 1024)} KB: se l'avvio
+                  sessione dà errore, togli qualche figura dal riepilogo (le immagini sono già compresse).
+                </p>
+              )}
               {result.warnings.length > 0 && (
                 <ul className="space-y-1 text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 list-disc pl-6">
                   {result.warnings.map((w, i) => (

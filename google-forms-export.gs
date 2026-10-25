@@ -30,11 +30,23 @@
  * 3. Copia l'URL che termina con /exec e incollalo nel riquadro "Script
  *    privato (Web App)" della finestra "Importa da Google Moduli": l'app
  *    leggerà domande, opzioni E risposte corrette in una volta sola.
+ *    ⚠️ Se in futuro modifichi questo codice, NON basta salvare: l'URL /exec
+ *    continua a eseguire la versione vecchia finché non fai
+ *    Distribuisci -> Gestisci distribuzioni -> ✏️ -> "Nuova versione".
  * L'URL si può riusare per sempre: cambia modulo solo con ?form=ID (l'app lo
  * fa da sola se includi l'ID del modulo nell'apposito campo).
  *
  * Il CSV generato usa le intestazioni riconosciute dall'app:
  * Tipo; Sezione; Domanda; Opzione A..H; Corretta; Punti; Criteri
+ * (il CSV non porta immagini: quelle arrivano solo con la via Web App).
+ *
+ * IMMAGINI
+ * Nella via Web App le immagini aggiunte come ELEMENTO a sé (icona immagine
+ * della barra laterale) vengono esportate e agganciate alla domanda che le
+ * segue. Le immagini inserite DENTRO una domanda non sono visibili alle API
+ * di Apps Script: vanno allegate a mano dall'app (pulsante "Immagine" nel
+ * riepilogo dell'importazione). Ogni immagine oltre 900 KB viene saltata con
+ * un avviso.
  */
 
 // ---------------------------------------------------------------------------
@@ -49,6 +61,12 @@ var USE_COMMA = false;
 
 /** Numero massimo di opzioni esportate (l'app accetta da A a H). */
 var MAX_OPTIONS = 8;
+
+/** Peso massimo di una singola immagine esportata (in byte). */
+var MAX_IMAGE_BYTES = 900 * 1024;
+
+/** Versione dello script: l'app la mostra per capire se il deployment è vecchio. */
+var SCRIPT_VERSION = "2026-10-25 immagini";
 
 // ---------------------------------------------------------------------------
 
@@ -328,7 +346,9 @@ function doGet(e) {
         "Nessun modulo: passa ?form=ID nel link oppure apri lo script da dentro il modulo."
       );
     }
-    return jsonOutput({ ok: true, form: costruisciJsonModulo(form) });
+    var modulo = costruisciJsonModulo(form);
+    applicaImmaginiDaApi(modulo, form);
+    return jsonOutput({ ok: true, form: modulo });
   } catch (err) {
     return jsonOutput({ ok: false, error: String(err && err.message ? err.message : err) });
   }
@@ -339,6 +359,9 @@ function costruisciJsonModulo(form) {
   var questions = [];
   var skipped = [];
   var section = "";
+  // Le immagini sono elementi a sé nel modulo: quella appena letta viene
+  // agganciata alla domanda successiva (figura del quesito).
+  var pendingImage = "";
 
   var items = form.getItems();
   for (var i = 0; i < items.length; i++) {
@@ -350,7 +373,21 @@ function costruisciJsonModulo(form) {
       continue;
     }
 
-    if (type === FormApp.ItemType.IMAGE || type === FormApp.ItemType.VIDEO || type === FormApp.ItemType.FILE_UPLOAD) {
+    if (type === FormApp.ItemType.IMAGE) {
+      var immagine = leggiImmagineItem(item.asImageItem());
+      if (immagine.src) {
+        pendingImage = immagine.src;
+      } else {
+        skipped.push(
+          'Immagine non importata' +
+            (immagine.motivo ? " (" + immagine.motivo + ")" : "") +
+            ': "' + safeText(item.getTitle()) + '"'
+        );
+      }
+      continue;
+    }
+
+    if (type === FormApp.ItemType.VIDEO || type === FormApp.ItemType.FILE_UPLOAD) {
       skipped.push('Elemento non testuale ignorato: "' + safeText(item.getTitle()) + '"');
       continue;
     }
@@ -388,15 +425,22 @@ function costruisciJsonModulo(form) {
       var gridCols = (grid.getColumns() || []).join(" | ");
       var variety = type === FormApp.ItemType.GRID ? "singola" : "multipla";
       for (var gr = 0; gr < gridRows.length; gr++) {
-        questions.push({
-          id: (question.id) + "_r" + gr,
+        // Niente spread di oggetti: lo script deve girare anche sul runtime
+        // ES5 di Apps Script, dove `...` è un errore di sintassi.
+        var gridQuestion = {
+          id: question.id + "_r" + gr,
           kind: "open",
           question: question.question + " — " + safeText(gridRows[gr]),
           options: [],
           required: false,
-          ...(section ? { section: section } : {}),
           note: "Griglia a scelta " + variety + ". Colonne: " + gridCols
-        });
+        };
+        if (section) gridQuestion.section = section;
+        if (gr === 0 && pendingImage) {
+          gridQuestion.image = pendingImage;
+          pendingImage = "";
+        }
+        questions.push(gridQuestion);
       }
       continue;
     } else if (
@@ -429,6 +473,11 @@ function costruisciJsonModulo(form) {
     var points = questionPoints(item);
     if (points > 0) question.points = points;
 
+    if (pendingImage) {
+      question.image = pendingImage;
+      pendingImage = "";
+    }
+
     questions.push(question);
   }
 
@@ -439,6 +488,7 @@ function costruisciJsonModulo(form) {
   return {
     title: safeText(form.getTitle()),
     description: safeText(form.getDescription()),
+    scriptVersion: SCRIPT_VERSION,
     questions: questions,
     skipped: skipped,
     sourceUrl: String(form.getPublishedUrl() || (form.getEditUrl() || "").replace("/edit", "/viewform"))
@@ -460,6 +510,124 @@ function readChoiceValues(choices, correctIndexes) {
     if (correctFlags[k]) correctIndexes.push(k);
   }
   return values;
+}
+
+/**
+ * Le immagini messe DENTRO una domanda non esistono per FormApp: le conosce
+ * solo la Forms API (questionItem.image.contentUri). Qui si prova a leggerle
+ * con il token dello script; se lo scope non basta, l'avviso dice cosa fare.
+ */
+function applicaImmaginiDaApi(modulo, form) {
+  var lettura;
+  try {
+    lettura = leggiImmaginiDaApi(form.getId());
+  } catch (e) {
+    modulo.skipped.push("Forms API non disponibile: " + (e && e.message ? e.message : e));
+    return;
+  }
+  if (lettura.error) {
+    modulo.skipped.push(lettura.error);
+    return;
+  }
+  var agganciate = 0;
+  for (var i = 0; i < modulo.questions.length; i++) {
+    var q = modulo.questions[i];
+    var src = lettura.images[q.id];
+    if (src && !q.image) {
+      q.image = src;
+      agganciate++;
+    }
+  }
+  var senzaFigura = 0;
+  for (var chiave in lettura.images) {
+    if (lettura.images.hasOwnProperty(chiave)) senzaFigura++;
+  }
+  if (senzaFigura === 0) {
+    modulo.skipped.push("Forms API consultata: nessuna immagine dentro le domande.");
+  } else {
+    modulo.skipped.push(
+      "Forms API: " + senzaFigura + " immagini dentro le domande trovate, " + agganciate + " agganciate."
+    );
+  }
+}
+
+/** GET forms.googleapis.com/v1/forms/{id} + download dei contentUri. */
+function leggiImmaginiDaApi(formId) {
+  var risultato = { images: {}, error: "" };
+  if (!formId) {
+    risultato.error = "Forms API: ID del modulo non disponibile.";
+    return risultato;
+  }
+  var token = ScriptApp.getOAuthToken();
+  var risposta = UrlFetchApp.fetch(
+    "https://forms.googleapis.com/v1/forms/" + encodeURIComponent(formId),
+    { headers: { Authorization: "Bearer " + token }, muteHttpExceptions: true }
+  );
+  var codice = risposta.getResponseCode();
+  if (codice === 401 || codice === 403) {
+    risultato.error =
+      "Forms API non autorizzata (HTTP " + codice + "): serve lo scope " +
+      "https://www.googleapis.com/auth/forms.body.readonly in appsscript.json " +
+      "(vedi GUIDA_IMPORT_GOOGLE_MODULI.md, sezione immagini). Nel frattempo le figure " +
+      "si possono allegare a mano dall'app col pulsante Immagine.";
+    return risultato;
+  }
+  if (codice !== 200) {
+    risultato.error = "Forms API ha risposto con errore " + codice + ".";
+    return risultato;
+  }
+  var dati = JSON.parse(risposta.getContentText());
+  var items = (dati && dati.items) || [];
+  for (var i = 0; i < items.length; i++) {
+    var voce = items[i];
+    var domanda = voce && voce.questionItem;
+    var immagine = domanda && domanda.image;
+    if (!immagine || !immagine.contentUri) continue;
+    var src = scaricaImmagineApi(immagine.contentUri, token);
+    if (src) risultato.images[voce.itemId] = src;
+  }
+  return risultato;
+}
+
+/** Scarica il contentUri dell'immagine e lo converte in data URL. */
+function scaricaImmagineApi(contentUri, token) {
+  try {
+    var risposta = UrlFetchApp.fetch(contentUri, {
+      headers: { Authorization: "Bearer " + token },
+      muteHttpExceptions: true
+    });
+    if (risposta.getResponseCode() !== 200) return "";
+    var blob = risposta.getBlob();
+    var bytes = blob.getBytes();
+    if (!bytes || !bytes.length || bytes.length > MAX_IMAGE_BYTES) return "";
+    var tipo = blob.getContentType() || "image/png";
+    if (!/^image\//.test(tipo)) tipo = "image/png";
+    return "data:" + tipo + ";base64," + Utilities.base64Encode(bytes);
+  } catch (e) {
+    return "";
+  }
+}
+
+/** Legge l'immagine dell'item come data URL (l'app la comprime prima di salvarla). */
+function leggiImmagineItem(imageItem) {
+  try {
+    var blob = imageItem.getImage();
+    if (!blob) return { src: "", motivo: "immagine non scaricabile" };
+    var bytes = blob.getBytes();
+    if (!bytes || bytes.length === 0) return { src: "", motivo: "immagine vuota" };
+    if (bytes.length > MAX_IMAGE_BYTES) {
+      return {
+        src: "",
+        motivo:
+          "troppo pesante: " + Math.round(bytes.length / 1024) + " KB, massimo " +
+          Math.round(MAX_IMAGE_BYTES / 1024) + " KB"
+      };
+    }
+    var tipo = blob.getContentType() || "image/png";
+    return { src: "data:" + tipo + ";base64," + Utilities.base64Encode(bytes), motivo: "" };
+  } catch (e) {
+    return { src: "", motivo: "lettura non riuscita" };
+  }
 }
 
 /** isRequired() esiste solo su alcuni tipi di item. */

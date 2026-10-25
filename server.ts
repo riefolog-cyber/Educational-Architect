@@ -1678,6 +1678,103 @@ app.get("/api/forms-import", async (req, res) => {
 // forms): the shared google-forms-export.gs exposes a doGet that returns the
 // form payload as JSON, correct answers included.
 // -----------------------------------------------------------------------------
+
+/**
+ * Fetches the Web App keeping WHAT Google actually answered. Without this, a
+ * stale deployment (or the sign-in page) is indistinguishable from an empty
+ * form: both would end up as "nessuna domanda leggibile".
+ */
+interface AppsScriptAnswer {
+  status: number;
+  finalUrl: string;
+  contentType: string;
+  body: string;
+  json: unknown | null;
+}
+
+async function fetchAppsScriptAnswer(target: string): Promise<AppsScriptAnswer | null> {
+  const controller = new AbortController();
+  // Apps Script va in cold start: la prima chiamata dopo inattività può durare 10-25s.
+  const timer = setTimeout(() => controller.abort(), 30000);
+  try {
+    const response = await fetch(target, {
+      redirect: "follow",
+      signal: controller.signal,
+      headers: {
+        Accept: "application/json,text/plain,*/*",
+        "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
+      },
+    });
+    const body = await response.text();
+    let json: unknown = null;
+    try {
+      json = JSON.parse(body);
+    } catch {
+      json = null;
+    }
+    return {
+      status: response.status,
+      finalUrl: response.url || target,
+      contentType: response.headers.get("content-type") || "",
+      body,
+      json,
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Testo visibile di una risposta HTML, corto abbastanza per un messaggio d'errore. */
+function readableHtmlExcerpt(body: string, max = 200): string {
+  const text = body
+    .replace(/<script[\s\S]*?<\/script>/gi, " ")
+    .replace(/<style[\s\S]*?<\/style>/gi, " ")
+    .replace(/<[^>]*>/g, " ")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&amp;/gi, "&")
+    .replace(/&#39;|&apos;/gi, "'")
+    .replace(/\s+/g, " ")
+    .trim();
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/**
+ * Traduce una risposta inutilizzabile di Apps Script nell'azione da fare.
+ * null quando il corpo non è una pagina Google riconoscibile.
+ */
+function explainAppsScriptAnswer(answer: AppsScriptAnswer, target: string): string | null {
+  const body = answer.body || "";
+  const lower = body.toLowerCase();
+  const excerpt = readableHtmlExcerpt(body);
+
+  if (/script function not found|function not found|funzione .*non trovata|no se encontró la función/.test(lower)) {
+    return "Apps Script risponde “Script function not found: doGet”: la versione ONLINE dello script non contiene doGet. Salvare il codice non aggiorna l'app web: in Apps Script fai Distribuisci → Gestisci distribuzioni → ✏️ → Versione: “Nuova versione” → Distribuisci, poi riprova.";
+  }
+
+  if (/accounts\.google\.com|servicelogin|accountchooser|\/consent/.test(answer.finalUrl.toLowerCase())) {
+    return "Google ha risposto con la pagina di accesso invece del JSON: la Web App non è raggiungibile in modo anonimo. In Apps Script: Distribuisci → Gestisci distribuzioni → ✏️ → “Chi ha accesso: Chiunque” → Distribuisci. Usa poi l'URL …/exec (non …/dev, che funziona solo per te da loggato).";
+  }
+
+  if (/autorizzazione richiesta|authorization required|richiesta di autorizzazione|needs authorization|non autorizzato/.test(lower)) {
+    return "Lo script non è ancora autorizzato: apri l'editor di Apps Script, esegui una volta la funzione doGet accettando i permessi, poi ridistribuisci con “Nuova versione”.";
+  }
+
+  if (/deployment (?:not found|does not exist)|distribuzione non trovata|deployment non trovato|impossibile trovare/.test(lower)) {
+    return "Il link /exec non punta a una distribuzione attiva: ricopia l'URL da Apps Script → Distribuisci → Gestisci distribuzioni → ✏️ → “URL dell'app web”.";
+  }
+
+  if (/html/i.test(answer.contentType) || /<html/i.test(body)) {
+    return `Apps Script ha restituito una pagina HTML invece del JSON, quasi sempre perché il deployment esegue una versione vecchia dello script. Contenuto: “${excerpt || "pagina senza testo"}”. Apri ${target} nel browser per vedere la risposta esatta, poi fai Distribuisci → Gestisci distribuzioni → ✏️ → “Nuova versione” → Distribuisci.`;
+  }
+
+  if (excerpt) {
+    return `Lo script non ha restituito JSON (Content-Type: ${answer.contentType || "sconosciuto"}). Contenuto ricevuto: “${excerpt}”.`;
+  }
+
+  return null;
+}
 app.get("/api/forms-script", async (req, res) => {
   try {
     const endpoint = normalizeAppsScriptExecUrl(String(req.query.app || ""));
@@ -1707,29 +1804,53 @@ app.get("/api/forms-script", async (req, res) => {
       ? `${endpoint}${endpoint.includes("?") ? "&" : "?"}form=${encodeURIComponent(formId)}`
       : endpoint;
 
-    const scriptResult = await fetchJsonQuietly(target);
+    const scriptResult = await fetchAppsScriptAnswer(target);
     if (!scriptResult) {
       throw new FormImportError(
-        "Lo script Apps Script non ha risposto in tempo: controlla la connessione del server.",
-        502
-      );
-    }
-    if (scriptResult.status !== 200) {
-      throw new FormImportError(
-        `Lo script ha risposto con errore ${scriptResult.status}. Controlla che il deployment sia "Esegui come me" e accessibile a "Chiunque". Riesegui anche la funzione doGet in editor per vedere l'errore reale.`,
+        "Lo script Apps Script non ha risposto entro 30s: la prima chiamata dopo un periodo di inattività può essere lenta, riprova una volta. Se si ripete, apri l'URL /exec nel browser e controlla che risponda col JSON.",
         502
       );
     }
 
-    const data = scriptResult.data as { ok?: boolean; error?: string; form?: unknown };
-    if (data && data.ok === false && data.error) {
+    if (scriptResult.status !== 200) {
+      throw new FormImportError(
+        explainAppsScriptAnswer(scriptResult, target) ??
+          `Lo script ha risposto con errore ${scriptResult.status}. Controlla che il deployment sia "Esegui come me" e accessibile a "Chiunque". Riesegui anche la funzione doGet in editor per vedere l'errore reale.`,
+        502
+      );
+    }
+
+    const data = (scriptResult.json && typeof scriptResult.json === "object" ? scriptResult.json : null) as {
+      ok?: boolean;
+      error?: string;
+      form?: unknown;
+      questions?: unknown;
+    } | null;
+
+    if (!data) {
+      // Non-JSON: quasi sempre una pagina di errore o di accesso di Google.
+      throw new FormImportError(
+        explainAppsScriptAnswer(scriptResult, target) ??
+          "Lo script non ha restituito JSON: controlla di aver incollato l'URL dell'app web (…/exec) e non quello dell'editor di Apps Script.",
+        502
+      );
+    }
+
+    if (data.ok === false && data.error) {
       throw new FormImportError(`Lo script segnala: ${data.error}`, 502);
     }
 
-    const form = normalizeLinkedFormPayload(data?.form ?? data);
+    const payload = data.form ?? data;
+    const form = normalizeLinkedFormPayload(payload);
     if (!form) {
+      const questions = (payload as any)?.questions;
+      const detail = Array.isArray(questions)
+        ? questions.length > 0
+          ? `Lo script ha restituito ${questions.length} domande ma nessuna con un testo utilizzabile`
+          : "Lo script ha letto il modulo ma non ci ha trovato domande (elenco “questions” vuoto)"
+        : `Lo script ha risposto senza un elenco “questions” (campi ricevuti: ${Object.keys(data).slice(0, 6).join(", ") || "nessuno"})`;
       throw new FormImportError(
-        "Lo script non ha restituito domande leggibili. Assicurati di usare la versione aggiornata di google-forms-export.gs (con la funzione doGet).",
+        `${detail}. Usa la versione aggiornata di google-forms-export.gs (con la funzione doGet) e ridistribuiscila con Distribuisci → Gestisci distribuzioni → ✏️ → “Nuova versione”.`,
         502
       );
     }

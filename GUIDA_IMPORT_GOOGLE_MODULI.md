@@ -28,6 +28,54 @@ mano nel riepilogo, o restano domande aperte).
 
 ---
 
+## 🖼️ Immagini delle domande
+
+Le domande con figure (pittogrammi, mappe, schemi) importano l'immagine **sopra le opzioni**, sia
+nello svolgimento sia nel riepilogo dello studente.
+
+| Come è messa l'immagine nel modulo | Cosa succede nell'import |
+|---|---|
+| **Elemento immagine** a sé (icona immagine della barra laterale), subito prima della domanda | ✅ arriva da sola, agganciata alla domanda che segue (via Web App) |
+| **Dentro la domanda** (immagine aggiunta con il pulsante immagine della domanda) | ⚠️ Apps Script non la vede: nel riepilogo dell'import premi **Immagine** sulla domanda e allega il file (o uno screenshot) |
+| Domanda con immagine caricata per URL/Drive non accessibile | ⚠️ compare tra gli avvisi: allega il file a mano |
+
+Dettagli utili:
+
+- l'app **comprime** ogni figura prima di salvarla (max 720 px, WebP): una foto da 300 KB diventa
+  tipicamente 20-40 KB, così il quiz resta dentro i limiti di Firestore (1 MB per documento) e
+  della libreria locale;
+- lo script salta le immagini oltre **900 KB** e lo segnala negli avvisi;
+- se il quiz con le figure supera ~600 KB, l'app avvisa: togli qualche immagine non indispensabile;
+- il **CSV** non contiene immagini: per le figure serve la via Web App (o l'allegato manuale);
+- i PDF/report stampabili non includono le figure.
+
+### Figure dentro la domanda: lettura automatica (facoltativa)
+
+`google-forms-export.gs` prova a leggere anche le immagini interne con la **Forms API** (l'unica
+fonte che le espone). Se lo script non ha lo scope giusto, l'app scrive negli avvisi
+"Forms API non autorizzata (HTTP 403)". Per abilitarla, una volta sola:
+
+1. Apps Script → ⚙️ **Impostazioni progetto** → spunta **"Mostra il file `appsscript.json` nell'editor"**.
+2. Apri `appsscript.json` e imposta gli scope (se `oauthScopes` non c'è, aggiungi la riga):
+
+   ```json
+   "oauthScopes": [
+     "https://www.googleapis.com/auth/forms",
+     "https://www.googleapis.com/auth/forms.body.readonly",
+     "https://www.googleapis.com/auth/script.external_request"
+   ]
+   ```
+
+3. Salva, esegui una volta `doGet` dall'editor concedendo i permessi, poi
+   **Distribuisci → Gestisci distribuzioni → ✏️ → Nuova versione**.
+4. Rileggi il modulo: negli avvisi compare
+   `Forms API: N immagini dentro le domande trovate, M agganciate`.
+
+Se l'account è Workspace e gli scope sono bloccati dall'amministratore, la lettura automatica non
+è possibile: restano l'allegato manuale e lo spostamento della figura fuori dalla domanda.
+
+---
+
 ## 🅰️ Web App: preparazione una volta sola (~5 minuti)
 
 1. **Crea lo script**
@@ -99,3 +147,7 @@ leggere i tuoi moduli raggiungibili dallo script). Per questo non è nel repo.
 | `403` dal browser/shell su `/viewform` | modulo non pubblico | per la via Web App è irrilevante; serve solo per la lettura "solo link" |
 | "Leggi dallo script" → 404 su un sito | server senza il nuovo endpoint `/api/forms-script` | aggiorna la versione del codice online e ripubblica |
 | Prima lettura lenta (3-25 s) | cold start di Apps Script/Render | normale, la successiva è rapida |
+| Import ok ma la figura della domanda manca | immagine messa *dentro* la domanda (invisibile allo script) | allega il file col pulsante **Immagine** nel riepilogo dell'import |
+| Avviso "Immagine non importata (troppo pesante…)" | figura oltre 900 KB | riducila nel modulo oppure allega la versione ridotta dall'app |
+| Avviso "Forms API non autorizzata (HTTP 403)" | manca lo scope `forms.body.readonly` | vedi la sezione immagini (manifest) oppure allega a mano |
+| Avviso "Lo script non dichiara la sua versione" | deployment su una copia vecchia del codice | Gestisci distribuzioni → ✏️ → Nuova versione |
