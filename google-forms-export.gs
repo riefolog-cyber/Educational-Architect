@@ -564,16 +564,23 @@ function leggiImmaginiDaApi(formId) {
     { headers: { Authorization: "Bearer " + token }, muteHttpExceptions: true }
   );
   var codice = risposta.getResponseCode();
-  if (codice === 401 || codice === 403) {
-    risultato.error =
-      "Forms API non autorizzata (HTTP " + codice + "): serve lo scope " +
-      "https://www.googleapis.com/auth/forms.body.readonly in appsscript.json " +
-      "(vedi GUIDA_IMPORT_GOOGLE_MODULI.md, sezione immagini). Nel frattempo le figure " +
-      "si possono allegare a mano dall'app col pulsante Immagine.";
-    return risultato;
-  }
   if (codice !== 200) {
-    risultato.error = "Forms API ha risposto con errore " + codice + ".";
+    var dettaglio = "";
+    try {
+      dettaglio = String(risposta.getContentText() || "")
+        .replace(/\s+/g, " ")
+        .slice(0, 200);
+    } catch (e) {
+      dettaglio = "";
+    }
+    risultato.error =
+      "Forms API ha risposto " + codice +
+      (dettaglio ? " — “" + dettaglio + "”" : "") +
+      ". Se il messaggio parla di “has not been used in project” o “API has not been used”: " +
+      "va attivata la Google Forms API nel progetto Cloud dello script (Impostazioni progetto -> " +
+      "Progetto Google Cloud Platform). Se invece parla di “insufficient” o “scope”: aggiungi " +
+      "https://www.googleapis.com/auth/forms.body.readonly in appsscript.json. " +
+      "Nel frattempo le figure si possono allegare a mano dall'app col pulsante Immagine.";
     return risultato;
   }
   var dati = JSON.parse(risposta.getContentText());
