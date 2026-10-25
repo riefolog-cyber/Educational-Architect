@@ -74,6 +74,22 @@ fonte che le espone). Se lo script non ha lo scope giusto, l'app scrive negli av
 Se l'account è Workspace e gli scope sono bloccati dall'amministratore, la lettura automatica non
 è possibile: restano l'allegato manuale e lo spostamento della figura fuori dalla domanda.
 
+### Se resta 403 dopo aver aggiunto lo scope
+
+Un 403 può voler dire anche che la **Google Forms API non è attiva nel progetto Cloud dello
+script**. Il messaggio di Google lo dice esplicitamente ("has not been used in project … or it is
+disabled") e l'app lo riporta negli avvisi. In quel caso:
+
+1. Apps Script → ⚙️ **Impostazioni progetto** → **Progetto Google Cloud Platform** →
+   **Cambia progetto** → **Crea nuovo progetto** (standard, non quello predefinito).
+2. Nella Google Cloud Console apri **API e servizi → Libreria**, cerca **Google Forms API** e
+   premi **Abilita** sul progetto appena creato.
+3. Torna nell'editor, esegui `doGet` (nuova autorizzazione) e fai
+   **Distribuisci → Gestisci distribuzioni → ✏️ → Nuova versione**.
+
+Se preferisci non toccare la console, l'alternativa senza permessi è spostare le figure **fuori**
+dalla domanda (elemento immagine sopra la domanda): arrivano con l'export normale.
+
 ---
 
 ## 🅰️ Web App: preparazione una volta sola (~5 minuti)
