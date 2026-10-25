@@ -75,6 +75,7 @@ export default function GoogleFormsImportModal({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const bulkImageInputRef = useRef<HTMLInputElement | null>(null);
 
   if (!isOpen) return null;
 
@@ -119,7 +120,37 @@ export default function GoogleFormsImportModal({
     }
   };
 
-  const removeImage = (questionId: string) => {
+  const handleBulkImagesChosen = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(e.target.files || []);
+    e.target.value = "";
+    if (files.length === 0 || !linked) return;
+    setImageBusy(true);
+    setError(null);
+    setResult(null);
+    try {
+      const srcs: string[] = [];
+      for (const f of files) {
+        srcs.push(await fileToExamImage(f));
+      }
+      setLinked((prev) => {
+        if (!prev) return prev;
+        let i = 0;
+        const questions = prev.questions.map((q) => {
+          if (q.image) return q;
+          if (i >= srcs.length) return q;
+          const image = srcs[i++];
+          return { ...q, image };
+        });
+        // If more images than empty slots, append to remaining questions in order too.
+        // (already handled above: only empty slots filled; extras ignored)
+        return { ...prev, questions };
+      });
+    } catch (err: any) {
+      setError(err?.message || "Immagini non importate.");
+    } finally {
+      setImageBusy(false);
+    }
+  };
     setResult(null);
     setLinked((prev) =>
       prev
@@ -332,6 +363,14 @@ export default function GoogleFormsImportModal({
             onChange={handleImageChosen}
             className="hidden"
           />
+          <input
+            ref={bulkImageInputRef}
+            type="file"
+            multiple
+            accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
+            onChange={handleBulkImagesChosen}
+            className="hidden"
+          />
 
           {/* Link import: the primary path */}
           <div className="rounded-2xl bg-slate-950/50 border border-white/10 p-3 space-y-2.5">
@@ -442,6 +481,21 @@ export default function GoogleFormsImportModal({
                   ))}
                 </ul>
               )}
+
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => bulkImageInputRef.current?.click()}
+                  disabled={imageBusy}
+                  className="inline-flex items-center gap-1.5 text-[10px] px-2.5 py-1.5 rounded-lg border border-teal-500/30 bg-teal-500/5 text-teal-300 hover:bg-teal-500/10 cursor-pointer disabled:opacity-40"
+                >
+                  {imageBusy ? <Loader2 className="w-3 h-3 animate-spin" /> : <ImageIcon className="w-3 h-3" />}
+                  Allega più figure in blocco
+                </button>
+                <p className="text-[10px] text-slate-500">
+                  Seleziona più immagini: vengono assegnate in ordine alle domande senza figura.
+                </p>
+              </div>
 
               <div className="max-h-64 overflow-y-auto space-y-1.5 pr-1">
                 {linked.questions.map((q, i) => {
