@@ -51,7 +51,7 @@ Dettagli utili:
 - lo script salta le immagini oltre **900 KB** e lo segnala negli avvisi;
 - se il quiz con le figure supera ~600 KB, l'app avvisa: togli qualche immagine non indispensabile;
 - il **CSV** non contiene immagini: per le figure serve la via Web App (o l'allegato manuale);
-- i PDF/report stampabili non includono le figure.
+- i PDF/report stampabili ora includono le figure quando disponibili (tramite il report web stampabile); il PDF generato da jsPDF resta testuale.
 
 ### Figure dentro la domanda: lettura automatica (facoltativa)
 

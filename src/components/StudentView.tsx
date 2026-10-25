@@ -99,7 +99,7 @@ function QuestionFigure({ src }: { src?: string }) {
     <img
       src={src}
       alt="Figura della domanda"
-      className="block max-h-64 w-auto max-w-full rounded-xl border border-white/10 bg-white p-2 object-contain"
+      className="block max-h-64 w-auto max-w-full rounded-xl border border-white/10 bg-white p-2 object-contain print:max-h-none print:max-w-full print:border-slate-300"
     />
   );
 }
@@ -3400,6 +3400,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           Risposte_Studente: answers
         }}
         examTitle={examData?.title}
+        examImages={examData?.images}
       />
     </div>
   );
