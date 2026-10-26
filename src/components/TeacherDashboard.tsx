@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
-import { jsPDF } from "jspdf";
+// jspdf è caricato dinamicamente in handleExportPDF per non pesare il bundle iniziale
+
 import { 
   collection, 
   getDocs, 
@@ -1291,7 +1292,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   // Export a student evaluation with metacognitive details to PDF
-  const handleExportPDF = (sub: SavedSubmission) => {
+  const handleExportPDF = async (sub: SavedSubmission) => {
     // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
     const sanitizePdfText = (text: string): string => {
       if (!text) return "";
@@ -1342,6 +1343,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     };
 
     try {
+      const { jsPDF } = await import("jspdf");
       const doc = new jsPDF();
       let currentY = 20;
       const pageHeight = 275;

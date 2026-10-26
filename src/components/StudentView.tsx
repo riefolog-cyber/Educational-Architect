@@ -1014,7 +1014,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     if ("wakeLock" in navigator) {
       navigator.wakeLock.request("screen")
         .then(wl => { wakeLockRef.current = wl; })
-        .catch(() => console.log("WakeLock non supportato dal browser."));
+        .catch(() => { /* WakeLock non supportato dal browser */ });
     }
 
     return () => {
@@ -1300,7 +1300,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         }
         isFirstPoll = false;
 
-        const statusResp = await fetch(`/api/evaluate/status/${currentJobId}`);
+        const statusResp = await fetchWithRetry(`/api/evaluate/status/${currentJobId}`, {}, 3, 1000);
         if (!statusResp.ok) {
           if (statusResp.status === 404 && rescue.payload && reenqueues < MAX_REENQUEUES) {
             // Job lost (server restarted): re-enqueue the same payload automatically
@@ -1450,11 +1450,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           // (each Render restart wipes the in-memory queue).
           const ageMs = Date.now() - (data.savedAt || 0);
           if (!data.savedAt || ageMs > 30 * 60 * 1000) {
-            console.log("[Rescue Engine] Discarding stale rescue token, jobId:", data.jobId);
+            // console.log removed
             localStorage.removeItem("active_eval_rescue");
             return;
           }
-          console.log("[Rescue Engine] Auto-resuming crashed/reloaded evaluation session for jobId:", data.jobId);
+          // console.log removed
           setSessionPin(data.sessionPin || "");
           setSessionRunId(data.sessionRunId || "");
           setExamType(data.examType || "quiz");
@@ -1866,6 +1866,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           <div className="text-left sm:text-right">
                             <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Voto Consigliato IA</p>
                             <p className="text-2xl font-display font-bold text-teal-400 mt-0.5">{selectedPastSub.Voto_Suggerito || "N/A"}</p>
+                            {parsedEval?.evaluationMode === "deterministic" && (
+                              <span className="mt-1 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30">
+                                Valutazione di riserva (senza IA) – da revisionare
+                              </span>
+                            )}
                           </div>
                         </div>
 

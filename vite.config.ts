@@ -19,7 +19,8 @@ export default defineConfig(() => {
           manualChunks(id: string) {
             if (!id.includes('node_modules')) return undefined;
             if (id.includes('firebase') || id.includes('@firebase')) return 'vendor-firebase';
-            if (id.includes('jspdf') || id.includes('html2canvas') || id.includes('purify')) return 'vendor-pdf';
+            if (id.includes('jspdf')) return 'vendor-jspdf';
+            if (id.includes('html2canvas') || id.includes('purify')) return 'vendor-pdf';
             if (id.includes('lucide-react')) return 'vendor-icons';
             if (id.includes('motion') || id.includes('framer-motion')) return 'vendor-motion';
             return 'vendor';

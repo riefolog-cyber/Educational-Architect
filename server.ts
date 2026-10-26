@@ -553,7 +553,7 @@ interface EvaluationJob {
 const jobStore = new Map<string, EvaluationJob>();
 const evaluationQueue: string[] = [];
 let activeWorkers = 0;
-const MAX_CONCURRENT_WORKERS = 5;
+const MAX_CONCURRENT_WORKERS = 8;
 
 // Hash mapping cache for preventing duplicate active evaluations from clicking submit twice or network drops
 const reqToJobCache = new Map<string, string>();
@@ -636,36 +636,53 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
    - Se è stata troppo severa o troppo ottimistica, commentalo con tatto e costruttività.
 3. DIVIETO CRITICO ASSOLUTO: NON menzionare domande aperte, NON accusare lo studente di aver lasciato fogli o domande in bianco, e NON inventare quesiti aperti fittizi. Questa prova conteneva solo domande a scelta multipla.`;
 
-      const response = await generateWithRetry({
-        model: "gemini-3.5-flash",
-        models: TASK_MODEL_PREFERENCE["evaluate"],
-        contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
-        config: {
-          systemInstruction,
-          temperature: 0.1,
-          maxOutputTokens: 2048,
-          thinkingConfig: {
-            thinkingLevel: "LOW"
-          },
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              mainErrors: { type: Type.STRING, description: "Sintesi pedagogica degli errori a scelta multipla e nozioni da consolidare." },
-              openEndedEvaluation: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
+      try {
+        const response = await generateWithRetry({
+          model: "gemini-3.5-flash",
+          models: TASK_MODEL_PREFERENCE["evaluate"],
+          contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
+          config: {
+            systemInstruction,
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+            thinkingConfig: {
+              thinkingLevel: "LOW"
             },
-            required: ["mainErrors", "openEndedEvaluation"]
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                mainErrors: { type: Type.STRING, description: "Sintesi pedagogica degli errori a scelta multipla e nozioni da consolidare." },
+                openEndedEvaluation: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
+              },
+              required: ["mainErrors", "openEndedEvaluation"]
+            }
           }
-        }
-      });
+        });
 
-      const responseText = extractResponseText(response);
-      if (!responseText) throw new Error("Risposta vuota dall'IA.");
+        const responseText = extractResponseText(response);
+        if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-      const evaluation = parseJsonResponse(responseText);
-      evaluation.suggestedGrade = mathGrade;
-      evaluation.openEndedDetails = [];
-      return evaluation;
+        const evaluation = parseJsonResponse(responseText);
+        evaluation.suggestedGrade = mathGrade;
+        evaluation.openEndedDetails = [];
+        evaluation.evaluationMode = "ai";
+        return evaluation;
+      } catch (aiErr) {
+        // Fallback deterministico: se l'IA non è disponibile o fallisce, il voto
+        // resta comunque calcolato in modo rigoroso dalle risposte corrette.
+        console.warn("[evaluate] Fallback deterministico MC-only:", aiErr?.message || aiErr);
+        const wrongSummary = wrongQuestions.length > 0
+          ? `Domande errate: ${wrongQuestions.map(w => `${w.number}) ${w.question} (scelta: ${w.studentChoice} → corretta: ${w.correctChoice})`).join("; ")}.`
+          : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
+        return {
+          suggestedGrade: mathGrade,
+          mainErrors: wrongSummary,
+          openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
+          openEndedDetails: [],
+          evaluationMode: "deterministic"
+        };
+      }
     }
 
     // CASE 2: QUIZ WITH OPEN ENDED QUESTIONS (Mixed or pure open-ended)
@@ -697,54 +714,68 @@ Nel tuo giudizio generale complessivo ("openEndedEvaluation"), devi essere estre
 Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10. 
 Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a un confronto meta-cognitivo amichevole e costruttivo fra l'andamento finale della prova e la sua personale aspettativa di autovalutazione. Commenta esplicitamente con tatto pedagogico se lo studente è stato troppo severo con se stesso, troppo ottimista, o estremamente accurato e realistico, stimolando la sua consapevolezza del proprio livello di preparazione.`;
 
-    const response = await generateWithRetry({
-      model: "gemini-3.5-flash",
-      models: TASK_MODEL_PREFERENCE["evaluate"],
-      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
-      config: {
-        systemInstruction,
-        temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
-        maxOutputTokens: 2048,
-        thinkingConfig: {
-          thinkingLevel: "LOW"
-        },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            mainErrors: { type: Type.STRING, description: "Sintesi dei principali errori e lacune riscontrati nelle risposte aperte, formulata in modo costruttivo e orientata al miglioramento." },
-            openEndedEvaluation: { type: Type.STRING, description: "Breve giudizio generale e integrato sulle risposte aperte, facendo riferimento equilibrato all'andamento complessivo." },
-            openEndedDetails: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  questionId: { type: Type.STRING },
-                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della risposta e suggerisce un miglioramento concreto." },
-                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
-                },
-                required: ["questionId", "feedback", "score"]
-              }
-            }
+    try {
+      const response = await generateWithRetry({
+        model: "gemini-3.5-flash",
+        models: TASK_MODEL_PREFERENCE["evaluate"],
+        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+        config: {
+          systemInstruction,
+          temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
+          maxOutputTokens: 2048,
+          thinkingConfig: {
+            thinkingLevel: "LOW"
           },
-          required: ["mainErrors", "openEndedEvaluation", "openEndedDetails"]
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              mainErrors: { type: Type.STRING, description: "Sintesi dei principali errori e lacune riscontrati nelle risposte aperte, formulata in modo costruttivo e orientata al miglioramento." },
+              openEndedEvaluation: { type: Type.STRING, description: "Breve giudizio generale e integrato sulle risposte aperte, facendo riferimento equilibrato all'andamento complessivo." },
+              openEndedDetails: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    questionId: { type: Type.STRING },
+                    feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della risposta e suggerisce un miglioramento concreto." },
+                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
+                  },
+                  required: ["questionId", "feedback", "score"]
+                }
+              }
+            },
+            required: ["mainErrors", "openEndedEvaluation", "openEndedDetails"]
+          }
         }
-      }
-    });
+      });
 
-    const responseText = extractResponseText(response);
-    if (!responseText) throw new Error("Risposta vuota dall'IA.");
+      const responseText = extractResponseText(response);
+      if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-    const evaluation = parseJsonResponse(responseText);
-    // Teacher-like guard: per-question scores are whole numbers 0-10.
-    // Clamp rogue model outputs (e.g. 11, -1, 7.5) before averaging.
-    // Weighted mean by question weight (plain mean when all weights are 1),
-    // scaled as a single-element array for the grade helper.
-    const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
-    const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
-    const oeScores = hasOeDetails ? [oeMean * 10] : [];
-    evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
-    return evaluation;
+      const evaluation = parseJsonResponse(responseText);
+      // Teacher-like guard: per-question scores are whole numbers 0-10.
+      // Clamp rogue model outputs (e.g. 11, -1, 7.5) before averaging.
+      // Weighted mean by question weight (plain mean when all weights are 1),
+      // scaled as a single-element array for the grade helper.
+      const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
+      const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
+      const oeScores = hasOeDetails ? [oeMean * 10] : [];
+      evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
+      evaluation.evaluationMode = "ai";
+      return evaluation;
+    } catch (aiErr) {
+      console.warn("[evaluate] Fallback deterministico quiz con aperte:", aiErr?.message || aiErr);
+      // Voto di riserva basato sulle sole MC (le aperte richiedono revisione docente).
+      const fallbackGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
+      return {
+        suggestedGrade: fallbackGrade,
+        mainErrors: "Valutazione in modalità riserva: le risposte aperte non sono state corrette dall'IA e richiedono revisione del docente. Il voto è basato sulle sole domande a scelta multipla.",
+        openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio MC ${mcScore}/${mcCount}, voto scolastico ${fallbackGrade}. Le domande aperte vanno revisionate manualmente dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+        openEndedDetails: [],
+        evaluationMode: "deterministic"
+      };
+    }
 
   } else if (normalizedTipo === "workbook") {
     const sections = report.domande?.sections || [];
