@@ -1693,6 +1693,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
               currentY += 1;
 
+const fibImg = domandeObj?.images?.[fib.id];
+              if (fibImg) {
+                checkPageBreak(70);
+                try {
+                  const ffmt = fibImg.includes("image/png") ? "PNG" : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg") ? "JPEG" : "PNG";
+                  doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
+                  currentY += 65;
+                } catch {}
+              }
+
               writeText(textOutputParts.join(""), 8.5, false, [71, 85, 105], 15);
               currentY += 1;
               writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
@@ -1729,6 +1739,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             checkPageBreak(25);
             writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
             currentY += 1;
+
+            const reflImg = domandeObj?.images?.[det.id];
+            if (reflImg) {
+              checkPageBreak(70);
+              try {
+                const rfmt = reflImg.includes("image/png") ? "PNG" : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
 
             // Student input box
             const displayAnsText = ansText === "[VUOTO]" ? "Risposta non data o lasciata vuota" : ansText;
@@ -4940,6 +4960,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }}
         submission={printableSub}
         examTitle={materia || printableSub?.Tipo}
+        examImages={(() => {
+          try {
+            const d = typeof printableSub?.Domande_Esame === "string"
+              ? JSON.parse(printableSub.Domande_Esame)
+              : printableSub?.Domande_Esame;
+            return d?.images;
+          } catch {
+            return undefined;
+          }
+        })()}
       />
 
       {/* Educational Access & Concurrency Help Modal */}
