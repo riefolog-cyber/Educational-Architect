@@ -66,7 +66,7 @@ var MAX_OPTIONS = 8;
 var MAX_IMAGE_BYTES = 900 * 1024;
 
 /** Versione dello script: l'app la mostra per capire se il deployment è vecchio. */
-var SCRIPT_VERSION = "2026-10-25 immagini";
+var SCRIPT_VERSION = "2026-10-25 immagini+diagnostica403";
 
 // ---------------------------------------------------------------------------
 

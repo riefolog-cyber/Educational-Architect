@@ -60,6 +60,12 @@ import {
   type SeverityPreset,
   SplitScreenDetection
 } from "../utils";
+import {
+  recoveryProgressLabel,
+  recoveryProgressHint,
+  recoveryProgressPercent,
+  type RecoveryProgress
+} from "../utils/recoveryProgress";
 
 interface StudentViewProps {
   user: any;
@@ -131,9 +137,13 @@ function serializeExamForSubmission(examData: any): string {
  * Chiede il piano di recupero e aspetta che la coda del server lo produca.
  * La richiesta accoda soltanto (jobId immediato): qui si interroga lo stato con
  * attese crescenti, così tutta la classe può chiederlo insieme senza saturare
- * l'IA e senza rubare posti alle correzioni degli elaborati.
+ * l'IA e senza rubare posti alle correzioni degli elaborati. `onProgress`
+ * aggiorna il pulsante con la posizione in coda.
  */
-async function requestRecoveryPlan(payload: Record<string, unknown>): Promise<string> {
+async function requestRecoveryPlan(
+  payload: Record<string, unknown>,
+  onProgress?: (progress: RecoveryProgress) => void
+): Promise<string> {
   const deadline = Date.now() + 8 * 60 * 1000;
   let attempt = 0;
   let reenqueues = 0;
@@ -153,6 +163,13 @@ async function requestRecoveryPlan(payload: Record<string, unknown>): Promise<st
       // Compatibilità con una risposta già pronta (server di una versione precedente).
       if (typeof data?.planHtml === "string" && data.planHtml.trim()) return data.planHtml;
       if (!data?.jobId) throw new Error("Il server non ha accodato la richiesta del piano.");
+      // Se lo stesso piano era già in lavorazione il server risponde
+      // "processing": in quel caso non c'è nessun posto in coda da mostrare.
+      onProgress?.(
+        data.status === "processing"
+          ? { status: "processing", position: 0 }
+          : { status: "queued", position: Math.max(1, Number(data.position) || 1) }
+      );
       jobId = String(data.jobId);
       continue;
     }
@@ -175,6 +192,11 @@ async function requestRecoveryPlan(payload: Record<string, unknown>): Promise<st
 
     const statusData = await statusResponse.json().catch(() => null);
     if (!statusData) throw new Error("Risposta non valida dal server durante l'attesa del piano.");
+    if (statusData.status === "pending") {
+      onProgress?.({ status: "queued", position: Math.max(1, Number(statusData.position) || 1) });
+    } else if (statusData.status === "processing") {
+      onProgress?.({ status: "processing", position: 0 });
+    }
     if (statusData.status === "failed") {
       throw new Error(statusData.error || "La generazione del piano è fallita.");
     }
@@ -203,6 +225,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [historyError, setHistoryError] = useState("");
   const [selectedPastSub, setSelectedPastSub] = useState<any | null>(null);
   const [generatingPlan, setGeneratingPlan] = useState(false);
+  const [recoveryProgress, setRecoveryProgress] = useState<RecoveryProgress | null>(null);
   
   // Current session definition
   const [sessionPin, setSessionPin] = useState("");
@@ -560,6 +583,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const handleGenerateRecoveryPlan = async (subId: string, submission: any) => {
     if (generatingPlan) return;
     setGeneratingPlan(true);
+    setRecoveryProgress(null);
     try {
       let finalEvalObj = null;
       try {
@@ -590,14 +614,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
       // Il piano passa da una coda dedicata sul server: con tutta la classe che
       // lo chiede insieme, le correzioni degli elaborati non perdono posti.
-      const planHtml = await requestRecoveryPlan({
-        tipo: submission.Tipo,
-        suggestedGrade: submission.Voto_Suggerito,
-        studentSelfGrade: submission.Autovalutazione,
-        evaluation: finalEvalObj,
-        answers: parsedAnswers,
-        examData: parsedExamData
-      });
+      const planHtml = await requestRecoveryPlan(
+        {
+          tipo: submission.Tipo,
+          suggestedGrade: submission.Voto_Suggerito,
+          studentSelfGrade: submission.Autovalutazione,
+          evaluation: finalEvalObj,
+          answers: parsedAnswers,
+          examData: parsedExamData
+        },
+        setRecoveryProgress
+      );
 
       // Save back to Firestore permanently
       if (dbFirestore) {
@@ -618,6 +645,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       alert(`⚠️ Errore durante la generazione del piano di recupero tramite IA: ${err.message}`);
     } finally {
       setGeneratingPlan(false);
+      setRecoveryProgress(null);
     }
   };
 
@@ -1971,7 +1999,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {generatingPlan ? (
                                   <>
                                     <RefreshCw className="w-3 h-3 animate-spin" />
-                                    <span>Elaborazione...</span>
+                                    <span>{recoveryProgressLabel(recoveryProgress)}</span>
                                   </>
                                 ) : (
                                   <>
@@ -1993,10 +2021,23 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           ) : (
                             <div className="text-xs text-slate-400 leading-relaxed py-1.5">
                               {generatingPlan ? (
-                                <p className="text-indigo-400 font-mono animate-pulse flex items-center gap-2">
-                                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                                  Il docente virtuale sta rileggendo le tue risposte per erogare un piano personalizzato di ripasso ed esercizi di rinforzo...
-                                </p>
+                                <div className="space-y-1.5">
+                                  <p className="text-indigo-400 font-mono animate-pulse flex items-center gap-2">
+                                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                                    {recoveryProgressLabel(recoveryProgress)}
+                                  </p>
+                                  <p className="text-[11px] text-slate-400">
+                                    {recoveryProgressHint(recoveryProgress)}
+                                  </p>
+                                  {recoveryProgress && recoveryProgress.position > 0 && (
+                                    <div className="h-1 w-full max-w-xs bg-slate-800 rounded-full overflow-hidden">
+                                      <div
+                                        className="h-full bg-indigo-500 transition-all duration-700 ease-out"
+                                        style={{ width: `${recoveryProgressPercent(recoveryProgress)}%` }}
+                                      />
+                                    </div>
+                                  )}
+                                </div>
                               ) : (
                                 <div className="space-y-2">
                                   <p>Nessun piano di ripasso personalizzato attivo per questo compito.</p>
@@ -3049,18 +3090,22 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                     onClick={async () => {
                       if (generatingPlan) return;
                       setGeneratingPlan(true);
+                      setRecoveryProgress(null);
                       try {
                         // Accodato sul server e atteso qui: la correzione degli
                         // altri elaborati non viene rallentata dai piani richiesti
                         // da tutta la classe.
-                        const planHtml = await requestRecoveryPlan({
-                          tipo: examType === "quiz" ? "Quiz" : "Workbook",
-                          suggestedGrade: evaluation?.suggestedGrade,
-                          studentSelfGrade: studentSelfGrade,
-                          evaluation: evaluation,
-                          answers: answers,
-                          examData: examData
-                        });
+                        const planHtml = await requestRecoveryPlan(
+                          {
+                            tipo: examType === "quiz" ? "Quiz" : "Workbook",
+                            suggestedGrade: evaluation?.suggestedGrade,
+                            studentSelfGrade: studentSelfGrade,
+                            evaluation: evaluation,
+                            answers: answers,
+                            examData: examData
+                          },
+                          setRecoveryProgress
+                        );
 
                         setActivePlanHtml(planHtml);
 
@@ -3079,6 +3124,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         alert(`⚠️ Errore di generazione: ${err.message}`);
                       } finally {
                         setGeneratingPlan(false);
+                        setRecoveryProgress(null);
                       }
                     }}
                     disabled={generatingPlan}
@@ -3087,7 +3133,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                     {generatingPlan ? (
                       <>
                         <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                        <span>Generazione in corso...</span>
+                        <span>{recoveryProgressLabel(recoveryProgress)}</span>
                       </>
                     ) : (
                       <>
@@ -3112,10 +3158,21 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               ) : (
                 <div className="text-xs text-slate-400 leading-relaxed py-1">
                   {generatingPlan ? (
-                    <p className="text-indigo-400 font-mono animate-pulse flex items-center gap-2">
-                      <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
-                      L'insegnante di supporto digitale sta redigendo i tuoi consigli e quesiti metodologici personalizzati...
-                    </p>
+                    <div className="space-y-1.5">
+                      <p className="text-indigo-400 font-mono animate-pulse flex items-center gap-2">
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin text-indigo-400" />
+                        {recoveryProgressLabel(recoveryProgress)}
+                      </p>
+                      <p className="text-[11px] text-slate-400">{recoveryProgressHint(recoveryProgress)}</p>
+                      {recoveryProgress && recoveryProgress.position > 0 && (
+                        <div className="h-1 w-full max-w-xs bg-slate-800 rounded-full overflow-hidden">
+                          <div
+                            className="h-full bg-indigo-500 transition-all duration-700 ease-out"
+                            style={{ width: `${recoveryProgressPercent(recoveryProgress)}%` }}
+                          />
+                        </div>
+                      )}
+                    </div>
                   ) : (
                     <div className="space-y-1.5 border-l border-white/5 pl-3">
                       <p>Vuoi migliorare la tua preparazione o ripassare i punti in cui hai faticato?</p>
