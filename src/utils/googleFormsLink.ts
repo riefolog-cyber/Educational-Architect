@@ -244,6 +244,39 @@ const TYPE_LABEL: Record<number, string> = {
  * Parses the form page HTML. Throws a teacher-friendly error when the page does
  * not contain the public form payload (private form, ended form, wrong URL).
  */
+/** Collects candidate image URLs buried anywhere inside a form item. */
+function collectImageUrls(value: unknown, found: string[]): void {
+  if (typeof value === "string") {
+    const s = value.trim();
+    if (!s) return;
+    if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(s)) {
+      if (!found.includes(s)) found.push(s);
+      return;
+    }
+    if (/^https?:\/\/[^"\s<>]+$/i.test(s)) {
+      const looksLikeImage =
+        /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/i.test(s) ||
+        /googleusercontent|ggpht|forms\.google.*image/i.test(s);
+      if (looksLikeImage && !found.includes(s)) found.push(s);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (const v of value) collectImageUrls(v, found);
+  } else if (value && typeof value === "object") {
+    for (const k of Object.keys(value as Record<string, unknown>)) {
+      collectImageUrls((value as Record<string, unknown>)[k], found);
+    }
+  }
+}
+
+/** Returns the first image URL found inside a Google Form item (or ""). */
+function extractItemImage(item: unknown): string {
+  const found: string[] = [];
+  collectImageUrls(item, found);
+  return found[0] || "";
+}
+
 export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
   const data = extractPublicLoadData(html);
   if (!data) {
@@ -261,6 +294,7 @@ export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
   const skipped: string[] = [];
   const usedIds = new Set<string>();
   let section: string | undefined;
+  let pendingImage = "";
 
   items.forEach((item, index) => {
     if (!item || typeof item !== "object") return;
@@ -271,13 +305,19 @@ export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
     // Items without an answer entry are visual blocks: section headers,
     // images, videos. A section header carries a title, images/videos do not.
     if (config.length === 0) {
-      if (type === 11 || type === 12) return;
+      if (type === 11) {
+        const img = extractItemImage(item);
+        if (img) pendingImage = img;
+        return;
+      }
+      if (type === 12) return;
       if (text) section = text;
       return;
     }
 
     if (type === 13) {
       skipped.push(`“${text || `Domanda ${index + 1}`}”: caricamento file, non importabile.`);
+      pendingImage = "";
       return;
     }
 
@@ -321,8 +361,13 @@ export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
           ? `Elemento ${index + 1} (${label}) saltato.`
           : `Elemento ${index + 1} senza testo, saltato.`
       );
+      pendingImage = "";
       return;
     }
+
+    const inlineImage = extractItemImage(item);
+    const image = normalizeQuestionImage(inlineImage || pendingImage);
+    pendingImage = "";
 
     questions.push({
       id,
@@ -332,6 +377,7 @@ export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
       required,
       ...(section ? { section } : {}),
       ...(note ? { note } : {}),
+      ...(image ? { image } : {}),
     });
   });
 

@@ -20,13 +20,15 @@ interface PrintableReportModalProps {
     [key: string]: any;
   } | null;
   examTitle?: string;
+  examImages?: Record<string, string>;
 }
 
 export default function PrintableReportModal({
   isOpen,
   onClose,
   submission,
-  examTitle
+  examTitle,
+  examImages
 }: PrintableReportModalProps) {
   const printAreaRef = useRef<HTMLDivElement>(null);
 
@@ -217,6 +219,22 @@ export default function PrintableReportModal({
                 </div>
               )}
             </div>
+
+            {/* Figure della prova */}
+            {examImages && Object.keys(examImages).length > 0 && (
+              <div className="space-y-2.5">
+                <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
+                  Figure della Prova
+                </h3>
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                  {Object.entries(examImages).map(([qid, src]) => (
+                    <div key={qid} className="border border-slate-200 rounded-xl p-2 bg-white">
+                      <img src={src} alt={`Figura ${qid}`} className="max-h-48 w-auto max-w-full object-contain mx-auto" />
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )}
 
             {/* Anti-Cheat & Regularity Section */}
             <div className="p-3 bg-slate-50 border border-slate-200 rounded-xl flex items-center justify-between">

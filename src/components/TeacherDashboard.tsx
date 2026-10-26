@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from "react";
-import { jsPDF } from "jspdf";
+// jspdf è caricato dinamicamente in handleExportPDF per non pesare il bundle iniziale
+
 import { 
   collection, 
   getDocs, 
@@ -583,8 +584,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const { type, count } = countLibraryQuestions(parsed);
       const formatted = JSON.stringify(
         parsed.sections
-          ? { title: parsed.title || title, sections: parsed.sections }
-          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [] },
+          ? { title: parsed.title || title, sections: parsed.sections, ...(parsed.images ? { images: parsed.images } : {}) }
+          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [], ...(parsed.images ? { images: parsed.images } : {}) },
         null,
         2
       );
@@ -1291,7 +1292,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   // Export a student evaluation with metacognitive details to PDF
-  const handleExportPDF = (sub: SavedSubmission) => {
+  const handleExportPDF = async (sub: SavedSubmission) => {
     // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
     const sanitizePdfText = (text: string): string => {
       if (!text) return "";
@@ -1342,6 +1343,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     };
 
     try {
+      const { jsPDF } = await import("jspdf");
       const doc = new jsPDF();
       let currentY = 20;
       const pageHeight = 275;
@@ -1591,6 +1593,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
             currentY += 1;
 
+            const mcImg = domandeObj?.images?.[q.id];
+            if (mcImg) {
+              checkPageBreak(70);
+              try {
+                const mfmt = mcImg.includes("image/png") ? "PNG" : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
+
             if (isCorrect) {
               writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
             } else {
@@ -1620,6 +1632,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             checkPageBreak(25);
             writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
             currentY += 1;
+
+            const oeImg = domandeObj?.images?.[questionRef?.id];
+            if (oeImg) {
+              checkPageBreak(70);
+              try {
+                const ofmt = oeImg.includes("image/png") ? "PNG" : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
 
             // Student input box
             const displayAnsText = ansText === "[VUOTO]" ? "Risposta non compilata o lasciata vuota (scena muta)" : ansText;
@@ -1671,6 +1693,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
               currentY += 1;
 
+const fibImg = domandeObj?.images?.[fib.id];
+              if (fibImg) {
+                checkPageBreak(70);
+                try {
+                  const ffmt = fibImg.includes("image/png") ? "PNG" : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg") ? "JPEG" : "PNG";
+                  doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
+                  currentY += 65;
+                } catch {}
+              }
+
               writeText(textOutputParts.join(""), 8.5, false, [71, 85, 105], 15);
               currentY += 1;
               writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
@@ -1707,6 +1739,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             checkPageBreak(25);
             writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
             currentY += 1;
+
+            const reflImg = domandeObj?.images?.[det.id];
+            if (reflImg) {
+              checkPageBreak(70);
+              try {
+                const rfmt = reflImg.includes("image/png") ? "PNG" : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
 
             // Student input box
             const displayAnsText = ansText === "[VUOTO]" ? "Risposta non data o lasciata vuota" : ansText;
@@ -4918,6 +4960,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }}
         submission={printableSub}
         examTitle={materia || printableSub?.Tipo}
+        examImages={(() => {
+          try {
+            const d = typeof printableSub?.Domande_Esame === "string"
+              ? JSON.parse(printableSub.Domande_Esame)
+              : printableSub?.Domande_Esame;
+            return d?.images;
+          } catch {
+            return undefined;
+          }
+        })()}
       />
 
       {/* Educational Access & Concurrency Help Modal */}

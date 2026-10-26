@@ -615,6 +615,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       title,
       sections: correctedSections,
       answerKey: parsed.answerKey || parsed.criteri || undefined,
+      ...(parsed.images ? { images: parsed.images } : {}),
     };
 
     const formattedJson = JSON.stringify(finalWorkbook, null, 2);
@@ -916,6 +917,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     title,
     multipleChoice: mcList.length > 0 ? mcList : undefined,
     openEnded: openList.length > 0 ? openList : undefined,
+    ...(parsed?.images ? { images: parsed.images } : {}),
   };
 
   const formattedJson = JSON.stringify(finalQuiz, null, 2);

@@ -67,6 +67,7 @@ export interface WorkbookExam {
   title: string;
   sections: WorkbookSection[];
   answerKey?: WorkbookAnswerKey;
+  images?: Record<string, string>;
 }
 
 export interface Exam {
@@ -114,6 +115,7 @@ export interface ReflectionEvaluationItem {
 
 export interface Evaluation {
   suggestedGrade: string; // Final weighted grade (e.g., "7.5", "8")
+  evaluationMode?: 'ai' | 'deterministic'; // Whether grading came from AI or deterministic fallback
   mainErrors?: string; // Summary of errors
   openEndedEvaluation?: string; // Review of open ended questions
   overallFeedback?: string; // Workbook overall feedback
