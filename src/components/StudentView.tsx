@@ -104,6 +104,90 @@ function QuestionFigure({ src }: { src?: string }) {
   );
 }
 
+/**
+ * Copia dell'esame da archiviare nel documento Firestore della consegna.
+ * Un documento ha un tetto di 1 MiB: con molte figure (compresse, ma pur sempre
+ * base64) il JSON dell'esame da solo può superarlo, e la scrittura fallirebbe
+ * per *tutti* gli studenti della classe nello stesso momento. Le immagini non
+ * servono al registro (il docente rivede testi, opzioni e risposte), quindi
+ * sopra la soglia si salvano senza: il resto della prova resta identico.
+ */
+const MAX_STORED_EXAM_CHARS = 450_000;
+function serializeExamForSubmission(examData: any): string {
+  try {
+    const full = JSON.stringify(examData ?? {});
+    if (full.length <= MAX_STORED_EXAM_CHARS) return full;
+    const { images, ...withoutImages } = examData || {};
+    console.warn(
+      `[Firestore] Esame di ${Math.round(full.length / 1024)} KB: archivio la copia senza immagini (${images ? Object.keys(images).length : 0}) per stare nel limite del documento.`
+    );
+    return JSON.stringify(withoutImages);
+  } catch {
+    return "{}";
+  }
+}
+
+/**
+ * Chiede il piano di recupero e aspetta che la coda del server lo produca.
+ * La richiesta accoda soltanto (jobId immediato): qui si interroga lo stato con
+ * attese crescenti, così tutta la classe può chiederlo insieme senza saturare
+ * l'IA e senza rubare posti alle correzioni degli elaborati.
+ */
+async function requestRecoveryPlan(payload: Record<string, unknown>): Promise<string> {
+  const deadline = Date.now() + 8 * 60 * 1000;
+  let attempt = 0;
+  let reenqueues = 0;
+  let jobId = "";
+
+  while (Date.now() < deadline) {
+    if (!jobId) {
+      const response = await fetchWithRetry("/api/generate-recovery-plan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+      });
+      const data = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(data?.error || `Errore di rete (${response.status}).`);
+      }
+      // Compatibilità con una risposta già pronta (server di una versione precedente).
+      if (typeof data?.planHtml === "string" && data.planHtml.trim()) return data.planHtml;
+      if (!data?.jobId) throw new Error("Il server non ha accodato la richiesta del piano.");
+      jobId = String(data.jobId);
+      continue;
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, Math.min(900 + attempt * 150, 2500)));
+    attempt++;
+
+    const statusResponse = await fetch(`/api/evaluate/status/${encodeURIComponent(jobId)}`);
+    if (statusResponse.status === 404) {
+      // Server riavviato: il job non esiste più, si riaccoda (max 3 volte).
+      if (++reenqueues > 3) {
+        throw new Error("Il server si è riavviato più volte: riprova tra qualche minuto.");
+      }
+      jobId = "";
+      continue;
+    }
+    if (!statusResponse.ok) {
+      throw new Error(`Errore di rete durante l'attesa del piano (HTTP ${statusResponse.status}).`);
+    }
+
+    const statusData = await statusResponse.json().catch(() => null);
+    if (!statusData) throw new Error("Risposta non valida dal server durante l'attesa del piano.");
+    if (statusData.status === "failed") {
+      throw new Error(statusData.error || "La generazione del piano è fallita.");
+    }
+    if (statusData.status === "completed") {
+      const plan = statusData.result?.planHtml;
+      if (typeof plan === "string" && plan.trim()) return plan;
+      throw new Error("Il piano generato è vuoto: riprova.");
+    }
+  }
+
+  throw new Error("L'attesa del piano è troppo lunga: riprova tra un minuto.");
+}
+
 export default function StudentView({ user, onLogout, onBack }: StudentViewProps) {
   // State
   const [pin, setPin] = useState("");
@@ -504,43 +588,31 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         parsedExamData = submission.Domande_Esame || {};
       }
 
-      const response = await fetchWithRetry("/api/generate-recovery-plan", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          tipo: submission.Tipo,
-          suggestedGrade: submission.Voto_Suggerito,
-          studentSelfGrade: submission.Autovalutazione,
-          evaluation: finalEvalObj,
-          answers: parsedAnswers,
-          examData: parsedExamData
-        })
+      // Il piano passa da una coda dedicata sul server: con tutta la classe che
+      // lo chiede insieme, le correzioni degli elaborati non perdono posti.
+      const planHtml = await requestRecoveryPlan({
+        tipo: submission.Tipo,
+        suggestedGrade: submission.Voto_Suggerito,
+        studentSelfGrade: submission.Autovalutazione,
+        evaluation: finalEvalObj,
+        answers: parsedAnswers,
+        examData: parsedExamData
       });
 
-      if (!response.ok) {
-        const errText = await response.text();
-        throw new Error(errText || "Impossibile completare la chiamata al docente tutor IA.");
+      // Save back to Firestore permanently
+      if (dbFirestore) {
+        const docRef = doc(dbFirestore, "valutazioni", subId);
+        await updateDoc(docRef, {
+          Piano_Recupero: planHtml
+        });
       }
 
-      const resData = await response.json();
-      if (resData.status === "success" && resData.planHtml) {
-        // Save back to Firestore permanently
-        if (dbFirestore) {
-          const docRef = doc(dbFirestore, "valutazioni", subId);
-          await updateDoc(docRef, {
-            Piano_Recupero: resData.planHtml
-          });
-        }
-        
-        // Update local state objects
-        const updatedSub = { ...submission, Piano_Recupero: resData.planHtml };
-        setSelectedPastSub(updatedSub);
-        
-        // Update selection in list
-        setHistoryList(prev => prev.map(item => item.id === subId ? updatedSub : item));
-      } else {
-        throw new Error("La risposta dell'IA non contiene un formato testuale valido.");
-      }
+      // Update local state objects
+      const updatedSub = { ...submission, Piano_Recupero: planHtml };
+      setSelectedPastSub(updatedSub);
+
+      // Update selection in list
+      setHistoryList(prev => prev.map(item => item.id === subId ? updatedSub : item));
     } catch (err: any) {
       console.error("Generazione piano fallita:", err);
       alert(`⚠️ Errore durante la generazione del piano di recupero tramite IA: ${err.message}`);
@@ -1290,18 +1362,24 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let finalEval: Evaluation;
       let isFirstPoll = true;
       let pollAttempts = 0;
-      const MAX_POLL_ATTEMPTS = 320; // Max ~4 minutes polling timeout
+      // Con due classi che consegnano insieme (40 elaborati) l'ultimo della coda
+      // aspetta minuti, non secondi: il budget è in tempo, non in numero di tentativi.
+      const MAX_WAIT_MS = 15 * 60 * 1000;
+      let pollingStartedAt = Date.now();
       let currentJobId = jobId;
       let reenqueues = 0;
       const MAX_REENQUEUES = 3; // Survive server restarts transparently
       while (true) {
         pollAttempts++;
-        if (pollAttempts > MAX_POLL_ATTEMPTS) {
-          throw new Error("Il tempo di attesa per la correzione è scaduto (timeout di 4 minuti). Le tue risposte sono state salvate nella bozza locale: puoi riprovare a consegnare.");
+        if (Date.now() - pollingStartedAt > MAX_WAIT_MS) {
+          throw new Error("Il tempo di attesa per la correzione è scaduto (15 minuti). Le tue risposte sono salvate nella bozza locale: premi di nuovo Consegna per riprovare.");
         }
 
         if (!isFirstPoll) {
-          await new Promise(r => setTimeout(r, 750)); // Safely throttle next poll (faster response)
+          // Attesa crescente con jitter: 40 studenti in coda non devono battere
+          // tutti sullo stesso secondo e pesare sul server.
+          const delay = Math.min(700 + pollAttempts * 120, 2600) + Math.random() * 350;
+          await new Promise(r => setTimeout(r, delay));
         }
         isFirstPoll = false;
 
@@ -1326,6 +1404,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                     localStorage.setItem("active_eval_rescue", JSON.stringify(rescue));
                   } catch {}
                   pollAttempts = 0;
+                  pollingStartedAt = Date.now();
                   isFirstPoll = true;
                   continue;
                 }
@@ -1355,7 +1434,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         }
 
         if (statusData.status === "pending") {
-          setSavingStatus(`Correzione in coda (Posizione attuale: ${statusData.position}). Attendere prego...`);
+          setSavingStatus(
+            `Correzione in coda (posizione ${statusData.position}): attesa di qualche minuto, non chiudere la pagina.`
+          );
         } else if (statusData.status === "processing") {
           setSavingStatus("L'Intelligenza Artificiale sta completando la correzione della tua prova ora...");
         } else if (statusData.status === "completed") {
@@ -1404,7 +1485,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             AntiCopia_InfractionsLog: JSON.stringify(rescue.behavior.infractionsLog),
             Full_Evaluation: JSON.stringify(finalEval),
             Risposte_Studente: JSON.stringify(rescue.answers),
-            Domande_Esame: JSON.stringify(rescue.examData)
+            Domande_Esame: serializeExamForSubmission(rescue.examData)
           };
 
           if (rescue.examType === "quiz") {
@@ -2969,41 +3050,30 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                       if (generatingPlan) return;
                       setGeneratingPlan(true);
                       try {
-                        const response = await fetchWithRetry("/api/generate-recovery-plan", {
-                          method: "POST",
-                          headers: { "Content-Type": "application/json" },
-                          body: JSON.stringify({
-                            tipo: examType === "quiz" ? "Quiz" : "Workbook",
-                            suggestedGrade: evaluation?.suggestedGrade,
-                            studentSelfGrade: studentSelfGrade,
-                            evaluation: evaluation,
-                            answers: answers,
-                            examData: examData
-                          })
+                        // Accodato sul server e atteso qui: la correzione degli
+                        // altri elaborati non viene rallentata dai piani richiesti
+                        // da tutta la classe.
+                        const planHtml = await requestRecoveryPlan({
+                          tipo: examType === "quiz" ? "Quiz" : "Workbook",
+                          suggestedGrade: evaluation?.suggestedGrade,
+                          studentSelfGrade: studentSelfGrade,
+                          evaluation: evaluation,
+                          answers: answers,
+                          examData: examData
                         });
 
-                        if (!response.ok) {
-                          const errText = await response.text();
-                          throw new Error(errText || "Impossibile completare la chiamata.");
+                        setActivePlanHtml(planHtml);
+
+                        // Write back to Firestore document permanently
+                        if (dbFirestore && activeSubmissionId) {
+                          const docRef = doc(dbFirestore, "valutazioni", activeSubmissionId);
+                          await updateDoc(docRef, {
+                            Piano_Recupero: planHtml
+                          });
                         }
 
-                        const resData = await response.json();
-                        if (resData.status === "success" && resData.planHtml) {
-                          setActivePlanHtml(resData.planHtml);
-                          
-                          // Write back to Firestore document permanently
-                          if (dbFirestore && activeSubmissionId) {
-                            const docRef = doc(dbFirestore, "valutazioni", activeSubmissionId);
-                            await updateDoc(docRef, {
-                              Piano_Recupero: resData.planHtml
-                            });
-                          }
-                          
-                          // Reload student history cache
-                          loadHistory();
-                        } else {
-                          throw new Error("Errore nella struttura della risposta.");
-                        }
+                        // Reload student history cache
+                        loadHistory();
                       } catch (err: any) {
                         console.error("Generazione piano immediato fallita:", err);
                         alert(`⚠️ Errore di generazione: ${err.message}`);

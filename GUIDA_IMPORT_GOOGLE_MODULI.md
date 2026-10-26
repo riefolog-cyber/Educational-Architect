@@ -1,8 +1,15 @@
 # 📥 Importazione da Google Moduli con risposta corrette automatiche
 
 Questa guida spiega come portare in "Educational Architect" un **Google Modulo** (con le sue
-**risposte corrette**, se il modulo è in modalità Quiz) tramite lo script di questo progetto:
-`google-forms-export.gs`.
+**risposte corrette**, se il modulo è in modalità Quiz).
+
+La via usata normalmente è la **Web App** `google-forms-export.gs` (o il suo **CSV**), con le
+figure delle domande allegate a mano dal pulsante **Immagine**.
+
+Esiste anche una via **facoltativa** basata su OAuth ("Connetti Google"), già **implementata lato
+server** ma **non esposta nell'interfaccia** dell'app: è documentata in appendice come riferimento
+tecnico, per riattivarla quando serve. Per l'uso quotidiano non cambia nulla: script + immagine
+allegata a mano.
 
 > 🔑 L'URL della Web App distribuita **non è contenuto in questo repository** (per privacy è in
 > `.gitignore`). Ogni docente lo ritrova sempre in: `script.google.com` → suo progetto →
@@ -29,6 +36,77 @@ Segue: restano intatti i titoli che iniziano con una data o un numero diverso da
 pesato; le opzioni multiple corrette usano la prima e le altre finiscono in nota.
 Le crocette **senza** chiave impostata nel modulo arrivano senza corretta (si segnano a
 mano nel riepilogo, o restano domande aperte).
+
+---
+
+## 🧪 Appendice tecnica — import via OAuth (pronto lato server, non nell'interfaccia)
+
+> ℹ️ **Stato attuale: non c'è nessun pulsante nell'app.** Gli endpoint sono attivi
+> (`/api/google/status`, `/api/google/oauth/start`, `/api/google/oauth/callback`,
+> `/api/google/oauth/result`) e il pulsante è stato tolto dal riquadro dell'import per non
+> appesantire il frontend. Questa appendice serve a chi in futuro vorrà riattivarlo: la
+> configurazione Cloud e le variabili d'ambiente qui sotto restano valide.
+
+La via OAuth legge il modulo direttamente dalla **Google Forms API**, quindi vede domande,
+**risposte corrette**, punteggi e **anche le immagini messe dentro le domande** — l'unica fonte che
+le espone. Se un giorno serve, costa una configurazione una volta sola e un giro su Google a ogni
+import.
+
+### Preparazione una volta sola (5-10 minuti)
+
+Tutto su un progetto Cloud **tuo**: se l'istituto blocca Apps Script o la Console, questo giro
+funziona lo stesso.
+
+1. **Crea il progetto**: [console.cloud.google.com/projectcreate](https://console.cloud.google.com/projectcreate)
+   (nome libero, es. `educational-architect-forms`).
+2. **Abilita la Google Forms API**: API e servizi → **Libreria** → cerca *Google Forms API* →
+   **Abilita** (col nuovo progetto selezionato in alto).
+3. **Schermata di consenso**: API e servizi → **Schermata di consenso OAuth** → tipo **Esterno**
+   (oppure **Interno** se l'account è Workspace) → nome dell'app ed email di supporto → salva.
+   Negli *Ambiti* aggiungi `https://www.googleapis.com/auth/forms.body.readonly`.
+   In **Utenti di prova** aggiungi **la tua email** (e quella dei colleghi che useranno l'import):
+   finché l'app non è verificata da Google, solo gli utenti di prova possono autorizzarla.
+4. **Credenziali**: API e servizi → **Credenziali** → *Crea credenziali* → **ID client OAuth** →
+   tipo **Applicazione web** → in **URI di reindirizzamento autorizzati** aggiungi:
+   - `https://IL-TUO-DOMINIO/api/google/oauth/callback`
+     (es. `https://educational-architect.onrender.com/api/google/oauth/callback`);
+   - `http://localhost:3000/api/google/oauth/callback` se provi in locale.
+   Copia **Client ID** e **Client secret**.
+5. **Sul server** (Render → Environment, oppure `.env` locale):
+
+   ```
+   APP_URL=https://IL-TUO-DOMINIO
+   GOOGLE_CLIENT_ID=....apps.googleusercontent.com
+   GOOGLE_CLIENT_SECRET=....
+   ```
+
+   `APP_URL` va scritto **senza slash finale** e deve coincidere col dominio del redirect.
+
+### Come funziona (per chi la riattiva)
+
+1. Il browser apre `/api/google/oauth/start?url=<link del modulo>` e va su Google.
+2. Google torna su `/api/google/oauth/callback`: il server scambia il codice, legge il modulo,
+   scarica le figure e prepara il risultato.
+3. Il browser torna sull'app con `?gforms_return=<id>` e chiede il payload a
+   `/api/google/oauth/result?id=<id>`: da lì si apre il solito riepilogo (miniature, corrette
+   pre-segnate).
+
+**Nessun token viene salvato** (si richiede a ogni import), quindi non resta niente sul server e non
+c'è niente da revocare. Per riattivare il pulsante basta rimettere nel riquadro dell'import la
+chiamata a `/api/google/status` e il link a `/api/google/oauth/start`.
+
+### Se l'import dice…
+
+| Messaggio | Rimedio |
+|---|---|
+| "La Google Forms API non è attiva nel progetto…" | punto 2, sullo **stesso** progetto dell'ID client |
+| "L'account scelto non ha concesso la lettura…" | rifai Connetti Google **lasciando la spunta** ai permessi |
+| "Modulo non trovato con questo account" | hai scelto l'account sbagliato: riprova col proprietario |
+| "L'accesso Google non è ancora configurato su questo server" | mancano `GOOGLE_CLIENT_ID`/`GOOGLE_CLIENT_SECRET` (punto 5): vanno impostate e il servizio riavviato |
+| "Google non ha rilasciato il token (400, redirect_uri_mismatch)" | il redirect del punto 4 non coincide con `APP_URL` (dominio, slash, http/https) |
+
+Se l'istituto blocca le app esterne per l'account scuola, usa un account personale e condividi il
+modulo con lui come collaboratore: l'import non richiede permessi all'istituto.
 
 ---
 
@@ -60,15 +138,23 @@ fonte che le espone). Se lo script non ha lo scope giusto, l'app scrive negli av
 "Forms API non autorizzata (HTTP 403)". Per abilitarla, una volta sola:
 
 1. Apps Script → ⚙️ **Impostazioni progetto** → spunta **"Mostra il file `appsscript.json` nell'editor"**.
-2. Apri `appsscript.json` e imposta gli scope (se `oauthScopes` non c'è, aggiungi la riga):
+2. Apri `appsscript.json` e imposta gli scope (se `oauthScopes` non c'è, aggiungi il blocco
+   qui sotto **senza cancellare le altre proprietà** — in particolare `webapp`, che mantiene la
+   Web App accessibile a "Chiunque"):
 
    ```json
    "oauthScopes": [
      "https://www.googleapis.com/auth/forms",
      "https://www.googleapis.com/auth/forms.body.readonly",
+     "https://www.googleapis.com/auth/drive",
      "https://www.googleapis.com/auth/script.external_request"
    ]
    ```
+
+   Con `oauthScopes` scritto a mano Apps Script **smette di rilevare gli scope da solo**: devono
+   comparire tutti i servizi usati dallo script — `forms` per FormApp, `drive` per l'esportazione
+   CSV (DriveApp), `script.external_request` per UrlFetchApp, la Forms API e il download delle
+   figure.
 
 3. Salva, esegui una volta `doGet` dall'editor concedendo i permessi, poi
    **Distribuisci → Gestisci distribuzioni → ✏️ → Nuova versione**.
@@ -78,21 +164,45 @@ fonte che le espone). Se lo script non ha lo scope giusto, l'app scrive negli av
 Se l'account è Workspace e gli scope sono bloccati dall'amministratore, la lettura automatica non
 è possibile: restano l'allegato manuale e lo spostamento della figura fuori dalla domanda.
 
-### Se resta 403 dopo aver aggiunto lo scope
+### Se resta 403: "API has not been used in project …"
 
-Un 403 può voler dire anche che la **Google Forms API non è attiva nel progetto Cloud dello
-script**. Il messaggio di Google lo dice esplicitamente ("has not been used in project … or it is
-disabled") e l'app lo riporta negli avvisi. In quel caso:
+Un 403 con questo testo dice che la **Google Forms API non è attiva nel progetto Cloud dello
+script** (il numero lo cita il messaggio, es. `234205936588`). Non c'entrano né il modulo né
+l'account che chiama la Web App: è un interruttore del progetto Cloud.
+
+> ⚠️ Il trucco del **servizio avanzato** (che con i progetti predefiniti abilita da solo l'API
+> quando aggiungi il servizio) **non vale per Forms**: in `Servizi → +` la voce Forms non esiste,
+> quindi quell'auto-abilitazione non si innesca. Serve la Console oppure cambiare progetto.
+
+**Via 1 — link diretto in Console, 30 secondi** (funziona solo se l'account ha i diritti sul
+progetto):
+`https://console.developers.google.com/apis/api/forms.googleapis.com/enable?project=NUMERO_PROGETTO`
+dove il numero è quello citato dal messaggio. Devi essere loggato con l'account che ha creato lo
+script (in Chrome il parametro `authuser=` dell'URL indica il conto attivo; se è quello sbagliato,
+cambia conto dall'avatar in alto a destra e riapri). Se la Console chiede **"Devi selezionare un
+progetto"** non premere Abilita, e se risponde **"non hai i permessi" / "progetto non trovato"**
+con un progetto Predefinito è il comportamento documentato (i progetti predefiniti non sono
+pienamente gestibili da tutti): passa alla via 2.
+
+**Via 2 — progetto standard tuo (fallback documentato; una volta cambiato non si torna al
+predefinito):**
 
 1. Apps Script → ⚙️ **Impostazioni progetto** → **Progetto Google Cloud Platform** →
-   **Cambia progetto** → **Crea nuovo progetto** (standard, non quello predefinito).
-2. Nella Google Cloud Console apri **API e servizi → Libreria**, cerca **Google Forms API** e
-   premi **Abilita** sul progetto appena creato.
-3. Torna nell'editor, esegui `doGet` (nuova autorizzazione) e fai
-   **Distribuisci → Gestisci distribuzioni → ✏️ → Nuova versione**.
+   **Cambia progetto** → **Crea nuovo progetto** (standard). Se l'istituto blocca la creazione di
+   progetti, restano la via manuale oppure l'account personale.
+2. Nella Google Cloud Console, **API e servizi → Libreria**, cerca **Google Forms API** e premi
+   **Abilita** (col progetto nuovo attivo in alto, il tuo: sei il proprietario, quindi funziona).
+3. Se all'esecuzione di `doGet` Google dice che l'app è **"in testing" / non verificata** (non
+   succedeva col progetto predefinito), aggiungiti come **utente di prova**: **API e servizi →
+   Schermata di consenso → Utenti di prova → Aggiungi utenti** col tuo indirizzo, poi riesegui
+   `doGet`.
+4. Fai **Distribuisci → Gestisci distribuzioni → ✏️ → Nuova versione**.
+5. Rileggi il modulo: l'avviso diventa
+   `Forms API: N immagini dentro le domande trovate, M agganciate`.
 
-Se preferisci non toccare la console, l'alternativa senza permessi è spostare le figure **fuori**
-dalla domanda (elemento immagine sopra la domanda): arrivano con l'export normale.
+Se nemmeno un progetto nuovo puoi crearlo (limite dell'istituto), la lettura automatica non è
+percorribile: restano l'allegato manuale e lo spostamento della figura **fuori** dalla domanda
+(elemento immagine sopra la domanda), che arrivano con l'export normale.
 
 ---
 

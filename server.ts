@@ -1,6 +1,7 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import crypto from "crypto";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
@@ -539,10 +540,13 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
 
 import { weightedOpenAverage } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
+import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
   id: string;
+  /** Correzione di un elaborato oppure piano di recupero: due corsie separate. */
+  kind: "evaluate" | "recovery";
   status: "pending" | "processing" | "completed" | "failed";
   reqBody: any;
   result?: any;
@@ -552,8 +556,46 @@ interface EvaluationJob {
 
 const jobStore = new Map<string, EvaluationJob>();
 const evaluationQueue: string[] = [];
+/** Corsia dei piani di recupero: non sottrae posti alle correzioni. */
+const recoveryQueue: string[] = [];
 let activeWorkers = 0;
-const MAX_CONCURRENT_WORKERS = 5;
+let activeRecoveryWorkers = 0;
+
+/**
+ * Quanti elaborati correggere davvero in parallelo. 5 è pensato per una o due
+ * classi che consegnano insieme: valori alti riducono la coda ma moltiplicano
+ * le richieste a Gemini (e quindi i 429). Regolabile da ambiente.
+ */
+const MAX_CONCURRENT_WORKERS = Math.min(12, Math.max(1, Number(process.env.EVAL_CONCURRENCY) || 5));
+/** Oltre questa lunghezza si risponde 429 invece di accumulare payload in memoria. */
+const MAX_QUEUE_LENGTH = Math.max(50, Number(process.env.EVAL_MAX_QUEUE) || 200);
+/** Un esito resta leggibile dal browser per 30 minuti, poi viene liberato. */
+const JOB_TTL_MS = 30 * 60 * 1000;
+/**
+ * Piani di recupero: pochi in parallelo (sono testi lunghi) e una coda più
+ * corta. Se tutta la classe li chiede insieme, si accodano qui e la correzione
+ * degli elaborati continua con i suoi posti.
+ */
+const MAX_RECOVERY_WORKERS = Math.min(6, Math.max(1, Number(process.env.RECOVERY_CONCURRENCY) || 2));
+const MAX_RECOVERY_QUEUE = Math.max(20, Number(process.env.RECOVERY_MAX_QUEUE) || 80);
+
+/**
+ * Libera la memoria dei job già conclusi: il payload di una consegna contiene
+ * anche il JSON dell'esame (con le immagini) e pesa centinaia di KB. Senza
+ * questa pulizia, dopo qualche classe su un'istanza piccola si arriva all'OOM.
+ */
+function purgeOldJobs(now = Date.now()) {
+  if (jobStore.size === 0) return;
+  for (const [id, job] of jobStore) {
+    if (job.status !== "completed" && job.status !== "failed") continue;
+    if (now - job.createdAt < JOB_TTL_MS) continue;
+    jobStore.delete(id);
+    job.reqBody = undefined;
+    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+      if (cachedJobId === id) reqToJobCache.delete(hashKey);
+    }
+  }
+}
 
 // Hash mapping cache for preventing duplicate active evaluations from clicking submit twice or network drops
 const reqToJobCache = new Map<string, string>();
@@ -569,6 +611,33 @@ function getRequestHash(body: any): string {
   } catch (err) {
     return "hash_" + Math.random().toString(36).substring(7);
   }
+}
+
+/**
+ * Messaggio leggibile per un errore dell'IA: il client a volte riceve il JSON
+ * grezzo del SDK (es. "API key not valid") e mostrarlo così com'è confonde.
+ */
+function humanAiError(raw: string): string {
+  const text = String(raw || "").trim();
+  if (!text) return "Errore durante la generazione con l'IA.";
+  if (text.startsWith("{")) {
+    try {
+      const parsed = JSON.parse(text);
+      const detail = parsed?.error?.message || parsed?.message;
+      if (typeof detail === "string" && detail.trim()) {
+        if (/api key not valid|invalid api key|api_key_invalid/i.test(detail)) {
+          return "La chiave API di Gemini non è valida: controlla la variabile d'ambiente del server.";
+        }
+        if (/quota|rate limit|resource exhausted|resource_exhausted/i.test(detail)) {
+          return "La quota dell'IA è momentaneamente esaurita: riprova tra qualche minuto.";
+        }
+        return detail;
+      }
+    } catch {
+      // non è JSON: si usa il testo originale
+    }
+  }
+  return text;
 }
 
 async function runEvaluationCore(reqBody: any) {
@@ -913,7 +982,7 @@ async function processQueue() {
     }, 30000);
   } catch (err: any) {
     job.status = "failed";
-    job.error = err.message || "Errore durante la valutazione";
+    job.error = humanAiError(err?.message || "Errore durante la valutazione");
     // Release hash immediately on error to allow fast retry
     for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
       if (cachedJobId === job.id) {
@@ -922,21 +991,10 @@ async function processQueue() {
     }
   } finally {
     activeWorkers--;
-    // Auto purge extremely old jobs & request cache
-    if (jobStore.size > 1000) {
-      const now = Date.now();
-      for (const [key, value] of jobStore.entries()) {
-        if (now - value.createdAt > 1000 * 60 * 60) {
-          jobStore.delete(key);
-          // Also clean mapping cache
-          for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-            if (cachedJobId === key) {
-              reqToJobCache.delete(hashKey);
-            }
-          }
-        }
-      }
-    }
+    // Il payload completo non serve più: tenerlo per ogni job concluso è il modo
+    // più rapido per esaurire la memoria dell'istanza.
+    job.reqBody = undefined;
+    purgeOldJobs();
     processQueue();
   }
 }
@@ -947,6 +1005,7 @@ app.get("/api/evaluate/warmup", (_req, res) => {
 });
 
 app.all("/api/evaluate/enqueue", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   if (req.method !== "POST") {
     return res.status(405).json({ 
       error: "Method Not Allowed. Il browser ha momentaneamente perso la sessione a causa dei cookie nel blocco iframe. La connessione è stata ripristinata con successo. Clicca nuovamente su Consegna per procedere!" 
@@ -970,9 +1029,19 @@ app.all("/api/evaluate/enqueue", (req, res) => {
     }
   }
 
+  // Backpressure: con due classi la coda resta corta, ma un ciclo di richieste
+  // impazzito non deve poter riempire la memoria del server.
+  if (evaluationQueue.length >= MAX_QUEUE_LENGTH) {
+    return res.status(429).json({
+      error:
+        "Ci sono troppi elaborati in coda in questo momento. Le tue risposte restano salvate nel browser: riprova tra un minuto.",
+    });
+  }
+
   const jobId = "job_" + Math.random().toString(36).substring(2, 15) + Date.now();
   const job: EvaluationJob = {
     id: jobId,
+    kind: "evaluate",
     status: "pending",
     reqBody: req.body,
     createdAt: Date.now()
@@ -987,6 +1056,7 @@ app.all("/api/evaluate/enqueue", (req, res) => {
 });
 
 app.get("/api/evaluate/status/:jobId", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
   const { jobId } = req.params;
   const job = jobStore.get(jobId);
 
@@ -995,20 +1065,26 @@ app.get("/api/evaluate/status/:jobId", (req, res) => {
   }
 
   if (job.status === "pending") {
-    const position = evaluationQueue.indexOf(jobId);
-    return res.json({ status: "pending", position: position !== -1 ? position + 1 : 0 });
+    const queue = job.kind === "recovery" ? recoveryQueue : evaluationQueue;
+    const position = queue.indexOf(jobId);
+    return res.json({ status: "pending", kind: job.kind, position: position !== -1 ? position + 1 : 0 });
   }
 
   if (job.status === "processing") {
-    return res.json({ status: "processing" });
+    return res.json({ status: "processing", kind: job.kind });
   }
 
   if (job.status === "completed") {
-    return res.json({ status: "completed", evaluation: job.result });
+    // `evaluation` resta il campo delle correzioni; i piani arrivano in `result`.
+    return res.json({
+      status: "completed",
+      kind: job.kind,
+      ...(job.kind === "recovery" ? { result: job.result } : { evaluation: job.result }),
+    });
   }
 
   if (job.status === "failed") {
-    return res.json({ status: "failed", error: job.error });
+    return res.json({ status: "failed", kind: job.kind, error: job.error });
   }
 });
 
@@ -1017,22 +1093,26 @@ app.get("/api/generate-recovery-plan", (_req, res) => {
   res.status(405).json({ error: "Questo endpoint richiede una richiesta POST con payload JSON per la generazione del piano." });
 });
 
-app.post("/api/generate-recovery-plan", async (req, res) => {
-  const { tipo, suggestedGrade, studentSelfGrade, evaluation, answers, examData } = req.body;
+/**
+ * Genera il piano di recupero di una consegna. Gira dentro la corsia dedicata:
+ * la correzione degli elaborati non perde un posto perché la classe ha chiesto
+ * trenta piani tutti insieme.
+ */
+async function runRecoveryCore(reqBody: any) {
+  const { tipo, suggestedGrade, studentSelfGrade, evaluation, answers, examData } = reqBody || {};
 
   if (!getApiKey()) {
-    return res.status(500).json({ error: "La chiave API di Gemini non è configurata nell'ambiente. Contatta l'amministratore scolastico." });
+    throw new Error("La chiave API di Gemini non è configurata nell'ambiente. Contatta l'amministratore scolastico.");
   }
 
-  try {
-    const hasOpenEnded = ((examData?.openEnded || []).length > 0) || 
-      ((examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []).length > 0);
+  const hasOpenEnded = ((examData?.openEnded || []).length > 0) || 
+    ((examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []).length > 0);
 
-    const examFormatInstruction = hasOpenEnded
-      ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
-      : "AVVERTENZA FONDAMENTALE SULLA STRUTTURA: Questa prova NON contiene domande a risposta aperta (è composta esclusivamente da domande a risposta multipla o completamenti testo). NON citare in nessun caso 'risposte brevi', 'superficiali', 'risposte non argomentate' o 'spazi lasciati in bianco'. Concentrati rigorosamente sui concetti teorici delle crocette errate e sui nodi concettuali da consolidare.";
+  const examFormatInstruction = hasOpenEnded
+    ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
+    : "AVVERTENZA FONDAMENTALE SULLA STRUTTURA: Questa prova NON contiene domande a risposta aperta (è composta esclusivamente da domande a risposta multipla o completamenti testo). NON citare in nessun caso 'risposte brevi', 'superficiali', 'risposte non argomentate' o 'spazi lasciati in bianco'. Concentrati rigorosamente sui concetti teorici delle crocette errate e sui nodi concettuali da consolidare.";
 
-    const prompt = `Sei un docente tutor empatico, saggio ed esperto di scuola secondaria di secondo grado italiana (scuola superiore).
+  const prompt = `Sei un docente tutor empatico, saggio ed esperto di scuola secondaria di secondo grado italiana (scuola superiore).
 Il tuo obiettivo è generare un **Piano di Studio e Recupero Didattico Personalizzato** su misura per uno studente che ha completato una prova di verifica.
 
 ${examFormatInstruction}
@@ -1058,28 +1138,112 @@ Il piano deve comprendere tassativamente queste 4 aree logiche:
 
 Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
 
-    const response = await generateWithRetry({
-      model: "gemini-3.5-flash",
-      models: TASK_MODEL_PREFERENCE["recovery-plan"],
-      contents: prompt,
-      config: {
-        temperature: 0.7,
-        maxOutputTokens: 2500,
-        thinkingConfig: {
-          thinkingLevel: "LOW"
-        }
+  const response = await generateWithRetry({
+    model: "gemini-3.5-flash",
+    models: TASK_MODEL_PREFERENCE["recovery-plan"],
+    contents: prompt,
+    config: {
+      temperature: 0.7,
+      maxOutputTokens: 2500,
+      thinkingConfig: {
+        thinkingLevel: "LOW"
       }
-    });
+    }
+  });
 
-    const text = extractResponseText(response);
-    return res.json({ status: "success", planHtml: text });
-  } catch (error: any) {
-    console.error("AI Recovery Plan Generation Failed:", error);
-    return res.status(500).json({ 
-      error: "La generazione del piano di recupero tramite IA ha riscontrato un errore.", 
-      details: error.message 
+  const text = extractResponseText(response);
+  if (!text || !text.trim()) throw new Error("L'IA non ha restituito un piano di recupero valido.");
+  return { planHtml: text };
+}
+
+/** Prende in carico i piani di recupero in coda, con i suoi posti dedicati. */
+async function processRecoveryQueue() {
+  if (activeRecoveryWorkers >= MAX_RECOVERY_WORKERS) return;
+  if (recoveryQueue.length === 0) return;
+
+  const jobId = recoveryQueue.shift();
+  if (!jobId) return;
+
+  const job = jobStore.get(jobId);
+  if (!job || job.kind !== "recovery" || job.status !== "pending") {
+    processRecoveryQueue();
+    return;
+  }
+
+  activeRecoveryWorkers++;
+  job.status = "processing";
+
+  try {
+    job.result = await runRecoveryCore(job.reqBody);
+    job.status = "completed";
+    setTimeout(() => {
+      for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+        if (cachedJobId === job.id) reqToJobCache.delete(hashKey);
+      }
+    }, 30000);
+  } catch (err: any) {
+    job.status = "failed";
+    job.error = humanAiError(err?.message || "Errore durante la generazione del piano");
+    console.warn("[Piano di recupero]", job.error);
+    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+      if (cachedJobId === job.id) reqToJobCache.delete(hashKey);
+    }
+  } finally {
+    activeRecoveryWorkers--;
+    job.reqBody = undefined;
+    purgeOldJobs();
+    processRecoveryQueue();
+  }
+}
+
+app.post("/api/generate-recovery-plan", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+
+  if (!getApiKey()) {
+    return res.status(500).json({ error: "La chiave API di Gemini non è configurata nell'ambiente. Contatta l'amministratore scolastico." });
+  }
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(400).json({ error: "Richiesta del piano di recupero priva dei dati della consegna." });
+  }
+
+  // Stessa consegna => stesso piano: un doppio clic non genera due testi.
+  const reqHash = "recovery_" + crypto.createHash("sha1").update(JSON.stringify(req.body)).digest("hex");
+  const existingJobId = reqToJobCache.get(reqHash);
+  if (existingJobId) {
+    const existingJob = jobStore.get(existingJobId);
+    if (existingJob && existingJob.status !== "failed") {
+      const position = recoveryQueue.indexOf(existingJobId);
+      return res.json({
+        status: existingJob.status,
+        jobId: existingJobId,
+        position: position !== -1 ? position + 1 : 0,
+        cached: true,
+      });
+    }
+  }
+
+  if (recoveryQueue.length >= MAX_RECOVERY_QUEUE) {
+    return res.status(429).json({
+      error: "Ci sono troppi piani di recupero in coda in questo momento: riprova tra un minuto.",
     });
   }
+
+  const jobId = "plan_" + Math.random().toString(36).substring(2, 15) + Date.now();
+  const job: EvaluationJob = {
+    id: jobId,
+    kind: "recovery",
+    status: "pending",
+    reqBody: req.body,
+    createdAt: Date.now(),
+  };
+
+  jobStore.set(jobId, job);
+  reqToJobCache.set(reqHash, jobId);
+  recoveryQueue.push(jobId);
+  processRecoveryQueue();
+
+  console.log(`[Piano di recupero] Accodato ${jobId} (posizione ${recoveryQueue.length}, lavoratori ${activeRecoveryWorkers}/${MAX_RECOVERY_WORKERS}).`);
+  return res.json({ status: "pending", jobId, position: recoveryQueue.length });
 });
 
 // API: Health probe & Docimological Analysis & Criteria Optimization
@@ -1863,6 +2027,309 @@ app.get("/api/forms-script", async (req, res) => {
     console.warn("[Forms Script]", message);
     res.status(status).json({ error: message });
   }
+});
+
+// -----------------------------------------------------------------------------
+// Google Forms import through OAuth ("Connetti Google"): the teacher authorises
+// the app for one import, the server reads forms.googleapis.com directly (the
+// only source that also sees the images placed INSIDE a question) and hands the
+// result back to the browser through a short-lived id. Nothing is stored on the
+// server: the access token lives only inside the callback request.
+// -----------------------------------------------------------------------------
+
+const GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth";
+const GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token";
+const GOOGLE_FORMS_API_URL = "https://forms.googleapis.com/v1/forms/";
+const GOOGLE_FORMS_SCOPE = "https://www.googleapis.com/auth/forms.body.readonly";
+/** Query params the SPA reads after the Google round trip. */
+const GOOGLE_IMPORT_RETURN_PARAM = "gforms_return";
+const GOOGLE_IMPORT_ERROR_PARAM = "gforms_error";
+const OAUTH_STATE_MAX_AGE_MS = 15 * 60 * 1000;
+const PENDING_IMPORT_MAX_AGE_MS = 20 * 60 * 1000;
+const MAX_FORM_IMAGES = 40;
+const MAX_FORM_IMAGE_BYTES = 6 * 1024 * 1024;
+
+interface PendingGoogleImport {
+  createdAt: number;
+  form: unknown;
+}
+
+/** Risultati pronti per il browser, per id casuale e con scadenza. */
+const pendingGoogleImports = new Map<string, PendingGoogleImport>();
+
+function cleanupPendingGoogleImports() {
+  const now = Date.now();
+  for (const [id, entry] of pendingGoogleImports) {
+    if (now - entry.createdAt > PENDING_IMPORT_MAX_AGE_MS) pendingGoogleImports.delete(id);
+  }
+}
+
+function googleOAuthConfig() {
+  const clientId = String(process.env.GOOGLE_CLIENT_ID || "").trim();
+  const clientSecret = String(process.env.GOOGLE_CLIENT_SECRET || "").trim();
+  return { clientId, clientSecret, configured: !!(clientId && clientSecret) };
+}
+
+/**
+ * Base URL pubblica dell'app: `APP_URL` quando è configurata (consigliato in
+ * produzione), altrimenti quella della richiesta (sviluppo locale).
+ */
+function publicBaseUrl(req: express.Request): string {
+  const explicit = String(process.env.APP_URL || "").trim().replace(/\/+$/, "");
+  if (explicit) return explicit;
+  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+    .split(",")[0]
+    .trim();
+  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "")
+    .split(",")[0]
+    .trim();
+  return host ? `${proto}://${host}` : "";
+}
+
+function googleCallbackUri(base: string): string {
+  return `${base}/api/google/oauth/callback`;
+}
+
+/** `state` firmato: non serve memoria fra /start e /callback. */
+function signGoogleState(formId: string, secret: string): string {
+  const body = Buffer.from(JSON.stringify({ formId, ts: Date.now() }), "utf8").toString("base64url");
+  const mac = crypto.createHmac("sha256", secret).update(body).digest("base64url");
+  return `${body}.${mac}`;
+}
+
+function verifyGoogleState(state: string, secret: string): { formId: string } | null {
+  const [body, mac] = (state || "").split(".");
+  if (!body || !mac) return null;
+  const expected = crypto.createHmac("sha256", secret).update(body).digest("base64url");
+  const given = Buffer.from(mac);
+  const wanted = Buffer.from(expected);
+  if (given.length !== wanted.length || !crypto.timingSafeEqual(given, wanted)) return null;
+  try {
+    const parsed = JSON.parse(Buffer.from(body, "base64url").toString("utf8")) as { formId?: unknown; ts?: unknown };
+    const formId = typeof parsed.formId === "string" ? parsed.formId.trim() : "";
+    const ts = Number(parsed.ts);
+    if (!formId || !Number.isFinite(ts) || Date.now() - ts > OAUTH_STATE_MAX_AGE_MS) return null;
+    return { formId };
+  } catch {
+    return null;
+  }
+}
+
+/** Raccoglie i `contentUri` delle immagini presenti nel payload della Forms API. */
+function collectFormImageUris(value: unknown, out: Set<string>) {
+  if (!value || typeof value !== "object") return;
+  if (Array.isArray(value)) {
+    value.forEach((entry) => collectFormImageUris(entry, out));
+    return;
+  }
+  const obj = value as Record<string, unknown>;
+  const uri = obj.contentUri;
+  if (typeof uri === "string" && /^https:\/\/forms\.googleapis\.com\//.test(uri)) out.add(uri);
+  Object.values(obj).forEach((entry) => collectFormImageUris(entry, out));
+}
+
+/** Scarica una figura del modulo in data URL, con il token dell'utente. */
+async function downloadFormImage(uri: string, accessToken: string): Promise<string | null> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 20000);
+  try {
+    const response = await fetch(uri, {
+      headers: { Authorization: `Bearer ${accessToken}` },
+      redirect: "follow",
+      signal: controller.signal,
+    });
+    if (!response.ok) return null;
+    const contentType = (response.headers.get("content-type") || "image/png").split(";")[0].trim();
+    if (!/^image\//i.test(contentType)) return null;
+    const bytes = Buffer.from(await response.arrayBuffer());
+    if (bytes.length === 0 || bytes.length > MAX_FORM_IMAGE_BYTES) return null;
+    return `data:${contentType};base64,${bytes.toString("base64")}`;
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Traduce un rifiuto della Forms API nell'azione da fare. */
+function explainFormsApiFailure(status: number, detail: string): string {
+  const lower = (detail || "").toLowerCase();
+  if (
+    /has not been used in project|accessnotconfigured|is disabled|service_disabled|api has not been used/.test(lower)
+  ) {
+    return "La Google Forms API non è attiva nel progetto Cloud dell'app. Apri console.cloud.google.com → API e servizi → Libreria → Google Forms API → Abilita (sullo stesso progetto del client OAuth) e riprova: non serve rifare l'accesso.";
+  }
+  if (/insufficient|scope|permission_denied|forbidden/.test(lower) && status === 403) {
+    return "L'account scelto non ha concesso la lettura dei moduli: ripeti “Connetti Google” e lascia spuntata la casella dei permessi. Se il modulo è di un altro account, scegli quello che lo possiede.";
+  }
+  if (status === 404) {
+    return "Modulo non trovato con questo account: verifica di aver scelto l'account che possiede il modulo e che il link sia quello giusto.";
+  }
+  if (status === 401) {
+    return "L'autorizzazione Google è scaduta: premi di nuovo “Connetti Google”.";
+  }
+  return `Google Forms API ha risposto ${status}${detail ? `: ${detail}` : ""}.`;
+}
+
+app.get("/api/google/status", (req, res) => {
+  const cfg = googleOAuthConfig();
+  const base = publicBaseUrl(req);
+  res.setHeader("Cache-Control", "no-store");
+  res.json({
+    configured: cfg.configured,
+    redirectUri: cfg.configured && base ? googleCallbackUri(base) : "",
+  });
+});
+
+app.get("/api/google/oauth/start", (req, res) => {
+  const base = publicBaseUrl(req);
+  const cfg = googleOAuthConfig();
+  const fail = (message: string) => {
+    if (!base) return res.status(500).type("text/plain").send(message);
+    return res.redirect(`${base}/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
+  };
+
+  if (!cfg.configured) {
+    return fail(
+      "L'accesso Google non è ancora configurato su questo server: servono GOOGLE_CLIENT_ID e GOOGLE_CLIENT_SECRET (vedi la guida, sezione “Connetti Google”). Nel frattempo usa il link pubblico o lo script."
+    );
+  }
+  if (!base) {
+    return res.status(500).type("text/plain").send("URL pubblico dell'app non determinabile: imposta la variabile APP_URL.");
+  }
+
+  try {
+    const formUrl = buildFormViewUrl(String(req.query.url || ""));
+    const formId = extractFormIdFromUrl(formUrl);
+    if (!formId) throw new FormImportError("Link del modulo non riconosciuto: incolla il link docs.google.com/forms/… del modulo.", 400);
+
+    const params = new URLSearchParams({
+      client_id: cfg.clientId,
+      redirect_uri: googleCallbackUri(base),
+      response_type: "code",
+      scope: `openid email ${GOOGLE_FORMS_SCOPE}`,
+      state: signGoogleState(formId, cfg.clientSecret),
+      prompt: "select_account",
+      include_granted_scopes: "true",
+    });
+    res.redirect(`${GOOGLE_AUTH_URL}?${params.toString()}`);
+  } catch (err: any) {
+    const message = err instanceof FormImportError ? err.message : "Non riesco ad avviare l'accesso Google: riprova.";
+    return fail(message);
+  }
+});
+
+app.get("/api/google/oauth/callback", async (req, res) => {
+  const base = publicBaseUrl(req);
+  const cfg = googleOAuthConfig();
+  const fail = (message: string) => {
+    console.warn("[Forms OAuth]", message);
+    if (!base) return res.status(500).type("text/plain").send(message);
+    return res.redirect(`${base}/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
+  };
+
+  if (!cfg.configured) return fail("L'accesso Google non è configurato su questo server (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).");
+  if (!base) return fail("URL pubblico dell'app non determinabile: imposta la variabile APP_URL.");
+
+  const googleError = String(req.query.error || "").trim();
+  if (googleError) {
+    return fail(
+      googleError === "access_denied"
+        ? "Hai annullato l'accesso a Google. Premi di nuovo “Connetti Google” e scegli l'account che possiede il modulo."
+        : `Google ha rifiutato l'accesso (${googleError}). Se l'account è dell'istituto, l'amministratore può bloccare le app esterne: in quel caso usa un account personale o lo script.`
+    );
+  }
+
+  const state = verifyGoogleState(String(req.query.state || ""), cfg.clientSecret);
+  if (!state) {
+    return fail("La richiesta di accesso è scaduta o non è valida: premi di nuovo “Connetti Google” nel riquadro dell'import.");
+  }
+
+  const code = String(req.query.code || "").trim();
+  if (!code) return fail("Google non ha restituito il codice di autorizzazione: riprova.");
+
+  try {
+    const tokenResponse = await fetch(GOOGLE_TOKEN_URL, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded", Accept: "application/json" },
+      body: new URLSearchParams({
+        code,
+        client_id: cfg.clientId,
+        client_secret: cfg.clientSecret,
+        redirect_uri: googleCallbackUri(base),
+        grant_type: "authorization_code",
+      }).toString(),
+    });
+    const tokenData = (await tokenResponse.json().catch(() => null)) as
+      | { access_token?: string; error?: string; error_description?: string }
+      | null;
+
+    if (!tokenResponse.ok || !tokenData?.access_token) {
+      const detail = tokenData?.error_description || tokenData?.error || "";
+      return fail(
+        `Google non ha rilasciato il token (${tokenResponse.status}${detail ? `, ${detail}` : ""}). Controlla che l'URL di reindirizzamento autorizzato contenga ${googleCallbackUri(base)} e riprova.`
+      );
+    }
+
+    const formResponse = await fetch(GOOGLE_FORMS_API_URL + encodeURIComponent(state.formId), {
+      headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" },
+    });
+    const formData = (await formResponse.json().catch(() => null)) as any;
+    if (!formResponse.ok) {
+      const detail = String(formData?.error?.message || "");
+      return fail(explainFormsApiFailure(formResponse.status, detail));
+    }
+
+    // Immagini: si scaricano prima di costruire il payload (il convertitore è sincrono).
+    const uris = new Set<string>();
+    collectFormImageUris(formData, uris);
+    const images = new Map<string, string>();
+    const toDownload = [...uris].slice(0, MAX_FORM_IMAGES);
+    const downloaded = await Promise.all(
+      toDownload.map(async (uri) => ({ uri, dataUrl: await downloadFormImage(uri, tokenData.access_token as string) }))
+    );
+    downloaded.forEach(({ uri, dataUrl }) => {
+      if (dataUrl) images.set(uri, dataUrl);
+    });
+
+    const form = buildLinkedFormFromApi(formData, {
+      sourceUrl: `https://docs.google.com/forms/d/${state.formId}/edit`,
+      imageFor: (uri) => images.get(uri),
+    });
+    if (!form) {
+      return fail("Il modulo non contiene domande importabili (solo immagini o titoli).");
+    }
+    if (uris.size > toDownload.length) {
+      form.skipped.push(`Immagini oltre il limite di ${MAX_FORM_IMAGES}: le altre vanno allegate a mano.`);
+    }
+    const missing = uris.size - images.size;
+    if (missing > 0) {
+      form.skipped.push(
+        `${missing} immagine/i non scaricabili dal modulo: allegale a mano col pulsante “Immagine” nel riepilogo.`
+      );
+    }
+
+    cleanupPendingGoogleImports();
+    const id = crypto.randomUUID();
+    pendingGoogleImports.set(id, { createdAt: Date.now(), form });
+    res.redirect(`${base}/?${GOOGLE_IMPORT_RETURN_PARAM}=${encodeURIComponent(id)}`);
+  } catch (err: any) {
+    return fail(err?.message ? `Lettura del modulo non riuscita: ${err.message}` : "Lettura del modulo non riuscita: riprova.");
+  }
+});
+
+app.get("/api/google/oauth/result", (req, res) => {
+  cleanupPendingGoogleImports();
+  const id = String(req.query.id || "").trim();
+  res.setHeader("Cache-Control", "no-store");
+  const entry = id ? pendingGoogleImports.get(id) : undefined;
+  if (!entry) {
+    return res.status(404).json({
+      error:
+        "L'importazione non è più disponibile (scaduta o server riavviato): riapri il riquadro e premi di nuovo “Connetti Google”.",
+    });
+  }
+  res.json({ ok: true, form: entry.form });
 });
 
 // Configure Vite or Static Assets handling

@@ -22,6 +22,9 @@ export type LinkedQuestionKind = "mc" | "checkbox" | "open" | "scale" | "grid";
 /** Where the correct-answer key came from, when one could be read automatically. */
 export type LinkedFormKeySource = "api" | "script";
 
+/** Which import route produced the payload (drives the hints in the modal). */
+export type LinkedFormOrigin = "link" | "script" | "google";
+
 export interface LinkedFormQuestion {
   /** Google entry id — stable, used as the review key. */
   id: string;
@@ -68,6 +71,8 @@ export interface LinkedFormPayload {
   /** Items that could not be imported (file upload, images, ...). */
   skipped: string[];
   sourceUrl: string;
+  /** Route that produced this payload (link pubblico, script, OAuth Google). */
+  importedVia?: LinkedFormOrigin;
   /** Set when at least one correct answer was read automatically. */
   keySource?: LinkedFormKeySource;
   /** How many questions carry an automatically read correct answer. */
@@ -339,6 +344,7 @@ export function parseFormHtml(html: string, sourceUrl = ""): LinkedFormPayload {
     ...(description ? { description } : {}),
     questions,
     skipped,
+    importedVia: "link",
     sourceUrl,
   };
 }
@@ -547,12 +553,15 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
     ? (raw.skipped as unknown[]).map((s) => cleanFormText(s)).filter(Boolean)
     : [];
 
+  const importedVia: LinkedFormOrigin = raw.importedVia === "google" ? "google" : "script";
+
   return {
     title,
     ...(description ? { description } : {}),
     questions,
     skipped,
     ...(cleanFormText(raw.scriptVersion) ? { scriptVersion: cleanFormText(raw.scriptVersion) } : {}),
+    importedVia,
     sourceUrl: cleanFormText(raw.sourceUrl),
     ...(keyed > 0 ? { keySource: "script" as LinkedFormKeySource, keyedCount: keyed } : {}),
   };
