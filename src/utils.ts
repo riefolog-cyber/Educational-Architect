@@ -324,27 +324,45 @@ export function detectSplitScreenStatus(): SplitScreenDetection {
   };
 }
 
-// Request true full-screen mode on supporting devices (Android Chrome, Desktop, etc.)
-export async function requestAppFullScreen(): Promise<boolean> {
-  if (typeof document === "undefined") return false;
+/**
+ * Alcuni contenitori (webview di app, iframe senza il permesso fullscreen,
+ * alcuni browser incorporati) lasciano la promessa di schermo intero in
+ * attesa per sempre, senza risolvere né rifiutare. Chi chiama "await" su quel
+ * promessa resta bloccato: il pulsante "Inizia la Prova" non partiva proprio.
+ * Qui la promessa viene delimitata nel tempo e l'attesa non ferma mai il flusso.
+ */
+const FULLSCREEN_REQUEST_TIMEOUT_MS = 1500;
+
+async function awaitFullscreenRequest(request: () => any): Promise<boolean> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
   try {
-    const docEl: any = document.documentElement;
-    if (docEl.requestFullscreen) {
-      await docEl.requestFullscreen();
-      return true;
-    } else if (docEl.webkitRequestFullscreen) {
-      await docEl.webkitRequestFullscreen();
-      return true;
-    } else if (docEl.mozRequestFullScreen) {
-      await docEl.mozRequestFullScreen();
-      return true;
-    } else if (docEl.msRequestFullscreen) {
-      await docEl.msRequestFullscreen();
-      return true;
-    }
+    const granted = await Promise.race([
+      Promise.resolve()
+        .then(request)
+        .then(() => true, () => false),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), FULLSCREEN_REQUEST_TIMEOUT_MS);
+      }),
+    ]);
+    return granted && isAppFullScreen();
   } catch (e) {
     console.warn("Fullscreen request not granted or not supported:", e);
+    return false;
+  } finally {
+    if (timer) clearTimeout(timer);
   }
+}
+
+// Request true full-screen mode on supporting devices (Android Chrome, Desktop, etc.)
+// Ritorna true solo se lo schermo intero è davvero attivo: l'attesa è delimitata,
+// così un browser che non risponde non blocca mai chi ha chiamato la funzione.
+export async function requestAppFullScreen(): Promise<boolean> {
+  if (typeof document === "undefined") return false;
+  const docEl: any = document.documentElement;
+  if (docEl.requestFullscreen) return awaitFullscreenRequest(() => docEl.requestFullscreen());
+  if (docEl.webkitRequestFullscreen) return awaitFullscreenRequest(() => docEl.webkitRequestFullscreen());
+  if (docEl.mozRequestFullScreen) return awaitFullscreenRequest(() => docEl.mozRequestFullScreen());
+  if (docEl.msRequestFullscreen) return awaitFullscreenRequest(() => docEl.msRequestFullscreen());
   return false;
 }
 
