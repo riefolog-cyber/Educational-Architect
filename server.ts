@@ -674,7 +674,8 @@ async function runEvaluationCore(reqBody: any) {
       const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
       mcList.forEach((q: any, idx: number) => {
         const userIdx = report.risposte?.mc?.[q.id];
-        if (userIdx !== q.correctIndex) {
+        const isMatch = userIdx !== undefined && userIdx !== null && Number(userIdx) === Number(q.correctIndex);
+        if (!isMatch) {
           wrongQuestions.push({
             number: idx + 1,
             question: q.question,
@@ -774,9 +775,11 @@ Per ogni singola risposta valutata ("openEndedDetails[...].feedback"), DEVI orga
 - **💡 Spunto di crescita:** [Un suggerimento pratico ed empatico rivolto direttamente allo studente con il "tu" su come recuperare o approfondire]
 
 [DIRETTIVA CRITICA DI COERENZA DIDATTICA]
-L'alunno ha ottenuto un punteggio di ${mcScore} su ${mcCount} nella sezione strutturata a scelta multipla (crocette).
+${mcCount > 0
+  ? `L'alunno ha ottenuto un punteggio di ${mcScore} su ${mcCount} nella sezione strutturata a scelta multipla (crocette).
 Il voto finale complessivo dell'intera prova viene calcolato matematicamente sul server integrando questo punteggio con i voti che deciderai per le domande aperte (peso: 40% crocette, 60% domande aperte).
-Nel tuo giudizio generale complessivo ("openEndedEvaluation"), devi essere estremamente coerente: se il voto finale complessivo risulterà sufficiente (voto >= 6.0) ad esempio per via del punteggio massimo alle crocette, EVITA di definire l'esito generale come stroncato o "insufficiente" in modo totalizzante. Sii invece specifico ed equilibrato: chiarisci che l'alunno consolida un buon livello nella parte a scelta multipla, sebbene le risposte aperte qui evidenziate mostrino lacune ed elementi di insufficienza. Non produrre testi che neghino il buon risultato delle crocette o che creino paradossi logici tra il giudizio descrittivo e il voto numerico passante.
+Nel tuo giudizio generale complessivo ("openEndedEvaluation"), devi essere estremamente coerente: se il voto finale complessivo risulterà sufficiente (voto >= 6.0) ad esempio per via del punteggio massimo alle crocette, EVITA di definire l'esito generale come stroncato o "insufficiente" in modo totalizzante. Sii invece specifico ed equilibrato: chiarisci che l'alunno consolida un buon livello nella parte a scelta multipla, sebbene le risposte aperte qui evidenziate mostrino lacune ed elementi di insufficienza. Non produrre testi che neghino il buon risultato delle crocette o che creino paradossi logici tra il giudizio descrittivo e il voto numerico passante.`
+  : `Questa prova NON include domande a scelta multipla, ma è composta esclusivamente da domande aperte. Il voto finale complessivo dell'intera prova sarà determinato al 100% dalla valutazione di queste risposte aperte. Nel tuo giudizio ("openEndedEvaluation"), concentrati unicamente sulla qualità delle risposte fornite, senza fare riferimento ad altre sezioni o a crocette non presenti.`}
 
 [ANALISI METACOGNITIVA]
 Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10. 
@@ -822,13 +825,12 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
       const evaluation = parseJsonResponse(responseText);
-      // Teacher-like guard: per-question scores are whole numbers 0-10.
-      // Clamp rogue model outputs (e.g. 11, -1, 7.5) before averaging.
-      // Weighted mean by question weight (plain mean when all weights are 1),
-      // scaled as a single-element array for the grade helper.
+      if (oeList.length > 0 && (!Array.isArray(evaluation.openEndedDetails) || evaluation.openEndedDetails.length === 0)) {
+        throw new Error("L'IA non ha fornito la valutazione delle domande aperte.");
+      }
       const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
       const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
-      const oeScores = hasOeDetails ? [oeMean * 10] : [];
+      const oeScores = hasOeDetails ? [oeMean] : [];
       evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
       evaluation.evaluationMode = "ai";
       return evaluation;
@@ -925,58 +927,76 @@ Ogni feedback per ciascuna risposta a domanda di riflessione ("reflectionDetails
 - 💡 **Spunto di riflessione:** [Crea un aggancio stimolante, ponendo un nuovo quesito o spunto che stimoli lo studente a proseguire il proprio percorso di maturazione concettuale]
 
 [DIRETTIVA CRITICA DI COERENZA DIDATTICA]
-L'alunno ha totalizzato un punteggio di ${fibScore} su ${fibCount} nella sezione delle frasi da completare (Fill-in-the-blank / parole mancanti).
+${fibCount > 0
+  ? `L'alunno ha totalizzato un punteggio di ${fibScore} su ${fibCount} nella sezione delle frasi da completare (Fill-in-the-blank / parole mancanti).
 Il voto finale complessivo viene calcolato matematicamente sul server integrando questo punteggio con i voti che assegnerai alle riflessioni critiche (peso: 40% parole mancanti, 60% riflessioni scritte).
-Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie ad un punteggio perfetto nei completamenti delle frasi, EVITA di definire l'andamento della prova como globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci che lo studente mostra un'ottima comprensione dei concetti oggettivi (frasi completate correttamente), sebbene le riflessioni personali debbano essere maggiormente ampliate o argomentate. Custodisci la coerenza logica tra il voto finale numerico e la valutazione qualitativa complessiva.
+Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie ad un punteggio perfetto nei completamenti delle frasi, EVITA di definire l'andamento della prova come globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci che lo studente mostra un'ottima comprensione dei concetti oggettivi (frasi completate correttamente), sebbene le riflessioni personali debbano essere maggiormente ampliate o argomentate. Custodisci la coerenza logica tra il voto finale numerico e la valutazione qualitativa complessiva.`
+  : `Questa prova di Workbook è composta ESCLUSIVAMENTE da domande di riflessione critica (non sono presenti completamenti di frasi o parole mancanti). Il voto finale sarà determinato al 100% dalla profondità, onestà e maturità delle riflessioni scritte. Non menzionare esercizi di completamento.`}
 
 [ANALISI METACOGNITIVA]
 Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10. 
 Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analizzare questo autovoto dell'alunno. Commenta con tatto pedagogico la sua capacità di auto-osservarsi e confrontarsi con il giudizio accademico del docente, sottolineando se ha sottostimato o sovrastimato il proprio lavoro o se ha dimostrato una perfetta ed eccellente lucidità critica nell'autovalutarsi.`;
 
-    const response = await generateWithRetry({
-      model: "gemini-3.5-flash",
-      models: TASK_MODEL_PREFERENCE["evaluate"],
-      contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
-      config: {
-        systemInstruction,
-        temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
-        maxOutputTokens: 2048,
-        thinkingConfig: {
-          thinkingLevel: "LOW"
-        },
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            overallFeedback: { type: Type.STRING, description: "Giudizio generale e incoraggiante sull'operato globale dello studente, che valorizzi i punti di forza e proponga miglioramenti concreti." },
-            reflectionDetails: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  id: { type: Type.STRING },
-                  feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della riflessione e suggerisce come approfondirla." },
-                  score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
-                },
-                required: ["id", "feedback", "score"]
-              }
-            }
+    try {
+      const response = await generateWithRetry({
+        model: "gemini-3.5-flash",
+        models: TASK_MODEL_PREFERENCE["evaluate"],
+        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+        config: {
+          systemInstruction,
+          temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
+          maxOutputTokens: 2048,
+          thinkingConfig: {
+            thinkingLevel: "LOW"
           },
-          required: ["overallFeedback", "reflectionDetails"]
+          responseMimeType: "application/json",
+          responseSchema: {
+            type: Type.OBJECT,
+            properties: {
+              overallFeedback: { type: Type.STRING, description: "Giudizio generale e incoraggiante sull'operato globale dello studente, che valorizzi i punti di forza e proponga miglioramenti concreti." },
+              reflectionDetails: {
+                type: Type.ARRAY,
+                items: {
+                  type: Type.OBJECT,
+                  properties: {
+                    id: { type: Type.STRING },
+                    feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della riflessione e suggerisce come approfondirla." },
+                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
+                  },
+                  required: ["id", "feedback", "score"]
+                }
+              }
+            },
+            required: ["overallFeedback", "reflectionDetails"]
+          }
         }
+      });
+
+      const responseText = extractResponseText(response);
+      if (!responseText) throw new Error("Risposta vuota dall'IA.");
+
+      const evaluation = parseJsonResponse(responseText);
+      if (rqList.length > 0 && (!Array.isArray(evaluation.reflectionDetails) || evaluation.reflectionDetails.length === 0)) {
+        throw new Error("L'IA non ha fornito la valutazione delle riflessioni critiche.");
       }
-    });
-
-    const responseText = extractResponseText(response);
-    if (!responseText) throw new Error("Risposta vuota dall'IA.");
-
-    const evaluation = parseJsonResponse(responseText);
-    const hasRqDetails = (evaluation.reflectionDetails || []).length > 0;
-    const rqMean = hasRqDetails ? weightedOpenAverage(evaluation.reflectionDetails, rqList) : 0;
-    const rqScores = hasRqDetails ? [rqMean * 10] : [];
-    evaluation.suggestedGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, rqScores);
-    evaluation.fibScore = fibScore;
-    return evaluation;
+      const hasRqDetails = (evaluation.reflectionDetails || []).length > 0;
+      const rqMean = hasRqDetails ? weightedOpenAverage(evaluation.reflectionDetails, rqList) : 0;
+      const rqScores = hasRqDetails ? [rqMean] : [];
+      evaluation.suggestedGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, rqScores);
+      evaluation.fibScore = fibScore;
+      evaluation.evaluationMode = "ai";
+      return evaluation;
+    } catch (aiErr: any) {
+      console.warn("[evaluate] Fallback deterministico workbook con riflessioni:", aiErr?.message || aiErr);
+      const fallbackGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, []);
+      return {
+        suggestedGrade: fallbackGrade,
+        overallFeedback: `Valutazione deterministica (riserva senza IA): punteggio completamento frasi ${fibScore}/${fibCount}, voto scolastico calcolato sulla parte oggettiva: ${fallbackGrade}. Le domande di riflessione critica richiedono revisione manuale del docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+        reflectionDetails: [],
+        fibScore: fibScore,
+        evaluationMode: "deterministic"
+      };
+    }
   }
 
   throw new Error("Tipo di esame non supportato.");
@@ -1608,7 +1628,7 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
       "fillInTheBlank": [
         {
           "id": "fib_1",
-          "sentence": "Frase didattica con una singola parola o concetto chiave omesso indicato tra parentesi quadre o da completare (es. 'L'organo principale della respirazione cellulare è il [mitocondrio].')",
+          "sentence": "Frase didattica con una singola parola o concetto chiave omesso sostituito TASSATIVAMENTE da '________' (es. 'L\'organo principale della respirazione cellulare è il ________.')",
           "answer": "mitocondrio"
         }
       ],
@@ -1624,6 +1644,11 @@ STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
   "recommendedDurationMinutes": 45,
   "summaryDescription": "Breve descrizione degli obiettivi educativi e competenze testate."
 }
+
+[REGOLA CRITICA PER 'fillInTheBlank' (COMPLETAMENTO TESTI)]:
+1. Nella proprietà 'sentence' la parola o il termine mancante DEVE ESSERE TASSATIVAMENTE SOSTITUITO DAI TRATTINI BASSI '________'.
+2. È SEVERAMENTE VIETATO inserire la parola corretta all'interno della frase (né in chiaro, né tra parentesi quadre come '[parola]'). La soluzione deve essere omessa e sostituita SOLO da '________'.
+3. Nella proprietà 'answer' inserisci il termine corretto e, se applicabile, 1 o 2 sinonimi o varianti lessicali valide separati dalla barra verticale '|' (es. "answer": "autodeterminazione | libertà di scelta | autonomia", oppure "answer": "fotosintesi | fotosintesi clorofilliana"). In questo modo il sistema premierà anche chi usa un sinonimo didatticamente valido.
 
 Ogni sezione DEVE contenere da 2 a 4 frasi fillInTheBlank e 1 domanda di riflessione (reflectionQuestions).
 Per le 1-2 frasi più importanti di tutto il workbook aggiungi il campo "weight": 2 (domanda fondamentale, vale doppio); tutte le altre omettono il campo (peso 1 implicito).
@@ -1686,6 +1711,33 @@ REGOLE ESSENZIALI:
 
     const generatedData = parseJsonResponse(responseText);
     
+    // Auto-sanitize fillInTheBlank sentences to guarantee brackets are converted to underscores
+    if (isWorkbook && Array.isArray(generatedData.sections)) {
+      for (const sec of generatedData.sections) {
+        if (Array.isArray(sec.fillInTheBlank)) {
+          for (const fib of sec.fillInTheBlank) {
+            if (fib && typeof fib.sentence === "string") {
+              if (/\[([^\]]+)\]/.test(fib.sentence)) {
+                const match = fib.sentence.match(/\[([^\]]+)\]/);
+                if (match && (!fib.answer || !fib.answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
+                  fib.answer = match[1].trim();
+                }
+                fib.sentence = fib.sentence.replace(/\[([^\]]+)\]/g, "________");
+              } else if (fib.answer && typeof fib.answer === "string" && !/_{2,}|\.{3,}/.test(fib.sentence)) {
+                const ansEsc = fib.answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                if (ansEsc.length > 0) {
+                  const re = new RegExp(`\\b${ansEsc}\\b`, "i");
+                  if (re.test(fib.sentence)) {
+                    fib.sentence = fib.sentence.replace(re, "________");
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+
     // Format JSON string for teacher editor
     const formattedJson = JSON.stringify({
       title: generatedData.title || topic.substring(0, 40),

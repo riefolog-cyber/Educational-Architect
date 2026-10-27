@@ -54,7 +54,7 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage } from "../utils";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
@@ -71,6 +71,7 @@ import {
   downloadTextFile,
   buildLibraryBackup,
   parseLibraryBackup,
+  sanitizeWorkbookExamJson,
   ExamLibraryItem
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
@@ -308,6 +309,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [gradeEditValue, setGradeEditValue] = useState("");
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmDeleteExamKey, setConfirmDeleteExamKey] = useState<string | null>(null);
+  const [confirmDeleteLibraryId, setConfirmDeleteLibraryId] = useState<string | null>(null);
   const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const [blindGradingMode, setBlindGradingMode] = useState(false);
@@ -607,17 +609,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   const handleLoadLibraryItem = (item: ExamLibraryItem) => {
-    setJsonText(item.examJson);
+    const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
+    setJsonText(sanitizedJson);
     if (item.title) setMateria(item.title);
-    validateExamJSON(item.examJson);
+    validateExamJSON(sanitizedJson);
     setLibraryMsg(`📥 "${item.title}" caricata nell'editor: imposta PIN e scadenza e premi Avvia Sessione Live.`);
   };
 
   const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
-    if (!user?.email) return;
-    if (!window.confirm(`Eliminare definitivamente "${item.title}" dalla libreria?`)) return;
+    const teacherEmail = user?.email || "anon";
     try {
-      await deleteLibraryExam(user.email, item.id);
+      await deleteLibraryExam(teacherEmail, item.id);
       await loadLibrary();
       setLibraryMsg(`🗑️ "${item.title}" eliminata dalla libreria.`);
     } catch (e: any) {
@@ -1089,17 +1091,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   const [recalculatingId, setRecalculatingId] = useState<string | null>(null);
 
-  // Helper to detect if an exam had 0 open-ended/reflection questions but was wrongly penalized
+  // Helper to detect if an exam had grade calculation discrepancies
   const hasGradeDiscrepancy = (sub: SavedSubmission): boolean => {
     try {
       const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
+      const evalObj = typeof sub.Full_Evaluation === "string" ? JSON.parse(sub.Full_Evaluation) : sub.Full_Evaluation;
+      const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
+
       if (sub.Tipo === "Quiz") {
         const oeCount = (domande?.openEnded || []).length;
         const mcCount = (domande?.multipleChoice || []).length;
         // Pure MC test with MC score >= 50% but suggested grade < 6
         if (oeCount === 0 && mcCount > 0 && (sub.Punteggio_MC || 0) >= mcCount * 0.5) {
-          const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
           if (gradeVal < 6.0) return true;
+        }
+        // Discrepancy where grade is 10 but student had wrong MC or lower open scores
+        if (gradeVal >= 9.8 && mcCount > 0 && (sub.Punteggio_MC || 0) < mcCount) {
+          return true;
+        }
+        if (gradeVal >= 9.8 && oeCount > 0) {
+          const oeDetails = evalObj?.openEndedDetails || [];
+          const oeMean = oeDetails.length > 0 ? oeDetails.reduce((a: number, d: any) => a + Number(d.score || 0), 0) / oeDetails.length : 0;
+          if (oeMean < 9.5) return true;
         }
       } else if (sub.Tipo === "Workbook") {
         const sections = domande?.sections || [];
@@ -1107,8 +1120,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
         // Pure FIB workbook with FIB score >= 50% but suggested grade < 6
         if (rqList.length === 0 && fibList.length > 0 && (sub.Punteggio_FIB || 0) >= fibList.length * 0.5) {
-          const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
           if (gradeVal < 6.0) return true;
+        }
+        // Discrepancy where grade is 10 but student got 0 or low FIB and average reflections
+        if (gradeVal >= 9.8 && fibList.length > 0 && (sub.Punteggio_FIB || 0) < fibList.length) {
+          const rqDetails = evalObj?.reflectionDetails || [];
+          const rqMean = rqDetails.length > 0 ? rqDetails.reduce((a: number, d: any) => a + Number(d.score || 0), 0) / rqDetails.length : 0;
+          if (rqMean < 9.5) return true;
         }
       }
     } catch {}
@@ -1148,40 +1166,38 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const mcList = domandeObj?.multipleChoice || [];
         const oeList = domandeObj?.openEnded || [];
 
-        if (oeList.length === 0 && mcList.length > 0) {
-          // Pure multiple-choice test
-          let correctCount = 0;
-          const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
+        let correctCount = 0;
+        const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
 
-          mcList.forEach((q: any, idx: number) => {
-            const chosen = ansObj.mc?.[q.id];
-            if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
-              correctCount++;
-            } else {
-              wrongQuestions.push({
-                number: idx + 1,
-                question: q.question,
-                studentChoice: (chosen !== undefined && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
-                correctChoice: q.options?.[q.correctIndex] || ""
-              });
-            }
-          });
-
-          // Fallback if ansObj was incomplete but sub.Punteggio_MC was already recorded
-          if (correctCount === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
-            correctCount = sub.Punteggio_MC;
+        mcList.forEach((q: any, idx: number) => {
+          const chosen = ansObj.mc?.[q.id];
+          if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
+            correctCount++;
+          } else {
+            wrongQuestions.push({
+              number: idx + 1,
+              question: q.question,
+              studentChoice: (chosen !== undefined && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
+              correctChoice: q.options?.[q.correctIndex] || ""
+            });
           }
+        });
 
-          updatedPunteggioMC = correctCount;
-          // Didactic weights: if the exam marks key questions, the grade
-          // follows the weighted fraction (counts stay as plain display).
-          const mcAnsNorm: Record<string, number> = {};
-          for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
-          const mcs = mcWeightedScore(mcList, mcAnsNorm);
-          newGrade = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0)
-            ? calculateQuizGrade((mcs.weightedCorrect / mcs.weightedTotal) * 10, 10, [])
-            : calculateQuizGrade(correctCount, mcList.length, []);
+        if (correctCount === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
+          correctCount = sub.Punteggio_MC;
+        }
+        updatedPunteggioMC = correctCount;
 
+        const mcAnsNorm: Record<string, number> = {};
+        for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
+        const mcs = mcWeightedScore(mcList, mcAnsNorm);
+        const gradeMcScore = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0)
+          ? (mcs.weightedCorrect / mcs.weightedTotal) * 10
+          : correctCount;
+        const gradeMcCount = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0) ? 10 : mcList.length;
+
+        if (oeList.length === 0) {
+          newGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
           evalObj.openEndedDetails = [];
           evalObj.suggestedGrade = newGrade;
           evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
@@ -1194,34 +1210,44 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
             newErrors = evalObj.mainErrors;
           }
+        } else {
+          const details = evalObj.openEndedDetails || [];
+          const oeMean = details.length > 0 ? weightedOpenAverage(details, oeList) : 0;
+          newGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, details.length > 0 ? [oeMean] : []);
+          evalObj.suggestedGrade = newGrade;
         }
       } else if (sub.Tipo === "Workbook") {
         const sections = domandeObj?.sections || [];
         const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
         const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
 
-        if (rqList.length === 0 && fibList.length > 0) {
-          // Pure fill-in-the-blank workbook
-          let correctFib = 0;
-          fibList.forEach((fib: any) => {
-            // Same teacher-like verdict as live scoring (accents, articles,
-            // small typos tolerated; incomplete terms rejected)
-            if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer)) correctFib++;
-          });
+        let correctFib = 0;
+        fibList.forEach((fib: any) => {
+          if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer)) correctFib++;
+        });
 
-          if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
-            correctFib = sub.Punteggio_FIB;
-          }
+        if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
+          correctFib = sub.Punteggio_FIB;
+        }
+        updatedPunteggioFIB = correctFib;
 
-          updatedPunteggioFIB = correctFib;
-          const fibs = fibWeightedScore(fibList, ansObj.wbFib || {}, isFibAnswerCorrect);
-          newGrade = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0)
-            ? calculateWorkbookGrade((fibs.weightedCorrect / fibs.weightedTotal) * 10, 10, [])
-            : calculateWorkbookGrade(correctFib, fibList.length, []);
+        const fibs = fibWeightedScore(fibList, ansObj.wbFib || {}, isFibAnswerCorrect);
+        const gradeFibScore = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0)
+          ? (fibs.weightedCorrect / fibs.weightedTotal) * 10
+          : correctFib;
+        const gradeFibCount = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0) ? 10 : fibList.length;
+
+        if (rqList.length === 0) {
+          newGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, []);
           evalObj.reflectionDetails = [];
           evalObj.suggestedGrade = newGrade;
           evalObj.overallFeedback = `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
           newFeedback = evalObj.overallFeedback;
+        } else {
+          const details = evalObj.reflectionDetails || [];
+          const rqMean = details.length > 0 ? weightedOpenAverage(details, rqList) : 0;
+          newGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, details.length > 0 ? [rqMean] : []);
+          evalObj.suggestedGrade = newGrade;
         }
       }
 
@@ -1676,18 +1702,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             if (fibList.length === 0) return;
 
             fibList.forEach((fib: any, fIdx: number) => {
-              const ansDict = ansObj.wbFib?.[fib.id] || {};
-              const parts = fib.sentence.split(/\[\.\.\.\]/);
-              
-              const textOutputParts: string[] = [];
-              parts.forEach((part: string, pIdx: number) => {
-                textOutputParts.push(part);
-                if (pIdx < parts.length - 1) {
-                  const val = ansDict[pIdx] || "____";
-                  const isCorrect = isFibAnswerCorrect(val, fib.answer);
-                  textOutputParts.push(` [Inserito: ${val} (${isCorrect ? "Corretto" : "Errato"})] `);
-                }
-              });
+              const rawVal = ansObj.wbFib?.[fib.id];
+              const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
+              const isCorrect = isFibAnswerCorrect(val, fib.answer);
+              const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+              const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
 
               checkPageBreak(15);
               writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
@@ -1703,7 +1722,7 @@ const fibImg = domandeObj?.images?.[fib.id];
                 } catch {}
               }
 
-              writeText(textOutputParts.join(""), 8.5, false, [71, 85, 105], 15);
+              writeText(fullText, 8.5, false, [71, 85, 105], 15);
               currentY += 1;
               writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
               currentY += 5;
@@ -2456,17 +2475,19 @@ const fibImg = domandeObj?.images?.[fib.id];
                 />
               </div>
 
-              <div className="space-y-1">
-                <label className="uppercase font-bold text-slate-500 text-[10px]">Severità Anti-Copia</label>
-                <select
-                  value={severityPreset}
-                  onChange={(e) => setSeverityPreset(e.target.value)}
-                  className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none text-xs font-semibold"
-                >
-                  <option value="tollerante">Tollerante — verifiche formative (grazia 5s, solo assenze lunghe)</option>
-                  <option value="normale">Normale — consigliata (grazia 3s)</option>
-                  <option value="rigido">Rigido — esami finali (grazia 2s)</option>
-                </select>
+              <div className="p-3 bg-slate-950/60 border border-teal-500/20 rounded-xl flex items-center justify-between gap-3">
+                <div className="space-y-0.5">
+                  <div className="flex items-center gap-1.5">
+                    <ShieldCheck className="w-3.5 h-3.5 text-teal-400" />
+                    <span className="text-xs font-bold text-teal-300">Protezione Anti-Copia Unificata</span>
+                  </div>
+                  <p className="text-[10px] text-slate-400">
+                    Calibrata per la scuola reale: zero falsi allarmi su iPhone/Android, blocco split-screen e copia/incolla.
+                  </p>
+                </div>
+                <span className="px-2 py-1 rounded text-[10px] font-mono font-bold bg-teal-500/15 text-teal-300 border border-teal-500/30 whitespace-nowrap">
+                  ✓ Attiva
+                </span>
               </div>
 
               <div className="space-y-2 bg-slate-900/90 p-3.5 rounded-2xl border border-indigo-500/30 shadow-lg">
@@ -3131,14 +3152,38 @@ const fibImg = domandeObj?.images?.[fib.id];
                           >
                             <Download className="w-3.5 h-3.5" />
                           </button>
-                          <button
-                            type="button"
-                            onClick={() => handleDeleteLibraryItem(item)}
-                            title={`Elimina "${item.title}" dalla libreria`}
-                            className="p-1.5 text-slate-500 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {confirmDeleteLibraryId === item.id ? (
+                            <div className="flex items-center gap-1 animate-fadeIn">
+                              <button
+                                type="button"
+                                onClick={() => {
+                                  handleDeleteLibraryItem(item);
+                                  setConfirmDeleteLibraryId(null);
+                                }}
+                                title="Conferma eliminazione definitiva"
+                                className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px] rounded cursor-pointer transition-colors shadow-sm"
+                              >
+                                Elimina?
+                              </button>
+                              <button
+                                type="button"
+                                onClick={() => setConfirmDeleteLibraryId(null)}
+                                title="Annulla"
+                                className="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] rounded cursor-pointer transition-colors"
+                              >
+                                ✕
+                              </button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              onClick={() => setConfirmDeleteLibraryId(item.id)}
+                              title={`Elimina "${item.title}" dalla libreria`}
+                              className="p-1.5 text-slate-500 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
+                            >
+                              <Trash2 className="w-3.5 h-3.5" />
+                            </button>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -4822,26 +4867,18 @@ const fibImg = domandeObj?.images?.[fib.id];
                                       <>
                                         <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">Completamento (Sezione {secIdx + 1})</p>
                                         {fibList.map((fib: any, fIdx: number) => {
-                                          const ansDict = ansObj.wbFib?.[fib.id] || {};
-                                          const parts = fib.sentence.split(/\[\.\.\.\]/);
-                                          
-                                          const reconstructed = parts.map((part: string, pIdx: number) => {
-                                            if (pIdx === parts.length - 1) return <span key={pIdx}>{part}</span>;
-                                            const val = ansDict[pIdx] || "";
-                                            const isCorrect = isFibAnswerCorrect(val, fib.answer);
-                                            return (
-                                              <span key={pIdx}>
-                                                {part}
-                                                <span className={`px-1 rounded ${isCorrect ? 'bg-teal-500/20 text-teal-300' : 'bg-rose-500/20 text-rose-300'}`}>[{val || "____"}]</span>
-                                              </span>
-                                            );
-                                          });
+                                          const rawVal = ansObj.wbFib?.[fib.id];
+                                          const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
+                                          const isCorrect = isFibAnswerCorrect(val, fib.answer);
+                                          const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
 
                                           return (
                                             <div key={fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
                                               <p className="font-bold text-slate-300 font-mono text-[10px]">FIB {fIdx + 1}</p>
                                               <p className="text-slate-300 text-[11px] leading-relaxed">
-                                                {reconstructed}
+                                                <span>{before}</span>
+                                                <span className={`px-1 rounded font-bold ${isCorrect ? 'bg-teal-500/20 text-teal-300' : 'bg-rose-500/20 text-rose-300'}`}>[{val || "____"}]</span>
+                                                <span>{after}</span>
                                               </p>
                                               <p className="text-[9px] text-slate-500 mt-1">Accettate: {fib.answer}</p>
                                             </div>

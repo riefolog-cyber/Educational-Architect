@@ -52,6 +52,7 @@ import {
   requestAppFullScreen,
   isAppFullScreen,
   isFibAnswerCorrect,
+  getFibSentenceParts,
   mcWeightedScore,
   fibWeightedScore,
   SEVERITY_PRESETS,
@@ -2776,26 +2777,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         <div className="space-y-3.5">
                           {sec.fillInTheBlank.map((fib: any) => {
                             const userText = answers.wbFib[fib.id] || "";
-                            
-                            // Replace underscore triggers into interactive inline HTML input fields!
-                            const parts = fib.sentence.split(/_{3,}/);
+                            const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
                             
                             return (
                               <div key={fib.id} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300">
-                                {parts.map((pText: string, pIdx: number) => (
-                                  <React.Fragment key={pIdx}>
-                                    <span>{pText}</span>
-                                    {pIdx < parts.length - 1 && (
-                                      <input
-                                        type="text"
-                                        value={userText}
-                                        onChange={(e) => handleInputFib(fib.id, e.target.value)}
-                                        placeholder="..."
-                                        className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm"
-                                      />
-                                    )}
-                                  </React.Fragment>
-                                ))}
+                                <span>{before}</span>
+                                <input
+                                  type="text"
+                                  value={userText}
+                                  onChange={(e) => handleInputFib(fib.id, e.target.value)}
+                                  placeholder="..."
+                                  className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm"
+                                />
+                                <span>{after}</span>
                                 <QuestionMeta q={fib} tone="teal" />
                               </div>
                             );
