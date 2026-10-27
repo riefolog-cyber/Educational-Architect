@@ -837,11 +837,18 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     } catch (aiErr) {
       console.warn("[evaluate] Fallback deterministico quiz con aperte:", aiErr?.message || aiErr);
       // Voto di riserva basato sulle sole MC (le aperte richiedono revisione docente).
-      const fallbackGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
+      // Senza crocette non c'è nulla da correggere in modo deterministico: meglio
+      // "N.V." (da correggere) che uno 0 finito nel registro al posto del voto.
+      const hasObjectivePart = gradeMcCount > 0;
+      const fallbackGrade = hasObjectivePart ? calculateQuizGrade(gradeMcScore, gradeMcCount, []) : "N.V.";
       return {
         suggestedGrade: fallbackGrade,
-        mainErrors: "Valutazione in modalità riserva: le risposte aperte non sono state corrette dall'IA e richiedono revisione del docente. Il voto è basato sulle sole domande a scelta multipla.",
-        openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio MC ${mcScore}/${mcCount}, voto scolastico ${fallbackGrade}. Le domande aperte vanno revisionate manualmente dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+        mainErrors: hasObjectivePart
+          ? "Valutazione in modalità riserva: le risposte aperte non sono state corrette dall'IA e richiedono revisione del docente. Il voto è basato sulle sole domande a scelta multipla."
+          : "Valutazione in modalità riserva: la prova è composta solo da domande aperte e l'IA non ha potuto correggerle. Il voto sarà assegnato dal docente.",
+        openEndedEvaluation: hasObjectivePart
+          ? `Valutazione deterministica (riserva senza IA): punteggio MC ${mcScore}/${mcCount}, voto scolastico ${fallbackGrade}. Le domande aperte vanno revisionate manualmente dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`
+          : `Valutazione deterministica (riserva senza IA): la prova non ha domande a scelta multipla, quindi nessun voto è stato calcolato automaticamente. Le domande aperte vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
         openEndedDetails: [],
         evaluationMode: "deterministic"
       };
@@ -876,34 +883,47 @@ Fornisci un giudizio complessivo equilibrato e motivante.
 Dedica l'ultimo paragrafo all'analisi metacognitiva confrontando il voto ottenuto (${mathGrade}) con l'autovalutazione (${report.autovalutazione}/10).
 NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
 
-      const response = await generateWithRetry({
-        model: "gemini-3.5-flash",
-        models: TASK_MODEL_PREFERENCE["evaluate"],
-        contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
-        config: {
-          systemInstruction,
-          temperature: 0.1,
-          maxOutputTokens: 2048,
-          thinkingConfig: { thinkingLevel: "LOW" },
-          responseMimeType: "application/json",
-          responseSchema: {
-            type: Type.OBJECT,
-            properties: {
-              overallFeedback: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
-            },
-            required: ["overallFeedback"]
+      try {
+        const response = await generateWithRetry({
+          model: "gemini-3.5-flash",
+          models: TASK_MODEL_PREFERENCE["evaluate"],
+          contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
+          config: {
+            systemInstruction,
+            temperature: 0.1,
+            maxOutputTokens: 2048,
+            thinkingConfig: { thinkingLevel: "LOW" },
+            responseMimeType: "application/json",
+            responseSchema: {
+              type: Type.OBJECT,
+              properties: {
+                overallFeedback: { type: Type.STRING, description: "Giudizio didattico complessivo ed analisi metacognitiva." }
+              },
+              required: ["overallFeedback"]
+            }
           }
-        }
-      });
+        });
 
-      const responseText = extractResponseText(response);
-      if (!responseText) throw new Error("Risposta vuota dall'IA.");
+        const responseText = extractResponseText(response);
+        if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-      const evaluation = parseJsonResponse(responseText);
-      evaluation.suggestedGrade = mathGrade;
-      evaluation.fibScore = fibScore;
-      evaluation.reflectionDetails = [];
-      return evaluation;
+        const evaluation = parseJsonResponse(responseText);
+        evaluation.suggestedGrade = mathGrade;
+        evaluation.fibScore = fibScore;
+        evaluation.reflectionDetails = [];
+        return evaluation;
+      } catch (aiErr: any) {
+        console.warn("[evaluate] Fallback deterministico workbook di soli completamenti:", aiErr?.message || aiErr);
+        // Nessuna riflessione da valutare: il voto resta quello dei completamenti.
+        const reserveGrade = gradeFibCount > 0 ? mathGrade : "N.V.";
+        return {
+          suggestedGrade: reserveGrade,
+          overallFeedback: `Valutazione deterministica (riserva senza IA): frasi completate correttamente ${fibScore}/${fibCount}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+          reflectionDetails: [],
+          fibScore: fibScore,
+          evaluationMode: "deterministic"
+        };
+      }
     }
 
     // CASE 2: WORKBOOK WITH REFLECTION QUESTIONS
@@ -988,10 +1008,14 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       return evaluation;
     } catch (aiErr: any) {
       console.warn("[evaluate] Fallback deterministico workbook con riflessioni:", aiErr?.message || aiErr);
-      const fallbackGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, []);
+      // Stessa regola del quiz: senza completamenti non si inventa un voto.
+      const hasObjectivePart = gradeFibCount > 0;
+      const fallbackGrade = hasObjectivePart ? calculateWorkbookGrade(gradeFibScore, gradeFibCount, []) : "N.V.";
       return {
         suggestedGrade: fallbackGrade,
-        overallFeedback: `Valutazione deterministica (riserva senza IA): punteggio completamento frasi ${fibScore}/${fibCount}, voto scolastico calcolato sulla parte oggettiva: ${fallbackGrade}. Le domande di riflessione critica richiedono revisione manuale del docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+        overallFeedback: hasObjectivePart
+          ? `Valutazione deterministica (riserva senza IA): punteggio completamento frasi ${fibScore}/${fibCount}, voto scolastico calcolato sulla parte oggettiva: ${fallbackGrade}. Le domande di riflessione critica richiedono revisione manuale del docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`
+          : `Valutazione deterministica (riserva senza IA): la prova non ha frasi da completare, quindi nessun voto è stato calcolato automaticamente. Le riflessioni vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
         reflectionDetails: [],
         fibScore: fibScore,
         evaluationMode: "deterministic"
