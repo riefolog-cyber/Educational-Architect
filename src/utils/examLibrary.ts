@@ -37,12 +37,73 @@ export interface NewLibraryExam {
 const keyFor = (teacherEmail: string) =>
   `exam_library_${(teacherEmail || "anon").toLowerCase().trim()}`;
 
+/**
+ * Automatically cleans workbook fill-in-the-blank sentences in exam JSON.
+ * Replaces bracketed solution words (e.g. "[autodeterminazione]") with "________"
+ * and ensures the omitted term is preserved as the correct answer.
+ */
+export function sanitizeWorkbookExamJson(rawJson: string): string {
+  try {
+    const obj = JSON.parse(rawJson);
+    let changed = false;
+    if (obj && Array.isArray(obj.sections)) {
+      for (const sec of obj.sections) {
+        if (Array.isArray(sec.fillInTheBlank)) {
+          for (const fib of sec.fillInTheBlank) {
+            if (fib && typeof fib.sentence === "string") {
+              // 1. Bracketed term e.g. "[autodeterminazione]" or "[...]"
+              if (/\[([^\]]+)\]/.test(fib.sentence)) {
+                const match = fib.sentence.match(/\[([^\]]+)\]/);
+                if (match && (!fib.answer || !fib.answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
+                  fib.answer = match[1].trim();
+                }
+                fib.sentence = fib.sentence.replace(/\[([^\]]+)\]/g, "________");
+                changed = true;
+              } else if (fib.answer && typeof fib.answer === "string" && !/_{2,}|\.{3,}/.test(fib.sentence)) {
+                // Sentence has no blank, but contains the answer word directly
+                const ansEsc = fib.answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+                if (ansEsc.length > 0) {
+                  const re = new RegExp(`\\b${ansEsc}\\b`, "i");
+                  if (re.test(fib.sentence)) {
+                    fib.sentence = fib.sentence.replace(re, "________");
+                    changed = true;
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+    return changed ? JSON.stringify(obj, null, 2) : rawJson;
+  } catch {
+    return rawJson;
+  }
+}
+
 function readAll(teacherEmail: string): ExamLibraryItem[] {
   try {
     const raw = localStorage.getItem(keyFor(teacherEmail));
     if (!raw) return [];
     const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
+    if (!Array.isArray(parsed)) return [];
+    let modified = false;
+    const sanitized = parsed.map((item) => {
+      if (item && item.examJson) {
+        const cleaned = sanitizeWorkbookExamJson(item.examJson);
+        if (cleaned !== item.examJson) {
+          modified = true;
+          return { ...item, examJson: cleaned };
+        }
+      }
+      return item;
+    });
+    if (modified) {
+      try {
+        localStorage.setItem(keyFor(teacherEmail), JSON.stringify(sanitized));
+      } catch {}
+    }
+    return sanitized;
   } catch {
     return [];
   }
@@ -76,7 +137,16 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
 }
 
 export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
-  const items = readAll(teacherEmail);
+  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const items = readAll(normEmail);
+  if (normEmail !== "anon") {
+    const anonItems = readAll("anon");
+    for (const it of anonItems) {
+      if (!items.some((existing) => existing.id === it.id)) {
+        items.push(it);
+      }
+    }
+  }
   items.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
   return items;
 }
@@ -84,15 +154,23 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
 export async function saveLibraryExam(item: NewLibraryExam): Promise<string> {
   const now = new Date().toISOString();
   const id = `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
-  const items = readAll(item.teacherEmail);
-  items.unshift({ ...item, id, createdAt: now, updatedAt: now });
-  writeAll(item.teacherEmail, items);
+  const normEmail = (item.teacherEmail || "anon").toLowerCase().trim();
+  const items = readAll(normEmail);
+  items.unshift({ ...item, teacherEmail: normEmail, id, createdAt: now, updatedAt: now });
+  writeAll(normEmail, items);
   return id;
 }
 
 export async function deleteLibraryExam(teacherEmail: string, id: string): Promise<void> {
-  const items = readAll(teacherEmail).filter((it) => it.id !== id);
-  writeAll(teacherEmail, items);
+  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const items = readAll(normEmail).filter((it) => it.id !== id);
+  writeAll(normEmail, items);
+  if (normEmail !== "anon") {
+    const anonItems = readAll("anon");
+    if (anonItems.some((it) => it.id === id)) {
+      writeAll("anon", anonItems.filter((it) => it.id !== id));
+    }
+  }
 }
 
 export function formatLibraryDate(iso: string): string {  try {

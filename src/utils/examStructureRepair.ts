@@ -581,12 +581,31 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       // Fill in the blank
       const rawFib = sec.fillInTheBlank || sec.completamento || sec.cloze || sec.frasi || [];
       const correctedFib = Array.isArray(rawFib)
-        ? rawFib.map((item: any, fIdx: number) => ({
-            id: item.id || `fib_${sIdx + 1}_${fIdx + 1}`,
-            sentence: item.sentence || item.frase || item.testo || item.prompt || "",
-            answer: item.answer || item.risposta || item.soluzione || "",
-            ...preservedDidacticFields(item),
-          }))
+        ? rawFib.map((item: any, fIdx: number) => {
+            let sentence = String(item.sentence || item.frase || item.testo || item.prompt || "");
+            let answer = String(item.answer || item.risposta || item.soluzione || "");
+            if (/\[([^\]]+)\]/.test(sentence)) {
+              const match = sentence.match(/\[([^\]]+)\]/);
+              if (match && (!answer || !answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
+                answer = match[1].trim();
+              }
+              sentence = sentence.replace(/\[([^\]]+)\]/g, "________");
+            } else if (answer && !/_{2,}|\.{3,}/.test(sentence)) {
+              const ansEsc = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+              if (ansEsc.length > 0) {
+                const re = new RegExp(`\\b${ansEsc}\\b`, "i");
+                if (re.test(sentence)) {
+                  sentence = sentence.replace(re, "________");
+                }
+              }
+            }
+            return {
+              id: item.id || `fib_${sIdx + 1}_${fIdx + 1}`,
+              sentence,
+              answer,
+              ...preservedDidacticFields(item),
+            };
+          })
         : [];
 
       // Reflection questions

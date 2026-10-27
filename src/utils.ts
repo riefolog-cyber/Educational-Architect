@@ -102,42 +102,52 @@ export function formatItalianScholasticGrade(gradeNum: number): string {
 export function calculateQuizGrade(mcScore: number, mcCount: number, oeScores: number[]): string {
   let finalGrade = 0;
   
-  if (mcCount > 0 && oeScores.length > 0) {
-    const mcFraction = mcScore / mcCount; // 0 to 1
-    const oeFraction = oeScores.reduce((a, b) => a + b, 0) / (oeScores.length * 10); // 0 to 1
+  const validOeScores = (oeScores || [])
+    .map((s) => Number(s))
+    .filter((s) => !isNaN(s))
+    .map((s) => Math.min(10, Math.max(0, s)));
+
+  if (mcCount > 0 && validOeScores.length > 0) {
+    const mcFraction = Math.min(1, Math.max(0, mcScore / mcCount)); // 0 to 1
+    const oeFraction = Math.min(1, Math.max(0, validOeScores.reduce((a, b) => a + b, 0) / (validOeScores.length * 10))); // 0 to 1
     
     // Balanced weight: 40% Multiple Choice, 60% Open Ended
     finalGrade = (mcFraction * 4.0) + (oeFraction * 6.0);
   } else if (mcCount > 0) {
     // Pure multiple-choice test: 100% based on multiple choice questions
-    finalGrade = (mcScore / mcCount) * 10;
-  } else if (oeScores.length > 0) {
+    finalGrade = Math.min(1, Math.max(0, mcScore / mcCount)) * 10;
+  } else if (validOeScores.length > 0) {
     // Pure open-ended test: 100% based on open-ended questions
-    finalGrade = oeScores.reduce((a, b) => a + b, 0) / oeScores.length;
+    finalGrade = validOeScores.reduce((a, b) => a + b, 0) / validOeScores.length;
   }
   
-  return formatItalianScholasticGrade(finalGrade);
+  return formatItalianScholasticGrade(Math.min(10, Math.max(0, finalGrade)));
 }
 
 // Helper to calculate mathematical grades for Workbook
 export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqScores: number[]): string {
   let finalGrade = 0;
   
-  if (fibCount > 0 && rqScores.length > 0) {
-    const fibFraction = fibScore / fibCount; // 0 to 1
-    const rqFraction = rqScores.reduce((a, b) => a + b, 0) / (rqScores.length * 10); // 0 to 1
+  const validRqScores = (rqScores || [])
+    .map((s) => Number(s))
+    .filter((s) => !isNaN(s))
+    .map((s) => Math.min(10, Math.max(0, s)));
+
+  if (fibCount > 0 && validRqScores.length > 0) {
+    const fibFraction = Math.min(1, Math.max(0, fibScore / fibCount)); // 0 to 1
+    const rqFraction = Math.min(1, Math.max(0, validRqScores.reduce((a, b) => a + b, 0) / (validRqScores.length * 10))); // 0 to 1
     
     // Balanced weight: 40% Fill-in-Blank, 60% Reflection Questions
     finalGrade = (fibFraction * 4.0) + (rqFraction * 6.0);
   } else if (fibCount > 0) {
     // Pure fill-in-the-blank test
-    finalGrade = (fibScore / fibCount) * 10;
-  } else if (rqScores.length > 0) {
+    finalGrade = Math.min(1, Math.max(0, fibScore / fibCount)) * 10;
+  } else if (validRqScores.length > 0) {
     // Pure reflection test
-    finalGrade = rqScores.reduce((a, b) => a + b, 0) / rqScores.length;
+    finalGrade = validRqScores.reduce((a, b) => a + b, 0) / validRqScores.length;
   }
   
-  return formatItalianScholasticGrade(finalGrade);
+  return formatItalianScholasticGrade(Math.min(10, Math.max(0, finalGrade)));
 }
 
 export interface SplitScreenDetection {
@@ -162,9 +172,9 @@ export interface SeverityConfig {
 }
 
 export const SEVERITY_PRESETS: Record<SeverityPreset, SeverityConfig> = {
-  tollerante: { graceMs: 5000, avvisoMaxSec: 15, splitHitsNeeded: 4, orientationBlackoutMs: 2500 },
-  normale: { graceMs: 3000, avvisoMaxSec: 10, splitHitsNeeded: 3, orientationBlackoutMs: 2000 },
-  rigido: { graceMs: 2000, avvisoMaxSec: 3, splitHitsNeeded: 2, orientationBlackoutMs: 1500 },
+  tollerante: { graceMs: 4500, avvisoMaxSec: 12, splitHitsNeeded: 3, orientationBlackoutMs: 2500 },
+  normale: { graceMs: 4000, avvisoMaxSec: 10, splitHitsNeeded: 3, orientationBlackoutMs: 2500 },
+  rigido: { graceMs: 3500, avvisoMaxSec: 8, splitHitsNeeded: 3, orientationBlackoutMs: 2200 },
 };
 
 export function normalizeSeverityPreset(v: any): SeverityPreset {
@@ -197,7 +207,8 @@ export function mcWeightedScore(
   for (const q of mcList || []) {
     const w = itemWeight(q);
     weightedTotal += w;
-    if (answersMc?.[q.id] === q.correctIndex) {
+    const userAns = answersMc?.[q.id];
+    if (userAns !== undefined && userAns !== null && Number(userAns) === Number(q.correctIndex)) {
       correct++;
       weightedCorrect += w;
     }
@@ -229,6 +240,26 @@ export function fibWeightedScore(
  * Weighted average of per-question 0-10 scores, matched by question id.
  * Falls back to the plain mean when no weights are present.
  */
+/**
+ * Helper to parse a score that might be a number or a string like "8", "8.5", "8/10", "7,5"
+ */
+export function parseScoreNum(s: any): number {
+  if (typeof s === "number") {
+    return isNaN(s) ? 0 : Math.min(10, Math.max(0, s));
+  }
+  if (!s) return 0;
+  const match = String(s).match(/(\d+(?:[.,]\d+)?)/);
+  if (match) {
+    const val = parseFloat(match[1].replace(",", "."));
+    return isNaN(val) ? 0 : Math.min(10, Math.max(0, val));
+  }
+  return 0;
+}
+
+/**
+ * Weighted average of per-question 0-10 scores, matched by question id.
+ * Falls back to positional order if IDs don't match, or plain mean when no weights are present.
+ */
 export function weightedOpenAverage(
   details: Array<{ questionId?: string; id?: string; score: any }>,
   questions: any[]
@@ -243,18 +274,22 @@ export function weightedOpenAverage(
   for (const w of weightById.values()) {
     if (w !== 1) { hasCustom = true; break; }
   }
-  const clamp = (n: number) => (isNaN(n) ? 0 : Math.min(10, Math.max(0, Math.round(n))));
   if (!hasCustom) {
-    return list.reduce((a, d) => a + clamp(Number(d.score)), 0) / list.length;
+    return list.reduce((a, d) => a + parseScoreNum(d.score), 0) / list.length;
   }
   let wSum = 0;
   let total = 0;
-  for (const d of list) {
+  list.forEach((d, idx) => {
     const key = String(d.questionId ?? d.id ?? "");
-    const w = weightById.get(key) ?? 1;
-    wSum += w;
-    total += clamp(Number(d.score)) * w;
-  }
+    let w = weightById.get(key);
+    // Positional fallback if questionId is an index or missing
+    if (w === undefined && questions && questions[idx]?.id) {
+      w = weightById.get(String(questions[idx].id));
+    }
+    const finalWeight = w ?? 1;
+    wSum += finalWeight;
+    total += parseScoreNum(d.score) * finalWeight;
+  });
   return wSum > 0 ? total / wSum : 0;
 }
 
@@ -386,20 +421,30 @@ export function isAppFullScreen(): boolean {
 
 // ---- Teacher-like fill-in-the-blank grading ----
 // Normalizes a fill-in-the-blank answer the way a human teacher reads it:
-// case, accents, punctuation and leading articles don't change the meaning.
+// case, accents, punctuation, curly quotes (iOS/Android) and leading articles don't change the meaning.
 export function normalizeFibAnswer(raw: string | undefined | null): string {
   let s = (raw || "").toLowerCase().trim();
   if (!s) return "";
-  // "l'acqua" -> "acqua" (handle elision before stripping punctuation)
-  s = s.replace(/^l'/, "").replace(/\bl'/g, " ");
+
+  // Normalize all typographic/curly quotes and apostrophes to standard ASCII apostrophe:
+  // U+2018 (‘), U+2019 (’), U+201B (‛), U+2032 (′), U+00B4 (´), U+0060 (`)
+  s = s.replace(/[\u2018\u2019\u201B\u2032\u00B4\`]/g, "'");
+
+  // Italian contractions/elisions: "l'acqua" -> "acqua", "un'amica" -> "amica", "d'inverno" -> "inverno", "nell'aria" -> "aria"
+  s = s.replace(/^(?:l|un|d|dell|all|dall|nell|sull)'/i, "").replace(/\b(?:l|un|d|dell|all|dall|nell|sull)'/gi, " ");
+
   // Strip accents/diacritics: "città" -> "citta", "perché" -> "perche"
   s = s.normalize("NFD").replace(/[\u0300-\u036f]/g, "");
+
   // Remove punctuation but keep letters, digits and spaces
   s = s.replace(/[^a-z0-9à-ÿ\s]/gi, " ");
+
   // Collapse whitespace
   s = s.replace(/\s+/g, " ").trim();
-  // Drop a single leading article: "il mitocondrio" -> "mitocondrio"
-  s = s.replace(/^(il|lo|la|i|gli|le|un|uno|una)\s+/i, "");
+
+  // Drop a single leading article or isolated elision residue: "il mitocondrio" -> "mitocondrio", "l acqua" -> "acqua"
+  s = s.replace(/^(?:il|lo|la|i|gli|le|un|uno|una|l|d)\s+/i, "");
+
   return s.trim();
 }
 
@@ -429,8 +474,18 @@ function isPureNumericFib(s: string): boolean {
   return /^[0-9]+(?:[.,][0-9]+)?$/.test(s.trim());
 }
 
+function parseNumericFibValue(s: string): number | null {
+  const norm = s.trim().replace(/\s+/g, "").replace(",", ".");
+  if (/^[0-9]+(?:\.[0-9]+)?$/.test(norm)) {
+    const val = parseFloat(norm);
+    return isNaN(val) ? null : val;
+  }
+  return null;
+}
+
 // Teacher-like verdict: exact match after normalization, plus a narrow typo
 // tolerance for genuine words (never for pure numbers like "12" vs "13").
+// Also checks mathematical/decimal equality ("3,5" == "3.5" == "3.50").
 // NOTE: an incomplete answer ("costituzione" for "costituzione italiana")
 // is NOT correct — a partial word is not the required term.
 export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer: string | undefined | null): boolean {
@@ -444,8 +499,17 @@ export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer
     .filter((s) => s.length > 0);
   if (alternatives.length === 0) return false;
 
+  const numUser = parseNumericFibValue(user);
+
   for (const ans of alternatives) {
     if (user === ans) return true;
+
+    // Check numeric equivalence (e.g. "3,5" vs "3.5" or "04" vs "4")
+    if (numUser !== null) {
+      const numAns = parseNumericFibValue(ans);
+      if (numAns !== null && numUser === numAns) return true;
+    }
+
     // Typo tolerance: single slip in a real word (length >= 5), two slips
     // only for long terms (length >= 9). Numbers must match exactly.
     if (!isPureNumericFib(user) && !isPureNumericFib(ans)) {
@@ -457,5 +521,69 @@ export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer
     }
   }
   return false;
+}
+
+/**
+ * Universal fill-in-the-blank sentence parser.
+ * Splits a sentence into { before, after } surrounding the blank.
+ * Handles:
+ * 1. Underscores: "__", "___", "________"
+ * 2. Bracketed terms: "[word]", "[...]", "[clue]" (NEVER reveals the bracketed solution word!)
+ * 3. Ellipsis: "..."
+ * 4. Raw answer word occurrence in the sentence
+ * 5. Fallback: appends the blank at the end
+ */
+export function getFibSentenceParts(sentence: string, answer?: string): { before: string; after: string } {
+  const s = sentence || "";
+
+  // 1. Underscores: 2 or more underscores
+  const underMatch = s.match(/_{2,}/);
+  if (underMatch && underMatch.index !== undefined) {
+    return {
+      before: s.substring(0, underMatch.index),
+      after: s.substring(underMatch.index + underMatch[0].length),
+    };
+  }
+
+  // 2. Bracketed term e.g. "[autodeterminazione]" or "[...]"
+  // Crucial: strips the bracketed word so the student is never shown the solution!
+  const bracketMatch = s.match(/\[([^\]]+)\]/);
+  if (bracketMatch && bracketMatch.index !== undefined) {
+    return {
+      before: s.substring(0, bracketMatch.index),
+      after: s.substring(bracketMatch.index + bracketMatch[0].length),
+    };
+  }
+
+  // 3. Ellipsis: 3 or more dots like "..."
+  const dotMatch = s.match(/\.{3,}/);
+  if (dotMatch && dotMatch.index !== undefined) {
+    return {
+      before: s.substring(0, dotMatch.index),
+      after: s.substring(dotMatch.index + dotMatch[0].length),
+    };
+  }
+
+  // 4. Exact word match of answer in sentence
+  if (answer && typeof answer === "string" && answer.trim()) {
+    const cleanAns = answer.trim();
+    const ansEsc = cleanAns.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    if (ansEsc.length > 0) {
+      const re = new RegExp(`\\b${ansEsc}\\b`, "i");
+      const ansMatch = s.match(re);
+      if (ansMatch && ansMatch.index !== undefined) {
+        return {
+          before: s.substring(0, ansMatch.index),
+          after: s.substring(ansMatch.index + ansMatch[0].length),
+        };
+      }
+    }
+  }
+
+  // 5. Fallback: blank at the end
+  return {
+    before: s ? s + " " : "",
+    after: "",
+  };
 }
 
