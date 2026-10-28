@@ -1026,50 +1026,50 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
   throw new Error("Tipo di esame non supportato.");
 }
 
-async function processQueue() {
-  if (activeWorkers >= MAX_CONCURRENT_WORKERS) return;
-  if (evaluationQueue.length === 0) return;
+function processQueue() {
+  while (activeWorkers < MAX_CONCURRENT_WORKERS && evaluationQueue.length > 0) {
+    const jobId = evaluationQueue.shift();
+    if (!jobId) break;
 
-  const jobId = evaluationQueue.shift();
-  if (!jobId) return;
-
-  const job = jobStore.get(jobId);
-  if (!job || job.status !== "pending") {
-    processQueue();
-    return;
-  }
-
-  activeWorkers++;
-  job.status = "processing";
-
-  try {
-    const result = await runEvaluationCore(job.reqBody);
-    job.status = "completed";
-    job.result = result;
-    // Release hash from active deduplication cache after 30 seconds
-    setTimeout(() => {
-      for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-        if (cachedJobId === job.id) {
-          reqToJobCache.delete(hashKey);
-        }
-      }
-    }, 30000);
-  } catch (err: any) {
-    job.status = "failed";
-    job.error = humanAiError(err?.message || "Errore durante la valutazione");
-    // Release hash immediately on error to allow fast retry
-    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-      if (cachedJobId === job.id) {
-        reqToJobCache.delete(hashKey);
-      }
+    const job = jobStore.get(jobId);
+    if (!job || job.status !== "pending") {
+      continue;
     }
-  } finally {
-    activeWorkers--;
-    // Il payload completo non serve più: tenerlo per ogni job concluso è il modo
-    // più rapido per esaurire la memoria dell'istanza.
-    job.reqBody = undefined;
-    purgeOldJobs();
-    processQueue();
+
+    activeWorkers++;
+    job.status = "processing";
+
+    (async (currentJob) => {
+      try {
+        const result = await runEvaluationCore(currentJob.reqBody);
+        currentJob.status = "completed";
+        currentJob.result = result;
+        // Release hash from active deduplication cache after 30 seconds
+        setTimeout(() => {
+          for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+            if (cachedJobId === currentJob.id) {
+              reqToJobCache.delete(hashKey);
+            }
+          }
+        }, 30000);
+      } catch (err: any) {
+        currentJob.status = "failed";
+        currentJob.error = humanAiError(err?.message || "Errore durante la valutazione");
+        // Release hash immediately on error to allow fast retry
+        for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+          if (cachedJobId === currentJob.id) {
+            reqToJobCache.delete(hashKey);
+          }
+        }
+      } finally {
+        activeWorkers--;
+        // Il payload completo non serve più: tenerlo per ogni job concluso è il modo
+        // più rapido per esaurire la memoria dell'istanza.
+        currentJob.reqBody = undefined;
+        purgeOldJobs();
+        processQueue();
+      }
+    })(job);
   }
 }
 
@@ -1231,42 +1231,42 @@ Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
 }
 
 /** Prende in carico i piani di recupero in coda, con i suoi posti dedicati. */
-async function processRecoveryQueue() {
-  if (activeRecoveryWorkers >= MAX_RECOVERY_WORKERS) return;
-  if (recoveryQueue.length === 0) return;
+function processRecoveryQueue() {
+  while (activeRecoveryWorkers < MAX_RECOVERY_WORKERS && recoveryQueue.length > 0) {
+    const jobId = recoveryQueue.shift();
+    if (!jobId) break;
 
-  const jobId = recoveryQueue.shift();
-  if (!jobId) return;
-
-  const job = jobStore.get(jobId);
-  if (!job || job.kind !== "recovery" || job.status !== "pending") {
-    processRecoveryQueue();
-    return;
-  }
-
-  activeRecoveryWorkers++;
-  job.status = "processing";
-
-  try {
-    job.result = await runRecoveryCore(job.reqBody);
-    job.status = "completed";
-    setTimeout(() => {
-      for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-        if (cachedJobId === job.id) reqToJobCache.delete(hashKey);
-      }
-    }, 30000);
-  } catch (err: any) {
-    job.status = "failed";
-    job.error = humanAiError(err?.message || "Errore durante la generazione del piano");
-    console.warn("[Piano di recupero]", job.error);
-    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-      if (cachedJobId === job.id) reqToJobCache.delete(hashKey);
+    const job = jobStore.get(jobId);
+    if (!job || job.kind !== "recovery" || job.status !== "pending") {
+      continue;
     }
-  } finally {
-    activeRecoveryWorkers--;
-    job.reqBody = undefined;
-    purgeOldJobs();
-    processRecoveryQueue();
+
+    activeRecoveryWorkers++;
+    job.status = "processing";
+
+    (async (currentJob) => {
+      try {
+        currentJob.result = await runRecoveryCore(currentJob.reqBody);
+        currentJob.status = "completed";
+        setTimeout(() => {
+          for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+            if (cachedJobId === currentJob.id) reqToJobCache.delete(hashKey);
+          }
+        }, 30000);
+      } catch (err: any) {
+        currentJob.status = "failed";
+        currentJob.error = humanAiError(err?.message || "Errore durante la generazione del piano");
+        console.warn("[Piano di recupero]", currentJob.error);
+        for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+          if (cachedJobId === currentJob.id) reqToJobCache.delete(hashKey);
+        }
+      } finally {
+        activeRecoveryWorkers--;
+        currentJob.reqBody = undefined;
+        purgeOldJobs();
+        processRecoveryQueue();
+      }
+    })(job);
   }
 }
 

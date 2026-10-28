@@ -72,6 +72,7 @@ import {
   buildLibraryBackup,
   parseLibraryBackup,
   sanitizeWorkbookExamJson,
+  fetchExamFromSessionPin,
   ExamLibraryItem
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
@@ -252,6 +253,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [librarySaving, setLibrarySaving] = useState(false);
   const [libraryMsg, setLibraryMsg] = useState<string | null>(null);
+  const [recoverPinInput, setRecoverPinInput] = useState("");
+  const [isRecoveringPin, setIsRecoveringPin] = useState(false);
   const libraryImportRef = useRef<HTMLInputElement | null>(null);
 
   // AI analysis of criteria state
@@ -611,9 +614,42 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleLoadLibraryItem = (item: ExamLibraryItem) => {
     const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
     setJsonText(sanitizedJson);
-    if (item.title) setMateria(item.title);
+    if (item.title) {
+      // Clean title from "(PIN ...)" suffix if present
+      const cleanTitle = item.title.replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim();
+      setMateria(cleanTitle || item.title);
+    }
+    if (item.id.startsWith("session_")) {
+      const pinFromId = item.id.replace("session_", "").trim();
+      if (pinFromId) setPin(pinFromId);
+    }
     validateExamJSON(sanitizedJson);
     setLibraryMsg(`📥 "${item.title}" caricata nell'editor: imposta PIN e scadenza e premi Avvia Sessione Live.`);
+  };
+
+  const handleFetchExamByPin = async (customPin?: string) => {
+    const targetPin = (customPin || recoverPinInput).trim();
+    if (!targetPin) {
+      alert("⚠️ Digita il codice PIN della sessione che desideri recuperare (es. 12).");
+      return;
+    }
+    setIsRecoveringPin(true);
+    setLibraryMsg(null);
+    try {
+      const item = await fetchExamFromSessionPin(targetPin);
+      if (!item) {
+        setLibraryMsg(`⚠️ Nessuna verifica attiva trovata su Cloud per il PIN "${targetPin}".`);
+        return;
+      }
+      handleLoadLibraryItem(item);
+      setPin(targetPin);
+      await loadLibrary();
+      setLibraryMsg(`✨ Recuperata con successo "${item.title}" dal PIN ${targetPin} e caricata nell'editor!`);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Errore recupero PIN: ${e.message}`);
+    } finally {
+      setIsRecoveringPin(false);
+    }
   };
 
   const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
@@ -3097,18 +3133,51 @@ const fibImg = domandeObj?.images?.[fib.id];
                   </div>
                 </div>
                 <p className="text-[10px] text-slate-400 leading-normal">
-                  Riusa una verifica già creata (anche da trascrizione SRT) per altre classi o sessioni di prova: caricala, cambia PIN e scadenza, avvia. Salvate in questo browser.
+                  Riusa una verifica già creata (anche da trascrizione SRT o sessione PIN) per altre classi: caricala con un click, cambia PIN o scadenza, e avvia.
                 </p>
+
+                {/* Direct PIN Session Retrieval Bar */}
+                <div className="flex items-center gap-1.5 p-1.5 bg-black/40 border border-amber-500/25 rounded-xl shadow-inner">
+                  <div className="relative flex-1">
+                    <input
+                      type="text"
+                      placeholder="Recupera da PIN Cloud (es. 12)..."
+                      value={recoverPinInput}
+                      onChange={(e) => setRecoverPinInput(e.target.value)}
+                      onKeyDown={(e) => {
+                        if (e.key === "Enter") {
+                          e.preventDefault();
+                          handleFetchExamByPin();
+                        }
+                      }}
+                      className="w-full px-2.5 py-1 text-xs bg-slate-950 border border-white/10 focus:border-amber-400 rounded-lg text-amber-200 placeholder:text-slate-500 outline-none font-mono font-bold uppercase"
+                    />
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => handleFetchExamByPin()}
+                    disabled={isRecoveringPin || !recoverPinInput.trim()}
+                    className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/35 text-amber-300 border border-amber-500/40 text-[11px] font-bold rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0 flex items-center gap-1"
+                  >
+                    {isRecoveringPin ? (
+                      <RefreshCw className="w-3 h-3 animate-spin" />
+                    ) : (
+                      <Search className="w-3 h-3" />
+                    )}
+                    <span>Recupera PIN</span>
+                  </button>
+                </div>
+
                 {libraryMsg && (
                   <p className="text-[11px] text-amber-100/90 bg-black/30 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
                     {libraryMsg}
                   </p>
                 )}
                 {libraryLoading ? (
-                  <p className="text-[11px] text-slate-400">Caricamento libreria...</p>
+                  <p className="text-[11px] text-slate-400">Caricamento libreria e sincronizzazione sessioni cloud...</p>
                 ) : library.length === 0 ? (
                   <p className="text-[11px] text-slate-500 italic">
-                    Ancora vuota: genera una verifica con l'IA o premi "Salva in libreria" nell'editor.
+                    Ancora vuota: genera una verifica con l'IA, digita un PIN in "Recupera PIN" o premi "Salva in libreria" nell'editor.
                   </p>
                 ) : (
                   <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
@@ -3119,7 +3188,14 @@ const fibImg = domandeObj?.images?.[fib.id];
                       >
                         <div className="flex items-start justify-between gap-2">
                           <div className="min-w-0">
-                            <p className="text-xs font-bold text-white truncate">{item.title}</p>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <p className="text-xs font-bold text-white truncate">{item.title}</p>
+                              {item.source?.includes("Cloud") && (
+                                <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                  ☁️ Cloud
+                                </span>
+                              )}
+                            </div>
                             <p className="text-[10px] text-slate-400 font-mono">
                               {item.examType} • {item.questionCount} quesiti • {formatLibraryDate(item.updatedAt)}
                             </p>

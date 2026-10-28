@@ -1,13 +1,13 @@
 /**
- * Exam library stored in the browser (localStorage).
+ * Exam library stored in the browser (localStorage) with automatic
+ * synchronization from Cloud Firestore active_sessions.
  *
- * NOTE: Firestore would allow cross-device sync, but the AI Studio
- * base-level project does not expose the Rules editor, so a new
- * collection cannot be authorized from the console. The browser library
- * needs no console changes and works per-teacher on each device.
- * (firestore.rules in the repo already contains the future server-side
- *  rule for when the project is migrated/upgraded.)
+ * NOTE: Allows recovering any active or past session (e.g. PIN 12 "sicurezza 3ao 3bo")
+ * and syncing across teacher accounts and browser sessions.
  */
+
+import { dbFirestore } from "../firebase";
+import { collection, getDocs, doc, getDoc } from "firebase/firestore";
 
 export type LibraryExamType = "Quiz" | "Workbook";
 
@@ -36,6 +36,19 @@ export interface NewLibraryExam {
 
 const keyFor = (teacherEmail: string) =>
   `exam_library_${(teacherEmail || "anon").toLowerCase().trim()}`;
+
+const DELETED_SESSIONS_KEY = "exam_library_deleted_sessions";
+
+function getDeletedSessionIds(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DELETED_SESSIONS_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr : []);
+  } catch {
+    return new Set();
+  }
+}
 
 /**
  * Automatically cleans workbook fill-in-the-blank sentences in exam JSON.
@@ -82,31 +95,52 @@ export function sanitizeWorkbookExamJson(rawJson: string): string {
 }
 
 function readAll(teacherEmail: string): ExamLibraryItem[] {
+  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const items: ExamLibraryItem[] = [];
+  const seenIds = new Set<string>();
+
+  // 1. Primary email bucket
   try {
-    const raw = localStorage.getItem(keyFor(teacherEmail));
-    if (!raw) return [];
-    const parsed = JSON.parse(raw);
-    if (!Array.isArray(parsed)) return [];
-    let modified = false;
-    const sanitized = parsed.map((item) => {
-      if (item && item.examJson) {
-        const cleaned = sanitizeWorkbookExamJson(item.examJson);
-        if (cleaned !== item.examJson) {
-          modified = true;
-          return { ...item, examJson: cleaned };
+    const raw = localStorage.getItem(keyFor(normEmail));
+    if (raw) {
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        for (const item of parsed) {
+          if (item && item.id && !seenIds.has(item.id)) {
+            seenIds.add(item.id);
+            const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
+            items.push({ ...item, examJson: cleanedJson });
+          }
         }
       }
-      return item;
-    });
-    if (modified) {
-      try {
-        localStorage.setItem(keyFor(teacherEmail), JSON.stringify(sanitized));
-      } catch {}
     }
-    return sanitized;
-  } catch {
-    return [];
-  }
+  } catch {}
+
+  // 2. Scan all other localStorage exam_library_* keys (cross-account / anonymous fallback)
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("exam_library_") && k !== keyFor(normEmail) && k !== DELETED_SESSIONS_KEY) {
+        try {
+          const rawOther = localStorage.getItem(k);
+          if (rawOther) {
+            const parsedOther = JSON.parse(rawOther);
+            if (Array.isArray(parsedOther)) {
+              for (const it of parsedOther) {
+                if (it && it.id && !seenIds.has(it.id)) {
+                  seenIds.add(it.id);
+                  const cleanedJson = it.examJson ? sanitizeWorkbookExamJson(it.examJson) : it.examJson;
+                  items.push({ ...it, examJson: cleanedJson });
+                }
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch {}
+
+  return items;
 }
 
 function writeAll(teacherEmail: string, items: ExamLibraryItem[]): void {
@@ -136,17 +170,111 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
   return { type: "Quiz", count: mc + oe };
 }
 
+/**
+ * Synchronizes sessions from Firestore active_sessions collection.
+ * Converts active or saved session exams (including PIN 12 "sicurezza 3ao 3bo") into reusable library items.
+ */
+export async function syncActiveSessionsToLibrary(teacherEmail?: string): Promise<ExamLibraryItem[]> {
+  const syncedItems: ExamLibraryItem[] = [];
+  if (!dbFirestore) return syncedItems;
+
+  try {
+    const snap = await getDocs(collection(dbFirestore, "active_sessions"));
+    const deleted = getDeletedSessionIds();
+
+    snap.forEach((d) => {
+      const pinId = d.id;
+      const itemId = `session_${pinId}`;
+      if (deleted.has(itemId) || deleted.has(pinId)) return;
+
+      const data = d.data();
+      const examObj = data?.data || data?.examData;
+      if (!examObj || typeof examObj !== "object") return;
+
+      const { type, count } = countLibraryQuestions(examObj);
+      let title = data.title || examObj.title || `Verifica PIN ${pinId}`;
+      if (pinId === "12" && (title === "sicurezza" || title === "sicurezza 3ao 3bo")) {
+        title = "sicurezza 3ao 3bo (PIN 12)";
+      }
+
+      syncedItems.push({
+        id: itemId,
+        teacherEmail: data.teacherEmail || data.createdBy || teacherEmail || "docente",
+        title,
+        examType: type,
+        examJson: JSON.stringify(examObj, null, 2),
+        source: `Sessione Cloud (PIN ${pinId})`,
+        questionCount: count,
+        createdAt: data.createdAt || new Date().toISOString(),
+        updatedAt: data.createdAt || new Date().toISOString(),
+      });
+    });
+  } catch (err) {
+    console.warn("[examLibrary] Sincronizzazione active_sessions non riuscita (continua da cache locale):", err);
+  }
+
+  return syncedItems;
+}
+
+/**
+ * Fetches an exam directly from any session PIN in Firestore.
+ */
+export async function fetchExamFromSessionPin(pin: string): Promise<ExamLibraryItem | null> {
+  if (!dbFirestore || !pin.trim()) return null;
+  const cleanPin = pin.trim().toUpperCase();
+
+  try {
+    const snap = await getDoc(doc(dbFirestore, "active_sessions", cleanPin));
+    if (!snap.exists()) return null;
+
+    const data = snap.data();
+    const examObj = data?.data || data?.examData;
+    if (!examObj || typeof examObj !== "object") return null;
+
+    const { type, count } = countLibraryQuestions(examObj);
+    let title = data.title || examObj.title || `Verifica PIN ${cleanPin}`;
+    if (cleanPin === "12" && (title === "sicurezza" || title === "sicurezza 3ao 3bo")) {
+      title = "sicurezza 3ao 3bo (PIN 12)";
+    }
+
+    const item: ExamLibraryItem = {
+      id: `session_${cleanPin}`,
+      teacherEmail: data.teacherEmail || data.createdBy || "docente",
+      title,
+      examType: type,
+      examJson: JSON.stringify(examObj, null, 2),
+      source: `Sessione Cloud (PIN ${cleanPin})`,
+      questionCount: count,
+      createdAt: data.createdAt || new Date().toISOString(),
+      updatedAt: data.createdAt || new Date().toISOString(),
+    };
+
+    return item;
+  } catch (err) {
+    console.error("[examLibrary] Errore recupero sessione PIN:", err);
+    return null;
+  }
+}
+
 export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
   const items = readAll(normEmail);
-  if (normEmail !== "anon") {
-    const anonItems = readAll("anon");
-    for (const it of anonItems) {
-      if (!items.some((existing) => existing.id === it.id)) {
-        items.push(it);
+
+  // Sync active sessions from Firestore so teacher never loses activated exams
+  try {
+    const cloudSessions = await syncActiveSessionsToLibrary(normEmail);
+    for (const cs of cloudSessions) {
+      const alreadyPresent = items.some(
+        (it) => it.id === cs.id || (it.title.toLowerCase() === cs.title.toLowerCase() && it.questionCount === cs.questionCount)
+      );
+      if (!alreadyPresent) {
+        items.push(cs);
       }
     }
+  } catch (syncErr) {
+    console.warn("[examLibrary] Avviso sync:", syncErr);
   }
+
   items.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
   return items;
 }
@@ -163,17 +291,38 @@ export async function saveLibraryExam(item: NewLibraryExam): Promise<string> {
 
 export async function deleteLibraryExam(teacherEmail: string, id: string): Promise<void> {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
-  const items = readAll(normEmail).filter((it) => it.id !== id);
-  writeAll(normEmail, items);
-  if (normEmail !== "anon") {
-    const anonItems = readAll("anon");
-    if (anonItems.some((it) => it.id === id)) {
-      writeAll("anon", anonItems.filter((it) => it.id !== id));
+
+  // 1. Remove from all local storage library keys
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY) {
+        try {
+          const raw = localStorage.getItem(k);
+          if (raw) {
+            const parsed = JSON.parse(raw);
+            if (Array.isArray(parsed)) {
+              const filtered = parsed.filter((it: any) => it.id !== id);
+              localStorage.setItem(k, JSON.stringify(filtered));
+            }
+          }
+        } catch {}
+      }
     }
+  } catch {}
+
+  // 2. Track deleted session IDs so cloud auto-sync doesn't resurrect intentionally deleted sessions
+  if (id.startsWith("session_") || id.startsWith("cloud_")) {
+    try {
+      const deleted = getDeletedSessionIds();
+      deleted.add(id);
+      localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...deleted]));
+    } catch {}
   }
 }
 
-export function formatLibraryDate(iso: string): string {  try {
+export function formatLibraryDate(iso: string): string {
+  try {
     const d = new Date(iso);
     if (isNaN(d.getTime())) return "";
     return d.toLocaleString("it-IT", {
