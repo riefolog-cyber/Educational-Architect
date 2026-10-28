@@ -150,6 +150,324 @@ export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqSco
   return formatItalianScholasticGrade(Math.min(10, Math.max(0, finalGrade)));
 }
 
+export interface GradeComponentItem {
+  id?: string;
+  number: number;
+  label: string;
+  score: number;
+  maxScore: number;
+  weight?: number;
+  feedback?: string;
+}
+
+export interface GradeBreakdownResult {
+  tipo: "Quiz" | "Workbook";
+  finalGradeFormatted: string;
+  finalNumeric: number;
+  formulaTitle: string;
+  formulaSummary: string;
+  isMixed: boolean;
+  isPureObjective: boolean;
+  isPureSubjective: boolean;
+  
+  objectivePart?: {
+    name: string;
+    score: number;
+    total: number;
+    percentage: number;
+    gradeOutOf10: number;
+    weightPct: number;
+    pointsEarned: number;
+  };
+  
+  subjectivePart?: {
+    name: string;
+    count: number;
+    items: GradeComponentItem[];
+    averageScore: number;
+    weightPct: number;
+    pointsEarned: number;
+  };
+  
+  explanationLines: string[];
+}
+
+/**
+ * Computes a detailed mathematical breakdown of how the final grade was calculated,
+ * including single question scores, component averages, weights, and the applied formula.
+ */
+export function computeGradeBreakdown(params: {
+  tipo: "Quiz" | "Workbook" | string;
+  examData?: any;
+  answers?: any;
+  evaluation?: any;
+  punteggioMC?: number;
+  punteggioFIB?: number;
+  votoSuggerito?: string;
+}): GradeBreakdownResult {
+  const isWorkbook = String(params.tipo || "").toLowerCase() === "workbook";
+  const tipo: "Quiz" | "Workbook" = isWorkbook ? "Workbook" : "Quiz";
+
+  let objScore = 0;
+  let objTotal = 0;
+  const subjectiveScores: number[] = [];
+  const subjectiveDetails: GradeComponentItem[] = [];
+
+  if (tipo === "Quiz") {
+    // 1. Multiple Choice
+    const mcList = Array.isArray(params.examData?.multipleChoice) ? params.examData.multipleChoice : [];
+    objTotal = mcList.length;
+    if (params.punteggioMC !== undefined && params.punteggioMC !== null && !isNaN(Number(params.punteggioMC))) {
+      objScore = Number(params.punteggioMC);
+    } else if (params.answers?.mc && objTotal > 0) {
+      objScore = mcList.reduce((acc: number, q: any) => {
+        const u = params.answers.mc[q.id];
+        return acc + (u !== undefined && u !== null && Number(u) === Number(q.correctIndex) ? 1 : 0);
+      }, 0);
+    }
+
+    // 2. Open-ended questions
+    const oeList = Array.isArray(params.examData?.openEnded) ? params.examData.openEnded : [];
+    const oeEvalList = Array.isArray(params.evaluation?.openEndedDetails) ? params.evaluation.openEndedDetails : [];
+    
+    if (oeEvalList.length > 0) {
+      oeEvalList.forEach((item: any, idx: number) => {
+        const s = Number(item.score);
+        const validScore = isNaN(s) ? 0 : Math.min(10, Math.max(0, s));
+        subjectiveScores.push(validScore);
+        const qMeta = oeList.find((q: any) => q.id === item.questionId) || oeList[idx];
+        subjectiveDetails.push({
+          id: item.questionId || `oe_${idx + 1}`,
+          number: idx + 1,
+          label: qMeta?.question ? (qMeta.question.length > 70 ? qMeta.question.slice(0, 70) + "..." : qMeta.question) : `Domanda Aperta ${idx + 1}`,
+          score: validScore,
+          maxScore: 10,
+          weight: qMeta?.weight ? Number(qMeta.weight) : 1,
+          feedback: item.feedback || ""
+        });
+      });
+    } else if (oeList.length > 0) {
+      oeList.forEach((q: any, idx: number) => {
+        subjectiveDetails.push({
+          id: q.id || `oe_${idx + 1}`,
+          number: idx + 1,
+          label: q.question ? (q.question.length > 70 ? q.question.slice(0, 70) + "..." : q.question) : `Domanda Aperta ${idx + 1}`,
+          score: 0,
+          maxScore: 10,
+          weight: q.weight ? Number(q.weight) : 1,
+          feedback: "In attesa di revisione docente"
+        });
+      });
+    }
+  } else {
+    // Workbook
+    const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
+    const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+    const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+    objTotal = fibList.length;
+
+    if (params.punteggioFIB !== undefined && params.punteggioFIB !== null && !isNaN(Number(params.punteggioFIB))) {
+      objScore = Number(params.punteggioFIB);
+    } else if (params.evaluation?.fibScore !== undefined && !isNaN(Number(params.evaluation.fibScore))) {
+      objScore = Number(params.evaluation.fibScore);
+      if (params.evaluation?.fibTotal) objTotal = Number(params.evaluation.fibTotal);
+    }
+
+    const rqEvalList = Array.isArray(params.evaluation?.reflectionDetails) ? params.evaluation.reflectionDetails : [];
+    if (rqEvalList.length > 0) {
+      rqEvalList.forEach((item: any, idx: number) => {
+        const s = Number(item.score);
+        const validScore = isNaN(s) ? 0 : Math.min(10, Math.max(0, s));
+        subjectiveScores.push(validScore);
+        const rMeta = rqList.find((r: any) => r.id === item.id) || rqList[idx];
+        subjectiveDetails.push({
+          id: item.id || `rq_${idx + 1}`,
+          number: idx + 1,
+          label: rMeta?.question ? (rMeta.question.length > 70 ? rMeta.question.slice(0, 70) + "..." : rMeta.question) : `Riflessione ${idx + 1}`,
+          score: validScore,
+          maxScore: 10,
+          weight: rMeta?.weight ? Number(rMeta.weight) : 1,
+          feedback: item.feedback || ""
+        });
+      });
+    } else if (rqList.length > 0) {
+      rqList.forEach((r: any, idx: number) => {
+        subjectiveDetails.push({
+          id: r.id || `rq_${idx + 1}`,
+          number: idx + 1,
+          label: r.question ? (r.question.length > 70 ? r.question.slice(0, 70) + "..." : r.question) : `Riflessione ${idx + 1}`,
+          score: 0,
+          maxScore: 10,
+          weight: r.weight ? Number(r.weight) : 1,
+          feedback: "In attesa di revisione docente"
+        });
+      });
+    }
+  }
+
+  const hasObj = objTotal > 0;
+  const hasSubj = subjectiveScores.length > 0;
+  let finalNumeric = 0;
+  let finalGradeFormatted = "";
+  let formulaTitle = "";
+  let formulaSummary = "";
+  const explanationLines: string[] = [];
+
+  let objPart: GradeBreakdownResult["objectivePart"];
+  let subjPart: GradeBreakdownResult["subjectivePart"];
+
+  if (hasObj && hasSubj) {
+    // Mixed: 40% Objective + 60% Subjective
+    const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
+    const objOutOf10 = objFraction * 10;
+    const objPoints = objOutOf10 * 0.40;
+
+    const subjSum = subjectiveScores.reduce((a, b) => a + b, 0);
+    const subjAvg = subjSum / subjectiveScores.length;
+    const subjPoints = subjAvg * 0.60;
+
+    finalNumeric = Math.min(10, Math.max(0, objPoints + subjPoints));
+    finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
+
+    const objName = tipo === "Quiz" ? "Quesiti a scelta multipla (Crocette)" : "Completamento frasi (FIB)";
+    const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
+
+    formulaTitle = "Valutazione Mista Ponderata (40% Oggettiva + 60% Aperte)";
+    formulaSummary = `(${objOutOf10.toFixed(2)} × 40%) + (${subjAvg.toFixed(2)} × 60%) = ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)} / 10`;
+
+    objPart = {
+      name: objName,
+      score: objScore,
+      total: objTotal,
+      percentage: Math.round(objFraction * 1000) / 10,
+      gradeOutOf10: Math.round(objOutOf10 * 10) / 10,
+      weightPct: 40,
+      pointsEarned: Math.round(objPoints * 100) / 100,
+    };
+
+    subjPart = {
+      name: subjName,
+      count: subjectiveScores.length,
+      items: subjectiveDetails,
+      averageScore: Math.round(subjAvg * 10) / 10,
+      weightPct: 60,
+      pointsEarned: Math.round(subjPoints * 100) / 100,
+    };
+
+    explanationLines.push(
+      `1. Parte Oggettiva (${objName}): ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 40% → ${objPoints.toFixed(2)} punti.`,
+      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. Media voti: ${subjAvg.toFixed(2)}/10. Incidenza 60% → ${subjPoints.toFixed(2)} punti.`,
+      `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico assegnato: ${finalGradeFormatted}.`
+    );
+
+  } else if (hasObj) {
+    // Pure Objective: 100%
+    const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
+    finalNumeric = Math.min(10, Math.max(0, objFraction * 10));
+    finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
+
+    const objName = tipo === "Quiz" ? "Quesiti a scelta multipla (Crocette)" : "Completamento frasi (FIB)";
+    formulaTitle = "Valutazione Matematica Lineare (100% Oggettiva)";
+    formulaSummary = `(${objScore} esatte / ${objTotal} quesiti) × 10 = ${finalNumeric.toFixed(2)} / 10`;
+
+    objPart = {
+      name: objName,
+      score: objScore,
+      total: objTotal,
+      percentage: Math.round(objFraction * 1000) / 10,
+      gradeOutOf10: Math.round(finalNumeric * 10) / 10,
+      weightPct: 100,
+      pointsEarned: Math.round(finalNumeric * 100) / 100,
+    };
+
+    explanationLines.push(
+      `Prova esclusivamente oggettiva (senza domande aperte): il voto riflette al 100% la percentuale di risposte corrette.`,
+      `Risposte esatte: ${objScore} su ${objTotal} quesiti (accuratezza: ${objPart.percentage}%).`,
+      `Formula matematica diretta: (${objScore} / ${objTotal}) × 10 = ${finalNumeric.toFixed(2)}/10 → Voto scolastico assegnato: ${finalGradeFormatted}.`
+    );
+
+  } else if (hasSubj) {
+    // Pure Subjective: 100%
+    const subjSum = subjectiveScores.reduce((a, b) => a + b, 0);
+    const subjAvg = subjSum / subjectiveScores.length;
+    finalNumeric = Math.min(10, Math.max(0, subjAvg));
+    finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
+
+    const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
+    formulaTitle = "Media Aritmetica dei Voti Singoli (100% Aperte)";
+    formulaSummary = `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjSum.toFixed(1)} / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
+
+    subjPart = {
+      name: subjName,
+      count: subjectiveScores.length,
+      items: subjectiveDetails,
+      averageScore: Math.round(subjAvg * 10) / 10,
+      weightPct: 100,
+      pointsEarned: Math.round(subjAvg * 100) / 100,
+    };
+
+    explanationLines.push(
+      `Prova esclusivamente a risposte aperte: il voto è dato dalla media dei voti assegnati ai singoli quesiti.`,
+      `Voti singoli quesiti: [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}].`,
+      `Formula della media: (${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)}/10 → Voto scolastico assegnato: ${finalGradeFormatted}.`
+    );
+  } else {
+    finalGradeFormatted = params.votoSuggerito || "N.V.";
+    formulaTitle = "Valutazione Non Quantificabile";
+    formulaSummary = "Dati insufficienti per il calcolo matematico del voto.";
+    explanationLines.push("Nessun quesito oggettivo o aperto rilevato per comporre un voto matematico.");
+  }
+
+  if (params.votoSuggerito && params.votoSuggerito !== "N.V." && params.votoSuggerito !== "—") {
+    finalGradeFormatted = params.votoSuggerito;
+  }
+
+  return {
+    tipo,
+    finalGradeFormatted,
+    finalNumeric: Math.round(finalNumeric * 100) / 100,
+    formulaTitle,
+    formulaSummary,
+    isMixed: hasObj && hasSubj,
+    isPureObjective: hasObj && !hasSubj,
+    isPureSubjective: !hasObj && hasSubj,
+    objectivePart: objPart,
+    subjectivePart: subjPart,
+    explanationLines,
+  };
+}
+
+/**
+ * Extracts and calculates the grade breakdown from a Firestore submission document.
+ */
+export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
+  const tipo: "Quiz" | "Workbook" = sub?.Tipo === "Workbook" ? "Workbook" : "Quiz";
+
+  const safeParse = (data: any) => {
+    if (!data) return null;
+    if (typeof data === "object") return data;
+    try {
+      return JSON.parse(data);
+    } catch {
+      return null;
+    }
+  };
+
+  const evaluation = safeParse(sub?.Full_Evaluation);
+  const examData = safeParse(sub?.Domande_Esame);
+  const answers = safeParse(sub?.Risposte_Studente);
+
+  return computeGradeBreakdown({
+    tipo,
+    examData,
+    answers,
+    evaluation,
+    punteggioMC: sub?.Punteggio_MC,
+    punteggioFIB: sub?.Punteggio_FIB,
+    votoSuggerito: sub?.Voto_Suggerito
+  });
+}
+
 export interface SplitScreenDetection {
   isSplit: boolean;
   reason?: string;

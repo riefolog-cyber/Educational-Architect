@@ -1,5 +1,7 @@
 import React, { useRef } from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
+import { extractBreakdownFromSubmission } from "../utils";
+import GradeCalculationReport from "./GradeCalculationReport";
 
 interface PrintableReportModalProps {
   isOpen: boolean;
@@ -167,6 +169,9 @@ export default function PrintableReportModal({
                 </p>
               </div>
             </div>
+
+            {/* Detailed Grade Composition & Calculation Breakdown */}
+            <GradeCalculationReport breakdown={extractBreakdownFromSubmission(submission)} isPrintMode={true} />
 
             {/* Qualitative Feedback Sections */}
             <div className="space-y-4">

@@ -54,7 +54,8 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage, extractBreakdownFromSubmission } from "../utils";
+import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
@@ -879,7 +880,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
 
-        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata! Codice di sblocco docente: ${unlockCode} (serve allo studente se la prova si blocca dopo un'uscita dalla pagina).`);
+        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata! Gli studenti bloccati possono essere sbloccati direttamente con 1 click dal Monitor d'Aula.`);
         setDashboardTab("live_monitor");
         setPin(targetPin);
         setMonitorPin(targetPin);
@@ -1557,6 +1558,33 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       currentY += 34;
+
+      // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
+      const breakdown = extractBreakdownFromSubmission(sub);
+      if (breakdown) {
+        checkPageBreak(28);
+        doc.setFillColor(248, 250, 252);
+        doc.setDrawColor(203, 213, 225);
+        doc.roundedRect(15, currentY, 180, 25, 2.5, 2.5, "FD");
+
+        doc.setFont("Helvetica", "bold");
+        doc.setFontSize(9);
+        doc.setTextColor(30, 41, 59);
+        doc.text(`Composizione del Voto: ${breakdown.formulaTitle}`, 19, currentY + 6);
+
+        doc.setFont("Courier", "bold");
+        doc.setFontSize(8.5);
+        doc.setTextColor(67, 56, 202);
+        doc.text(breakdown.formulaSummary, 19, currentY + 13);
+
+        doc.setFont("Helvetica", "normal");
+        doc.setFontSize(7.5);
+        doc.setTextColor(71, 85, 105);
+        const explText = breakdown.explanationLines[0] || "";
+        doc.text(explText.length > 105 ? explText.slice(0, 105) + "..." : explText, 19, currentY + 19);
+
+        currentY += 29;
+      }
 
       // Parser per i dati IA completi
       let evalObj: any = null;
@@ -3350,7 +3378,6 @@ const fibImg = domandeObj?.images?.[fib.id];
                 }
                 sessions={activeSessions}
                 isSessionLive={isSessionLive}
-                unlockCode={activeSessions.find((s) => s.pin === monitorPin)?.unlockCode}
                 loadingSessions={loadingSessions}
                 onSelectPin={(next) => {
                   setMonitorPin(next);
@@ -4692,6 +4719,9 @@ const fibImg = domandeObj?.images?.[fib.id];
                   <p className="text-3xl font-display font-medium text-indigo-400 mt-1">{selectedSub.Autovalutazione}/10</p>
                 </div>
               </div>
+
+              {/* Detailed Grade Breakdown & Mathematical Average */}
+              <GradeCalculationReport breakdown={extractBreakdownFromSubmission(selectedSub)} />
 
               {isBorderlineSubmission(selectedSub) && (
                 <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-[11px] text-amber-200 leading-relaxed">

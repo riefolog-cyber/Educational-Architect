@@ -27,7 +27,6 @@ import {
   ArrowLeft,
   Lock,
   Unlock,
-  KeyRound,
   ChevronRight,
   Info,
   BookOpen,
@@ -37,7 +36,8 @@ import {
   Maximize2,
   Printer,
   Eye,
-  GraduationCap
+  GraduationCap,
+  Wifi
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
@@ -59,8 +59,10 @@ import {
   normalizeSeverityPreset,
   isAppleMobile,
   type SeverityPreset,
-  SplitScreenDetection
+  SplitScreenDetection,
+  computeGradeBreakdown
 } from "../utils";
+import GradeCalculationReport from "./GradeCalculationReport";
 import {
   recoveryProgressLabel,
   recoveryProgressHint,
@@ -266,12 +268,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [isSplitScreenBlocked, setIsSplitScreenBlocked] = useState(false);
 
   // Hard lock applied when the student leaves the page mid-exam.
-  // It cannot be dismissed: it is released only by the teacher (code or remote).
+  // It cannot be dismissed: it is released only by the teacher directly from the Live Monitor.
   const [examLocked, setExamLocked] = useState(false);
   const [lockReason, setLockReason] = useState("");
-  const [lockCodeInput, setLockCodeInput] = useState("");
-  const [lockError, setLockError] = useState("");
-  const [sessionUnlockCode, setSessionUnlockCode] = useState("");
   const lockedRef = useRef(false);
   const remoteUnlockSeenRef = useRef<string | null>(null);
 
@@ -441,23 +440,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     lockedRef.current = true;
     setExamLocked(true);
     setLockReason(reason);
-    setLockCodeInput("");
-    setLockError("");
     persistExamLock(true, reason);
     void syncLockState(true, reason);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionPin, user?.email]);
 
-  const releaseExamLock = useCallback((via: "code" | "remote" = "code") => {
+  const releaseExamLock = useCallback((via: "remote" | "direct" = "remote") => {
     lockedRef.current = false;
     setExamLocked(false);
     setLockReason("");
-    setLockCodeInput("");
-    setLockError("");
     persistExamLock(false);
     void syncLockState(false, "");
-    // Back to fullscreen as soon as the block is lifted (unlock-code submission
-    // counts as a user gesture; on remote unlock the guard effect covers it).
+    // Back to fullscreen as soon as the block is lifted
     if (!isAppleMobile()) void requestAppFullScreen();
     setInfractionToastMsg(
       via === "remote"
@@ -484,7 +478,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   }, [activeScreen, examLocked]);
 
   // Remote unlock: the teacher presses "Sblocca" in the live monitor, which
-  // writes a new remoteUnlockId on this student's live_students document.
+  // writes a new remoteUnlockId and locked: false on this student's live_students document.
   useEffect(() => {
     if (!dbFirestore || !sessionPin || !user?.email) return;
     const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
@@ -492,40 +486,26 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const unsubscribe = onSnapshot(
       studentDocRef,
       (snap) => {
-        const remoteId = snap.data()?.remoteUnlockId;
+        const data = snap.data();
+        const remoteId = data?.remoteUnlockId;
         const currentId = remoteId ? String(remoteId) : "";
+        const isDocLocked = data?.locked === true;
         if (remoteUnlockSeenRef.current === null) {
-          // First snapshot: record the baseline (field present OR absent) without
-          // acting. With the old logic a first snapshot carrying remoteId was
-          // treated as "initial state" and swallowed — so a teacher pressing
-          // "Sblocca" while the doc had no prior remoteUnlockId (the normal
-          // case) never released the lock.
+          // First snapshot: record the baseline without acting.
           remoteUnlockSeenRef.current = currentId;
           return;
         }
         if (currentId !== remoteUnlockSeenRef.current) {
           remoteUnlockSeenRef.current = currentId;
           if (currentId && lockedRef.current) releaseExamLockRef.current("remote");
+        } else if (!isDocLocked && lockedRef.current && (data?.lockState === "unlocked" || data?.unlockedAt)) {
+          releaseExamLockRef.current("remote");
         }
       },
       (err) => console.warn("Ascolto sblocco docente non disponibile:", err)
     );
     return () => unsubscribe();
   }, [sessionPin, user?.email]);
-
-  const handleUnlockCodeSubmit = () => {
-    const expected = (sessionUnlockCode || "").trim();
-    const typed = (lockCodeInput || "").trim();
-    if (!expected) {
-      setLockError("Sessione senza codice: chiedi al docente di sbloccare la prova dal monitor d'aula.");
-      return;
-    }
-    if (typed !== expected) {
-      setLockError("Codice errato. Chiedi al docente il codice di sblocco della sessione.");
-      return;
-    }
-    releaseExamLock("code");
-  };
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const elapsedRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
@@ -796,15 +776,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
           setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
-          setSessionUnlockCode(String(sessionData.unlockCode || "").trim());
-
           // Restore a lock applied before a page reload: refreshing must not
           // be a way to get back into the exam without the teacher.
           lockedRef.current = false;
           setExamLocked(false);
           setLockReason("");
-          setLockCodeInput("");
-          setLockError("");
           try {
             const storedLock = sessionStorage.getItem(`exam_lock_${formattedPin}`);
             if (storedLock) {
@@ -1784,9 +1760,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     lockedRef.current = false;
     setExamLocked(false);
     setLockReason("");
-    setLockCodeInput("");
-    setLockError("");
-    setSessionUnlockCode("");
     setActiveScreen("enter-pin");
     setPin("");
     setSessionPin("");
@@ -3034,6 +3007,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             </div>
 
+            {/* Detailed Grade Calculation & Average breakdown */}
+            {evaluation && (
+              <GradeCalculationReport
+                breakdown={computeGradeBreakdown({
+                  tipo: examType === "quiz" ? "Quiz" : "Workbook",
+                  examData,
+                  answers,
+                  evaluation,
+                  votoSuggerito: evaluation.suggestedGrade
+                })}
+              />
+            )}
+
             {/* General Overall feedback */}
             {evaluation?.overallFeedback && (
               <div className="bg-indigo-950/30 border border-indigo-500/20 p-5 rounded-2xl space-y-2">
@@ -3388,59 +3374,42 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         </div>
       )}
 
-      {/* Hard exam lock: leaving the page freezes the exam until the teacher unlocks it */}
+      {/* Hard exam lock: leaving the page freezes the exam until the teacher unlocks it directly from the live monitor */}
       {examLocked && (
-        <div className="fixed inset-0 bg-slate-950/95 z-[100000] flex flex-col justify-center items-center p-6 text-center leading-relaxed backdrop-blur-xl">
-          <div className="p-4 bg-red-500/15 border-2 border-red-500/40 text-red-400 rounded-3xl mb-5">
+        <div className="fixed inset-0 bg-slate-950/95 z-[100000] flex flex-col justify-center items-center p-6 text-center leading-relaxed backdrop-blur-xl animate-fadeIn">
+          <div className="p-4 bg-red-500/15 border-2 border-red-500/40 text-red-400 rounded-3xl mb-5 animate-pulse">
             <Lock className="w-12 h-12" />
           </div>
           <h2 className="text-2xl sm:text-3xl font-display font-bold text-white mb-2 uppercase tracking-wide">
-            Prova bloccata
+            Prova Bloccata
           </h2>
-          <p className="text-sm text-red-100/90 max-w-lg mb-1 leading-relaxed">
-            La pagina è stata abbandonata durante lo svolgimento della prova
-            {lockReason ? ` (${lockReason})` : ""}. Le risposte salvate non sono andate perse,
-            ma per riprendere serve l'autorizzazione del docente: non c'è nessun pulsante per aggirare il blocco.
-          </p>
-          <p className="text-[11px] text-slate-400 max-w-md mb-6 leading-relaxed">
-            Il tempo d'esame continua a scorrere. Chiedi al docente il codice di sblocco oppure attendi
-            che sblocchi la tua prova dal monitor d'aula.
+          <p className="text-sm text-red-100/90 max-w-lg mb-2 leading-relaxed">
+            La pagina o la modalità a schermo intero è stata abbandonata durante lo svolgimento della prova
+            {lockReason ? ` (${lockReason})` : ""}. Le risposte salvate finora sono al sicuro.
           </p>
 
-          <div className="w-full max-w-xs space-y-2">
-            <div className="flex items-center gap-2">
-              <KeyRound className="w-4 h-4 text-amber-300 shrink-0" />
-              <input
-                type="text"
-                inputMode="numeric"
-                autoComplete="off"
-                maxLength={6}
-                value={lockCodeInput}
-                onChange={(e) => {
-                  setLockCodeInput(e.target.value);
-                  setLockError("");
-                }}
-                onKeyDown={(e) => {
-                  if (e.key === "Enter") handleUnlockCodeSubmit();
-                }}
-                placeholder="Codice di sblocco docente"
-                className="flex-1 px-3 py-2.5 rounded-xl bg-slate-900 border border-white/15 text-white text-sm font-mono text-center tracking-[0.3em] outline-none focus:border-amber-400"
-              />
-            </div>
-            {lockError && (
-              <p className="text-[11px] text-red-300 bg-red-500/10 border border-red-500/30 rounded-xl p-2 leading-relaxed">
-                {lockError}
+          <div className="w-full max-w-md bg-slate-900/90 border border-white/10 rounded-2xl p-5 my-3 space-y-3 text-left shadow-2xl">
+            <div className="flex items-center gap-3">
+              <span className="relative flex h-3.5 w-3.5 shrink-0">
+                <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                <span className="relative inline-flex rounded-full h-3.5 w-3.5 bg-emerald-500"></span>
+              </span>
+              <p className="text-xs font-bold text-emerald-300">
+                In attesa dello sblocco da parte del docente...
               </p>
-            )}
-            <button
-              type="button"
-              onClick={handleUnlockCodeSubmit}
-              className="w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold rounded-xl transition-all shadow-lg flex items-center justify-center gap-2 cursor-pointer active:scale-[0.98]"
-            >
-              <Unlock className="w-4 h-4" />
-              Sblocca con il codice docente
-            </button>
+            </div>
+            <p className="text-xs text-slate-300 leading-relaxed">
+              Avvisa il docente: sbloccherà la tua prova <b>con 1 click direttamente dal Monitor d'Aula</b> della sua postazione, senza bisogno di codici.
+            </p>
+            <div className="flex items-center gap-2 pt-2 border-t border-white/5 text-[11px] text-slate-400 font-mono">
+              <Wifi className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+              <span>Sincronizzazione real-time attiva: la schermata ripartirà automaticamente.</span>
+            </div>
           </div>
+
+          <p className="text-[11px] text-slate-500 max-w-sm leading-relaxed">
+            Non chiudere o ricaricare la pagina: appena il docente preme "Sblocca", riprenderai subito da dove eri rimasto.
+          </p>
         </div>
       )}
 

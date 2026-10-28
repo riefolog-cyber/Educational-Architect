@@ -538,7 +538,7 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
   return formatItalianScholasticGrade(finalGrade);
 };
 
-import { weightedOpenAverage } from "./src/utils";
+import { weightedOpenAverage, computeGradeBreakdown } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
@@ -736,6 +736,14 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         evaluation.suggestedGrade = mathGrade;
         evaluation.openEndedDetails = [];
         evaluation.evaluationMode = "ai";
+        evaluation.gradeBreakdown = computeGradeBreakdown({
+          tipo: "Quiz",
+          examData: report.domande,
+          answers: report.risposte,
+          evaluation,
+          punteggioMC: mcScore,
+          votoSuggerito: mathGrade
+        });
         return evaluation;
       } catch (aiErr) {
         // Fallback deterministico: se l'IA non è disponibile o fallisce, il voto
@@ -749,7 +757,14 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
           mainErrors: wrongSummary,
           openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
           openEndedDetails: [],
-          evaluationMode: "deterministic"
+          evaluationMode: "deterministic",
+          gradeBreakdown: computeGradeBreakdown({
+            tipo: "Quiz",
+            examData: report.domande,
+            answers: report.risposte,
+            punteggioMC: mcScore,
+            votoSuggerito: mathGrade
+          })
         };
       }
     }
@@ -833,6 +848,14 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       const oeScores = hasOeDetails ? [oeMean] : [];
       evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
       evaluation.evaluationMode = "ai";
+      evaluation.gradeBreakdown = computeGradeBreakdown({
+        tipo: "Quiz",
+        examData: report.domande,
+        answers: report.risposte,
+        evaluation,
+        punteggioMC: mcScore,
+        votoSuggerito: evaluation.suggestedGrade
+      });
       return evaluation;
     } catch (aiErr) {
       console.warn("[evaluate] Fallback deterministico quiz con aperte:", aiErr?.message || aiErr);
@@ -850,7 +873,14 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
           ? `Valutazione deterministica (riserva senza IA): punteggio MC ${mcScore}/${mcCount}, voto scolastico ${fallbackGrade}. Le domande aperte vanno revisionate manualmente dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`
           : `Valutazione deterministica (riserva senza IA): la prova non ha domande a scelta multipla, quindi nessun voto è stato calcolato automaticamente. Le domande aperte vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
         openEndedDetails: [],
-        evaluationMode: "deterministic"
+        evaluationMode: "deterministic",
+        gradeBreakdown: computeGradeBreakdown({
+          tipo: "Quiz",
+          examData: report.domande,
+          answers: report.risposte,
+          punteggioMC: mcScore,
+          votoSuggerito: fallbackGrade
+        })
       };
     }
 
@@ -1005,6 +1035,14 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       evaluation.suggestedGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, rqScores);
       evaluation.fibScore = fibScore;
       evaluation.evaluationMode = "ai";
+      evaluation.gradeBreakdown = computeGradeBreakdown({
+        tipo: "Workbook",
+        examData: report.domande,
+        answers: report.risposte,
+        evaluation,
+        punteggioFIB: fibScore,
+        votoSuggerito: evaluation.suggestedGrade
+      });
       return evaluation;
     } catch (aiErr: any) {
       console.warn("[evaluate] Fallback deterministico workbook con riflessioni:", aiErr?.message || aiErr);
@@ -1018,7 +1056,14 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
           : `Valutazione deterministica (riserva senza IA): la prova non ha frasi da completare, quindi nessun voto è stato calcolato automaticamente. Le riflessioni vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
         reflectionDetails: [],
         fibScore: fibScore,
-        evaluationMode: "deterministic"
+        evaluationMode: "deterministic",
+        gradeBreakdown: computeGradeBreakdown({
+          tipo: "Workbook",
+          examData: report.domande,
+          answers: report.risposte,
+          punteggioFIB: fibScore,
+          votoSuggerito: fallbackGrade
+        })
       };
     }
   }
