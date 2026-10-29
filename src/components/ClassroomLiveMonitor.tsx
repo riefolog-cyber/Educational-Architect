@@ -171,19 +171,31 @@ export default function ClassroomLiveMonitor({
     return `${Math.floor(diffSec / 60)}m fa`;
   };
 
-  // Filter students
-  const filteredStudents = resolvedStudents.filter(s => {
-    const matchesSearch = 
-      s.studentName.toLowerCase().includes(search.toLowerCase()) ||
-      s.studentEmail.toLowerCase().includes(search.toLowerCase());
+  // Filter and prioritize students (locked students first so teacher sees them immediately)
+  const filteredStudents = resolvedStudents
+    .filter((s) => {
+      const matchesSearch =
+        s.studentName.toLowerCase().includes(search.toLowerCase()) ||
+        s.studentEmail.toLowerCase().includes(search.toLowerCase());
 
-    if (!matchesSearch) return false;
+      if (!matchesSearch) return false;
 
-    if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
-    if (filter === "submitted") return s.status === "submitted";
-    if (filter === "alerts") return s.tabSwitches > 0 || s.pasteAttempts > 0;
-    return s.status !== "offline";
-  });
+      if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
+      if (filter === "submitted") return s.status === "submitted";
+      if (filter === "alerts") return s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0;
+      return s.status !== "offline";
+    })
+    .sort((a, b) => {
+      // 1. Locked students always float to the top
+      if (a.locked && !b.locked) return -1;
+      if (!a.locked && b.locked) return 1;
+      // 2. Active alerts
+      const aAlerts = a.tabSwitches > 0 || a.pasteAttempts > 0 ? 1 : 0;
+      const bAlerts = b.tabSwitches > 0 || b.pasteAttempts > 0 ? 1 : 0;
+      if (bAlerts !== aAlerts) return bAlerts - aAlerts;
+      // 3. Alphabetical
+      return (a.studentName || "").localeCompare(b.studentName || "");
+    });
 
   const handleClearRoom = async () => {
     if (!dbFirestore || !pin || clearing) return;

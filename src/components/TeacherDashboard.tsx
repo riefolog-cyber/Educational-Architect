@@ -298,10 +298,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // View mode: "chronological" (individual submissions), "by_student" (aggregated by student), or "by_exam" (grouped by test/session)
   const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam">("chronological");
-  const [studentSortBy, setStudentSortBy] = useState<"highest_avg" | "lowest_avg" | "most_tests" | "name_asc" | "recent">("highest_avg");
-  const [examSortBy, setExamSortBy] = useState<"highest_avg" | "recent" | "most_students" | "pin_asc" | "highest_pass_rate">("highest_avg");
-  const [chronologicalSortBy, setChronologicalSortBy] = useState<"grade_desc" | "grade_asc" | "recent" | "name_asc" | "violations_desc">("grade_desc");
-  const [examRosterSort, setExamRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("grade_desc");
+  const [studentSortBy, setStudentSortBy] = useState<"highest_avg" | "lowest_avg" | "most_tests" | "name_asc" | "recent">("recent");
+  const [examSortBy, setExamSortBy] = useState<"highest_avg" | "recent" | "most_students" | "pin_asc" | "highest_pass_rate">("recent");
+  const [chronologicalSortBy, setChronologicalSortBy] = useState<"grade_desc" | "grade_asc" | "recent" | "name_asc" | "violations_desc">("recent");
+  const [examRosterSort, setExamRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("recent");
   const [expandedStudentKey, setExpandedStudentKey] = useState<string | null>(null);
   const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
   const [copiedExamPin, setCopiedExamPin] = useState<string | null>(null);
@@ -655,12 +655,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
     const teacherEmail = user?.email || "anon";
+    // Optimistic UI removal so the list updates immediately without delay
+    setLibrary(prev => prev.filter(it => it.id !== item.id));
     try {
       await deleteLibraryExam(teacherEmail, item.id);
       await loadLibrary();
-      setLibraryMsg(`🗑️ "${item.title}" eliminata dalla libreria.`);
+      setLibraryMsg(`🗑️ "${item.title}" eliminata definitivamente dalla libreria.`);
     } catch (e: any) {
       setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore locale"}.`);
+      await loadLibrary();
     }
   };
 
@@ -3620,6 +3623,25 @@ const fibImg = domandeObj?.images?.[fib.id];
                   <div className="flex gap-2 shrink-0 flex-wrap">
                     <button
                       onClick={() => {
+                        setChronologicalSortBy("recent");
+                        setStudentSortBy("recent");
+                        setExamRosterSort("recent");
+                        setExamSortBy("recent");
+                      }}
+                      className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
+                        (submissionViewMode === "chronological" && chronologicalSortBy === "recent") ||
+                        (submissionViewMode === "by_student" && studentSortBy === "recent") ||
+                        (submissionViewMode === "by_exam" && examRosterSort === "recent")
+                          ? "bg-indigo-600/30 border-indigo-500/50 text-indigo-200 shadow-sm font-bold"
+                          : "bg-slate-950/50 border-white/10 text-slate-400 hover:text-white"
+                      }`}
+                      title="Ordina l'elenco per data e ora di consegna più recente (predefinito)"
+                    >
+                      <Clock className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>🕒 Più Recenti</span>
+                    </button>
+                    <button
+                      onClick={() => {
                         setChronologicalSortBy("grade_desc");
                         setStudentSortBy("highest_avg");
                         setExamRosterSort("grade_desc");
@@ -4419,13 +4441,24 @@ const fibImg = domandeObj?.images?.[fib.id];
                         </span>
                       </div>
                     )}
+                    {chronologicalSortBy === "recent" && (
+                      <div className="flex items-center justify-between px-3.5 py-2 bg-indigo-500/10 border border-indigo-500/20 rounded-xl text-indigo-300 text-xs font-semibold">
+                        <span className="flex items-center gap-2">
+                          <Clock className="w-4 h-4 text-indigo-400" />
+                          <span>Elenco ordinato per <b>Consegne più recenti</b> (ultimi elaborati ricevuti in alto)</span>
+                        </span>
+                        <span className="text-[11px] text-indigo-400/80 font-mono">
+                          {filteredSubmissions.length} {filteredSubmissions.length === 1 ? "elaborato" : "elaborati"}
+                        </span>
+                      </div>
+                    )}
                     <div className="overflow-x-auto border border-white/5 rounded-2xl">
                       <table className="w-full text-left border-collapse text-xs">
                         <thead>
                           <tr className="bg-slate-950/80 text-slate-400 uppercase tracking-wider font-bold text-[10px] border-b border-white/5 select-none">
                             <th className="p-2 sm:p-3 text-center w-12">#</th>
                             <th 
-                              onClick={() => setChronologicalSortBy(prev => prev === "name_asc" ? "grade_desc" : "name_asc")}
+                              onClick={() => setChronologicalSortBy(prev => prev === "name_asc" ? "recent" : "name_asc")}
                               className="p-2 sm:p-3 cursor-pointer hover:text-white transition-colors"
                               title="Clicca per ordinare per nome studente (A-Z)"
                             >
@@ -4440,8 +4473,8 @@ const fibImg = domandeObj?.images?.[fib.id];
                               title="Clicca per ordinare per data consegna più recente"
                             >
                               <span className="inline-flex items-center gap-1">
-                                <span>Tipologia</span>
-                                {chronologicalSortBy === "recent" && <span className="text-teal-400 font-bold">↓</span>}
+                                <span>Tipologia / Consegna</span>
+                                {chronologicalSortBy === "recent" && <span className="text-indigo-400 font-bold">↓</span>}
                               </span>
                             </th>
                             <th 

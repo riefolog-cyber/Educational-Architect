@@ -322,8 +322,10 @@ export function computeGradeBreakdown(params: {
     const objOutOf10 = objFraction * 10;
     const objPoints = objOutOf10 * 0.40;
 
-    const subjSum = subjectiveScores.reduce((a, b) => a + b, 0);
-    const subjAvg = subjSum / subjectiveScores.length;
+    const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + (d.weight || 1), 0);
+    const subjWeightedSum = subjectiveDetails.reduce((a, d) => a + d.score * (d.weight || 1), 0);
+    const hasCustomWeights = subjectiveDetails.some(d => (d.weight || 1) !== 1);
+    const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
     const subjPoints = subjAvg * 0.60;
 
     finalNumeric = Math.min(10, Math.max(0, objPoints + subjPoints));
@@ -354,9 +356,11 @@ export function computeGradeBreakdown(params: {
       pointsEarned: Math.round(subjPoints * 100) / 100,
     };
 
+    const subjAvgLabel = hasCustomWeights ? `Media ponderata pesi didattici: ${subjAvg.toFixed(2)}/10` : `Media voti: ${subjAvg.toFixed(2)}/10`;
+
     explanationLines.push(
       `1. Parte Oggettiva (${objName}): ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 40% → ${objPoints.toFixed(2)} punti.`,
-      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. Media voti: ${subjAvg.toFixed(2)}/10. Incidenza 60% → ${subjPoints.toFixed(2)} punti.`,
+      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. ${subjAvgLabel}. Incidenza 60% → ${subjPoints.toFixed(2)} punti.`,
       `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
 
@@ -388,14 +392,18 @@ export function computeGradeBreakdown(params: {
 
   } else if (hasSubj) {
     // Pure Subjective: 100%
-    const subjSum = subjectiveScores.reduce((a, b) => a + b, 0);
-    const subjAvg = subjSum / subjectiveScores.length;
+    const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + (d.weight || 1), 0);
+    const subjWeightedSum = subjectiveDetails.reduce((a, d) => a + d.score * (d.weight || 1), 0);
+    const hasCustomWeights = subjectiveDetails.some(d => (d.weight || 1) !== 1);
+    const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
     finalNumeric = Math.min(10, Math.max(0, subjAvg));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
 
     const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
-    formulaTitle = "Media Aritmetica dei Voti Singoli (100% Aperte)";
-    formulaSummary = `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjSum.toFixed(1)} / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
+    formulaTitle = hasCustomWeights ? "Media Ponderata dei Voti Singoli (Pesi Didattici)" : "Media Aritmetica dei Voti Singoli (100% Aperte)";
+    formulaSummary = hasCustomWeights
+      ? `Somma pesata (${subjWeightedSum.toFixed(2)}) / Pesi totali (${totalSubjWeight}) = ${subjAvg.toFixed(2)} / 10`
+      : `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
 
     subjPart = {
       name: subjName,
@@ -407,9 +415,9 @@ export function computeGradeBreakdown(params: {
     };
 
     explanationLines.push(
-      `Prova esclusivamente a risposte aperte: il voto è dato dalla media dei voti assegnati ai singoli quesiti.`,
-      `Voti singoli quesiti: [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}].`,
-      `Formula della media: (${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)}/10 → Voto scolastico assegnato: ${finalGradeFormatted}.`
+      `Prova esclusivamente a risposte aperte: il voto è dato dalla ${hasCustomWeights ? "media ponderata (in base ai pesi didattici impostati dal docente)" : "media aritmetica"} dei singoli quesiti.`,
+      `Voti singoli quesiti: [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10${subjectiveDetails[i]?.weight && subjectiveDetails[i].weight !== 1 ? ` (peso ${subjectiveDetails[i].weight})` : ""}`).join(", ")}].`,
+      `Formula: ${formulaSummary} → Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
   } else {
     finalGradeFormatted = params.votoSuggerito || "N.V.";

@@ -596,6 +596,9 @@ function purgeOldJobs(now = Date.now()) {
   }
 }
 
+// Periodic cleanup timer every 5 minutes to continuously prevent memory leaks
+setInterval(() => purgeOldJobs(), 5 * 60 * 1000);
+
 // Hash mapping cache for preventing duplicate active evaluations from clicking submit twice or network drops
 const reqToJobCache = new Map<string, string>();
 
@@ -941,6 +944,15 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         evaluation.suggestedGrade = mathGrade;
         evaluation.fibScore = fibScore;
         evaluation.reflectionDetails = [];
+        evaluation.evaluationMode = "ai";
+        evaluation.gradeBreakdown = computeGradeBreakdown({
+          tipo: "Workbook",
+          examData: report.domande,
+          answers: report.risposte,
+          evaluation,
+          punteggioFIB: fibScore,
+          votoSuggerito: mathGrade
+        });
         return evaluation;
       } catch (aiErr: any) {
         console.warn("[evaluate] Fallback deterministico workbook di soli completamenti:", aiErr?.message || aiErr);
@@ -951,7 +963,14 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
           overallFeedback: `Valutazione deterministica (riserva senza IA): frasi completate correttamente ${fibScore}/${fibCount}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
           reflectionDetails: [],
           fibScore: fibScore,
-          evaluationMode: "deterministic"
+          evaluationMode: "deterministic",
+          gradeBreakdown: computeGradeBreakdown({
+            tipo: "Workbook",
+            examData: report.domande,
+            answers: report.risposte,
+            punteggioFIB: fibScore,
+            votoSuggerito: reserveGrade
+          })
         };
       }
     }

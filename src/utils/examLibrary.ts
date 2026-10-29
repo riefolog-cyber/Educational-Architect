@@ -258,12 +258,16 @@ export async function fetchExamFromSessionPin(pin: string): Promise<ExamLibraryI
 
 export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
-  const items = readAll(normEmail);
+  const deleted = getDeletedSessionIds();
+  const items = readAll(normEmail).filter(
+    (it) => !deleted.has(it.id) && !deleted.has(it.id.replace("session_", ""))
+  );
 
   // Sync active sessions from Firestore so teacher never loses activated exams
   try {
     const cloudSessions = await syncActiveSessionsToLibrary(normEmail);
     for (const cs of cloudSessions) {
+      if (deleted.has(cs.id) || deleted.has(cs.id.replace("session_", ""))) continue;
       const alreadyPresent = items.some(
         (it) => it.id === cs.id || (it.title.toLowerCase() === cs.title.toLowerCase() && it.questionCount === cs.questionCount)
       );
@@ -311,14 +315,15 @@ export async function deleteLibraryExam(teacherEmail: string, id: string): Promi
     }
   } catch {}
 
-  // 2. Track deleted session IDs so cloud auto-sync doesn't resurrect intentionally deleted sessions
-  if (id.startsWith("session_") || id.startsWith("cloud_")) {
-    try {
-      const deleted = getDeletedSessionIds();
-      deleted.add(id);
-      localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...deleted]));
-    } catch {}
-  }
+  // 2. Track deleted IDs so cloud auto-sync and readAll never resurrect intentionally deleted items
+  try {
+    const deleted = getDeletedSessionIds();
+    deleted.add(id);
+    if (id.startsWith("session_")) {
+      deleted.add(id.replace("session_", ""));
+    }
+    localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...deleted]));
+  } catch {}
 }
 
 export function formatLibraryDate(iso: string): string {
