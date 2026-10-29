@@ -750,6 +750,30 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             };
           }
 
+          // Reciprocal safeguard: If examContent is a Workbook (has sections) and has openEnded at root,
+          // migrate them into the last section's reflectionQuestions so they are rendered and evaluated!
+          if (examContent && Array.isArray(examContent.sections) && examContent.sections.length > 0 && Array.isArray(examContent.openEnded) && examContent.openEnded.length > 0) {
+            const sectionsCopy = [...examContent.sections];
+            const targetSec = { ...sectionsCopy[sectionsCopy.length - 1] };
+            const existingRQ = Array.isArray(targetSec.reflectionQuestions) ? [...targetSec.reflectionQuestions] : [];
+            for (const oe of examContent.openEnded) {
+              if (!existingRQ.some((rq: any) => rq.id === oe.id || rq.question === oe.question)) {
+                existingRQ.push({
+                  id: oe.id || `ref_${existingRQ.length + 1}`,
+                  question: oe.question,
+                  criteria: oe.criteria || oe.criteri,
+                  weight: oe.weight || 1
+                });
+              }
+            }
+            targetSec.reflectionQuestions = existingRQ;
+            sectionsCopy[sectionsCopy.length - 1] = targetSec;
+            examContent = {
+              ...examContent,
+              sections: sectionsCopy
+            };
+          }
+
           // Anti-cheat: Randomize questions and options if enabled by teacher
           if (sessionData.randomizeQuestions && examContent?.multipleChoice) {
             const shuffledMC = examContent.multipleChoice.map((q: any) => {

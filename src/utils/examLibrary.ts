@@ -94,12 +94,17 @@ export function sanitizeWorkbookExamJson(rawJson: string): string {
   }
 }
 
+function cleanExamTitle(t: string): string {
+  return (t || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+}
+
 function readAll(teacherEmail: string): ExamLibraryItem[] {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
   const items: ExamLibraryItem[] = [];
   const seenIds = new Set<string>();
+  const seenTitles = new Set<string>();
 
-  // 1. Primary email bucket
+  // 1. Primary email bucket (authoritative)
   try {
     const raw = localStorage.getItem(keyFor(normEmail));
     if (raw) {
@@ -107,7 +112,10 @@ function readAll(teacherEmail: string): ExamLibraryItem[] {
       if (Array.isArray(parsed)) {
         for (const item of parsed) {
           if (item && item.id && !seenIds.has(item.id)) {
+            const cleanT = cleanExamTitle(item.title);
+            if (cleanT && seenTitles.has(cleanT)) continue;
             seenIds.add(item.id);
+            if (cleanT) seenTitles.add(cleanT);
             const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
             items.push({ ...item, examJson: cleanedJson });
           }
@@ -128,7 +136,11 @@ function readAll(teacherEmail: string): ExamLibraryItem[] {
             if (Array.isArray(parsedOther)) {
               for (const it of parsedOther) {
                 if (it && it.id && !seenIds.has(it.id)) {
+                  const cleanT = cleanExamTitle(it.title);
+                  // Never add older duplicate from another bucket if primary bucket already has this title
+                  if (cleanT && seenTitles.has(cleanT)) continue;
                   seenIds.add(it.id);
+                  if (cleanT) seenTitles.add(cleanT);
                   const cleanedJson = it.examJson ? sanitizeWorkbookExamJson(it.examJson) : it.examJson;
                   items.push({ ...it, examJson: cleanedJson });
                 }
@@ -163,11 +175,16 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
     for (const s of examObj.sections) {
       n += (s.fillInTheBlank || []).length + (s.reflectionQuestions || []).length;
     }
+    // Also include any questions attached at root
+    if (Array.isArray(examObj.openEnded)) n += examObj.openEnded.length;
+    if (Array.isArray(examObj.multipleChoice)) n += examObj.multipleChoice.length;
     return { type: "Workbook", count: n };
   }
   const mc = Array.isArray(examObj?.multipleChoice) ? examObj.multipleChoice.length : 0;
   const oe = Array.isArray(examObj?.openEnded) ? examObj.openEnded.length : 0;
-  return { type: "Quiz", count: mc + oe };
+  const rq = Array.isArray(examObj?.reflectionQuestions) ? examObj.reflectionQuestions.length : 0;
+  const generic = Array.isArray(examObj?.questions) ? examObj.questions.length : (Array.isArray(examObj?.domande) ? examObj.domande.length : 0);
+  return { type: "Quiz", count: mc + oe + rq + (mc === 0 && oe === 0 ? generic : 0) };
 }
 
 /**
@@ -268,11 +285,28 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
     const cloudSessions = await syncActiveSessionsToLibrary(normEmail);
     for (const cs of cloudSessions) {
       if (deleted.has(cs.id) || deleted.has(cs.id.replace("session_", ""))) continue;
-      const alreadyPresent = items.some(
-        (it) => it.id === cs.id || (it.title.toLowerCase() === cs.title.toLowerCase() && it.questionCount === cs.questionCount)
-      );
-      if (!alreadyPresent) {
+      const csCleanTitle = (cs.title || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+      const csPin = cs.id.replace("session_", "").trim().toLowerCase();
+
+      // Check if this session is already represented in local library (by ID, PIN or title)
+      const existingMatch = items.find((it) => {
+        if (it.id === cs.id) return true;
+        const itPin = it.id.startsWith("session_") ? it.id.replace("session_", "").trim().toLowerCase() : "";
+        if (csPin && itPin && csPin === itPin) return true;
+        const itCleanTitle = (it.title || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+        return itCleanTitle && csCleanTitle && itCleanTitle === csCleanTitle;
+      });
+
+      if (!existingMatch) {
         items.push(cs);
+      } else {
+        // If the cloud session has strictly more questions than the local representation,
+        // sync the cloud content forward. Otherwise, preserve the locally updated version.
+        if (cs.questionCount > existingMatch.questionCount) {
+          existingMatch.examJson = cs.examJson;
+          existingMatch.questionCount = cs.questionCount;
+          existingMatch.updatedAt = cs.updatedAt;
+        }
       }
     }
   } catch (syncErr) {
@@ -283,14 +317,56 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
   return items;
 }
 
-export async function saveLibraryExam(item: NewLibraryExam): Promise<string> {
+export async function saveLibraryExam(
+  item: NewLibraryExam,
+  targetId?: string
+): Promise<string> {
   const now = new Date().toISOString();
-  const id = `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   const normEmail = (item.teacherEmail || "anon").toLowerCase().trim();
   const items = readAll(normEmail);
-  items.unshift({ ...item, teacherEmail: normEmail, id, createdAt: now, updatedAt: now });
-  writeAll(normEmail, items);
-  return id;
+
+  // Clean the title for comparison (e.g. ignore "(PIN ...)")
+  const cleanTitle = (item.title || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+
+  // Find if an item with the same targetId or same clean title already exists in the library
+  let existingIndex = -1;
+  if (targetId) {
+    existingIndex = items.findIndex((it) => it.id === targetId);
+  }
+  if (existingIndex === -1 && cleanTitle) {
+    existingIndex = items.findIndex((it) => {
+      const itCleanTitle = (it.title || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+      return itCleanTitle === cleanTitle;
+    });
+  }
+
+  let finalId = targetId || `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
+  if (existingIndex >= 0) {
+    // In-place update: preserve identity, update JSON and question count!
+    finalId = items[existingIndex].id;
+    items[existingIndex] = {
+      ...items[existingIndex],
+      ...item,
+      id: finalId,
+      teacherEmail: normEmail,
+      updatedAt: now,
+    };
+    // Deduplicate any stale entries with the same title or ID to prevent ghost duplicates
+    const deduplicated = items.filter((it, idx) => {
+      if (idx === existingIndex) return true;
+      if (it.id === finalId) return false;
+      const otherClean = (it.title || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+      return otherClean !== cleanTitle;
+    });
+    writeAll(normEmail, deduplicated);
+  } else {
+    // Add new library item
+    items.unshift({ ...item, teacherEmail: normEmail, id: finalId, createdAt: now, updatedAt: now });
+    writeAll(normEmail, items);
+  }
+
+  return finalId;
 }
 
 export async function deleteLibraryExam(teacherEmail: string, id: string): Promise<void> {

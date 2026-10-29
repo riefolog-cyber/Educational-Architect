@@ -254,6 +254,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [libraryLoading, setLibraryLoading] = useState(false);
   const [librarySaving, setLibrarySaving] = useState(false);
   const [libraryMsg, setLibraryMsg] = useState<string | null>(null);
+  const [loadedLibraryItemId, setLoadedLibraryItemId] = useState<string | null>(null);
   const [recoverPinInput, setRecoverPinInput] = useState("");
   const [isRecoveringPin, setIsRecoveringPin] = useState(false);
   const libraryImportRef = useRef<HTMLInputElement | null>(null);
@@ -545,10 +546,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // ---- Exam library (browser localStorage): save / load / delete reusable exams ----
   const loadLibrary = async () => {
-    if (!user?.email) return;
+    const emailToUse = user?.email || "docente_sandbox@scuola.it";
     setLibraryLoading(true);
     try {
-      const items = await listLibraryExams(user.email);
+      const items = await listLibraryExams(emailToUse);
       setLibrary(items);
     } catch (e: any) {
       console.warn("Libreria verifiche non caricata:", e);
@@ -563,12 +564,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   }, [user?.email]);
 
   const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
-    if (!user?.email) {
-      alert("⚠️ Devi aver effettuato l'accesso come docente per salvare in libreria.");
-      return;
-    }
+    const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const raw = (jsonOverride ?? jsonText).trim();
-    const title = (titleOverride ?? materia).trim() || "Verifica senza titolo";
     if (!raw) {
       alert("⚠️ Niente da salvare: l'editor è vuoto.");
       return;
@@ -584,27 +581,98 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       alert("⚠️ Il contenuto non è un esame valido.");
       return;
     }
+
+    const title = (titleOverride || materia || parsed?.title || "Verifica senza titolo").trim();
+    if (!materia.trim() && title !== "Verifica senza titolo") {
+      setMateria(title);
+    }
+
     setLibrarySaving(true);
     setLibraryMsg(null);
     try {
+      // Ensure title is present on the parsed object
+      if (!parsed.title && title) {
+        parsed.title = title;
+      }
+
+      // Normalization safeguard: If Workbook (sections) and root openEnded exists,
+      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated
+      if (Array.isArray(parsed.sections) && parsed.sections.length > 0 && Array.isArray(parsed.openEnded) && parsed.openEnded.length > 0) {
+        const lastSec = parsed.sections[parsed.sections.length - 1];
+        if (lastSec) {
+          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+          for (const oe of parsed.openEnded) {
+            if (!lastSec.reflectionQuestions.some((rq: any) => rq.id === oe.id || rq.question === oe.question)) {
+              lastSec.reflectionQuestions.push({
+                id: oe.id || `ref_${lastSec.reflectionQuestions.length + 1}`,
+                question: oe.question,
+                criteria: oe.criteria || oe.criteri,
+                weight: oe.weight || 1
+              });
+            }
+          }
+        }
+      }
+
+      // Normalization safeguard: If Quiz (no sections) and reflectionQuestions exists at root,
+      // migrate them into openEnded
+      if (!parsed.sections && Array.isArray(parsed.reflectionQuestions) && parsed.reflectionQuestions.length > 0) {
+        if (!Array.isArray(parsed.openEnded)) parsed.openEnded = [];
+        for (const rq of parsed.reflectionQuestions) {
+          if (!parsed.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
+            parsed.openEnded.push({
+              id: rq.id || `q_ref_${parsed.openEnded.length + 1}`,
+              question: rq.question,
+              criteria: rq.criteria || rq.criteri,
+              weight: rq.weight || 1
+            });
+          }
+        }
+        delete parsed.reflectionQuestions;
+      }
+
       const { type, count } = countLibraryQuestions(parsed);
-      const formatted = JSON.stringify(
-        parsed.sections
-          ? { title: parsed.title || title, sections: parsed.sections, ...(parsed.images ? { images: parsed.images } : {}) }
-          : { title: parsed.title || title, multipleChoice: parsed.multipleChoice || [], openEnded: parsed.openEnded || [], ...(parsed.images ? { images: parsed.images } : {}) },
-        null,
-        2
+      // PRESERVE ALL ORIGINAL & NEW QUESTIONS: serialize the entire parsed object!
+      const formatted = JSON.stringify(parsed, null, 2);
+
+      const savedId = await saveLibraryExam(
+        {
+          teacherEmail: effectiveEmail,
+          title,
+          examType: type,
+          examJson: formatted,
+          source,
+          questionCount: count,
+        },
+        loadedLibraryItemId || undefined
       );
-      await saveLibraryExam({
-        teacherEmail: user.email,
-        title,
-        examType: type,
-        examJson: formatted,
-        source,
-        questionCount: count,
-      });
+
+      setLoadedLibraryItemId(savedId);
+
+      // Keep cloud active session in sync if a PIN is assigned and exists in Firestore
+      const targetPin = pin.trim().toUpperCase();
+      if (dbFirestore && targetPin) {
+        try {
+          const sessionRef = doc(dbFirestore, "active_sessions", targetPin);
+          const snap = await getDoc(sessionRef);
+          if (snap.exists()) {
+            const sessData = snap.data();
+            if (!sessData.teacherEmail || sessData.teacherEmail === user.email || sessData.teacherId === user.uid) {
+              await setDoc(sessionRef, {
+                ...sessData,
+                data: parsed,
+                title: parsed.title || title,
+                updatedAt: new Date().toISOString()
+              }, { merge: true });
+            }
+          }
+        } catch (cloudErr) {
+          console.warn("Sincronizzazione sessione cloud non riuscita (non bloccante):", cloudErr);
+        }
+      }
+
       await loadLibrary();
-      setLibraryMsg(`✅ "${title}" salvata in libreria su questo browser (${count} quesiti). La ritrovi qui per riusarla con altre classi.`);
+      setLibraryMsg(`✅ "${title}" salvata in libreria con ${count} quesiti completi (tutte le aggiunte salvate).`);
     } catch (e: any) {
       setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "spazio locale esaurito"}.`);
     } finally {
@@ -613,6 +681,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   const handleLoadLibraryItem = (item: ExamLibraryItem) => {
+    setLoadedLibraryItemId(item.id);
     const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
     setJsonText(sanitizedJson);
     if (item.title) {
@@ -625,7 +694,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (pinFromId) setPin(pinFromId);
     }
     validateExamJSON(sanitizedJson);
-    setLibraryMsg(`📥 "${item.title}" caricata nell'editor: imposta PIN e scadenza e premi Avvia Sessione Live.`);
+    setLibraryMsg(`📥 "${item.title}" (${item.questionCount} quesiti) caricata nell'editor: pronta per modifiche o avvio sessione.`);
   };
 
   const handleFetchExamByPin = async (customPin?: string) => {
@@ -721,6 +790,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     reader.onload = (event) => {
       const text = event.target?.result as string;
       setJsonText(text);
+      try {
+        const parsed = JSON.parse(text);
+        if (parsed.title && !materia.trim()) {
+          setMateria(parsed.title);
+        }
+      } catch {}
       const valid = validateExamJSON(text);
       if (!valid && canAutoCorrectStructure(text)) {
         // Automatically attempt repair on upload with clear notice!
@@ -1030,6 +1105,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (data.status === "success" && data.extendedJson) {
         setJsonText(data.extendedJson);
         validateExamJSON(data.extendedJson);
+        try {
+          const parsed = JSON.parse(data.extendedJson);
+          if (parsed.title && (!materia.trim() || materia === "Verifica senza titolo")) {
+            setMateria(parsed.title);
+          }
+        } catch {}
         setLastExtensionResult({
           summary: data.summary || "Contenuti aggiunti con successo all'esame!",
           addedItems: data.addedItems || []
@@ -2885,6 +2966,21 @@ const fibImg = domandeObj?.images?.[fib.id];
                         </div>
                       </div>
                     )}
+
+                    <div className="pt-2 border-t border-emerald-500/20 flex flex-wrap items-center justify-between gap-2">
+                      <button
+                        type="button"
+                        onClick={() => handleSaveToLibrary("Editor + IA")}
+                        disabled={librarySaving}
+                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer transition-all shadow-md shadow-emerald-600/20 disabled:opacity-50"
+                      >
+                        <PlusCircle className="w-3.5 h-3.5" />
+                        <span>{librarySaving ? "Salvataggio..." : "Salva l'esame aggiornato in Libreria"}</span>
+                      </button>
+                      <span className="text-[10px] text-emerald-400 font-medium">
+                        ✓ Contenuti integrati nell'editor
+                      </span>
+                    </div>
                   </div>
                 )}
 

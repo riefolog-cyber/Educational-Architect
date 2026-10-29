@@ -1544,44 +1544,40 @@ app.all("/api/extend-exam-json", async (req, res) => {
   }
 
   try {
-    let parsedInput: any = null;
+    let baseExam: any = null;
     try {
-      parsedInput = JSON.parse(examJson);
-    } catch {}
-    const isInputWorkbook = !!(parsedInput && Array.isArray(parsedInput.sections));
+      baseExam = JSON.parse(examJson);
+    } catch {
+      try {
+        baseExam = parseJsonResponse(examJson);
+      } catch {}
+    }
+    if (!baseExam || typeof baseExam !== "object") {
+      baseExam = { title: "Verifica", multipleChoice: [], openEnded: [] };
+    }
+
+    const isInputWorkbook = !!(baseExam.sections && Array.isArray(baseExam.sections));
 
     const response = await generateWithRetry({
       model: "gemini-3.1-flash-lite",
       models: TASK_MODEL_PREFERENCE["extend-exam"],
-      contents: `Esame attuale (JSON caricato dal docente):\n${examJson}\n\nCosa aggiungere all'esame:\n${instruction.trim()}\nTipo di contenuto preferito: ${additionType || "automatico/misto"}`,
+      contents: `Esame attuale caricato dal docente:\n${examJson}\n\nRichiesta del docente (cosa aggiungere di NUOVO):\n${instruction.trim()}\nTipo di contenuto: ${additionType || "automatico/misto"}`,
       config: {
-        systemInstruction: `Sei un esperto docente e progettista didattico per la scuola secondaria di secondo grado italiana.
-Ricevi l'esame scolastico attuale in formato JSON e una richiesta del docente su cosa AGGIUNGERE di nuovo all'esame che NON è contenuto nel JSON caricato.
+        systemInstruction: `Sei un docente e progettista didattico esperto della scuola secondaria italiana.
+Il tuo compito è generare ESCLUSIVAMENTE I NUOVI CONTENUTI RICHIESTI dal docente da aggiungere all'esame, coerenti con l'argomento e il livello scolastico.
 
-REGOLA ARCHITETTURALE FONDAMENTALE SULLA STRUTTURA:
-L'esame caricato è di tipo: ${isInputWorkbook ? "WORKBOOK (strutturato con 'sections', ciascuna con 'sintesi', 'fillInTheBlank' e 'reflectionQuestions')" : "QUIZ (strutturato con 'multipleChoice' per le domande chiuse e 'openEnded' per le domande aperte)"}
+STRUTTURA DELL'ESAME:
+- Tipo: ${isInputWorkbook ? "WORKBOOK (sezioni didattiche)" : "QUIZ (domande a risposta multipla e aperte)"}
 
-${!isInputWorkbook ? `⚠️ REGOLE CRITICHE PER I QUIZ:
-1. Nei Quiz, TUTTE le domande a risposta aperta (incluse le domande di riflessione critica, argomentazione, pensiero critico o giudizio personale) DEVONO TASSATIVAMENTE ESSERE INSERITE NELL'ARRAY 'openEnded' all'interno dell'oggetto esame!
-2. NON creare un array 'reflectionQuestions' alla radice di un Quiz (questo campo è riservato solo alle sezioni dei Workbook e se messo alla radice di un Quiz non viene visualizzato agli studenti).
-3. NON aggiungere 'sections' trasformando il Quiz in Workbook.
-4. Ogni domanda aggiunta in 'openEnded' deve avere una formulazione chiara, un id progressivo (es. q3, q4) e criteri docimologici di valutazione nel campo 'criteria'.` : `⚠️ REGOLE PER I WORKBOOK:
-1. Le domande di riflessione critica vanno inserite all'interno dell'array 'reflectionQuestions' della sezione appropriata (o di una nuova sezione con 'title' e 'sintesi').
-2. I completamenti vanno inseriti in 'fillInTheBlank'.`}
-
-I tuoi compiti:
-1. MANTENERE INTATTO L'ESISTENTE: Non eliminare MAI né modificare le domande, sezioni o contenuti già presenti nell'esame. Mantieni intatti i titoli, le opzioni e i testi esistenti.
-2. GENERARE I NUOVI CONTENUTI RICHIESTI:
-   - Se il docente chiede domande aperte o di riflessione in un Quiz: inseriscile in 'openEnded' con ID progressivi e criteri.
-   - Se il docente chiede domande a scelta multipla: inseriscile in 'multipleChoice' con 4 opzioni plausibili e 'correctIndex' (da 0 a 3).
-   - Se il docente chiede domande di riflessione in un Workbook: inseriscile in 'reflectionQuestions' all'interno delle 'sections'.
-3. RESTITUIRE IL RISULTATO:
-   - summary: Una sintesi chiara di cosa è stato aggiunto (es. "Aggiunta 1 domanda a risposta aperta di riflessione critica con criteri di valutazione").
-   - addedItems: Array di oggetti descrittivi di ciascun nuovo elemento aggiunto:
-     [{ "type": "open_ended" | "multiple_choice" | "reflection" | "section" | "criteria", "title": string, "previewText": string }]
-   - extendedJson: La stringa JSON formattata e serializzata dell'intero esame aggiornato (tutto l'esame precedente + tutti i nuovi elementi perfettamente integrati nel formato corretto).`,
-        temperature: 0.2,
-        maxOutputTokens: 8192,
+REGOLE TASSATIVE:
+1. Genera SOLO i nuovi quesiti da AGGIUNGERE. NON ripetere o riscrivere le domande già presenti nel JSON caricato.
+2. Se il docente chiede domande a scelta multipla: inseriscile in 'newMultipleChoice' con 'question', 4 'options' plausibili e 'correctIndex' (0-3).
+3. Se il docente chiede domande aperte o di riflessione in un Quiz: inseriscile in 'newOpenEnded' con 'question' articolata e chiara, e criteri docimologici analitici in 'criteria'.
+4. Se il docente chiede domande di riflessione in un Workbook: inseriscile in 'newReflectionQuestions' con 'question' e criteri in 'criteria'.
+5. Se il docente chiede una nuova sezione per un Workbook: inseriscila in 'newSections' con 'title', 'sintesi' e 'fillInTheBlank' o 'reflectionQuestions'.
+6. In 'addedItems', descrivi sinteticamente ciascun nuovo elemento aggiunto (tipo, titolo, previewText).`,
+        temperature: 0.3,
+        maxOutputTokens: 4096,
         responseMimeType: "application/json",
         responseSchema: {
           type: Type.OBJECT,
@@ -1599,9 +1595,75 @@ I tuoi compiti:
                 required: ["type", "title", "previewText"]
               }
             },
-            extendedJson: { type: Type.STRING }
+            newMultipleChoice: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  question: { type: Type.STRING },
+                  options: { type: Type.ARRAY, items: { type: Type.STRING } },
+                  correctIndex: { type: Type.INTEGER }
+                },
+                required: ["question", "options", "correctIndex"]
+              }
+            },
+            newOpenEnded: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  question: { type: Type.STRING },
+                  criteria: { type: Type.STRING }
+                },
+                required: ["question", "criteria"]
+              }
+            },
+            newReflectionQuestions: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  question: { type: Type.STRING },
+                  criteria: { type: Type.STRING }
+                },
+                required: ["question"]
+              }
+            },
+            newSections: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  title: { type: Type.STRING },
+                  sintesi: { type: Type.STRING },
+                  fillInTheBlank: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        sentence: { type: Type.STRING },
+                        answer: { type: Type.STRING }
+                      },
+                      required: ["sentence", "answer"]
+                    }
+                  },
+                  reflectionQuestions: {
+                    type: Type.ARRAY,
+                    items: {
+                      type: Type.OBJECT,
+                      properties: {
+                        question: { type: Type.STRING },
+                        criteria: { type: Type.STRING }
+                      },
+                      required: ["question"]
+                    }
+                  }
+                },
+                required: ["title"]
+              }
+            }
           },
-          required: ["summary", "addedItems", "extendedJson"]
+          required: ["summary", "addedItems"]
         }
       }
     });
@@ -1612,42 +1674,141 @@ I tuoi compiti:
     }
 
     const data = parseJsonResponse(responseText);
-    
-    // Normalize and repair output object
-    let parsedObj: any = null;
-    if (typeof data.extendedJson === "object" && data.extendedJson !== null) {
-      parsedObj = data.extendedJson;
-    } else if (typeof data.extendedJson === "string") {
-      try {
-        parsedObj = JSON.parse(data.extendedJson);
-      } catch (pErr) {
-        // Leave raw string
-      }
-    }
+    const addedItems: Array<{ type: string; title: string; previewText: string }> = Array.isArray(data.addedItems) ? data.addedItems : [];
 
-    // Normalization safeguard: If exam is Quiz (no sections) and has reflectionQuestions at root, migrate them into openEnded!
-    if (parsedObj && typeof parsedObj === "object" && !parsedObj.sections) {
-      if (Array.isArray(parsedObj.reflectionQuestions) && parsedObj.reflectionQuestions.length > 0) {
-        if (!Array.isArray(parsedObj.openEnded)) parsedObj.openEnded = [];
-        for (const rq of parsedObj.reflectionQuestions) {
-          if (!parsedObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-            parsedObj.openEnded.push({
-              id: rq.id || `q_ref_${parsedObj.openEnded.length + 1}`,
-              question: rq.question,
-              criteria: rq.criteria || rq.criteri
+    // --- PROGRAMMATIC MERGE: Guarantee 100% preservation of all existing items and clean appending ---
+
+    // 1. Merge new Multiple Choice
+    if (Array.isArray(data.newMultipleChoice) && data.newMultipleChoice.length > 0) {
+      if (isInputWorkbook) {
+        const lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (lastSec) {
+          if (!Array.isArray(lastSec.multipleChoice)) lastSec.multipleChoice = [];
+          for (const mc of data.newMultipleChoice) {
+            lastSec.multipleChoice.push({
+              id: `q_mc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+              question: mc.question,
+              options: mc.options,
+              correctIndex: mc.correctIndex
             });
           }
         }
-        delete parsedObj.reflectionQuestions;
+      } else {
+        if (!Array.isArray(baseExam.multipleChoice)) baseExam.multipleChoice = [];
+        const baseIndex = baseExam.multipleChoice.length;
+        for (let i = 0; i < data.newMultipleChoice.length; i++) {
+          const mc = data.newMultipleChoice[i];
+          baseExam.multipleChoice.push({
+            id: `q_mc_${baseIndex + i + 1}`,
+            question: mc.question,
+            options: mc.options,
+            correctIndex: mc.correctIndex
+          });
+          if (!addedItems.some((a) => a.previewText === mc.question)) {
+            addedItems.push({
+              type: "multiple_choice",
+              title: `Domanda a Crocette #${baseIndex + i + 1}`,
+              previewText: mc.question
+            });
+          }
+        }
       }
     }
 
-    const finalJson = parsedObj ? JSON.stringify(parsedObj, null, 2) : String(data.extendedJson);
+    // 2. Merge new Open Ended questions
+    if (Array.isArray(data.newOpenEnded) && data.newOpenEnded.length > 0) {
+      if (isInputWorkbook) {
+        const lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (lastSec) {
+          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+          for (const oe of data.newOpenEnded) {
+            lastSec.reflectionQuestions.push({
+              id: `ref_${lastSec.reflectionQuestions.length + 1}`,
+              question: oe.question,
+              criteria: oe.criteria || "Valutare pertinenza, correttezza concettuale e proprietà lessicale.",
+              weight: 1
+            });
+          }
+        }
+      } else {
+        if (!Array.isArray(baseExam.openEnded)) baseExam.openEnded = [];
+        const baseIndex = baseExam.openEnded.length;
+        for (let i = 0; i < data.newOpenEnded.length; i++) {
+          const oe = data.newOpenEnded[i];
+          baseExam.openEnded.push({
+            id: `q_open_${baseIndex + i + 1}`,
+            question: oe.question,
+            criteria: oe.criteria || "Valutare chiarezza espositiva, pertinenza e coerenza argomentativa.",
+            weight: 1
+          });
+          if (!addedItems.some((a) => a.previewText === oe.question)) {
+            addedItems.push({
+              type: "open_ended",
+              title: `Domanda Aperta #${baseIndex + i + 1}`,
+              previewText: oe.question
+            });
+          }
+        }
+      }
+    }
+
+    // 3. Merge new Reflection Questions
+    if (Array.isArray(data.newReflectionQuestions) && data.newReflectionQuestions.length > 0) {
+      if (isInputWorkbook) {
+        const lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (lastSec) {
+          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+          for (const rq of data.newReflectionQuestions) {
+            lastSec.reflectionQuestions.push({
+              id: `ref_${lastSec.reflectionQuestions.length + 1}`,
+              question: rq.question,
+              criteria: rq.criteria || "Valutare capacità critica, originalità e coerenza.",
+              weight: 1
+            });
+          }
+        }
+      } else {
+        if (!Array.isArray(baseExam.openEnded)) baseExam.openEnded = [];
+        const baseIndex = baseExam.openEnded.length;
+        for (let i = 0; i < data.newReflectionQuestions.length; i++) {
+          const rq = data.newReflectionQuestions[i];
+          baseExam.openEnded.push({
+            id: `q_ref_${baseIndex + i + 1}`,
+            question: rq.question,
+            criteria: rq.criteria || "Valutare profondità di riflessione e giudizio autonomo.",
+            weight: 1
+          });
+        }
+      }
+    }
+
+    // 4. Merge new Sections (Workbook)
+    if (Array.isArray(data.newSections) && data.newSections.length > 0) {
+      if (!Array.isArray(baseExam.sections)) baseExam.sections = [];
+      for (const ns of data.newSections) {
+        baseExam.sections.push({
+          title: ns.title,
+          sintesi: ns.sintesi || "",
+          fillInTheBlank: (ns.fillInTheBlank || []).map((fib: any, fIdx: number) => ({
+            id: `fib_${baseExam.sections.length + 1}_${fIdx + 1}`,
+            sentence: fib.sentence,
+            answer: fib.answer
+          })),
+          reflectionQuestions: (ns.reflectionQuestions || []).map((rq: any, rIdx: number) => ({
+            id: `ref_${baseExam.sections.length + 1}_${rIdx + 1}`,
+            question: rq.question,
+            criteria: rq.criteria || "Valutare comprensione e riflessione critica."
+          }))
+        });
+      }
+    }
+
+    const finalJson = JSON.stringify(baseExam, null, 2);
 
     return res.json({
       status: "success",
-      summary: data.summary || "Contenuti aggiunti con successo all'esame.",
-      addedItems: data.addedItems || [],
+      summary: data.summary || `Contenuti aggiunti con successo all'esame (${addedItems.length} nuovi elementi integrati).`,
+      addedItems,
       extendedJson: finalJson
     });
   } catch (error: any) {
