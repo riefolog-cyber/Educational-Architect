@@ -563,7 +563,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.email]);
 
-  const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
+  const handleSaveToLibrary = async (
+    source: string,
+    jsonOverride?: string,
+    titleOverride?: string,
+    options?: { forceNew?: boolean }
+  ) => {
     const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const raw = (jsonOverride ?? jsonText).trim();
     if (!raw) {
@@ -596,7 +601,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       // Normalization safeguard: If Workbook (sections) and root openEnded exists,
-      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated
+      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated.
+      // Root openEnded is then removed: keeping both copies duplicated the question count
+      // and could make the library item look inconsistent on reload.
       if (Array.isArray(parsed.sections) && parsed.sections.length > 0 && Array.isArray(parsed.openEnded) && parsed.openEnded.length > 0) {
         const lastSec = parsed.sections[parsed.sections.length - 1];
         if (lastSec) {
@@ -611,6 +618,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               });
             }
           }
+          delete parsed.openEnded;
         }
       }
 
@@ -635,6 +643,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       // PRESERVE ALL ORIGINAL & NEW QUESTIONS: serialize the entire parsed object!
       const formatted = JSON.stringify(parsed, null, 2);
 
+      // Only update-in-place when we are still saving the SAME exam that was
+      // loaded from the library. If the editor now contains another exam (file
+      // loaded with "Sfoglia", new AI generation, different title), reusing the
+      // old id would overwrite the wrong library entry and make the additions
+      // appear "lost" when reopening the original exam.
+      const normalizeTitleForMatch = (t: string) =>
+        (t || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
+      const loadedItem = loadedLibraryItemId
+        ? library.find((it) => it.id === loadedLibraryItemId)
+        : undefined;
+      const sameLoadedExam =
+        !!loadedItem &&
+        normalizeTitleForMatch(loadedItem.title) === normalizeTitleForMatch(title);
+      const targetId = !options?.forceNew && sameLoadedExam ? loadedLibraryItemId! : undefined;
+
       const savedId = await saveLibraryExam(
         {
           teacherEmail: effectiveEmail,
@@ -644,7 +667,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           source,
           questionCount: count,
         },
-        loadedLibraryItemId || undefined
+        targetId
       );
 
       setLoadedLibraryItemId(savedId);
@@ -657,7 +680,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           const snap = await getDoc(sessionRef);
           if (snap.exists()) {
             const sessData = snap.data();
-            if (!sessData.teacherEmail || sessData.teacherEmail === user.email || sessData.teacherId === user.uid) {
+            if (!sessData.teacherEmail || sessData.teacherEmail === user?.email || sessData.teacherId === user?.uid) {
               await setDoc(sessionRef, {
                 ...sessData,
                 data: parsed,
@@ -672,9 +695,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       await loadLibrary();
-      setLibraryMsg(`✅ "${title}" salvata in libreria con ${count} quesiti completi (tutte le aggiunte salvate).`);
+      const kb = Math.round(new Blob([formatted]).size / 1024);
+      const sizeNote = kb >= 3500
+        ? ` ⚠️ Verifica molto grande (${kb} KB): la libreria del browser ha circa 5 MB, valuta di rimuovere immagini pesanti.`
+        : "";
+      const savedNote = targetId ? "aggiornata" : "salvata";
+      setLibraryMsg(`✅ "${title}" ${savedNote} in libreria con ${count} quesiti completi (${kb} KB), tutte le aggiunte incluse.${sizeNote}`);
     } catch (e: any) {
-      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "spazio locale esaurito"}.`);
+      const quota = /quota|spazio/i.test(e?.message || "") || e?.name === "QuotaExceededError";
+      setLibraryMsg(
+        quota
+          ? `❌ Salvataggio non riuscito: spazio della libreria del browser esaurito. Elimina qualche vecchia verifica (o esportala con "Backup") e riprova.`
+          : `❌ Salvataggio non riuscito: ${e.message || "errore sconosciuto"}.`
+      );
     } finally {
       setLibrarySaving(false);
     }
@@ -789,6 +822,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = event.target?.result as string;
+      // A freshly uploaded file is a new exam: do not overwrite the library
+      // entry that was previously loaded in the editor.
+      setLoadedLibraryItemId(null);
       setJsonText(text);
       try {
         const parsed = JSON.parse(text);
@@ -5206,7 +5242,7 @@ const fibImg = domandeObj?.images?.[fib.id];
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
           // Keep a history copy so it can be reused for other classes
-          handleSaveToLibrary("Generatore IA", generatedJson, newTitle);
+          handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { forceNew: true });
         }}
       />
 
@@ -5219,7 +5255,7 @@ const fibImg = domandeObj?.images?.[fib.id];
           setJsonText(importedJson);
           if (importedTitle) setMateria(importedTitle);
           validateExamJSON(importedJson);
-          handleSaveToLibrary("Google Moduli", importedJson, importedTitle);
+          handleSaveToLibrary("Google Moduli", importedJson, importedTitle, { forceNew: true });
         }}
       />
 

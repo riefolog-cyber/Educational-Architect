@@ -98,60 +98,72 @@ function cleanExamTitle(t: string): string {
   return (t || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
 }
 
+/** Recency score used to pick the freshest copy when the same title exists twice. */
+function itemRecency(item: ExamLibraryItem): number {
+  const ts = Date.parse(item.updatedAt || item.createdAt || "");
+  if (!isNaN(ts)) return ts;
+  return Number(item.questionCount) || 0;
+}
+
+/**
+ * Reads the library from every local bucket (primary account + legacy/sandbox
+ * buckets) and keeps ONE entry per title: the most recently updated one.
+ *
+ * Keeping the first match used to resurrect old copies that had no AI-added
+ * questions, which made "Salva in libreria" look broken after reopening an
+ * exam. Newest wins now, so additions are never shadowed by stale duplicates.
+ */
 function readAll(teacherEmail: string): ExamLibraryItem[] {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
-  const items: ExamLibraryItem[] = [];
+  const candidates: ExamLibraryItem[] = [];
   const seenIds = new Set<string>();
-  const seenTitles = new Set<string>();
 
-  // 1. Primary email bucket (authoritative)
+  const collect = (parsed: any) => {
+    if (!Array.isArray(parsed)) return;
+    for (const item of parsed) {
+      if (!item || !item.id || seenIds.has(item.id)) continue;
+      seenIds.add(item.id);
+      const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
+      candidates.push({ ...item, examJson: cleanedJson });
+    }
+  };
+
+  // 1. Primary email bucket
   try {
     const raw = localStorage.getItem(keyFor(normEmail));
-    if (raw) {
-      const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (item && item.id && !seenIds.has(item.id)) {
-            const cleanT = cleanExamTitle(item.title);
-            if (cleanT && seenTitles.has(cleanT)) continue;
-            seenIds.add(item.id);
-            if (cleanT) seenTitles.add(cleanT);
-            const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
-            items.push({ ...item, examJson: cleanedJson });
-          }
-        }
-      }
-    }
+    if (raw) collect(JSON.parse(raw));
   } catch {}
 
-  // 2. Scan all other localStorage exam_library_* keys (cross-account / anonymous fallback)
+  // 2. All other exam_library_* keys (cross-account / anonymous fallback)
   try {
     for (let i = 0; i < localStorage.length; i++) {
       const k = localStorage.key(i);
       if (k && k.startsWith("exam_library_") && k !== keyFor(normEmail) && k !== DELETED_SESSIONS_KEY) {
         try {
           const rawOther = localStorage.getItem(k);
-          if (rawOther) {
-            const parsedOther = JSON.parse(rawOther);
-            if (Array.isArray(parsedOther)) {
-              for (const it of parsedOther) {
-                if (it && it.id && !seenIds.has(it.id)) {
-                  const cleanT = cleanExamTitle(it.title);
-                  // Never add older duplicate from another bucket if primary bucket already has this title
-                  if (cleanT && seenTitles.has(cleanT)) continue;
-                  seenIds.add(it.id);
-                  if (cleanT) seenTitles.add(cleanT);
-                  const cleanedJson = it.examJson ? sanitizeWorkbookExamJson(it.examJson) : it.examJson;
-                  items.push({ ...it, examJson: cleanedJson });
-                }
-              }
-            }
-          }
+          if (rawOther) collect(JSON.parse(rawOther));
         } catch {}
       }
     }
   } catch {}
 
+  // 3. One entry per title (newest updatedAt wins); items without a title are kept.
+  const byTitle = new Map<string, ExamLibraryItem>();
+  const untitled: ExamLibraryItem[] = [];
+  for (const item of candidates) {
+    const cleanT = cleanExamTitle(item.title);
+    if (!cleanT) {
+      untitled.push(item);
+      continue;
+    }
+    const current = byTitle.get(cleanT);
+    if (!current || itemRecency(item) >= itemRecency(current)) {
+      byTitle.set(cleanT, item);
+    }
+  }
+
+  const items = [...byTitle.values(), ...untitled];
+  items.sort((a, b) => itemRecency(b) - itemRecency(a));
   return items;
 }
 
@@ -223,7 +235,7 @@ export async function syncActiveSessionsToLibrary(teacherEmail?: string): Promis
         source: `Sessione Cloud (PIN ${pinId})`,
         questionCount: count,
         createdAt: data.createdAt || new Date().toISOString(),
-        updatedAt: data.createdAt || new Date().toISOString(),
+        updatedAt: data.updatedAt || data.createdAt || new Date().toISOString(),
       });
     });
   } catch (err) {
@@ -263,7 +275,7 @@ export async function fetchExamFromSessionPin(pin: string): Promise<ExamLibraryI
       source: `Sessione Cloud (PIN ${cleanPin})`,
       questionCount: count,
       createdAt: data.createdAt || new Date().toISOString(),
-      updatedAt: data.createdAt || new Date().toISOString(),
+      updatedAt: data.updatedAt || data.createdAt || new Date().toISOString(),
     };
 
     return item;
@@ -300,9 +312,14 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
       if (!existingMatch) {
         items.push(cs);
       } else {
-        // If the cloud session has strictly more questions than the local representation,
-        // sync the cloud content forward. Otherwise, preserve the locally updated version.
-        if (cs.questionCount > existingMatch.questionCount) {
+        // Forward-sync the cloud content only when it is BOTH richer and newer than
+        // the local copy. Without the timestamp check an old active session could
+        // replace a just-saved exam (e.g. adding multiple-choice questions to a
+        // Workbook does not increase the counted total), making additions vanish.
+        const cloudTs = Date.parse(cs.updatedAt || "");
+        const localTs = Date.parse(existingMatch.updatedAt || "");
+        const cloudIsNewer = isNaN(cloudTs) || isNaN(localTs) ? true : cloudTs > localTs;
+        if (cs.questionCount > existingMatch.questionCount && cloudIsNewer) {
           existingMatch.examJson = cs.examJson;
           existingMatch.questionCount = cs.questionCount;
           existingMatch.updatedAt = cs.updatedAt;
