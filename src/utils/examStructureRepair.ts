@@ -618,22 +618,43 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
           }))
         : [];
 
+      // Multiple choice questions in section (crocette)
+      const rawSecMc = sec.multipleChoice || sec.crocette || sec.sceltaMultipla || [];
+      const correctedSecMc = Array.isArray(rawSecMc)
+        ? rawSecMc.map((item: any, mIdx: number) => {
+            const opts = Array.isArray(item.options || item.opzioni)
+              ? (item.options || item.opzioni).map((o: any) => String(o || ""))
+              : [];
+            let cIdx = Number(item.correctIndex ?? item.rispostaCorretta ?? item.indiceCorretta ?? 0);
+            if (isNaN(cIdx) || cIdx < 0 || (opts.length > 0 && cIdx >= opts.length)) cIdx = 0;
+            return {
+              id: item.id || `q_mc_${sIdx + 1}_${mIdx + 1}`,
+              question: String(item.question || item.domanda || `Domanda ${mIdx + 1}`),
+              options: opts.length > 0 ? opts : ["Opzione A", "Opzione B", "Opzione C", "Opzione D"],
+              correctIndex: cIdx,
+              ...preservedDidacticFields(item),
+            };
+          })
+        : [];
+
       correctedSections.push({
         title: secTitle,
         sintesi: secSintesi,
         fillInTheBlank: correctedFib,
+        multipleChoice: correctedSecMc.length > 0 ? correctedSecMc : undefined,
         reflectionQuestions: correctedRef,
         glossary: Array.isArray(sec.glossary || sec.glossario) ? (sec.glossary || sec.glossario) : undefined,
         checklist: Array.isArray(sec.checklist) ? sec.checklist : undefined,
       });
     });
 
-    changes.push(`Riorganizzate ${correctedSections.length} sezioni didattiche con 'sintesi', 'fillInTheBlank' e 'reflectionQuestions'.`);
+    changes.push(`Riorganizzate ${correctedSections.length} sezioni didattiche con 'sintesi', 'fillInTheBlank', 'multipleChoice' e 'reflectionQuestions'.`);
 
     const finalWorkbook: WorkbookExam = {
       title,
       sections: correctedSections,
       answerKey: parsed.answerKey || parsed.criteri || undefined,
+      ...(parsed.multipleChoice && Array.isArray(parsed.multipleChoice) ? { multipleChoice: parsed.multipleChoice } : {}),
       ...(parsed.images ? { images: parsed.images } : {}),
     };
 

@@ -323,11 +323,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
       const answeredCount = examType === "quiz"
         ? Object.keys(answers.mc).length + Object.keys(answers.oe).filter(k => (answers.oe[k] || "").trim().length > 0).length
-        : Object.keys(answers.wbFib).length + Object.keys(answers.wbRq).filter(k => (answers.wbRq[k] || "").trim().length > 0).length;
+        : Object.keys(answers.wbFib).length + Object.keys(answers.wbRq).filter(k => (answers.wbRq[k] || "").trim().length > 0).length + Object.keys(answers.mc).length;
 
       const totalQuestions = examType === "quiz"
         ? ((examData?.multipleChoice?.length || 0) + (examData?.openEnded?.length || 0))
-        : ((examData?.sections || []).flatMap((s: any) => [...(s.fillInTheBlank || []), ...(s.reflectionQuestions || [])]).length || 1);
+        : ((examData?.sections || []).flatMap((s: any) => [...(s.fillInTheBlank || []), ...(s.reflectionQuestions || []), ...(s.multipleChoice || [])]).length + (examData?.multipleChoice?.length || 0) || 1);
 
       const progressPercent = Math.min(100, Math.round((answeredCount / (totalQuestions || 1)) * 100));
 
@@ -1518,6 +1518,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             submissionData.Feedback_Generale = cleanVal(finalEval.openEndedEvaluation);
           } else {
             submissionData.Punteggio_FIB = rescue.calculatedFIBScore;
+            if (rescue.calculatedMCScore !== undefined && rescue.calculatedMCScore > 0) {
+              submissionData.Punteggio_MC = rescue.calculatedMCScore;
+            }
             submissionData.Feedback_Generale = cleanVal(finalEval.overallFeedback);
           }
 
@@ -1597,12 +1600,24 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setActiveScreen("evaluating");
     setSavingStatus("Generazione della valutazione tramite IA e registrazione sessione...");
 
-    // Quiz evaluation scores math pre-calculation (count + didactic weights)
+    // Evaluation scores math pre-calculation (count + didactic weights)
+    const allExamMC: any[] = [];
+    if (examData?.multipleChoice && Array.isArray(examData.multipleChoice)) {
+      allExamMC.push(...examData.multipleChoice);
+    }
+    if (examData?.sections && Array.isArray(examData.sections)) {
+      examData.sections.forEach((sec: any) => {
+        if (sec.multipleChoice && Array.isArray(sec.multipleChoice)) {
+          allExamMC.push(...sec.multipleChoice);
+        }
+      });
+    }
+
     let calculatedMCScore = 0;
     let mcWeightedCorrect = 0;
     let mcWeightedTotal = 0;
-    if (examType === "quiz" && examData?.multipleChoice) {
-      const mc = mcWeightedScore(examData.multipleChoice, answers.mc);
+    if (allExamMC.length > 0) {
+      const mc = mcWeightedScore(allExamMC, answers.mc);
       calculatedMCScore = mc.correct;
       mcWeightedCorrect = mc.weightedCorrect;
       mcWeightedTotal = mc.weightedTotal;
@@ -2100,14 +2115,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           </div>
                         </div>
 
-                        {/* Detailed Quiz Correctness Recap */}
-                        {selectedPastSub.Tipo === "Quiz" && parsedExamData?.multipleChoice && parsedExamData.multipleChoice.length > 0 && (
+                        {/* Detailed Quiz/Workbook MCQ Correctness Recap */}
+                        {((parsedExamData?.multipleChoice && parsedExamData.multipleChoice.length > 0) || (parsedExamData?.sections && parsedExamData.sections.some((s: any) => s.multipleChoice && s.multipleChoice.length > 0))) && (
                           <div className="space-y-4 pt-2">
                             <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
                               Dettaglio Risposte Sezione Multipla:
                             </h4>
                             <div className="grid grid-cols-1 gap-2.5">
-                              {parsedExamData.multipleChoice.map((q: any, iIdx: number) => {
+                              {[...(parsedExamData?.multipleChoice || []), ...((parsedExamData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
                                 const selectedOptIndex = parsedAnswers?.mc?.[q.id];
                                 const isCorrect = selectedOptIndex === q.correctIndex;
                                 const uAns = q.options[selectedOptIndex] || "Scelta mancante";
@@ -2735,6 +2750,54 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             ) : (
               // WORKBOOK Workspace layout
               <div className="space-y-8 text-left">
+                {/* Root level multiple choice questions if present in Workbook */}
+                {examData?.multipleChoice && examData.multipleChoice.length > 0 && (
+                  <div className="p-5 bg-slate-950/20 border border-white/5 rounded-2xl space-y-4">
+                    <h3 className="text-sm font-bold text-teal-400 flex items-center gap-2">
+                      <CheckCircle className="w-4 h-4" />
+                      <span>Quesiti a scelta multipla generali</span>
+                    </h3>
+                    <div className="space-y-4">
+                      {examData.multipleChoice.map((q: any, qIdx: number) => {
+                        const userSel = answers.mc[q.id];
+                        return (
+                          <div key={q.id} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3">
+                            <p className="font-medium text-slate-200 text-sm">
+                              <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
+                              {q.question}
+                              <QuestionMeta q={q} tone="teal" />
+                            </p>
+                            <QuestionFigure src={examData?.images?.[q.id]} />
+                            <div className="grid grid-cols-1 gap-2 pl-2">
+                              {q.options.map((opt: string, optIdx: number) => (
+                                <button
+                                  key={optIdx}
+                                  type="button"
+                                  onClick={() => handleSelectMC(q.id, optIdx)}
+                                  className={`p-3 rounded-xl border text-left text-xs transition-all flex items-center justify-between group ${
+                                    userSel === optIdx
+                                      ? "bg-teal-500/15 border-teal-500 text-white font-medium shadow-sm"
+                                      : "bg-slate-900/60 border-white/5 text-slate-300 hover:border-white/20 hover:text-white"
+                                  }`}
+                                >
+                                  <span>{opt}</span>
+                                  <div className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 ${
+                                    userSel === optIdx
+                                      ? "border-teal-400 bg-teal-400/20 text-teal-400"
+                                      : "border-slate-700 group-hover:border-slate-500"
+                                  }`}>
+                                    {userSel === optIdx && <div className="w-1.5 h-1.5 bg-teal-400 rounded-full" />}
+                                  </div>
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {examData?.sections && examData.sections.map((sec: any, sIdx: number) => (
                   <div key={sIdx} className="p-5 bg-slate-950/20 border border-white/5 rounded-2xl space-y-6">
                     <h3 className="text-sm font-bold text-teal-400 flex items-center gap-2">
@@ -2788,6 +2851,54 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 />
                                 <span>{after}</span>
                                 <QuestionMeta q={fib} tone="teal" />
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
+                    {/* Section Multiple Choice Questions (Crocette) */}
+                    {sec.multipleChoice && sec.multipleChoice.length > 0 && (
+                      <div className="space-y-4 pt-2">
+                        <p className="text-xs font-bold uppercase tracking-wider text-teal-400 flex items-center gap-1.5">
+                          <CheckCircle className="w-3.5 h-3.5" />
+                          <span>Quesiti a scelta multipla:</span>
+                        </p>
+                        <div className="space-y-4">
+                          {sec.multipleChoice.map((q: any, qIdx: number) => {
+                            const userSel = answers.mc[q.id];
+                            return (
+                              <div key={q.id} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3">
+                                <p className="font-medium text-slate-200 text-sm">
+                                  <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
+                                  {q.question}
+                                  <QuestionMeta q={q} tone="teal" />
+                                </p>
+                                <QuestionFigure src={examData?.images?.[q.id]} />
+                                <div className="grid grid-cols-1 gap-2 pl-2">
+                                  {q.options.map((opt: string, optIdx: number) => (
+                                    <button
+                                      key={optIdx}
+                                      type="button"
+                                      onClick={() => handleSelectMC(q.id, optIdx)}
+                                      className={`p-3 rounded-xl border text-left text-xs transition-all flex items-center justify-between group ${
+                                        userSel === optIdx
+                                          ? "bg-teal-500/15 border-teal-500 text-white font-medium shadow-sm"
+                                          : "bg-slate-900/60 border-white/5 text-slate-300 hover:border-white/20 hover:text-white"
+                                      }`}
+                                    >
+                                      <span>{opt}</span>
+                                      <div className={`w-3.5 h-3.5 rounded-full border flex items-center justify-center shrink-0 ${
+                                        userSel === optIdx
+                                          ? "border-teal-400 bg-teal-400/20 text-teal-400"
+                                          : "border-slate-700 group-hover:border-slate-500"
+                                      }`}>
+                                        {userSel === optIdx && <div className="w-1.5 h-1.5 bg-teal-400 rounded-full" />}
+                                      </div>
+                                    </button>
+                                  ))}
+                                </div>
                               </div>
                             );
                           })}
@@ -3187,14 +3298,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               )}
             </div>
 
-            {/* MCQ Quiz detailed correctness recap */}
-            {examType === "quiz" && examData?.multipleChoice && examData.multipleChoice.length > 0 && (
+            {/* MCQ Quiz/Workbook detailed correctness recap */}
+            {((examData?.multipleChoice && examData.multipleChoice.length > 0) || (examData?.sections && examData.sections.some((s: any) => s.multipleChoice && s.multipleChoice.length > 0))) && (
               <div className="space-y-3.5 pt-2">
                 <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
                   Dettaglio Risposte Sezione Multipla:
                 </h4>
                 <div className="grid grid-cols-1 gap-2.5">
-                  {examData.multipleChoice.map((q: any, iIdx: number) => {
+                  {[...(examData?.multipleChoice || []), ...((examData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
                     const isCorrect = answers.mc[q.id] === q.correctIndex;
                     const uAns = q.options[answers.mc[q.id]] || "Scelta mancante";
                     return (

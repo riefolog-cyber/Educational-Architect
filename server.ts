@@ -1552,8 +1552,16 @@ app.all("/api/extend-exam-json", async (req, res) => {
         baseExam = parseJsonResponse(examJson);
       } catch {}
     }
-    if (!baseExam || typeof baseExam !== "object") {
+    if (Array.isArray(baseExam)) {
+      baseExam = { title: "Verifica", multipleChoice: baseExam, openEnded: [] };
+    } else if (!baseExam || typeof baseExam !== "object") {
       baseExam = { title: "Verifica", multipleChoice: [], openEnded: [] };
+    }
+    if (Array.isArray(baseExam.domande) && !baseExam.multipleChoice) {
+      baseExam.multipleChoice = baseExam.domande;
+    }
+    if (Array.isArray(baseExam.questions) && !baseExam.multipleChoice) {
+      baseExam.multipleChoice = baseExam.questions;
     }
 
     const isInputWorkbook = !!(baseExam.sections && Array.isArray(baseExam.sections));

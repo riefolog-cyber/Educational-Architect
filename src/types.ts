@@ -53,6 +53,7 @@ export interface ReflectionQuestion {
 export interface WorkbookSection {
   title: string;
   sintesi?: string;
+  multipleChoice?: MultipleChoiceQuestion[];
   fillInTheBlank?: FillInTheBlank[];
   reflectionQuestions?: ReflectionQuestion[];
   glossary?: { term: string; definition: string }[];
@@ -66,6 +67,7 @@ export interface WorkbookAnswerKey {
 export interface WorkbookExam {
   title: string;
   sections: WorkbookSection[];
+  multipleChoice?: MultipleChoiceQuestion[];
   answerKey?: WorkbookAnswerKey;
   images?: Record<string, string>;
 }

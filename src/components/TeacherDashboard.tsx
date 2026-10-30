@@ -490,6 +490,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             setCanAutoRepair(true);
             return null;
           }
+          if (Array.isArray(data.sections[i].multipleChoice)) {
+            for (let m = 0; m < data.sections[i].multipleChoice.length; m++) {
+              const q = data.sections[i].multipleChoice[m];
+              if (!q || !q.question || !Array.isArray(q.options) || q.correctIndex === undefined) {
+                setValidationError(`Errore Sezione ${i + 1}, Crocetta ${m + 1}: Domanda a scelta multipla incompleta.`);
+                setCanAutoRepair(true);
+                return null;
+              }
+            }
+          }
         }
       }
 
@@ -563,12 +573,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.email]);
 
-  const handleSaveToLibrary = async (
-    source: string,
-    jsonOverride?: string,
-    titleOverride?: string,
-    options?: { forceNew?: boolean }
-  ) => {
+  const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
     const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const raw = (jsonOverride ?? jsonText).trim();
     if (!raw) {
@@ -601,9 +606,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       // Normalization safeguard: If Workbook (sections) and root openEnded exists,
-      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated.
-      // Root openEnded is then removed: keeping both copies duplicated the question count
-      // and could make the library item look inconsistent on reload.
+      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated
       if (Array.isArray(parsed.sections) && parsed.sections.length > 0 && Array.isArray(parsed.openEnded) && parsed.openEnded.length > 0) {
         const lastSec = parsed.sections[parsed.sections.length - 1];
         if (lastSec) {
@@ -618,7 +621,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               });
             }
           }
-          delete parsed.openEnded;
         }
       }
 
@@ -643,20 +645,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       // PRESERVE ALL ORIGINAL & NEW QUESTIONS: serialize the entire parsed object!
       const formatted = JSON.stringify(parsed, null, 2);
 
-      // Only update-in-place when we are still saving the SAME exam that was
-      // loaded from the library. If the editor now contains another exam (file
-      // loaded with "Sfoglia", new AI generation, different title), reusing the
-      // old id would overwrite the wrong library entry and make the additions
-      // appear "lost" when reopening the original exam.
-      const normalizeTitleForMatch = (t: string) =>
-        (t || "").replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim().toLowerCase();
-      const loadedItem = loadedLibraryItemId
-        ? library.find((it) => it.id === loadedLibraryItemId)
-        : undefined;
-      const sameLoadedExam =
-        !!loadedItem &&
-        normalizeTitleForMatch(loadedItem.title) === normalizeTitleForMatch(title);
-      const targetId = !options?.forceNew && sameLoadedExam ? loadedLibraryItemId! : undefined;
+      // Keep editor in sync with formatted and validated JSON
+      setJsonText(formatted);
 
       const savedId = await saveLibraryExam(
         {
@@ -667,20 +657,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           source,
           questionCount: count,
         },
-        targetId
+        loadedLibraryItemId || undefined
       );
 
       setLoadedLibraryItemId(savedId);
 
       // Keep cloud active session in sync if a PIN is assigned and exists in Firestore
-      const targetPin = pin.trim().toUpperCase();
+      const targetPin = (pin.trim() || (loadedLibraryItemId?.startsWith("session_") ? loadedLibraryItemId.replace("session_", "").trim() : "")).toUpperCase();
       if (dbFirestore && targetPin) {
         try {
           const sessionRef = doc(dbFirestore, "active_sessions", targetPin);
           const snap = await getDoc(sessionRef);
           if (snap.exists()) {
             const sessData = snap.data();
-            if (!sessData.teacherEmail || sessData.teacherEmail === user?.email || sessData.teacherId === user?.uid) {
+            const teacherEmail = user?.email || effectiveEmail;
+            if (!sessData.teacherEmail || sessData.teacherEmail === teacherEmail || !user?.uid || sessData.teacherId === user?.uid) {
               await setDoc(sessionRef, {
                 ...sessData,
                 data: parsed,
@@ -695,19 +686,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       await loadLibrary();
-      const kb = Math.round(new Blob([formatted]).size / 1024);
-      const sizeNote = kb >= 3500
-        ? ` ⚠️ Verifica molto grande (${kb} KB): la libreria del browser ha circa 5 MB, valuta di rimuovere immagini pesanti.`
-        : "";
-      const savedNote = targetId ? "aggiornata" : "salvata";
-      setLibraryMsg(`✅ "${title}" ${savedNote} in libreria con ${count} quesiti completi (${kb} KB), tutte le aggiunte incluse.${sizeNote}`);
+      setLibraryMsg(`✅ "${title}" salvata in libreria con ${count} quesiti completi (tutte le aggiunte salvate).`);
     } catch (e: any) {
-      const quota = /quota|spazio/i.test(e?.message || "") || e?.name === "QuotaExceededError";
-      setLibraryMsg(
-        quota
-          ? `❌ Salvataggio non riuscito: spazio della libreria del browser esaurito. Elimina qualche vecchia verifica (o esportala con "Backup") e riprova.`
-          : `❌ Salvataggio non riuscito: ${e.message || "errore sconosciuto"}.`
-      );
+      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "spazio locale esaurito"}.`);
     } finally {
       setLibrarySaving(false);
     }
@@ -818,18 +799,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (!file) return;
+    const inputEl = e.target;
 
     const reader = new FileReader();
     reader.onload = (event) => {
-      const text = event.target?.result as string;
-      // A freshly uploaded file is a new exam: do not overwrite the library
-      // entry that was previously loaded in the editor.
-      setLoadedLibraryItemId(null);
+      const text = (event.target?.result as string) || "";
       setJsonText(text);
+      setLoadedLibraryItemId(null); // Fresh upload: decouple from prior session item
       try {
-        const parsed = JSON.parse(text);
-        if (parsed.title && !materia.trim()) {
-          setMateria(parsed.title);
+        const parsed = tolerantJsonParse(text);
+        if (parsed && typeof parsed === "object") {
+          const extractedTitle = (parsed.title || parsed.titolo || file.name.replace(/\.[^/.]+$/, "")).trim();
+          if (extractedTitle) {
+            setMateria(extractedTitle);
+          }
         }
       } catch {}
       const valid = validateExamJSON(text);
@@ -840,11 +823,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           setJsonText(repairResult.correctedJson);
           setAutoCorrectionNotice(repairResult);
           validateExamJSON(repairResult.correctedJson);
-          if (repairResult.title && !materia.trim()) {
+          if (repairResult.title) {
             setMateria(repairResult.title);
           }
         }
       }
+      inputEl.value = ""; // Allow re-uploading the same file
     };
     reader.readAsText(file);
   };
@@ -2800,6 +2784,15 @@ const fibImg = domandeObj?.images?.[fib.id];
                       <>
                         <button
                           type="button"
+                          onClick={() => downloadTextFile(libraryFilename(materia || "verifica_esame"), jsonText)}
+                          title="Scarica il file JSON aggiornato sul tuo computer"
+                          className="text-[10px] text-teal-400 hover:text-teal-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Scarica JSON</span>
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => handleSaveToLibrary("Editor")}
                           disabled={librarySaving}
                           title="Salva questa verifica nella libreria per riusarla con altre classi"
@@ -3004,17 +2997,28 @@ const fibImg = domandeObj?.images?.[fib.id];
                     )}
 
                     <div className="pt-2 border-t border-emerald-500/20 flex flex-wrap items-center justify-between gap-2">
-                      <button
-                        type="button"
-                        onClick={() => handleSaveToLibrary("Editor + IA")}
-                        disabled={librarySaving}
-                        className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer transition-all shadow-md shadow-emerald-600/20 disabled:opacity-50"
-                      >
-                        <PlusCircle className="w-3.5 h-3.5" />
-                        <span>{librarySaving ? "Salvataggio..." : "Salva l'esame aggiornato in Libreria"}</span>
-                      </button>
+                      <div className="flex items-center gap-2 flex-wrap">
+                        <button
+                          type="button"
+                          onClick={() => handleSaveToLibrary("Editor + IA")}
+                          disabled={librarySaving}
+                          className="px-3 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center gap-1.5 cursor-pointer transition-all shadow-md shadow-emerald-600/20 disabled:opacity-50"
+                        >
+                          <PlusCircle className="w-3.5 h-3.5" />
+                          <span>{librarySaving ? "Salvataggio..." : "Salva l'esame aggiornato in Libreria"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => downloadTextFile(libraryFilename(materia || "verifica_esame_aggiornata"), jsonText)}
+                          className="px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600/30 text-teal-300 border border-teal-500/30 text-xs font-bold rounded-xl flex items-center gap-1 cursor-pointer transition-all"
+                          title="Scarica subito il file JSON aggiornato con tutte le nuove domande"
+                        >
+                          <Download className="w-3 h-3" />
+                          <span>Scarica JSON</span>
+                        </button>
+                      </div>
                       <span className="text-[10px] text-emerald-400 font-medium">
-                        ✓ Contenuti integrati nell'editor
+                        ✓ Contenuti integrati nell'editor: pronto per salvataggio o avvio prova
                       </span>
                     </div>
                   </div>
@@ -5242,7 +5246,7 @@ const fibImg = domandeObj?.images?.[fib.id];
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
           // Keep a history copy so it can be reused for other classes
-          handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { forceNew: true });
+          handleSaveToLibrary("Generatore IA", generatedJson, newTitle);
         }}
       />
 
@@ -5255,7 +5259,7 @@ const fibImg = domandeObj?.images?.[fib.id];
           setJsonText(importedJson);
           if (importedTitle) setMateria(importedTitle);
           validateExamJSON(importedJson);
-          handleSaveToLibrary("Google Moduli", importedJson, importedTitle, { forceNew: true });
+          handleSaveToLibrary("Google Moduli", importedJson, importedTitle);
         }}
       />
 
