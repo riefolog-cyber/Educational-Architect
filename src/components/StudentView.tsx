@@ -49,6 +49,7 @@ import {
   detectGibberish,
   fetchWithRetry,
   detectSplitScreenStatus,
+  isKeyboardViewportShiftActive,
   requestAppFullScreen,
   isAppFullScreen,
   isFibAnswerCorrect,
@@ -920,6 +921,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
       // Rotation grace: intermediate animation frames have odd dimensions
       if (Date.now() - lastOrientationRef.current < sev.orientationBlackoutMs) {
+        return;
+      }
+      // Soft keyboard grace: while the student is typing (or the keyboard is
+      // closing and the viewport has not been restored yet) the page height is
+      // legitimately shorter. Never flag it, and clear a pending false positive.
+      if (isKeyboardViewportShiftActive()) {
+        splitHitsRef.current = 0;
+        setIsSplitScreenBlocked(false);
         return;
       }
 

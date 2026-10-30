@@ -619,19 +619,78 @@ export function weightedOpenAverage(
   return wSum > 0 ? total / wSum : 0;
 }
 
+/**
+ * The on-screen keyboard (and its closing animation) shrinks the viewport exactly
+ * like a split screen does. On a phone that is a false positive: in the videos
+ * recorded during a real exam, simply typing "Altezza visuale ridotta al 68%"
+ * triggered a full-screen "SCHERMO CONDIVISO RILEVATO" block.
+ *
+ * We therefore remember the last time the student interacted with a text field
+ * and ignore height-based geometry for a short grace period, which covers the
+ * keyboard being open AND the ~1s during which Safari/Chrome restore the viewport
+ * after it closes (during that animation `document.activeElement` is already
+ * `body`, so the previous guard alone was useless).
+ */
+const KEYBOARD_GRACE_MS = 3500;
+let lastEditableInteractionAt = 0;
+let keyboardTrackingInstalled = false;
+
+function isEditableElement(el: Element | null): boolean {
+  if (!el) return false;
+  const tag = el.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || (el as HTMLElement).isContentEditable === true;
+}
+
+function markEditableInteraction() {
+  lastEditableInteractionAt = Date.now();
+}
+
+function installKeyboardTracking() {
+  if (keyboardTrackingInstalled) return;
+  if (typeof document === "undefined" || typeof window === "undefined") return;
+  keyboardTrackingInstalled = true;
+
+  const onEditableEvent = (e: Event) => {
+    if (isEditableElement(e.target as Element | null)) markEditableInteraction();
+  };
+
+  // focusin/input bubble: catches tap-to-type and every keystroke.
+  document.addEventListener("focusin", onEditableEvent, true);
+  document.addEventListener("input", onEditableEvent, true);
+
+  // iOS Safari does not resize window.innerHeight when the keyboard opens; the
+  // only signal is visualViewport shrinking while a field is focused.
+  try {
+    window.visualViewport?.addEventListener("resize", () => {
+      if (isEditableElement(document.activeElement)) markEditableInteraction();
+    });
+  } catch {}
+}
+
+/** True while the soft keyboard may be (or may just have been) shrinking the viewport. */
+export function isKeyboardViewportShiftActive(): boolean {
+  return Date.now() - lastEditableInteractionAt < KEYBOARD_GRACE_MS;
+}
+
+/** True on iPhone/iPod: iOS phones have no split screen / multi-window at all. */
+function isIPhone(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return /iPhone|iPod/i.test(navigator.userAgent || "");
+}
+
 // Robust split-screen and multi-window detection across mobile (Android/iOS) and desktop
 export function detectSplitScreenStatus(): SplitScreenDetection {
   if (typeof window === "undefined" || typeof screen === "undefined") {
     return { isSplit: false, ratio: 1 };
   }
 
+  installKeyboardTracking();
+
   // Check if student is actively focusing an input or textarea (virtual keyboard on mobile decreases innerHeight)
   const activeEl = document.activeElement;
-  const isInputFocused = !!activeEl && (
-    activeEl.tagName === "INPUT" ||
-    activeEl.tagName === "TEXTAREA" ||
-    (activeEl as HTMLElement).isContentEditable
-  );
+  const isInputFocused = isEditableElement(activeEl);
+  // Keep extending the grace window while the student is typing.
+  if (isInputFocused) markEditableInteraction();
 
   const screenH = window.screen.availHeight || window.screen.height || 1;
   const screenW = window.screen.availWidth || window.screen.width || 1;
@@ -643,13 +702,19 @@ export function detectSplitScreenStatus(): SplitScreenDetection {
 
   const isPortrait = screenH >= screenW;
 
-  // If no input is focused (e.g. before starting exam, or reading questions/MCQ),
-  // a significant reduction in window dimensions indicates split-screen / multi-window
-  if (!isInputFocused) {
+  // If no input is focused (e.g. before starting exam, or reading questions/MCQ)
+  // and no keyboard was used a moment ago, a significant reduction in window
+  // dimensions indicates split-screen / multi-window.
+  // iPhone/iPod are excluded from geometry-only detection: iOS phones cannot show
+  // two apps side by side, so a shorter viewport there is only browser chrome or
+  // the keyboard. iPad/Android/desktop keep full detection.
+  const canUseGeometry = !isInputFocused && !isKeyboardViewportShiftActive() && !isIPhone();
+
+  if (canUseGeometry) {
     // 1. Vertical split screen (typical mobile Android portrait: WhatsApp on top, test app on bottom)
     // In normal mobile mode, innerH / screenH is typically >= 0.78 even with browser address bar.
     // In split screen, innerH / screenH drops to ~0.35 - 0.60.
-    if (isPortrait && heightRatio < 0.70) {
+    if (isPortrait && heightRatio < 0.62) {
       return {
         isSplit: true,
         reason: `Altezza visuale ridotta al ${Math.round(heightRatio * 100)}% dello schermo. Rilevata suddivisione schermo verticale (Split Screen / Multi-Finestra).`,
@@ -659,7 +724,7 @@ export function detectSplitScreenStatus(): SplitScreenDetection {
     }
 
     // 2. Horizontal split screen (side-by-side apps in landscape or tablet/desktop)
-    if (!isPortrait && widthRatio < 0.70) {
+    if (!isPortrait && widthRatio < 0.62) {
       return {
         isSplit: true,
         reason: `Larghezza visuale ridotta al ${Math.round(widthRatio * 100)}% dello schermo. Rilevata suddivisione schermo orizzontale (Split Screen affiancato).`,
@@ -669,7 +734,7 @@ export function detectSplitScreenStatus(): SplitScreenDetection {
     }
 
     // 3. Floating window / Pop-up view / Picture-in-picture view
-    if (heightRatio < 0.75 && widthRatio < 0.75) {
+    if (heightRatio < 0.68 && widthRatio < 0.68) {
       return {
         isSplit: true,
         reason: `Finestra ridotta (${Math.round(widthRatio * 100)}% x ${Math.round(heightRatio * 100)}%). Rilevata finestra ridotta o fluttuante.`,
