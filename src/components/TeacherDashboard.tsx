@@ -1378,16 +1378,42 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           : correctFib;
         const gradeFibCount = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0) ? 10 : fibList.length;
 
+        // Check for multiple-choice questions in Workbook (sections + root)
+        const wbMcList: any[] = [];
+        if (Array.isArray(domandeObj?.multipleChoice)) wbMcList.push(...domandeObj.multipleChoice);
+        sections.forEach((s: any) => {
+          if (Array.isArray(s.multipleChoice)) wbMcList.push(...s.multipleChoice);
+        });
+
+        let correctMc = 0;
+        if (wbMcList.length > 0) {
+          wbMcList.forEach((q: any) => {
+            const chosen = ansObj.mc?.[q.id];
+            if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
+              correctMc++;
+            }
+          });
+          if (correctMc === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
+            correctMc = sub.Punteggio_MC;
+          }
+          updatedPunteggioMC = correctMc;
+        }
+
+        const compositeObjScore = gradeFibScore + correctMc;
+        const compositeObjCount = gradeFibCount + wbMcList.length;
+
         if (rqList.length === 0) {
-          newGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, []);
+          newGrade = calculateWorkbookGrade(compositeObjScore, compositeObjCount, []);
           evalObj.reflectionDetails = [];
           evalObj.suggestedGrade = newGrade;
-          evalObj.overallFeedback = `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
+          evalObj.overallFeedback = wbMcList.length > 0
+            ? `Valutazione completata del quaderno di lavoro: l'alunno ha conseguito ${correctFib}/${fibList.length} termini FIB e ${correctMc}/${wbMcList.length} risposte a scelta multipla (voto matematico: ${newGrade}).`
+            : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
           newFeedback = evalObj.overallFeedback;
         } else {
           const details = evalObj.reflectionDetails || [];
           const rqMean = details.length > 0 ? weightedOpenAverage(details, rqList) : 0;
-          newGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, details.length > 0 ? [rqMean] : []);
+          newGrade = calculateWorkbookGrade(compositeObjScore, compositeObjCount, details.length > 0 ? [rqMean] : []);
           evalObj.suggestedGrade = newGrade;
         }
       }

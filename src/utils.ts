@@ -107,6 +107,10 @@ export function calculateQuizGrade(mcScore: number, mcCount: number, oeScores: n
     .filter((s) => !isNaN(s))
     .map((s) => Math.min(10, Math.max(0, s)));
 
+  if (mcCount <= 0 && validOeScores.length === 0) {
+    return "—";
+  }
+
   if (mcCount > 0 && validOeScores.length > 0) {
     const mcFraction = Math.min(1, Math.max(0, mcScore / mcCount)); // 0 to 1
     const oeFraction = Math.min(1, Math.max(0, validOeScores.reduce((a, b) => a + b, 0) / (validOeScores.length * 10))); // 0 to 1
@@ -132,6 +136,10 @@ export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqSco
     .map((s) => Number(s))
     .filter((s) => !isNaN(s))
     .map((s) => Math.min(10, Math.max(0, s)));
+
+  if (fibCount <= 0 && validRqScores.length === 0) {
+    return "—";
+  }
 
   if (fibCount > 0 && validRqScores.length > 0) {
     const fibFraction = Math.min(1, Math.max(0, fibScore / fibCount)); // 0 to 1
@@ -264,14 +272,46 @@ export function computeGradeBreakdown(params: {
     const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
     const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
     const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-    objTotal = fibList.length;
-
-    if (params.punteggioFIB !== undefined && params.punteggioFIB !== null && !isNaN(Number(params.punteggioFIB))) {
-      objScore = Number(params.punteggioFIB);
-    } else if (params.evaluation?.fibScore !== undefined && !isNaN(Number(params.evaluation.fibScore))) {
-      objScore = Number(params.evaluation.fibScore);
-      if (params.evaluation?.fibTotal) objTotal = Number(params.evaluation.fibTotal);
+    
+    // Check multiple choice in Workbook (both in sections and root level)
+    const wbMcList: any[] = [];
+    if (Array.isArray(params.examData?.multipleChoice)) {
+      wbMcList.push(...params.examData.multipleChoice);
     }
+    sections.forEach((s: any) => {
+      if (Array.isArray(s.multipleChoice)) {
+        wbMcList.push(...s.multipleChoice);
+      }
+    });
+
+    let fibScore = 0;
+    let fibTotal = fibList.length;
+    if (params.punteggioFIB !== undefined && params.punteggioFIB !== null && !isNaN(Number(params.punteggioFIB))) {
+      fibScore = Number(params.punteggioFIB);
+    } else if (params.evaluation?.fibScore !== undefined && !isNaN(Number(params.evaluation.fibScore))) {
+      fibScore = Number(params.evaluation.fibScore);
+      if (params.evaluation?.fibTotal) fibTotal = Number(params.evaluation.fibTotal);
+    } else if (params.answers?.wbFib) {
+      fibScore = fibList.reduce((acc: number, f: any) => {
+        return acc + (isFibAnswerCorrect(params.answers.wbFib[f.id], f.answer) ? 1 : 0);
+      }, 0);
+    }
+
+    let mcScore = 0;
+    const mcTotal = wbMcList.length;
+    if (mcTotal > 0) {
+      if (params.punteggioMC !== undefined && params.punteggioMC !== null && !isNaN(Number(params.punteggioMC))) {
+        mcScore = Number(params.punteggioMC);
+      } else if (params.answers?.mc) {
+        mcScore = wbMcList.reduce((acc: number, q: any) => {
+          const u = params.answers.mc[q.id];
+          return acc + (u !== undefined && u !== null && Number(u) === Number(q.correctIndex) ? 1 : 0);
+        }, 0);
+      }
+    }
+
+    objTotal = fibTotal + mcTotal;
+    objScore = fibScore + mcScore;
 
     const rqEvalList = Array.isArray(params.evaluation?.reflectionDetails) ? params.evaluation.reflectionDetails : [];
     if (rqEvalList.length > 0) {
@@ -316,6 +356,23 @@ export function computeGradeBreakdown(params: {
   let objPart: GradeBreakdownResult["objectivePart"];
   let subjPart: GradeBreakdownResult["subjectivePart"];
 
+  // Determine user-facing label for objective section
+  const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
+  const wbHasMc = tipo === "Workbook" && (
+    (Array.isArray(params.examData?.multipleChoice) && params.examData.multipleChoice.length > 0) ||
+    sections.some((s: any) => Array.isArray(s.multipleChoice) && s.multipleChoice.length > 0)
+  );
+  const wbHasFib = tipo === "Workbook" && sections.some((s: any) => Array.isArray(s.fillInTheBlank) && s.fillInTheBlank.length > 0);
+  
+  let resolvedObjName = "Completamento frasi (FIB)";
+  if (tipo === "Quiz") {
+    resolvedObjName = "Quesiti a scelta multipla (Crocette)";
+  } else if (wbHasMc && wbHasFib) {
+    resolvedObjName = "Quesiti Oggettivi (FIB + Crocette)";
+  } else if (wbHasMc) {
+    resolvedObjName = "Quesiti a scelta multipla (Crocette)";
+  }
+
   if (hasObj && hasSubj) {
     // Mixed: 40% Objective + 60% Subjective
     const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
@@ -331,7 +388,7 @@ export function computeGradeBreakdown(params: {
     finalNumeric = Math.min(10, Math.max(0, objPoints + subjPoints));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
 
-    const objName = tipo === "Quiz" ? "Quesiti a scelta multipla (Crocette)" : "Completamento frasi (FIB)";
+    const objName = resolvedObjName;
     const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
 
     formulaTitle = "Valutazione Mista Ponderata (40% Oggettiva + 60% Aperte)";
@@ -370,7 +427,7 @@ export function computeGradeBreakdown(params: {
     finalNumeric = Math.min(10, Math.max(0, objFraction * 10));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
 
-    const objName = tipo === "Quiz" ? "Quesiti a scelta multipla (Crocette)" : "Completamento frasi (FIB)";
+    const objName = resolvedObjName;
     formulaTitle = "Valutazione Matematica Lineare (100% Oggettiva)";
     formulaSummary = `(${objScore} esatte / ${objTotal} quesiti) × 10 = ${finalNumeric.toFixed(2)} / 10`;
 

@@ -1688,15 +1688,27 @@ REGOLE TASSATIVE:
     // 1. Merge new Multiple Choice
     if (Array.isArray(data.newMultipleChoice) && data.newMultipleChoice.length > 0) {
       if (isInputWorkbook) {
-        const lastSec = baseExam.sections[baseExam.sections.length - 1];
-        if (lastSec) {
-          if (!Array.isArray(lastSec.multipleChoice)) lastSec.multipleChoice = [];
-          for (const mc of data.newMultipleChoice) {
-            lastSec.multipleChoice.push({
-              id: `q_mc_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-              question: mc.question,
-              options: mc.options,
-              correctIndex: mc.correctIndex
+        if (!Array.isArray(baseExam.sections)) baseExam.sections = [];
+        let lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (!lastSec) {
+          lastSec = { title: "Sezione Didattica", multipleChoice: [], fillInTheBlank: [], reflectionQuestions: [] };
+          baseExam.sections.push(lastSec);
+        }
+        if (!Array.isArray(lastSec.multipleChoice)) lastSec.multipleChoice = [];
+        for (let i = 0; i < data.newMultipleChoice.length; i++) {
+          const mc = data.newMultipleChoice[i];
+          const newId = `q_mc_${Date.now()}_${i + 1}`;
+          lastSec.multipleChoice.push({
+            id: newId,
+            question: mc.question,
+            options: mc.options,
+            correctIndex: mc.correctIndex
+          });
+          if (!addedItems.some((a) => a.previewText === mc.question)) {
+            addedItems.push({
+              type: "multiple_choice",
+              title: `Crocetta (${lastSec.title || "Sezione"})`,
+              previewText: mc.question
             });
           }
         }
@@ -1725,15 +1737,27 @@ REGOLE TASSATIVE:
     // 2. Merge new Open Ended questions
     if (Array.isArray(data.newOpenEnded) && data.newOpenEnded.length > 0) {
       if (isInputWorkbook) {
-        const lastSec = baseExam.sections[baseExam.sections.length - 1];
-        if (lastSec) {
-          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
-          for (const oe of data.newOpenEnded) {
-            lastSec.reflectionQuestions.push({
-              id: `ref_${lastSec.reflectionQuestions.length + 1}`,
-              question: oe.question,
-              criteria: oe.criteria || "Valutare pertinenza, correttezza concettuale e proprietà lessicale.",
-              weight: 1
+        if (!Array.isArray(baseExam.sections)) baseExam.sections = [];
+        let lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (!lastSec) {
+          lastSec = { title: "Sezione Didattica", reflectionQuestions: [] };
+          baseExam.sections.push(lastSec);
+        }
+        if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+        for (let i = 0; i < data.newOpenEnded.length; i++) {
+          const oe = data.newOpenEnded[i];
+          const newId = `ref_${Date.now()}_${i + 1}`;
+          lastSec.reflectionQuestions.push({
+            id: newId,
+            question: oe.question,
+            criteria: oe.criteria || "Valutare pertinenza, correttezza concettuale e proprietà lessicale.",
+            weight: 1
+          });
+          if (!addedItems.some((a) => a.previewText === oe.question)) {
+            addedItems.push({
+              type: "reflection",
+              title: `Riflessione (${lastSec.title || "Sezione"})`,
+              previewText: oe.question
             });
           }
         }
@@ -1762,15 +1786,27 @@ REGOLE TASSATIVE:
     // 3. Merge new Reflection Questions
     if (Array.isArray(data.newReflectionQuestions) && data.newReflectionQuestions.length > 0) {
       if (isInputWorkbook) {
-        const lastSec = baseExam.sections[baseExam.sections.length - 1];
-        if (lastSec) {
-          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
-          for (const rq of data.newReflectionQuestions) {
-            lastSec.reflectionQuestions.push({
-              id: `ref_${lastSec.reflectionQuestions.length + 1}`,
-              question: rq.question,
-              criteria: rq.criteria || "Valutare capacità critica, originalità e coerenza.",
-              weight: 1
+        if (!Array.isArray(baseExam.sections)) baseExam.sections = [];
+        let lastSec = baseExam.sections[baseExam.sections.length - 1];
+        if (!lastSec) {
+          lastSec = { title: "Sezione Didattica", reflectionQuestions: [] };
+          baseExam.sections.push(lastSec);
+        }
+        if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+        for (let i = 0; i < data.newReflectionQuestions.length; i++) {
+          const rq = data.newReflectionQuestions[i];
+          const newId = `ref_${Date.now()}_${i + 1}`;
+          lastSec.reflectionQuestions.push({
+            id: newId,
+            question: rq.question,
+            criteria: rq.criteria || "Valutare capacità critica, originalità e coerenza.",
+            weight: 1
+          });
+          if (!addedItems.some((a) => a.previewText === rq.question)) {
+            addedItems.push({
+              type: "reflection",
+              title: `Riflessione (${lastSec.title || "Sezione"})`,
+              previewText: rq.question
             });
           }
         }
@@ -1785,6 +1821,13 @@ REGOLE TASSATIVE:
             criteria: rq.criteria || "Valutare profondità di riflessione e giudizio autonomo.",
             weight: 1
           });
+          if (!addedItems.some((a) => a.previewText === rq.question)) {
+            addedItems.push({
+              type: "open_ended",
+              title: `Riflessione Critica #${baseIndex + i + 1}`,
+              previewText: rq.question
+            });
+          }
         }
       }
     }
