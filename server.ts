@@ -2,7 +2,6 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import { createServer as createViteServer } from "vite";
 import { GoogleGenAI, Type } from "@google/genai";
 import dotenv from "dotenv";
 
@@ -2694,7 +2693,9 @@ async function startServer() {
   });
 
   if (!isProduction) {
-    // Development Mode
+    // Development Mode. Vite is imported lazily so a production deploy that
+    // installs only runtime dependencies (`npm ci --omit=dev`) still boots.
+    const { createServer: createViteServer } = await import("vite");
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
