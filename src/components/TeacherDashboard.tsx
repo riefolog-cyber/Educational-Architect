@@ -49,12 +49,13 @@ import {
   Check,
   PlusCircle,
   Undo2,
-  FileUp
+  FileUp,
+  Archive
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage, extractBreakdownFromSubmission } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage, extractBreakdownFromSubmission, detectGibberish } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
@@ -326,6 +327,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
+
+  // Cumulative ZIP export state
+  const [isExportingZip, setIsExportingZip] = useState<boolean>(false);
+  const [zipProgress, setZipProgress] = useState<{ current: number; total: number } | null>(null);
 
   // Live sessions opened by this teacher (used by the real-time classroom monitor)
   const [activeSessions, setActiveSessions] = useState<LiveSessionSummary[]>([]);
@@ -1353,6 +1358,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         } else {
           const details = evalObj.openEndedDetails || [];
+          details.forEach((det: any, idx: number) => {
+            const q = oeList.find((item: any) => item.id === det.questionId) || oeList[idx];
+            const rawAns = String(ansObj.oe?.[q?.id] || ansObj.openEnded?.[q?.id] || "").trim();
+            if (detectGibberish(rawAns)) {
+              det.score = 0;
+            }
+          });
           const oeMean = details.length > 0 ? weightedOpenAverage(details, oeList) : 0;
           newGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, details.length > 0 ? [oeMean] : []);
           evalObj.suggestedGrade = newGrade;
@@ -1412,6 +1424,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           newFeedback = evalObj.overallFeedback;
         } else {
           const details = evalObj.reflectionDetails || [];
+          details.forEach((det: any, idx: number) => {
+            const r = rqList.find((item: any) => item.id === det.id) || rqList[idx];
+            const rawAns = String(ansObj.wbRq?.[r?.id] || "").trim();
+            if (detectGibberish(rawAns)) {
+              det.score = 0;
+            }
+          });
           const rqMean = details.length > 0 ? weightedOpenAverage(details, rqList) : 0;
           newGrade = calculateWorkbookGrade(compositeObjScore, compositeObjCount, details.length > 0 ? [rqMean] : []);
           evalObj.suggestedGrade = newGrade;
@@ -1484,519 +1503,595 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Export a student evaluation with metacognitive details to PDF
-  const handleExportPDF = async (sub: SavedSubmission) => {
-    // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
-    const sanitizePdfText = (text: string): string => {
-      if (!text) return "";
-      
-      let temp = text
-        .replace(/<[^>]+>/g, '') 
-        .replace(/&ldquo;/g, '"')
-        .replace(/&rdquo;/g, '"')
-        .replace(/&mdash;/g, '-')
-        .replace(/&ndash;/g, '-')
-        .replace(/&amp;/g, '&')
-        .replace(/&eacute;/g, 'e')
-        .replace(/&agrave;/g, 'a')
-        .replace(/&egrave;/g, 'e')
-        .replace(/&igrave;/g, 'i')
-        .replace(/&ograve;/g, 'o')
-        .replace(/&ugrave;/g, 'u')
-        .replace(/\*\*/g, '') 
-        .replace(/\*/g, '');
+  // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
+  const sanitizePdfText = (text: string): string => {
+    if (!text) return "";
+    
+    let temp = text
+      .replace(/<[^>]+>/g, '') 
+      .replace(/&ldquo;/g, '"')
+      .replace(/&rdquo;/g, '"')
+      .replace(/&mdash;/g, '-')
+      .replace(/&ndash;/g, '-')
+      .replace(/&amp;/g, '&')
+      .replace(/&eacute;/g, 'e')
+      .replace(/&agrave;/g, 'a')
+      .replace(/&egrave;/g, 'e')
+      .replace(/&igrave;/g, 'i')
+      .replace(/&ograve;/g, 'o')
+      .replace(/&ugrave;/g, 'u')
+      .replace(/\*\*/g, '') 
+      .replace(/\*/g, '');
 
-      // Replace common icons and emojis with safe text representations
-      temp = temp
-        .replace(/[✅✔️✔]/g, "[SI] ")
-        .replace(/[❌✖️✖🔴🚨🛑]/g, "[NO] ")
-        .replace(/[⏱️⏰⏳]/g, "[TEMPO] ")
-        .replace(/[⚠️💡⭐🌟📌🎯🔍🎓📘📖✏️📝⚙️🧪🩺💼🧠🧬]/g, "* ")
-        .replace(/[➢➔➤➔➜🛈ℹ️]/g, "-> ")
-        .replace(/[•●▪▪]/g, "- ")
-        .replace(/[\u201C\u201D]/g, '"') // Smart quotes
-        .replace(/[\u2018\u2019]/g, "'"); // Smart single quotes
-      
-      // Filter out code points above 255 to completely prevent weird character rendering artifacts
-      // standard Italian accented letters à è é ì ò ù are within 0-255 range (ISO-8859-1)
-      let result = "";
-      for (let i = 0; i < temp.length; i++) {
-        const charCode = temp.charCodeAt(i);
-        if (charCode <= 255) {
-          result += temp.charAt(i);
+    // Replace common icons and emojis with safe text representations
+    temp = temp
+      .replace(/[✅✔️✔]/g, "[SI] ")
+      .replace(/[❌✖️✖🔴🚨🛑]/g, "[NO] ")
+      .replace(/[⏱️⏰⏳]/g, "[TEMPO] ")
+      .replace(/[⚠️💡⭐🌟📌🎯🔍🎓📘📖✏️📝⚙️🧪🩺💼🧠🧬]/g, "* ")
+      .replace(/[➢➔➤➔➜🛈ℹ️]/g, "-> ")
+      .replace(/[•●▪▪]/g, "- ")
+      .replace(/[\u201C\u201D]/g, '"') // Smart quotes
+      .replace(/[\u2018\u2019]/g, "'"); // Smart single quotes
+    
+    // Filter out code points above 255 to completely prevent weird character rendering artifacts
+    // standard Italian accented letters à è é ì ò ù are within 0-255 range (ISO-8859-1)
+    let result = "";
+    for (let i = 0; i < temp.length; i++) {
+      const charCode = temp.charCodeAt(i);
+      if (charCode <= 255) {
+        result += temp.charAt(i);
+      } else {
+        if (charCode >= 0x2000 && charCode <= 0x206F) {
+          result += "-";
         } else {
-          if (charCode >= 0x2000 && charCode <= 0x206F) {
-            result += "-";
-          } else {
-            result += " ";
-          }
+          result += " ";
         }
       }
-      return result.trim() ? result : " ";
+    }
+    return result.trim() ? result : " ";
+  };
+
+  // Reusable function to assemble the full pedagogical report jsPDF document
+  const createSubmissionPdfDoc = (sub: SavedSubmission, jsPDFConstructor: any) => {
+    const doc = new jsPDFConstructor();
+    let currentY = 20;
+    const pageHeight = 275;
+
+    const checkPageBreak = (neededHeight: number) => {
+      if (currentY + neededHeight > pageHeight) {
+        doc.addPage();
+        currentY = 20;
+        doc.setFont("Helvetica", "normal");
+        doc.setFontSize(8);
+        doc.setTextColor(150, 150, 150);
+        doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(sub.Nome || "")}`, 15, 12);
+        doc.line(15, 14, 195, 14);
+        doc.setDrawColor(230, 230, 230);
+        currentY = 22;
+      }
     };
 
+    const writeText = (text: string, fontSize: number = 10, isBold: boolean = false, color: [number, number, number] = [30, 41, 59], xPos: number = 15) => {
+      if (!text) return;
+      doc.setFont("Helvetica", isBold ? "bold" : "normal");
+      doc.setFontSize(fontSize);
+      doc.setTextColor(color[0], color[1], color[2]);
+      
+      const cleanStr = sanitizePdfText(text);
+      const lines: string[] = doc.splitTextToSize(cleanStr, 195 - xPos);
+      for (const line of lines) {
+        checkPageBreak(5);
+        doc.text(line, xPos, currentY);
+        currentY += 5;
+      }
+    };
+
+    const writeParagraphs = (rawText: string, fontSize: number = 10, color: [number, number, number] = [51, 65, 85], xPos: number = 15) => {
+      if (!rawText) return;
+      const blocks = rawText.split(/\n+/);
+      for (const block of blocks) {
+        if (!block.trim()) continue;
+        
+        const isListItem = block.trim().startsWith('-') || block.trim().startsWith('*') || /^\d+\./.test(block.trim());
+        if (isListItem) {
+          doc.setFont("Helvetica", "normal");
+          doc.setFontSize(fontSize);
+          doc.setTextColor(color[0], color[1], color[2]);
+          
+          const cleanBlock = sanitizePdfText(block.replace(/^[\s-*•\d+.]\s*/, ''));
+          const lines: string[] = doc.splitTextToSize("-  " + cleanBlock, 195 - (xPos + 4));
+          for (let j = 0; j < lines.length; j++) {
+            checkPageBreak(5);
+            const indentX = j === 0 ? xPos : xPos + 4;
+            doc.text(lines[j], indentX, currentY);
+            currentY += 5;
+          }
+          currentY += 1.5; 
+        } else {
+          writeText(block, fontSize, false, color, xPos);
+          currentY += 2; 
+        }
+      }
+    };
+
+    // 1. PAGE HEADER
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(16);
+    doc.setTextColor(13, 148, 136); // Teal
+    doc.text("EDUCATIONAL ARCHITECT", 15, currentY);
+    currentY += 6;
+
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(9);
+    doc.setTextColor(100, 116, 139);
+    doc.text("Report di Valutazione Cognitiva e Metacognitiva Autonoma", 15, currentY);
+    currentY += 8;
+
+    doc.setDrawColor(226, 232, 240);
+    doc.line(15, currentY, 195, currentY);
+    currentY += 10;
+
+    // 2. DETTAGLIO STUDENTE CARD
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42); // Deep slate
+    doc.text("Anagrafica & Informazioni Prova", 15, currentY);
+    currentY += 6;
+
+    // Draw box for student details
+    doc.setFillColor(248, 250, 252);
+    doc.rect(15, currentY, 180, 24, "F");
+    
+    doc.setFontSize(9);
+    doc.setFont("Helvetica", "normal");
+    doc.setTextColor(71, 85, 105);
+    
+    // Column 1
+    doc.text(`Studente: ${sanitizePdfText(sub.Nome || "Anonimo")}`, 18, currentY + 6);
+    doc.text(`Email: ${sanitizePdfText(sub.Email || "N/D")}`, 18, currentY + 12);
+    doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 18);
+
+    // Column 2
+    const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
+    doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
+    doc.text(`Data Svolgimento: ${dateStr}`, 110, currentY + 12);
+    doc.text(`Valutazione ID: ${sub.id || "N/D"}`, 110, currentY + 18);
+    
+    currentY += 30;
+
+    // 3. DASHBOARD DI PERFORMANCE
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42);
+    doc.text("Dashboard delle Metriche & Valutazione", 15, currentY);
+    currentY += 6;
+
+    // Draw stats box
+    doc.setFillColor(241, 245, 249);
+    doc.rect(15, currentY, 180, 26, "F");
+
+    // Stats 1: Voto IA
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(71, 85, 105);
+    doc.text("VOTO CONSIGLIATO IA", 20, currentY + 8);
+    doc.setFontSize(16);
+    doc.setTextColor(13, 148, 136); // Teal
+    doc.text(`${sub.Voto_Suggerito || "N/A"}/10`, 20, currentY + 18);
+
+    // Stats 2: Autovalutazione
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(71, 85, 105);
+    doc.text("AUTOVALUTAZIONE META.", 85, currentY + 8);
+    doc.setFontSize(16);
+    doc.setTextColor(79, 70, 229); // Indigo
+    doc.text(`${sub.Autovalutazione || "—"}/10`, 85, currentY + 18);
+
+    // Stats 3: Monitoraggio Integrità
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(8);
+    doc.setTextColor(71, 85, 105);
+    doc.text("MONITORAGGIO INTEGRITÀ", 150, currentY + 8);
+    doc.setFontSize(10);
+    const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
+    if (totalViolations > 0) {
+      doc.setTextColor(180, 83, 9); // Amber
+      doc.text(`Rilevato (${totalViolations} violazioni)`, 150, currentY + 18);
+    } else {
+      doc.setTextColor(5, 150, 105); // Emerald Green
+      doc.text("Ottima (0 anomalie)", 150, currentY + 18);
+    }
+
+    currentY += 34;
+
+    // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
+    const breakdown = extractBreakdownFromSubmission(sub);
+    if (breakdown) {
+      checkPageBreak(28);
+      doc.setFillColor(248, 250, 252);
+      doc.setDrawColor(203, 213, 225);
+      doc.roundedRect(15, currentY, 180, 25, 2.5, 2.5, "FD");
+
+      doc.setFont("Helvetica", "bold");
+      doc.setFontSize(9);
+      doc.setTextColor(30, 41, 59);
+      doc.text(`Composizione del Voto: ${breakdown.formulaTitle}`, 19, currentY + 6);
+
+      doc.setFont("Courier", "bold");
+      doc.setFontSize(8.5);
+      doc.setTextColor(67, 56, 202);
+      doc.text(breakdown.formulaSummary, 19, currentY + 13);
+
+      doc.setFont("Helvetica", "normal");
+      doc.setFontSize(7.5);
+      doc.setTextColor(71, 85, 105);
+      const explText = breakdown.explanationLines[0] || "";
+      doc.text(explText.length > 105 ? explText.slice(0, 105) + "..." : explText, 19, currentY + 19);
+
+      currentY += 29;
+    }
+
+    // Parser per i dati IA completi
+    let evalObj: any = null;
+    try {
+      evalObj = typeof sub.Full_Evaluation === "string" 
+        ? JSON.parse(sub.Full_Evaluation) 
+        : sub.Full_Evaluation;
+    } catch {}
+
+    // 4. GIUDIZIO DIDATTICO COMPLESSIVO
+    const generalFeedback = sub.Feedback_Generale || evalObj?.overallFeedback || evalObj?.openEndedEvaluation;
+    if (generalFeedback) {
+      doc.setFont("Helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(15, 23, 42);
+      doc.text("Giudizio Didattico Complessivo", 15, currentY);
+      currentY += 6;
+
+      writeParagraphs(generalFeedback, 9.5, [30, 41, 59], 15);
+      currentY += 6;
+    }
+
+    // 5. ERRORI PRINCIPALI
+    const mainErrors = sub.Errori_Principali || evalObj?.mainErrors;
+    if (mainErrors) {
+      checkPageBreak(15);
+      doc.setFont("Helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(220, 38, 38); // Red
+      doc.text("Errori Principali Evidenziati", 15, currentY);
+      currentY += 6;
+
+      writeParagraphs(mainErrors, 9.5, [185, 28, 28], 15);
+      currentY += 6;
+    }
+
+    // 5.5 PIANO DI RECUPERO IA
+    const recoveryPlan = sub.Piano_Recupero;
+    if (recoveryPlan) {
+      checkPageBreak(15);
+      doc.setFont("Helvetica", "bold");
+      doc.setFontSize(11);
+      doc.setTextColor(13, 148, 136); // Teal
+      doc.text("Piano di Recupero Consigliato dall'IA", 15, currentY);
+      currentY += 6;
+
+      writeParagraphs(recoveryPlan, 9.5, [13, 148, 136], 15);
+      currentY += 6;
+    }
+
+    // 6. DETTAGLI PUNTUALI DOMANDE E RISPOSTE
+    checkPageBreak(25);
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(11);
+    doc.setTextColor(15, 23, 42);
+    doc.text("Dettaglio Risposte & Analisi Metacognitiva", 15, currentY);
+    currentY += 6;
+
+    let ansObj: any = {};
+    try {
+      ansObj = typeof sub.Risposte_Studente === "string" 
+        ? JSON.parse(sub.Risposte_Studente) 
+        : sub.Risposte_Studente;
+    } catch {}
+
+    let domandeObj: any = null;
+    if (sub.Domande_Esame) {
+      try {
+        domandeObj = typeof sub.Domande_Esame === "string"
+          ? JSON.parse(sub.Domande_Esame)
+          : sub.Domande_Esame;
+      } catch {}
+    }
+
+    if (sub.Tipo === "Quiz") {
+      const mcqList = domandeObj?.multipleChoice || [];
+      const oeList = domandeObj?.openEnded || [];
+      const details = evalObj?.openEndedDetails || [];
+
+      // Scelta Multipla
+      if (mcqList.length > 0) {
+        checkPageBreak(15);
+        doc.setFont("Helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(71, 85, 105);
+        doc.text("A) Sezione Risposte a Scelta Multipla (Crocette)", 15, currentY);
+        currentY += 6;
+
+        mcqList.forEach((q: any, idx: number) => {
+          const selectedOptIdx = ansObj.mc?.[q.id];
+          const selectedOptText = selectedOptIdx !== undefined ? q.options[selectedOptIdx] : "Risposta non data o mancante";
+          const correctOptText = q.options[q.correctIndex];
+          const isCorrect = selectedOptIdx === q.correctIndex;
+          
+          checkPageBreak(18);
+          writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
+          currentY += 1;
+
+          const mcImg = domandeObj?.images?.[q.id];
+          if (mcImg) {
+            checkPageBreak(70);
+            try {
+              const mfmt = mcImg.includes("image/png") ? "PNG" : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg") ? "JPEG" : "PNG";
+              doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
+              currentY += 65;
+            } catch {}
+          }
+
+          if (isCorrect) {
+            writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
+          } else {
+            writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
+            currentY += 1;
+            writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
+          }
+          currentY += 4.5;
+        });
+        currentY += 2;
+      }
+
+      // Domande Aperte (render solo se la prova includeva effettivamente domande aperte)
+      if (details && details.length > 0 && oeList && oeList.length > 0) {
+        checkPageBreak(15);
+        doc.setFont("Helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(71, 85, 105);
+        doc.text("B) Sezione Sviluppo Domande Aperte & Correzione Didattica", 15, currentY);
+        currentY += 6;
+
+        details.forEach((det: any, idx: number) => {
+          const ansText = ansObj.oe?.[det.questionId] || "Assente";
+          const questionRef = oeList.find((q: any) => q.id === det.questionId);
+          const questionText = questionRef ? questionRef.question : `Quesito Aperto ${idx + 1}`;
+
+          checkPageBreak(25);
+          writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
+          currentY += 1;
+
+          const oeImg = domandeObj?.images?.[questionRef?.id];
+          if (oeImg) {
+            checkPageBreak(70);
+            try {
+              const ofmt = oeImg.includes("image/png") ? "PNG" : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg") ? "JPEG" : "PNG";
+              doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
+              currentY += 65;
+            } catch {}
+          }
+
+          // Student input box
+          const displayAnsText = ansText === "[VUOTO]" ? "Risposta non compilata o lasciata vuota (scena muta)" : ansText;
+          writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
+          currentY += 1.5;
+
+          // Tutor IA Corrective detail
+          checkPageBreak(12);
+          writeText(`Analisi Correttiva Tutor IA (Voto: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
+          currentY += 1;
+
+          writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
+          currentY += 4;
+        });
+      }
+
+    } else {
+      // Workbook reflections details
+      const sections = domandeObj?.sections || [];
+      const details = evalObj?.reflectionDetails || [];
+
+      if (sections.length > 0) {
+        checkPageBreak(15);
+        doc.setFont("Helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(71, 85, 105);
+        doc.text("A) Verifiche di Completamento Terminologico (Fill-in-the-Blank)", 15, currentY);
+        currentY += 6;
+
+        sections.forEach((sec: any, secIdx: number) => {
+          const fibList = sec.fillInTheBlank || [];
+          if (fibList.length === 0) return;
+
+          fibList.forEach((fib: any, fIdx: number) => {
+            const rawVal = ansObj.wbFib?.[fib.id];
+            const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
+            const isCorrect = isFibAnswerCorrect(val, fib.answer);
+            const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+            const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
+
+            checkPageBreak(15);
+            writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
+            currentY += 1;
+
+            const fibImg = domandeObj?.images?.[fib.id];
+            if (fibImg) {
+              checkPageBreak(70);
+              try {
+                const ffmt = fibImg.includes("image/png") ? "PNG" : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg") ? "JPEG" : "PNG";
+                doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
+                currentY += 65;
+              } catch {}
+            }
+
+            writeText(fullText, 8.5, false, [71, 85, 105], 15);
+            currentY += 1;
+            writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
+            currentY += 5;
+          });
+        });
+        currentY += 3;
+      }
+
+      // Reflection questions (render solo se presenti nel workbook)
+      const hasReflections = sections.some((s: any) => s.reflectionQuestions && s.reflectionQuestions.length > 0);
+      if (details && details.length > 0 && hasReflections) {
+        checkPageBreak(15);
+        doc.setFont("Helvetica", "bold");
+        doc.setFontSize(10);
+        doc.setTextColor(71, 85, 105);
+        doc.text("B) Domande di Riflessione Critica & Metacognitiva", 15, currentY);
+        currentY += 6;
+
+        details.forEach((det: any, idx: number) => {
+          const ansText = ansObj.wbRq?.[det.id] || "Assente";
+          let questionText = `Riflessione Critica ${idx + 1}`;
+          
+          if (sections.length > 0) {
+            for (const sec of sections) {
+              const found = sec.reflectionQuestions?.find((r: any) => r.id === det.id);
+              if (found) {
+                questionText = found.question;
+                break;
+              }
+            }
+          }
+
+          checkPageBreak(25);
+          writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
+          currentY += 1;
+
+          const reflImg = domandeObj?.images?.[det.id];
+          if (reflImg) {
+            checkPageBreak(70);
+            try {
+              const rfmt = reflImg.includes("image/png") ? "PNG" : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg") ? "JPEG" : "PNG";
+              doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
+              currentY += 65;
+            } catch {}
+          }
+
+          // Student input box
+          const displayAnsText = ansText === "[VUOTO]" ? "Risposta non data o lasciata vuota" : ansText;
+          writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
+          currentY += 1.5;
+
+          // Tutor IA evaluation detail
+          checkPageBreak(12);
+          writeText(`Feedback Didattico Customizzato (Punteggio: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
+          currentY += 1;
+
+          writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
+          currentY += 4;
+        });
+      }
+    }
+
+    // 7. FOOTER PAGE SIGNATURE
+    checkPageBreak(18);
+    currentY += 8;
+    doc.setDrawColor(226, 232, 240);
+    doc.line(15, currentY, 195, currentY);
+    currentY += 6;
+    doc.setFont("Helvetica", "italic");
+    doc.setFontSize(7.5);
+    doc.setTextColor(148, 163, 184);
+    doc.text("Firmato digitalmente e certificato da Educational Architect AI Engine. Conservare per il quaderno dei feedback scolastici.", 15, currentY);
+
+    return doc;
+  };
+
+  // Export a student evaluation with metacognitive details to PDF
+  const handleExportPDF = async (sub: SavedSubmission) => {
     try {
       const { jsPDF } = await import("jspdf");
-      const doc = new jsPDF();
-      let currentY = 20;
-      const pageHeight = 275;
-
-      const checkPageBreak = (neededHeight: number) => {
-        if (currentY + neededHeight > pageHeight) {
-          doc.addPage();
-          currentY = 20;
-          doc.setFont("Helvetica", "normal");
-          doc.setFontSize(8);
-          doc.setTextColor(150, 150, 150);
-          doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(sub.Nome || "")}`, 15, 12);
-          doc.line(15, 14, 195, 14);
-          doc.setDrawColor(230, 230, 230);
-          currentY = 22;
-        }
-      };
-
-      const writeText = (text: string, fontSize: number = 10, isBold: boolean = false, color: [number, number, number] = [30, 41, 59], xPos: number = 15) => {
-        if (!text) return;
-        doc.setFont("Helvetica", isBold ? "bold" : "normal");
-        doc.setFontSize(fontSize);
-        doc.setTextColor(color[0], color[1], color[2]);
-        
-        const cleanStr = sanitizePdfText(text);
-        const lines: string[] = doc.splitTextToSize(cleanStr, 195 - xPos);
-        for (const line of lines) {
-          checkPageBreak(5);
-          doc.text(line, xPos, currentY);
-          currentY += 5;
-        }
-      };
-
-      const writeParagraphs = (rawText: string, fontSize: number = 10, color: [number, number, number] = [51, 65, 85], xPos: number = 15) => {
-        if (!rawText) return;
-        const blocks = rawText.split(/\n+/);
-        for (const block of blocks) {
-          if (!block.trim()) continue;
-          
-          const isListItem = block.trim().startsWith('-') || block.trim().startsWith('*') || /^\d+\./.test(block.trim());
-          if (isListItem) {
-            doc.setFont("Helvetica", "normal");
-            doc.setFontSize(fontSize);
-            doc.setTextColor(color[0], color[1], color[2]);
-            
-            const cleanBlock = sanitizePdfText(block.replace(/^[\s-*•\d+.]\s*/, ''));
-            const lines: string[] = doc.splitTextToSize("-  " + cleanBlock, 195 - (xPos + 4));
-            for (let j = 0; j < lines.length; j++) {
-              checkPageBreak(5);
-              const indentX = j === 0 ? xPos : xPos + 4;
-              doc.text(lines[j], indentX, currentY);
-              currentY += 5;
-            }
-            currentY += 1.5; 
-          } else {
-            writeText(block, fontSize, false, color, xPos);
-            currentY += 2; 
-          }
-        }
-      };
-
-      // 1. PAGE HEADER
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(16);
-      doc.setTextColor(13, 148, 136); // Teal
-      doc.text("EDUCATIONAL ARCHITECT", 15, currentY);
-      currentY += 6;
-
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(9);
-      doc.setTextColor(100, 116, 139);
-      doc.text("Report di Valutazione Cognitiva e Metacognitiva Autonoma", 15, currentY);
-      currentY += 8;
-
-      doc.setDrawColor(226, 232, 240);
-      doc.line(15, currentY, 195, currentY);
-      currentY += 10;
-
-      // 2. DETTAGLIO STUDENTE CARD
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(15, 23, 42); // Deep slate
-      doc.text("Anagrafica & Informazioni Prova", 15, currentY);
-      currentY += 6;
-
-      // Draw box for student details
-      doc.setFillColor(248, 250, 252);
-      doc.rect(15, currentY, 180, 24, "F");
-      
-      doc.setFontSize(9);
-      doc.setFont("Helvetica", "normal");
-      doc.setTextColor(71, 85, 105);
-      
-      // Column 1
-      doc.text(`Studente: ${sanitizePdfText(sub.Nome || "Anonimo")}`, 18, currentY + 6);
-      doc.text(`Email: ${sanitizePdfText(sub.Email || "N/D")}`, 18, currentY + 12);
-      doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 18);
-
-      // Column 2
-      const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
-      doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
-      doc.text(`Data Svolgimento: ${dateStr}`, 110, currentY + 12);
-      doc.text(`Valutazione ID: ${sub.id || "N/D"}`, 110, currentY + 18);
-      
-      currentY += 30;
-
-      // 3. DASHBOARD DI PERFORMANCE
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(15, 23, 42);
-      doc.text("Dashboard delle Metriche & Valutazione", 15, currentY);
-      currentY += 6;
-
-      // Draw stats box
-      doc.setFillColor(241, 245, 249);
-      doc.rect(15, currentY, 180, 26, "F");
-
-      // Stats 1: Voto IA
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(8);
-      doc.setTextColor(71, 85, 105);
-      doc.text("VOTO CONSIGLIATO IA", 20, currentY + 8);
-      doc.setFontSize(16);
-      doc.setTextColor(13, 148, 136); // Teal
-      doc.text(`${sub.Voto_Suggerito || "N/A"}/10`, 20, currentY + 18);
-
-      // Stats 2: Autovalutazione
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(8);
-      doc.setTextColor(71, 85, 105);
-      doc.text("AUTOVALUTAZIONE META.", 85, currentY + 8);
-      doc.setFontSize(16);
-      doc.setTextColor(79, 70, 229); // Indigo
-      doc.text(`${sub.Autovalutazione || "—"}/10`, 85, currentY + 18);
-
-      // Stats 3: Monitoraggio Integrità
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(8);
-      doc.setTextColor(71, 85, 105);
-      doc.text("MONITORAGGIO INTEGRITÀ", 150, currentY + 8);
-      doc.setFontSize(10);
-      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
-      if (totalViolations > 0) {
-        doc.setTextColor(180, 83, 9); // Amber
-        doc.text(`Rilevato (${totalViolations} violazioni)`, 150, currentY + 18);
-      } else {
-        doc.setTextColor(5, 150, 105); // Emerald Green
-        doc.text("Ottima (0 anomalie)", 150, currentY + 18);
-      }
-
-      currentY += 34;
-
-      // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
-      const breakdown = extractBreakdownFromSubmission(sub);
-      if (breakdown) {
-        checkPageBreak(28);
-        doc.setFillColor(248, 250, 252);
-        doc.setDrawColor(203, 213, 225);
-        doc.roundedRect(15, currentY, 180, 25, 2.5, 2.5, "FD");
-
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(9);
-        doc.setTextColor(30, 41, 59);
-        doc.text(`Composizione del Voto: ${breakdown.formulaTitle}`, 19, currentY + 6);
-
-        doc.setFont("Courier", "bold");
-        doc.setFontSize(8.5);
-        doc.setTextColor(67, 56, 202);
-        doc.text(breakdown.formulaSummary, 19, currentY + 13);
-
-        doc.setFont("Helvetica", "normal");
-        doc.setFontSize(7.5);
-        doc.setTextColor(71, 85, 105);
-        const explText = breakdown.explanationLines[0] || "";
-        doc.text(explText.length > 105 ? explText.slice(0, 105) + "..." : explText, 19, currentY + 19);
-
-        currentY += 29;
-      }
-
-      // Parser per i dati IA completi
-      let evalObj: any = null;
-      try {
-        evalObj = typeof sub.Full_Evaluation === "string" 
-          ? JSON.parse(sub.Full_Evaluation) 
-          : sub.Full_Evaluation;
-      } catch {}
-
-      // 4. GIUDIZIO DIDATTICO COMPLESSIVO
-      const generalFeedback = sub.Feedback_Generale || evalObj?.overallFeedback || evalObj?.openEndedEvaluation;
-      if (generalFeedback) {
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(11);
-        doc.setTextColor(15, 23, 42);
-        doc.text("Giudizio Didattico Complessivo", 15, currentY);
-        currentY += 6;
-
-        writeParagraphs(generalFeedback, 9.5, [30, 41, 59], 15);
-        currentY += 6;
-      }
-
-      // 5. ERRORI PRINCIPALI
-      const mainErrors = sub.Errori_Principali || evalObj?.mainErrors;
-      if (mainErrors) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(11);
-        doc.setTextColor(220, 38, 38); // Red
-        doc.text("Errori Principali Evidenziati", 15, currentY);
-        currentY += 6;
-
-        writeParagraphs(mainErrors, 9.5, [185, 28, 28], 15);
-        currentY += 6;
-      }
-
-      // 5.5 PIANO DI RECUPERO IA
-      const recoveryPlan = sub.Piano_Recupero;
-      if (recoveryPlan) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(11);
-        doc.setTextColor(13, 148, 136); // Teal
-        doc.text("Piano di Recupero Consigliato dall'IA", 15, currentY);
-        currentY += 6;
-
-        writeParagraphs(recoveryPlan, 9.5, [13, 148, 136], 15);
-        currentY += 6;
-      }
-
-      // 6. DETTAGLI PUNTUALI DOMANDE E RISPOSTE
-      checkPageBreak(25);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(15, 23, 42);
-      doc.text("Dettaglio Risposte & Analisi Metacognitiva", 15, currentY);
-      currentY += 6;
-
-      let ansObj: any = {};
-      try {
-        ansObj = typeof sub.Risposte_Studente === "string" 
-          ? JSON.parse(sub.Risposte_Studente) 
-          : sub.Risposte_Studente;
-      } catch {}
-
-      let domandeObj: any = null;
-      if (sub.Domande_Esame) {
-        try {
-          domandeObj = typeof sub.Domande_Esame === "string"
-            ? JSON.parse(sub.Domande_Esame)
-            : sub.Domande_Esame;
-        } catch {}
-      }
-
-      if (sub.Tipo === "Quiz") {
-        const mcqList = domandeObj?.multipleChoice || [];
-        const oeList = domandeObj?.openEnded || [];
-        const details = evalObj?.openEndedDetails || [];
-
-        // Scelta Multipla
-        if (mcqList.length > 0) {
-          checkPageBreak(15);
-          doc.setFont("Helvetica", "bold");
-          doc.setFontSize(10);
-          doc.setTextColor(71, 85, 105);
-          doc.text("A) Sezione Risposte a Scelta Multipla (Crocette)", 15, currentY);
-          currentY += 6;
-
-          mcqList.forEach((q: any, idx: number) => {
-            const selectedOptIdx = ansObj.mc?.[q.id];
-            const selectedOptText = selectedOptIdx !== undefined ? q.options[selectedOptIdx] : "Risposta non data o mancante";
-            const correctOptText = q.options[q.correctIndex];
-            const isCorrect = selectedOptIdx === q.correctIndex;
-            
-            checkPageBreak(18);
-            writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
-            currentY += 1;
-
-            const mcImg = domandeObj?.images?.[q.id];
-            if (mcImg) {
-              checkPageBreak(70);
-              try {
-                const mfmt = mcImg.includes("image/png") ? "PNG" : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg") ? "JPEG" : "PNG";
-                doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
-                currentY += 65;
-              } catch {}
-            }
-
-            if (isCorrect) {
-              writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
-            } else {
-              writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
-              currentY += 1;
-              writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
-            }
-            currentY += 4.5;
-          });
-          currentY += 2;
-        }
-
-        // Domande Aperte (render solo se la prova includeva effettivamente domande aperte)
-        if (details && details.length > 0 && oeList && oeList.length > 0) {
-          checkPageBreak(15);
-          doc.setFont("Helvetica", "bold");
-          doc.setFontSize(10);
-          doc.setTextColor(71, 85, 105);
-          doc.text("B) Sezione Sviluppo Domande Aperte & Correzione Didattica", 15, currentY);
-          currentY += 6;
-
-          details.forEach((det: any, idx: number) => {
-            const ansText = ansObj.oe?.[det.questionId] || "Assente";
-            const questionRef = oeList.find((q: any) => q.id === det.questionId);
-            const questionText = questionRef ? questionRef.question : `Quesito Aperto ${idx + 1}`;
-
-            checkPageBreak(25);
-            writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
-            currentY += 1;
-
-            const oeImg = domandeObj?.images?.[questionRef?.id];
-            if (oeImg) {
-              checkPageBreak(70);
-              try {
-                const ofmt = oeImg.includes("image/png") ? "PNG" : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg") ? "JPEG" : "PNG";
-                doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
-                currentY += 65;
-              } catch {}
-            }
-
-            // Student input box
-            const displayAnsText = ansText === "[VUOTO]" ? "Risposta non compilata o lasciata vuota (scena muta)" : ansText;
-            writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
-            currentY += 1.5;
-
-            // Tutor IA Corrective detail
-            checkPageBreak(12);
-            writeText(`Analisi Correttiva Tutor IA (Voto: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
-            currentY += 1;
-
-            writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
-            currentY += 4;
-          });
-        }
-
-      } else {
-        // Workbook reflections details
-        const sections = domandeObj?.sections || [];
-        const details = evalObj?.reflectionDetails || [];
-
-        if (sections.length > 0) {
-          checkPageBreak(15);
-          doc.setFont("Helvetica", "bold");
-          doc.setFontSize(10);
-          doc.setTextColor(71, 85, 105);
-          doc.text("A) Verifiche di Completamento Terminologico (Fill-in-the-Blank)", 15, currentY);
-          currentY += 6;
-
-          sections.forEach((sec: any, secIdx: number) => {
-            const fibList = sec.fillInTheBlank || [];
-            if (fibList.length === 0) return;
-
-            fibList.forEach((fib: any, fIdx: number) => {
-              const rawVal = ansObj.wbFib?.[fib.id];
-              const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
-              const isCorrect = isFibAnswerCorrect(val, fib.answer);
-              const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
-              const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
-
-              checkPageBreak(15);
-              writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
-              currentY += 1;
-
-const fibImg = domandeObj?.images?.[fib.id];
-              if (fibImg) {
-                checkPageBreak(70);
-                try {
-                  const ffmt = fibImg.includes("image/png") ? "PNG" : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg") ? "JPEG" : "PNG";
-                  doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
-                  currentY += 65;
-                } catch {}
-              }
-
-              writeText(fullText, 8.5, false, [71, 85, 105], 15);
-              currentY += 1;
-              writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
-              currentY += 5;
-            });
-          });
-          currentY += 3;
-        }
-
-        // Reflection questions (render solo se presenti nel workbook)
-        const hasReflections = sections.some((s: any) => s.reflectionQuestions && s.reflectionQuestions.length > 0);
-        if (details && details.length > 0 && hasReflections) {
-          checkPageBreak(15);
-          doc.setFont("Helvetica", "bold");
-          doc.setFontSize(10);
-          doc.setTextColor(71, 85, 105);
-          doc.text("B) Domande di Riflessione Critica & Metacognitiva", 15, currentY);
-          currentY += 6;
-
-          details.forEach((det: any, idx: number) => {
-            const ansText = ansObj.wbRq?.[det.id] || "Assente";
-            let questionText = `Riflessione Critica ${idx + 1}`;
-            
-            if (sections.length > 0) {
-              for (const sec of sections) {
-                const found = sec.reflectionQuestions?.find((r: any) => r.id === det.id);
-                if (found) {
-                  questionText = found.question;
-                  break;
-                }
-              }
-            }
-
-            checkPageBreak(25);
-            writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
-            currentY += 1;
-
-            const reflImg = domandeObj?.images?.[det.id];
-            if (reflImg) {
-              checkPageBreak(70);
-              try {
-                const rfmt = reflImg.includes("image/png") ? "PNG" : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg") ? "JPEG" : "PNG";
-                doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
-                currentY += 65;
-              } catch {}
-            }
-
-            // Student input box
-            const displayAnsText = ansText === "[VUOTO]" ? "Risposta non data o lasciata vuota" : ansText;
-            writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
-            currentY += 1.5;
-
-            // Tutor IA evaluation detail
-            checkPageBreak(12);
-            writeText(`Feedback Didattico Customizzato (Punteggio: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
-            currentY += 1;
-
-            writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
-            currentY += 4;
-          });
-        }
-      }
-
-      // 7. FOOTER PAGE SIGNATURE
-      checkPageBreak(18);
-      currentY += 8;
-      doc.setDrawColor(226, 232, 240);
-      doc.line(15, currentY, 195, currentY);
-      currentY += 6;
-      doc.setFont("Helvetica", "italic");
-      doc.setFontSize(7.5);
-      doc.setTextColor(148, 163, 184);
-      doc.text("Firmato digitalmente e certificato da Educational Architect AI Engine. Conservare per il quaderno dei feedback scolastici.", 15, currentY);
-
-      // Save PDF
+      const doc = createSubmissionPdfDoc(sub, jsPDF);
       const formattedName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
       doc.save(`esito_ea_${formattedName}_pin_${sub.Pin || "esame"}.pdf`);
-
     } catch (pdfErr) {
       console.error("PDF generation error:", pdfErr);
       alert("❌ Errore durante l'assemblaggio del PDF. Riprovare.");
+    }
+  };
+
+  // Cumulative ZIP export: bundles multiple PDF evaluations into a single compressed .zip file
+  const handleExportZip = async (subsToExport: SavedSubmission[], zipBaseName = "verifiche_classe") => {
+    if (!subsToExport || subsToExport.length === 0) {
+      alert("Nessuna verifica presente da esportare in ZIP.");
+      return;
+    }
+    setIsExportingZip(true);
+    setZipProgress({ current: 0, total: subsToExport.length });
+
+    try {
+      const [{ jsPDF }, JSZipModule] = await Promise.all([
+        import("jspdf"),
+        import("jszip")
+      ]);
+      const JSZip = (JSZipModule as any).default || JSZipModule;
+      const zip = new JSZip();
+
+      const usedFilenames = new Map<string, number>();
+
+      for (let i = 0; i < subsToExport.length; i++) {
+        const sub = subsToExport[i];
+        setZipProgress({ current: i + 1, total: subsToExport.length });
+
+        // Let the event loop cycle so React state can update progress smoothly
+        if (i % 2 === 0) {
+          await new Promise((r) => setTimeout(r, 15));
+        }
+
+        const doc = createSubmissionPdfDoc(sub, jsPDF);
+        const arrayBuffer = doc.output("arraybuffer");
+
+        const rawName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
+        const pinPart = (sub.Pin || "esame").toLowerCase().replace(/[^a-z0-9]/g, "_");
+        let baseFilename = `esito_${rawName}_pin_${pinPart}`;
+        const count = usedFilenames.get(baseFilename) || 0;
+        usedFilenames.set(baseFilename, count + 1);
+        const finalFilename = count > 0 ? `${baseFilename}_${count + 1}.pdf` : `${baseFilename}.pdf`;
+
+        zip.file(finalFilename, arrayBuffer);
+      }
+
+      const zipBlob = await zip.generateAsync({
+        type: "blob",
+        compression: "DEFLATE",
+        compressionOptions: { level: 6 }
+      });
+
+      const cleanZipName = zipBaseName.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+      const timestamp = new Date().toISOString().slice(0, 10);
+      const url = URL.createObjectURL(zipBlob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `${cleanZipName}_${timestamp}.zip`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+
+      setDeleteNotify({
+        type: "success",
+        message: `✅ Archivio ZIP generato con successo! Scaricati ${subsToExport.length} report PDF per il registro elettronico.`
+      });
+      setTimeout(() => setDeleteNotify(null), 5000);
+    } catch (err: any) {
+      console.error("Errore generazione archivio ZIP:", err);
+      alert(`❌ Errore durante la creazione dello ZIP: ${err?.message || err}`);
+    } finally {
+      setIsExportingZip(false);
+      setZipProgress(null);
     }
   };
 
@@ -3633,6 +3728,24 @@ const fibImg = domandeObj?.images?.[fib.id];
                       </span>
                     </button>
                     <button
+                      type="button"
+                      disabled={isExportingZip || filteredSubmissions.length === 0}
+                      onClick={() => handleExportZip(filteredSubmissions, "archivio_verifiche_pdf")}
+                      className="flex items-center gap-1.5 py-1.5 px-3 bg-indigo-600 hover:bg-indigo-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer shadow-md disabled:opacity-40"
+                      title="Scarica tutti i report PDF delle verifiche visibili in un unico archivio compresso ZIP per il registro elettronico"
+                    >
+                      {isExportingZip ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <Archive className="w-3.5 h-3.5" />
+                      )}
+                      <span>
+                        {isExportingZip && zipProgress
+                          ? `ZIP (${zipProgress.current}/${zipProgress.total})...`
+                          : "Scarica ZIP PDF"}
+                      </span>
+                    </button>
+                    <button
                       onClick={handleLoadSubmissions}
                       disabled={loadingSubmissions}
                       className="flex items-center gap-1 py-1.5 px-3 bg-slate-800 text-slate-300 hover:text-white rounded-xl text-xs transition-colors cursor-pointer disabled:opacity-40"
@@ -4316,6 +4429,22 @@ const fibImg = domandeObj?.images?.[fib.id];
                                     >
                                       <Download className="w-3.5 h-3.5" />
                                       <span className="hidden sm:inline">CSV Prova</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={isExportingZip}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const zipName = `verifiche_${exam.title}_pin_${exam.pin}`;
+                                        handleExportZip(exam.submissions, zipName);
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer disabled:opacity-40"
+                                      title={`Scarica tutti i ${exam.submissions.length} PDF individuali di questa prova in un unico archivio compresso ZIP per il registro elettronico`}
+                                    >
+                                      <Archive className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">ZIP di Classe ({exam.submissions.length})</span>
+                                      <span className="sm:hidden">ZIP ({exam.submissions.length})</span>
                                     </button>
 
                                     {/* Delete Exam Group Button with confirmation */}
@@ -5414,6 +5543,30 @@ const fibImg = domandeObj?.images?.[fib.id];
               >
                 Ho Capito, Chiudi
               </button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      {/* Floating ZIP Export Progress Indicator */}
+      {isExportingZip && zipProgress && (
+        <div className="fixed bottom-6 right-6 z-50 bg-slate-900 border border-indigo-500/40 shadow-2xl rounded-2xl p-4 flex items-center gap-3 animate-slideUp text-white">
+          <div className="p-2.5 bg-indigo-500/20 rounded-xl text-indigo-400">
+            <RefreshCw className="w-5 h-5 animate-spin" />
+          </div>
+          <div className="pr-2">
+            <p className="text-xs font-bold text-white flex items-center gap-1.5">
+              <Archive className="w-3.5 h-3.5 text-indigo-400" />
+              <span>Generazione Archivio ZIP in corso...</span>
+            </p>
+            <p className="text-[11px] text-slate-300">
+              Elaborazione PDF {zipProgress.current} di {zipProgress.total} ({Math.round((zipProgress.current / zipProgress.total) * 100)}%)
+            </p>
+            <div className="w-52 bg-slate-800 h-1.5 rounded-full mt-1.5 overflow-hidden">
+              <div 
+                className="bg-indigo-500 h-full transition-all duration-150"
+                style={{ width: `${(zipProgress.current / zipProgress.total) * 100}%` }}
+              />
             </div>
           </div>
         </div>

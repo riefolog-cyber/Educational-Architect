@@ -64,6 +64,7 @@ export default function ClassroomLiveMonitor({
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
   const [unlockingId, setUnlockingId] = useState<string | null>(null);
+  const [unlockingAll, setUnlockingAll] = useState(false);
 
   // Update clock every 5s to refresh relative time ("10s fa")
   useEffect(() => {
@@ -237,6 +238,33 @@ export default function ClassroomLiveMonitor({
     }
   };
 
+  // Batch remote unlock: unlocks all locked students in the classroom at once with 1 click
+  const handleUnlockAll = async () => {
+    if (!dbFirestore || !pin || unlockingAll) return;
+    const lockedStudents = students.filter(s => s.locked);
+    if (lockedStudents.length === 0) return;
+
+    setUnlockingAll(true);
+    try {
+      const nowIso = new Date().toISOString();
+      const baseUnlockId = `u_all_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      await Promise.all(
+        lockedStudents.map((s) =>
+          updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", s.id), {
+            remoteUnlockId: `${baseUnlockId}_${s.id}`,
+            lockState: "unlocked",
+            locked: false,
+            unlockedAt: nowIso
+          })
+        )
+      );
+    } catch (err) {
+      console.warn("Sblocco cumulativo aula non riuscito:", err);
+    } finally {
+      setUnlockingAll(false);
+    }
+  };
+
   const liveSessions = sessions.filter((s) => (isSessionLive ? isSessionLive(s) : s.active));
 
   return (
@@ -365,22 +393,34 @@ export default function ClassroomLiveMonitor({
 
       {/* Banner if any student is currently locked */}
       {students.some((s) => s.locked) && (
-        <div className="p-3.5 bg-red-950/40 border border-red-500/40 rounded-2xl flex items-center justify-between gap-3 text-red-200 animate-fadeIn">
+        <div className="p-3.5 bg-red-950/40 border border-red-500/40 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-red-200 animate-fadeIn">
           <div className="flex items-center gap-2.5">
             <Lock className="w-4 h-4 text-red-400 shrink-0 animate-bounce" />
             <span className="text-xs font-bold">
               {students.filter((s) => s.locked).length === 1
-                ? "1 studente ha la prova bloccata: clicca 'Sblocca' nella sua riga per riabilitarlo immediatamente."
-                : `${students.filter((s) => s.locked).length} studenti hanno la prova bloccata: clicca 'Sblocca' accanto a ciascuno per riabilitarli.`}
+                ? "1 studente ha la prova bloccata: puoi sbloccarlo direttamente con 1 click."
+                : `${students.filter((s) => s.locked).length} studenti hanno la prova bloccata: puoi sbloccare tutta l'aula insieme.`}
             </span>
           </div>
-          <button
-            type="button"
-            onClick={() => setFilter("alerts")}
-            className="px-3 py-1 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-100 rounded-lg text-[11px] font-semibold shrink-0 transition-colors cursor-pointer"
-          >
-            Mostra bloccati
-          </button>
+          <div className="flex items-center gap-2 w-full sm:w-auto">
+            <button
+              type="button"
+              onClick={handleUnlockAll}
+              disabled={unlockingAll}
+              className="flex-1 sm:flex-initial px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer disabled:opacity-50"
+              title="Sblocca simultaneamente tutti gli studenti bloccati di questa sessione"
+            >
+              <Unlock className="w-3.5 h-3.5" />
+              <span>{unlockingAll ? "Sblocco in corso..." : `Sblocca Tutta l'Aula (${students.filter(s => s.locked).length})`}</span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setFilter("alerts")}
+              className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-100 rounded-xl text-[11px] font-semibold shrink-0 transition-colors cursor-pointer"
+            >
+              Mostra bloccati
+            </button>
+          </div>
         </div>
       )}
 

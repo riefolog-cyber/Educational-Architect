@@ -35,21 +35,25 @@ export function formatMarkdown(text: string | undefined): string {
   return formatted;
 }
 
-// Custom simple parser to detect junk entries
+// Custom simple parser to detect junk or empty/surrender entries
 export function detectGibberish(str: string | undefined): boolean {
   if (!str) return true;
   const t = str.trim().toLowerCase();
-  const cleanT = t.replace(/[.,/#!$%^&*;:{}=\-_`~()]/g, "").trim(); 
+  if (!t || t === "[vuoto]") return true;
+
+  // Strip punctuation and symbols to isolate letters/digits
+  const cleanT = t.replace(/[.,/#!$%^&*;:{}=\-_`~()?\\/|<>@+='"\s]/g, "").trim(); 
+  if (!cleanT || cleanT.length <= 1) return true;
   
   // Pattern for giving up easily
   const rinuncePattern = /^(?:(?:no(n)?|nn)\s*(?:lo\s*)?so|boh+|bho+|bo+|(?:no(n)?|nn)\s*saprei|(?:no(n)?|nn)\s*(?:mi\s*)?ricordo|niente|nessuna|(?:no(n)?|nn)\s*h?o\s*studiato|(?:no(n)?|nn)\s*(?:l')?h?o\s*capit[oa]|(?:no(n)?|nn)\s*capisco|(?:no(n)?|nn)\s*h?o\s*idea|(?:no(n)?|nn)\s*ne\s*ho\s*idea|non\s*saprei\s*proprio|ma\s*che\s*ne\s*so|boh|non\s*lo\s*so\s*proprio|mi\s*sa\s*di\s*cavolata|non\s*serve\s*a\s*niente|non\s*so\s*nulla)$/i;
   
-  if (rinuncePattern.test(cleanT)) return true;
+  if (rinuncePattern.test(cleanT) || rinuncePattern.test(t)) return true;
   
-  // If we reach here, it's not obviously empty or a give up string.
-  // The Gemini prompt already explicitly instructs it to give a 0 for keyboard mashing
-  // or incoherent answers, so we rely on the GenAI evaluation instead of aggressive manual regexes
-  // that can easily cause false positives (e.g. typos, foreign words, symbols).
+  // Repetitive single character or consonant mashing (e.g. "aaaaa", "asdfasdf", "sjisksjsjsj...")
+  if (/^([a-z])\1{3,}$/i.test(cleanT)) return true;
+  if (/^[bcdfghjklmnpqrstvwxyz]{6,}$/i.test(cleanT)) return true;
+
   return false;
 }
 

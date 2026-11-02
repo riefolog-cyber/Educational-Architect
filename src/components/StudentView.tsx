@@ -109,7 +109,9 @@ function QuestionFigure({ src }: { src?: string }) {
     <img
       src={src}
       alt="Figura della domanda"
-      className="block max-h-64 w-auto max-w-full rounded-xl border border-white/10 bg-white p-2 object-contain print:max-h-none print:max-w-full print:border-slate-300"
+      draggable={false}
+      onContextMenu={(e) => e.preventDefault()}
+      className="block max-h-64 w-auto max-w-full rounded-xl border border-white/10 bg-white p-2 object-contain print:max-h-none print:max-w-full print:border-slate-300 select-none pointer-events-auto"
     />
   );
 }
@@ -267,6 +269,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Real-time split screen and display integrity state
   const [splitScreenInfo, setSplitScreenInfo] = useState<SplitScreenDetection>(() => detectSplitScreenStatus());
   const [isSplitScreenBlocked, setIsSplitScreenBlocked] = useState(false);
+  const [isFullscreenBlocked, setIsFullscreenBlocked] = useState(false);
+  const [isOnline, setIsOnline] = useState<boolean>(() => typeof navigator !== "undefined" ? navigator.onLine : true);
 
   // Hard lock applied when the student leaves the page mid-exam.
   // It cannot be dismissed: it is released only by the teacher directly from the Live Monitor.
@@ -314,6 +318,23 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     window.addEventListener("mousemove", handleMouseMove);
     return () => window.removeEventListener("mousemove", handleMouseMove);
   }, [readingRuler]);
+
+  // Network connection integrity listener for school Wi-Fi
+  useEffect(() => {
+    const handleOnline = () => {
+      setIsOnline(true);
+      setInfractionToastMsg("🟢 Connessione internet scolastica ripristinata: sincronizzazione attiva.");
+    };
+    const handleOffline = () => {
+      setIsOnline(false);
+    };
+    window.addEventListener("online", handleOnline);
+    window.addEventListener("offline", handleOffline);
+    return () => {
+      window.removeEventListener("online", handleOnline);
+      window.removeEventListener("offline", handleOffline);
+    };
+  }, []);
 
   // Live progress synchronization to Firestore for Teacher Dashboard
   const syncLiveProgress = useCallback(async (
@@ -475,7 +496,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   useEffect(() => {
     if (!examLocked) return;
     if (activeScreen === "exam-space" || activeScreen === "warning") return;
-    releaseExamLockRef.current("code");
+    releaseExamLockRef.current("direct");
   }, [activeScreen, examLocked]);
 
   // Remote unlock: the teacher presses "Sblocca" in the live monitor, which
@@ -511,27 +532,44 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const elapsedRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
 
-  // Auto-save draft triggers
+  // Auto-save draft triggers with per-student isolation on shared school PCs
+  const getDraftKey = (currPin: string) => {
+    const userEmailKey = (user?.email || "anon").toLowerCase().replace(/[^a-z0-9]/g, "_");
+    return `draft_${currPin}_${userEmailKey}`;
+  };
+
   const saveDraft = (currPin: string, currAnswers: Answers) => {
-    localStorage.setItem(`draft_${currPin}`, JSON.stringify(currAnswers));
+    try {
+      localStorage.setItem(getDraftKey(currPin), JSON.stringify(currAnswers));
+    } catch (e) {
+      console.warn("Impossibile salvare la bozza in localStorage:", e);
+    }
   };
 
   const loadDraft = (currPin: string): boolean => {
-    const draft = localStorage.getItem(`draft_${currPin}`);
-    if (draft) {
-      try {
+    try {
+      // 1. Try student-specific isolated draft
+      let draft = localStorage.getItem(getDraftKey(currPin));
+      // 2. Fallback to shared draft if not found
+      if (!draft) {
+        draft = localStorage.getItem(`draft_${currPin}`);
+      }
+      if (draft) {
         const parsed = JSON.parse(draft);
         setAnswers(parsed);
         return true;
-      } catch (e) {
-        console.error("Errore recupero bozza:", e);
       }
+    } catch (e) {
+      console.error("Errore recupero bozza:", e);
     }
     return false;
   };
 
   const clearDraft = (currPin: string) => {
-    localStorage.removeItem(`draft_${currPin}`);
+    try {
+      localStorage.removeItem(getDraftKey(currPin));
+      localStorage.removeItem(`draft_${currPin}`);
+    } catch {}
   };
 
   // Optimization 2 & 3: Load history of submissions and generate personalized support plans
@@ -1063,9 +1101,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
     };
 
-    // Window Blur (Crucial for split-screen on mobile: fires immediately when user taps WhatsApp in the other split!)
+    // Window Blur (Crucial for split-screen or dual monitors on desktop PC!)
     const handleWindowBlur = () => {
-      handleLeave("Perdita focus finestra (interazione con altra app affiancata o barra di sistema)");
+      const isDualScreenOrTiled = !document.hidden && document.visibilityState === "visible";
+      if (isDualScreenOrTiled) {
+        handleLeave("Click su secondo monitor o applicazione affiancata (perdita del focus visivo)");
+      } else {
+        handleLeave("Perdita focus finestra (interazione con altra app affiancata o barra di sistema)");
+      }
     };
 
     const handleWindowFocus = () => {
@@ -1075,23 +1118,56 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // Fullscreen change listener
     const handleFullscreenChange = () => {
       if (!isAppFullScreen()) {
-        triggerInfraction("uscita_schermo_intero", "Uscita dalla modalità a schermo intero");
+        if (!isAppleMobile()) {
+          setIsFullscreenBlocked(true);
+        }
+        triggerInfraction("uscita_schermo_intero", "Uscita dalla modalità a schermo intero su PC o monitor");
         // The exam must always go back to fullscreen: try immediately.
-        // Chrome allows a programmatic re-entry right after an exit
-        // ("fullscreen re-entry allowance"); if the browser refuses,
-        // the gesture-based guard below re-acquires it at the first tap.
-        void requestAppFullScreen();
+        // Chrome allows a programmatic re-entry right after an exit;
+        // if refused, the dedicated blocking overlay captures the next user gesture.
+        void requestAppFullScreen().then(() => {
+          if (isAppFullScreen()) {
+            setIsFullscreenBlocked(false);
+          }
+        });
+      } else {
+        setIsFullscreenBlocked(false);
       }
     };
 
     const handlePaste = (e: ClipboardEvent) => {
       e.preventDefault();
-      triggerInfraction("copia_incolla");
+      triggerInfraction("copia_incolla", "Tentativo di incollare testo disattivato. Scrivi le tue risposte manualmente.");
+    };
+
+    const handleCopy = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inField = !!target?.closest?.('input, textarea, [contenteditable="true"]');
+      if (!inField) {
+        e.preventDefault();
+        triggerInfraction("copia_incolla", "Tentativo di copiare il testo della prova o delle domande");
+      }
+    };
+
+    const handleCut = (e: ClipboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      const inField = !!target?.closest?.('input, textarea, [contenteditable="true"]');
+      if (!inField) {
+        e.preventDefault();
+      }
+    };
+
+    const handleDrop = (e: DragEvent) => {
+      e.preventDefault();
+      triggerInfraction("copia_incolla", "Tentativo di trascinamento testo dall'esterno (Drag & Drop)");
+    };
+
+    const handleDragOver = (e: DragEvent) => {
+      e.preventDefault();
     };
 
     const handleContextMenu = (e: MouseEvent) => {
-      // iPhone text editing relies on long-press (cursor loupe, selection):
-      // inside answer fields just block the menu silently, no infraction.
+      // Inside text inputs/textareas, allow normal text interactions; block outside
       const target = e.target as HTMLElement | null;
       const inField = !!target?.closest?.('input, textarea, [contenteditable="true"]');
       e.preventDefault();
@@ -1101,22 +1177,83 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
 
     const handleKeyDown = (e: KeyboardEvent) => {
+      const isCmdOrCtrl = e.ctrlKey || e.metaKey;
+
+      // 1. DevTools & Source inspection
       const isInspector = e.key === "F12" || 
-        (e.ctrlKey && e.shiftKey && ["I", "J", "C"].includes(e.key.toUpperCase())) ||
-        (e.ctrlKey && e.key.toLowerCase() === "u");
+        (isCmdOrCtrl && e.shiftKey && ["I", "J", "C"].includes(e.key.toUpperCase())) ||
+        (isCmdOrCtrl && e.key.toLowerCase() === "u");
       
       if (isInspector) {
         e.preventDefault();
-        triggerInfraction("tasto_vietato");
+        triggerInfraction("tasto_vietato", "Tentativo di apertura strumenti sviluppatore o ispezione codice");
+        return;
       }
+
+      // 2. Prevent page reload (F5, Ctrl+R, Cmd+R, Ctrl+Shift+R)
+      if (e.key === "F5" || (isCmdOrCtrl && e.key.toLowerCase() === "r")) {
+        e.preventDefault();
+        setInfractionToastMsg("Ricaricamento pagina bloccato durante la prova. Le tue risposte sono salvate automaticamente.");
+        return;
+      }
+
+      // 3. Prevent print & save page (Ctrl+P, Ctrl+S, Cmd+P, Cmd+S)
+      if (isCmdOrCtrl && (e.key.toLowerCase() === "p" || e.key.toLowerCase() === "s")) {
+        e.preventDefault();
+        triggerInfraction("tasto_vietato", `Scorciatoia vietata (${e.ctrlKey ? "Ctrl" : "Cmd"}+${e.key.toUpperCase()})`);
+        return;
+      }
+
+      // 4. Prevent browser history, downloads, bookmarks (Ctrl+H, Ctrl+J, Ctrl+D)
+      if (isCmdOrCtrl && ["h", "j", "d"].includes(e.key.toLowerCase())) {
+        e.preventDefault();
+        triggerInfraction("tasto_vietato", `Scorciatoia browser intercettata (${e.ctrlKey ? "Ctrl" : "Cmd"}+${e.key.toUpperCase()})`);
+        return;
+      }
+
+      // 5. Fullscreen toggle shortcut F11
+      if (e.key === "F11") {
+        e.preventDefault();
+        void requestAppFullScreen().then(() => {
+          if (isAppFullScreen()) setIsFullscreenBlocked(false);
+        });
+        return;
+      }
+
+      // 6. Prevent browser navigation shortcuts (Alt + Left/Right)
+      if (e.altKey && (e.key === "ArrowLeft" || e.key === "ArrowRight" || e.key === "Left" || e.key === "Right")) {
+        e.preventDefault();
+        return;
+      }
+
+      // 7. Prevent accidental Backspace navigation outside text inputs
+      if (e.key === "Backspace") {
+        const target = e.target as HTMLElement | null;
+        const inField = !!target?.closest?.('input, textarea, [contenteditable="true"]');
+        if (!inField) {
+          e.preventDefault();
+        }
+      }
+    };
+
+    // Prevent accidental tab closure or browser window close
+    const handleBeforeUnload = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "La prova d'esame è in corso. Se esci o chiudi la finestra la sessione verrà segnalata e bloccata.";
+      return e.returnValue;
     };
 
     document.addEventListener("visibilitychange", handleVisibility);
     window.addEventListener("blur", handleWindowBlur);
     window.addEventListener("focus", handleWindowFocus);
+    window.addEventListener("beforeunload", handleBeforeUnload);
     document.addEventListener("fullscreenchange", handleFullscreenChange);
     document.addEventListener("webkitfullscreenchange", handleFullscreenChange);
     document.addEventListener("paste", handlePaste);
+    document.addEventListener("copy", handleCopy);
+    document.addEventListener("cut", handleCut);
+    document.addEventListener("drop", handleDrop);
+    document.addEventListener("dragover", handleDragOver);
     document.addEventListener("contextmenu", handleContextMenu);
     document.addEventListener("keydown", handleKeyDown);
 
@@ -1135,9 +1272,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", handleWindowFocus);
+      window.removeEventListener("beforeunload", handleBeforeUnload);
       document.removeEventListener("fullscreenchange", handleFullscreenChange);
       document.removeEventListener("webkitfullscreenchange", handleFullscreenChange);
       document.removeEventListener("paste", handlePaste);
+      document.removeEventListener("copy", handleCopy);
+      document.removeEventListener("cut", handleCut);
+      document.removeEventListener("drop", handleDrop);
+      document.removeEventListener("dragover", handleDragOver);
       document.removeEventListener("contextmenu", handleContextMenu);
       document.removeEventListener("keydown", handleKeyDown);
       
@@ -1154,8 +1296,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   useEffect(() => {
     if (!isExamActive) return;
     const regain = () => {
-      if (!isAppFullScreen()) {
-        void requestAppFullScreen();
+      if (!isAppFullScreen() && !isAppleMobile()) {
+        void requestAppFullScreen().then(() => {
+          if (isAppFullScreen()) {
+            setIsFullscreenBlocked(false);
+          }
+        });
       }
     };
     document.addEventListener("pointerdown", regain, true);
@@ -1275,7 +1421,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
 
     // 2. Request browser full screen
-    await requestAppFullScreen();
+    const fsOk = await requestAppFullScreen();
+    if (!fsOk && !isAppleMobile()) {
+      if (!isAppFullScreen()) {
+        setIsFullscreenBlocked(true);
+      }
+    } else {
+      setIsFullscreenBlocked(false);
+    }
 
     setIsExamActive(true);
     setActiveScreen("exam-space");
@@ -1827,15 +1980,34 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     <div className="w-full max-w-3xl mx-auto">
       {/* Timer persistent floating banner during exam taking */}
       {isExamActive && (
-        <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-6 py-3 rounded-full border shadow-2xl backdrop-blur-md flex items-center gap-3 font-display font-bold text-sm tracking-wide z-50 transition-all ${
+        <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-5 py-2.5 rounded-full border shadow-2xl backdrop-blur-md flex items-center gap-2.5 font-display font-bold text-xs sm:text-sm tracking-wide z-50 transition-all ${
           timerUrgent 
             ? "bg-red-950/90 border-red-500/40 text-red-100 animate-pulse" 
             : "bg-slate-900/90 border-white/10 text-white"
         }`}>
           <Timer className={`w-4 h-4 ${timerUrgent ? "text-red-400" : "text-emerald-400"}`} />
           <span>{remainingTimeText}</span>
-          <span className="text-xs bg-emerald-500/10 text-emerald-400 px-2.5 py-0.5 rounded-full font-mono border border-emerald-500/20">
+          <span className="hidden sm:inline-block text-[11px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded-full font-mono border border-emerald-500/20">
             Bozza salvata ✓
+          </span>
+          <div 
+            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono border bg-slate-950/80 border-white/10" 
+            title={isOnline ? "Connesso al server d'istituto" : "Connessione scolastica momentaneamente assente: risposte salvate in locale"}
+          >
+            <span className={`w-2 h-2 rounded-full ${isOnline ? "bg-emerald-400" : "bg-amber-400 animate-ping"}`} />
+            <span className={isOnline ? "text-slate-300" : "text-amber-300 font-bold"}>
+              {isOnline ? "Server Connesso" : "Offline"}
+            </span>
+          </div>
+        </div>
+      )}
+
+      {/* Offline Alert Banner */}
+      {isExamActive && !isOnline && (
+        <div className="fixed top-20 left-1/2 -translate-x-1/2 z-50 max-w-lg w-[calc(100%-2rem)] p-3 bg-amber-950/95 border-2 border-amber-500/60 rounded-2xl text-amber-100 text-xs shadow-2xl flex items-center gap-2.5 animate-fadeIn">
+          <Wifi className="w-5 h-5 text-amber-400 shrink-0 animate-pulse" />
+          <span>
+            <b>Rete scolastica momentaneamente assente:</b> Niente panico! Le tue risposte continuano ad essere salvate in locale sul computer e verranno sincronizzate non appena la rete torna disponibile.
           </span>
         </div>
       )}
@@ -2482,7 +2654,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             />
           )}
 
-          <div className={`${accessibilityClasses} p-6 sm:p-8 rounded-3xl border transition-all ${
+          <div className={`${accessibilityClasses} p-6 sm:p-8 rounded-3xl border transition-all select-none ${
             contrastTheme === "sepia"
               ? "bg-[#faf6eb] text-[#2b251a] border-amber-900/20"
               : contrastTheme === "light"
@@ -2696,7 +2868,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 value={savedValue}
                                 onChange={(e) => handleInputOE(q.id, e.target.value)}
                                 placeholder="Scrivi qui i dettagli..."
-                                className="w-full min-h-[140px] p-4 bg-slate-950/60 border border-white/10 rounded-2xl text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 transition-colors text-sm line-relaxed"
+                                className="w-full min-h-[140px] p-4 bg-slate-950/60 border border-white/10 rounded-2xl text-white placeholder-slate-600 focus:outline-none focus:border-indigo-500 transition-colors text-sm line-relaxed select-text"
                               />
                               <div className="flex justify-between items-center text-xs text-slate-500 px-1">
                                 <span>Severità brevità attiva</span>
@@ -2740,7 +2912,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                   handleInputRq(q.id, e.target.value);
                                 }}
                                 placeholder="Scrivi qui la tua riflessione personale..."
-                                className="w-full min-h-[140px] p-4 bg-slate-950/60 border border-teal-500/20 rounded-2xl text-white placeholder-slate-600 focus:outline-none focus:border-teal-500 transition-colors text-sm line-relaxed"
+                                className="w-full min-h-[140px] p-4 bg-slate-950/60 border border-teal-500/20 rounded-2xl text-white placeholder-slate-600 focus:outline-none focus:border-teal-500 transition-colors text-sm line-relaxed select-text"
                               />
                               <div className="flex justify-between items-center text-xs text-slate-500 px-1">
                                 <span>Riflessione critica personale</span>
@@ -2856,7 +3028,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                   value={userText}
                                   onChange={(e) => handleInputFib(fib.id, e.target.value)}
                                   placeholder="..."
-                                  className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm"
+                                  className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm select-text"
                                 />
                                 <span>{after}</span>
                                 <QuestionMeta q={fib} tone="teal" />
@@ -2935,7 +3107,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                   value={rqValue}
                                   onChange={(e) => handleInputRq(rq.id, e.target.value)}
                                   placeholder="Inserisci la tua argomentazione ed i nessi logici..."
-                                  className="w-full min-h-[90px] p-3 bg-slate-950/40 border border-white/10 rounded-xl text-white placeholder-slate-700 focus:outline-none focus:border-indigo-500 transition-colors text-sm line-relaxed"
+                                  className="w-full min-h-[90px] p-3 bg-slate-950/40 border border-white/10 rounded-xl text-white placeholder-slate-700 focus:outline-none focus:border-indigo-500 transition-colors text-sm line-relaxed select-text"
                                 />
                                 <div className="text-[11px] text-right text-slate-500">
                                   {wordCount} parole {wordCount < 15 && "(severità minima adatta: 15-20 parole)"}
@@ -3482,6 +3654,37 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               <span>Concludi e Torna alla Home</span>
             </button>
           </div>
+        </div>
+      )}
+
+      {/* Dedicated Desktop Fullscreen Enforcement Modal */}
+      {isFullscreenBlocked && isExamActive && !isAppleMobile() && (
+        <div className="fixed inset-0 bg-slate-950/98 z-[99998] flex flex-col justify-center items-center p-6 text-center leading-relaxed backdrop-blur-md animate-fadeIn">
+          <div className="p-4 bg-amber-500/15 border-2 border-amber-500/40 text-amber-400 rounded-3xl mb-5 animate-bounce">
+            <Maximize2 className="w-12 h-12" />
+          </div>
+          <h2 className="text-2xl sm:text-3xl font-display font-bold text-white mb-2 uppercase tracking-wide">
+            Schermo Intero Obbligatorio
+          </h2>
+          <p className="text-sm text-amber-200/90 max-w-lg mb-4 leading-relaxed">
+            Sui computer fissi e postazioni PC scolastiche la prova deve svolgersi esclusivamente a <b>Schermo Intero</b> per garantire la regolarità del test ed impedire l'accesso ad altre finestre o applicazioni.
+            L'uscita dalla modalità a schermo intero è stata segnalata nel registro antifrode del docente.
+          </p>
+          <div className="p-3 bg-slate-900 border border-white/10 rounded-xl text-xs text-slate-300 font-mono mb-6 max-w-md">
+            Clicca sul pulsante qui sotto per riattivare immediatamente la modalità a Schermo Intero e continuare il test.
+          </div>
+          <button
+            onClick={async () => {
+              await requestAppFullScreen();
+              if (isAppFullScreen()) {
+                setIsFullscreenBlocked(false);
+              }
+            }}
+            className="px-6 py-3.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer active:scale-95 text-sm"
+          >
+            <Maximize2 className="w-4 h-4" />
+            <span>Ripristina Schermo Intero e Continua</span>
+          </button>
         </div>
       )}
 

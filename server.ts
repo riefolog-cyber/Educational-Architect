@@ -537,7 +537,7 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
   return formatItalianScholasticGrade(finalGrade);
 };
 
-import { weightedOpenAverage, computeGradeBreakdown } from "./src/utils";
+import { weightedOpenAverage, computeGradeBreakdown, detectGibberish } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
@@ -845,6 +845,21 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       if (oeList.length > 0 && (!Array.isArray(evaluation.openEndedDetails) || evaluation.openEndedDetails.length === 0)) {
         throw new Error("L'IA non ha fornito la valutazione delle domande aperte.");
       }
+
+      // Deterministic zero enforcement: if an answer is blank, [VUOTO], pure punctuation (like "...."),
+      // or detected gibberish, the score MUST be 0 and the feedback pedagogical.
+      if (Array.isArray(evaluation.openEndedDetails)) {
+        evaluation.openEndedDetails.forEach((det: any, idx: number) => {
+          const q = oeList.find((item: any) => item.id === det.questionId) || oeList[idx];
+          const qId = q?.id || det.questionId;
+          const rawAns = String(report.risposte?.oe?.[qId] || report.risposte?.openEnded?.[qId] || "").trim();
+          if (detectGibberish(rawAns)) {
+            det.score = 0;
+            det.feedback = "🎯 **Competenza:** Spazio lasciato privo di trattazione o risposta non pertinente.\n✍️ **Proprietà lessicale:** Assente.\n💡 **Spunto di crescita:** Cerca di formulare una risposta anche sintetica per dimostrare le conoscenze di base.";
+          }
+        });
+      }
+
       const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
       const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
       const oeScores = hasOeDetails ? [oeMean] : [];
@@ -1047,10 +1062,35 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       if (rqList.length > 0 && (!Array.isArray(evaluation.reflectionDetails) || evaluation.reflectionDetails.length === 0)) {
         throw new Error("L'IA non ha fornito la valutazione delle riflessioni critiche.");
       }
+
+      // Deterministic zero enforcement for blank, pure punctuation or gibberish reflections
+      if (Array.isArray(evaluation.reflectionDetails)) {
+        evaluation.reflectionDetails.forEach((det: any, idx: number) => {
+          const r = rqList.find((item: any) => item.id === det.id) || rqList[idx];
+          const rId = r?.id || det.id;
+          const rawAns = String(report.risposte?.wbRq?.[rId] || "").trim();
+          if (detectGibberish(rawAns)) {
+            det.score = 0;
+            det.feedback = "Riflessione assente o priva di argomentazione concettuale.";
+          }
+        });
+      }
+
+      // Check if Workbook also has multiple choice questions (sections or root)
+      const wbMcList: any[] = [];
+      if (Array.isArray(report.domande?.multipleChoice)) wbMcList.push(...report.domande.multipleChoice);
+      (report.domande?.sections || []).forEach((s: any) => {
+        if (Array.isArray(s.multipleChoice)) wbMcList.push(...s.multipleChoice);
+      });
+      const mcCount = wbMcList.length;
+      const mcScore = Number(report.punteggioMC || 0);
+      const totalObjScore = gradeFibScore + mcScore;
+      const totalObjCount = gradeFibCount + mcCount;
+
       const hasRqDetails = (evaluation.reflectionDetails || []).length > 0;
       const rqMean = hasRqDetails ? weightedOpenAverage(evaluation.reflectionDetails, rqList) : 0;
       const rqScores = hasRqDetails ? [rqMean] : [];
-      evaluation.suggestedGrade = calculateWorkbookGrade(gradeFibScore, gradeFibCount, rqScores);
+      evaluation.suggestedGrade = calculateWorkbookGrade(totalObjScore, totalObjCount, rqScores);
       evaluation.fibScore = fibScore;
       evaluation.evaluationMode = "ai";
       evaluation.gradeBreakdown = computeGradeBreakdown({
@@ -1059,6 +1099,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         answers: report.risposte,
         evaluation,
         punteggioFIB: fibScore,
+        punteggioMC: mcScore,
         votoSuggerito: evaluation.suggestedGrade
       });
       return evaluation;
