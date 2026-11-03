@@ -267,17 +267,24 @@ export interface GradeComponentItem {
   maxScore: number;
   weight?: number;
   feedback?: string;
+  /** True when the question has not been evaluated yet and is only provisionally 0. */
+  pending?: boolean;
 }
 
 export interface GradeBreakdownResult {
   tipo: "Quiz" | "Workbook";
+  /** Grade produced by the current formula. */
   finalGradeFormatted: string;
   finalNumeric: number;
+  /** Grade currently stored on the submission, when it differs from finalGradeFormatted. */
+  registeredGradeFormatted?: string;
   formulaTitle: string;
   formulaSummary: string;
   isMixed: boolean;
   isPureObjective: boolean;
   isPureSubjective: boolean;
+  /** True when every subjective question is still unevaluated. */
+  isSubjectivePendingOnly?: boolean;
   
   objectivePart?: {
     name: string;
@@ -287,6 +294,8 @@ export interface GradeBreakdownResult {
     gradeOutOf10: number;
     weightPct: number;
     pointsEarned: number;
+    /** True when at least one objective item has a didactic weight different from 1. */
+    isWeighted: boolean;
   };
   
   subjectivePart?: {
@@ -296,10 +305,12 @@ export interface GradeBreakdownResult {
     averageScore: number;
     weightPct: number;
     pointsEarned: number;
+    /** True when at least one subjective item has a didactic weight different from 1. */
+    isWeighted: boolean;
   };
   
   explanationLines: string[];
-  /** Open-ended questions with no evaluation yet (counted as 0 until reviewed). */
+  /** Open-ended questions with no evaluation yet. */
   pendingSubjectiveCount?: number;
 }
 
@@ -315,9 +326,18 @@ export function computeGradeBreakdown(params: {
   punteggioMC?: number;
   punteggioFIB?: number;
   votoSuggerito?: string;
+  /**
+   * How to treat open questions without an evaluation:
+   * - "zero" (default): they count as 0/10 and are flagged as pending, which is
+   *   what an AI-gradeable exam does until the teacher/AI reviews them;
+   * - "exclude": they are left out of the grade (used by deterministic reserve
+   *   grades, which are based on the objective part only).
+   */
+  pendingSubjective?: "zero" | "exclude";
 }): GradeBreakdownResult {
   const isWorkbook = String(params.tipo || "").toLowerCase() === "workbook";
   const tipo: "Quiz" | "Workbook" = isWorkbook ? "Workbook" : "Quiz";
+  const pendingMode = params.pendingSubjective === "exclude" ? "exclude" : "zero";
 
   let objScore = 0; // raw number of correct objective answers (for display)
   let objTotal = 0; // raw number of objective questions (for display)
@@ -332,6 +352,13 @@ export function computeGradeBreakdown(params: {
     if (v === undefined || v === null || v === "") return null;
     const n = Number(v);
     return Number.isFinite(n) ? n : null;
+  };
+
+  const clampScore = (v: any) => Math.min(10, Math.max(0, Number(v) || 0));
+  const shortenQuestion = (q: any, fallback: string) => {
+    const text = typeof q?.question === "string" ? q.question.trim() : "";
+    if (!text) return fallback;
+    return text.length > 70 ? text.slice(0, 70) + "..." : text;
   };
 
   /**
@@ -356,6 +383,62 @@ export function computeGradeBreakdown(params: {
     return { correct, total, weightedCorrect, weightedTotal };
   };
 
+  /**
+   * Merges the per-question evaluations with the exam questions, so a partial
+   * AI response can no longer silently drop (and therefore inflate) the grade.
+   * Missing questions are either counted as 0 ("zero") or excluded ("exclude").
+   */
+  const buildSubjective = (
+    questions: any[],
+    details: any[],
+    idOf: (d: any) => any,
+    fallbackLabel: (n: number) => string
+  ): GradeComponentItem[] => {
+    const covered = new Set<number>();
+    const parsed: GradeComponentItem[] = [];
+
+    details.forEach((item: any, idx: number) => {
+      const rawId = idOf(item);
+      let qIndex = rawId !== undefined && rawId !== null
+        ? questions.findIndex((q) => q?.id !== undefined && q?.id !== null && String(q.id) === String(rawId))
+        : -1;
+      if (qIndex < 0 && questions[idx]) qIndex = idx;
+      const qMeta = qIndex >= 0 ? questions[qIndex] : undefined;
+      if (qIndex >= 0) covered.add(qIndex);
+
+      parsed.push({
+        id: rawId !== undefined && rawId !== null ? String(rawId) : (qMeta?.id || `subj_${idx + 1}`),
+        number: qIndex >= 0 ? qIndex + 1 : idx + 1,
+        label: shortenQuestion(qMeta, fallbackLabel(idx + 1)),
+        score: clampScore(item.score),
+        maxScore: 10,
+        weight: itemWeight(qMeta),
+        feedback: item.feedback || "",
+        pending: false,
+      });
+    });
+
+    const pending: GradeComponentItem[] = [];
+    questions.forEach((q, idx) => {
+      if (covered.has(idx)) return;
+      pendingSubjectiveCount++;
+      if (pendingMode === "zero") {
+        pending.push({
+          id: q?.id !== undefined && q?.id !== null ? String(q.id) : `subj_${idx + 1}`,
+          number: idx + 1,
+          label: shortenQuestion(q, fallbackLabel(idx + 1)),
+          score: 0,
+          maxScore: 10,
+          weight: itemWeight(q),
+          feedback: "In attesa di revisione docente",
+          pending: true,
+        });
+      }
+    });
+
+    return [...parsed, ...pending].sort((a, b) => a.number - b.number);
+  };
+
   const hasMcAnswers = !!params.answers?.mc && typeof params.answers.mc === "object";
   const hasFibAnswers = !!params.answers?.wbFib && typeof params.answers.wbFib === "object";
 
@@ -377,39 +460,16 @@ export function computeGradeBreakdown(params: {
     // 2. Open-ended questions
     const oeList = Array.isArray(params.examData?.openEnded) ? params.examData.openEnded : [];
     const oeEvalList = Array.isArray(params.evaluation?.openEndedDetails) ? params.evaluation.openEndedDetails : [];
-
-    if (oeEvalList.length > 0) {
-      oeEvalList.forEach((item: any, idx: number) => {
-        const validScore = Math.min(10, Math.max(0, Number(item.score) || 0));
-        subjectiveScores.push(validScore);
-        const qMeta = oeList.find((q: any) => q.id === item.questionId) || oeList[idx];
-        subjectiveDetails.push({
-          id: item.questionId || qMeta?.id || `oe_${idx + 1}`,
-          number: idx + 1,
-          label: qMeta?.question ? (qMeta.question.length > 70 ? qMeta.question.slice(0, 70) + "..." : qMeta.question) : `Domanda Aperta ${idx + 1}`,
-          score: validScore,
-          maxScore: 10,
-          weight: itemWeight(qMeta),
-          feedback: item.feedback || ""
-        });
-      });
-    } else if (oeList.length > 0) {
-      // Questions exist but the AI/teacher has not evaluated them yet: count
-      // them as 0 so the breakdown matches the grade that was actually saved.
-      pendingSubjectiveCount = oeList.length;
-      oeList.forEach((q: any, idx: number) => {
-        subjectiveScores.push(0);
-        subjectiveDetails.push({
-          id: q.id || `oe_${idx + 1}`,
-          number: idx + 1,
-          label: q.question ? (q.question.length > 70 ? q.question.slice(0, 70) + "..." : q.question) : `Domanda Aperta ${idx + 1}`,
-          score: 0,
-          maxScore: 10,
-          weight: itemWeight(q),
-          feedback: "In attesa di revisione docente"
-        });
-      });
-    }
+    const oeItems = buildSubjective(
+      oeList,
+      oeEvalList,
+      (d) => d.questionId,
+      (n) => `Domanda Aperta ${n}`
+    );
+    oeItems.forEach((item) => {
+      subjectiveDetails.push(item);
+      subjectiveScores.push(item.score);
+    });
   } else {
     // Workbook
     const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
@@ -449,40 +509,21 @@ export function computeGradeBreakdown(params: {
       wbMcList.some((q: any) => itemWeight(q) !== 1);
 
     const rqEvalList = Array.isArray(params.evaluation?.reflectionDetails) ? params.evaluation.reflectionDetails : [];
-    if (rqEvalList.length > 0) {
-      rqEvalList.forEach((item: any, idx: number) => {
-        const validScore = Math.min(10, Math.max(0, Number(item.score) || 0));
-        subjectiveScores.push(validScore);
-        const rMeta = rqList.find((r: any) => r.id === item.id) || rqList[idx];
-        subjectiveDetails.push({
-          id: item.id || rMeta?.id || `rq_${idx + 1}`,
-          number: idx + 1,
-          label: rMeta?.question ? (rMeta.question.length > 70 ? rMeta.question.slice(0, 70) + "..." : rMeta.question) : `Riflessione ${idx + 1}`,
-          score: validScore,
-          maxScore: 10,
-          weight: itemWeight(rMeta),
-          feedback: item.feedback || ""
-        });
-      });
-    } else if (rqList.length > 0) {
-      pendingSubjectiveCount = rqList.length;
-      rqList.forEach((r: any, idx: number) => {
-        subjectiveScores.push(0);
-        subjectiveDetails.push({
-          id: r.id || `rq_${idx + 1}`,
-          number: idx + 1,
-          label: r.question ? (r.question.length > 70 ? r.question.slice(0, 70) + "..." : r.question) : `Riflessione ${idx + 1}`,
-          score: 0,
-          maxScore: 10,
-          weight: itemWeight(r),
-          feedback: "In attesa di revisione docente"
-        });
-      });
-    }
+    const rqItems = buildSubjective(
+      rqList,
+      rqEvalList,
+      (d) => d.id,
+      (n) => `Riflessione ${n}`
+    );
+    rqItems.forEach((item) => {
+      subjectiveDetails.push(item);
+      subjectiveScores.push(item.score);
+    });
   }
 
   const hasObj = objWeightedTotal > 0;
   const hasSubj = subjectiveScores.length > 0;
+  const isSubjectivePendingOnly = pendingSubjectiveCount > 0 && !subjectiveDetails.some((d) => !d.pending);
   let finalNumeric = 0;
   let finalGradeFormatted = "";
   let formulaTitle = "";
@@ -545,6 +586,7 @@ export function computeGradeBreakdown(params: {
       gradeOutOf10: Math.round(objOutOf10 * 10) / 10,
       weightPct: 50,
       pointsEarned: Math.round(objPoints * 100) / 100,
+      isWeighted: objHasCustomWeights,
     };
 
     subjPart = {
@@ -554,15 +596,19 @@ export function computeGradeBreakdown(params: {
       averageScore: Math.round(subjAvg * 10) / 10,
       weightPct: 50,
       pointsEarned: Math.round(subjPoints * 100) / 100,
+      isWeighted: hasCustomSubjWeights,
     };
 
     const subjAvgLabel = hasCustomSubjWeights ? `Media ponderata pesi didattici: ${subjAvg.toFixed(2)}/10` : `Media voti: ${subjAvg.toFixed(2)}/10`;
-    const objWeightLabel = objHasCustomWeights ? " (pesi didattici applicati)" : "";
+    const objCountLabel = objHasCustomWeights
+      ? `${objScore}/${objTotal} risposte esatte (conteggio grezzo; accuratezza ponderata ${objPart.percentage}%)`
+      : `${objScore}/${objTotal} risposte esatte (${objPart.percentage}%)`;
+    const evaluatedSubj = subjectiveDetails.filter((d) => !d.pending).length;
 
     explanationLines.push(
-      `1. Parte Oggettiva (${objName})${objWeightLabel}: ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 50% → ${objPoints.toFixed(2)} punti.`,
-      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. ${subjAvgLabel}. Incidenza 50% → ${subjPoints.toFixed(2)} punti.`,
-      `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico assegnato: ${finalGradeFormatted}.`
+      `1. Parte Oggettiva (${objName})${objHasCustomWeights ? " con pesi didattici" : ""}: ${objCountLabel}. Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 50% → ${objPoints.toFixed(2)} punti.`,
+      `2. Parte Argomentativa (${subjName}): ${evaluatedSubj} quesiti valutati${pendingSubjectiveCount > 0 ? `, ${pendingSubjectiveCount} in attesa` : ""} con voti [${subjectiveDetails.map((d) => `Q${d.number}: ${d.pending ? "in attesa" : `${d.score}/10`}`).join(", ")}]. ${subjAvgLabel}. Incidenza 50% → ${subjPoints.toFixed(2)} punti.`,
+      `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico calcolato: ${finalGradeFormatted}.`
     );
 
   } else if (hasObj) {
@@ -582,24 +628,25 @@ export function computeGradeBreakdown(params: {
       gradeOutOf10: Math.round(finalNumeric * 10) / 10,
       weightPct: 100,
       pointsEarned: Math.round(finalNumeric * 100) / 100,
+      isWeighted: objHasCustomWeights,
     };
+
+    const accuracyLabel = objHasCustomWeights
+      ? `Risposte esatte: ${objScore} su ${objTotal} quesiti (conteggio grezzo). Accuratezza ponderata: ${objPart.percentage}%.`
+      : `Risposte esatte: ${objScore} su ${objTotal} quesiti (accuratezza: ${objPart.percentage}%).`;
+    const formulaText = objHasCustomWeights
+      ? `Formula pesata: (${objWeightedCorrect.toFixed(2)} pesi ottenuti / ${objWeightedTotal.toFixed(2)} pesi totali) × 10 = ${finalNumeric.toFixed(2)}/10 → Voto scolastico calcolato: ${finalGradeFormatted}.`
+      : `Formula matematica diretta: (${objScore} / ${objTotal}) × 10 = ${finalNumeric.toFixed(2)}/10 → Voto scolastico calcolato: ${finalGradeFormatted}.`;
 
     explanationLines.push(
       `Prova esclusivamente oggettiva (senza domande aperte): il voto riflette al 100% la percentuale di risposte corrette${objHasCustomWeights ? ", calcolata sui pesi didattici" : ""}.`,
-      `Risposte esatte: ${objScore} su ${objTotal} quesiti (accuratezza: ${objPart.percentage}%).`,
-      `Formula matematica diretta: (${objScore} / ${objTotal}) × 10 = ${finalNumeric.toFixed(2)}/10 → Voto scolastico assegnato: ${finalGradeFormatted}.`
+      accuracyLabel,
+      formulaText
     );
 
   } else if (hasSubj) {
     // Pure Subjective: 100%
-    finalNumeric = Math.min(10, Math.max(0, subjAvg));
-    finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
-
     const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
-    formulaTitle = hasCustomSubjWeights ? "Media Ponderata dei Voti Singoli (Pesi Didattici)" : "Media Aritmetica dei Voti Singoli (100% Aperte)";
-    formulaSummary = hasCustomSubjWeights
-      ? `Somma pesata (${subjWeightedSum.toFixed(2)}) / Pesi totali (${totalSubjWeight}) = ${subjAvg.toFixed(2)} / 10`
-      : `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
 
     subjPart = {
       name: subjName,
@@ -608,13 +655,33 @@ export function computeGradeBreakdown(params: {
       averageScore: Math.round(subjAvg * 10) / 10,
       weightPct: 100,
       pointsEarned: Math.round(subjAvg * 100) / 100,
+      isWeighted: hasCustomSubjWeights,
     };
 
-    explanationLines.push(
-      `Prova esclusivamente a risposte aperte: il voto è dato dalla ${hasCustomSubjWeights ? "media ponderata (in base ai pesi didattici impostati dal docente)" : "media aritmetica"} dei singoli quesiti.`,
-      `Voti singoli quesiti: [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10${subjectiveDetails[i]?.weight && subjectiveDetails[i].weight !== 1 ? ` (peso ${subjectiveDetails[i].weight})` : ""}`).join(", ")}].`,
-      `Formula: ${formulaSummary} → Voto scolastico assegnato: ${finalGradeFormatted}.`
-    );
+    if (isSubjectivePendingOnly) {
+      // No real evaluation exists yet: do not publish a fake 0/10.
+      finalNumeric = 0;
+      finalGradeFormatted = "N.V.";
+      formulaTitle = "Valutazione in attesa di correzione";
+      formulaSummary = `Nessuna delle ${pendingSubjectiveCount} domande aperte è ancora stata valutata.`;
+      explanationLines.push(
+        `Le ${pendingSubjectiveCount} domande aperte non hanno ancora una valutazione: il voto resta "N.V." fino alla correzione docente o al ricalcolo IA.`
+      );
+    } else {
+      finalNumeric = Math.min(10, Math.max(0, subjAvg));
+      finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
+
+      formulaTitle = hasCustomSubjWeights ? "Media Ponderata dei Voti Singoli (Pesi Didattici)" : "Media Aritmetica dei Voti Singoli (100% Aperte)";
+      formulaSummary = hasCustomSubjWeights
+        ? `Somma pesata (${subjWeightedSum.toFixed(2)}) / Pesi totali (${totalSubjWeight}) = ${subjAvg.toFixed(2)} / 10`
+        : `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
+
+      explanationLines.push(
+        `Prova esclusivamente a risposte aperte: il voto è dato dalla ${hasCustomSubjWeights ? "media ponderata (in base ai pesi didattici impostati dal docente)" : "media aritmetica"} dei singoli quesiti.`,
+        `Voti singoli quesiti: [${subjectiveDetails.map((d) => `Q${d.number}: ${d.score}/10${d.weight && d.weight !== 1 ? ` (peso ${d.weight})` : ""}`).join(", ")}].`,
+        `Formula: ${formulaSummary} → Voto scolastico calcolato: ${finalGradeFormatted}.`
+      );
+    }
   } else {
     finalGradeFormatted = params.votoSuggerito || "N.V.";
     formulaTitle = "Valutazione Non Quantificabile";
@@ -623,24 +690,45 @@ export function computeGradeBreakdown(params: {
   }
 
   if (pendingSubjectiveCount > 0) {
-    explanationLines.push(
-      `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: concorrono al calcolo come 0/10 fino alla correzione. Usa "Ricalcola voto" per ottenere una valutazione reale.`
-    );
+    if (pendingMode === "exclude") {
+      // Reserve grade: the pending questions are deliberately left out, but the
+      // report must still say so (this includes the case where nothing at all
+      // has been evaluated yet).
+      explanationLines.push(
+        hasObj
+          ? `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: non sono incluse nel voto di riserva, calcolato sulla sola parte oggettiva.`
+          : `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: il voto resta "N.V." fino alla correzione.`
+      );
+    } else if (!isSubjectivePendingOnly) {
+      explanationLines.push(
+        `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: concorrono al calcolo come 0/10 fino alla correzione. Usa "Ricalcola voto" per ottenere una valutazione reale.`
+      );
+    }
   }
 
-  if (params.votoSuggerito && params.votoSuggerito !== "N.V." && params.votoSuggerito !== "—") {
-    finalGradeFormatted = params.votoSuggerito;
+  const registeredNumeric = parseItalianGrade(params.votoSuggerito);
+  const registeredGradeFormatted =
+    Number.isFinite(registeredNumeric) && Math.abs(registeredNumeric - finalNumeric) > 0.05
+      ? params.votoSuggerito
+      : undefined;
+
+  if (registeredGradeFormatted) {
+    explanationLines.push(
+      `ℹ️ Voto attualmente registrato: ${registeredGradeFormatted}. La formula attuale produce ${finalGradeFormatted}: usa "Ricalcola voto" per allineare il registro.`
+    );
   }
 
   return {
     tipo,
     finalGradeFormatted,
     finalNumeric: Math.round(finalNumeric * 100) / 100,
+    registeredGradeFormatted,
     formulaTitle,
     formulaSummary,
     isMixed: hasObj && hasSubj,
     isPureObjective: hasObj && !hasSubj,
     isPureSubjective: !hasObj && hasSubj,
+    isSubjectivePendingOnly,
     objectivePart: objPart,
     subjectivePart: subjPart,
     explanationLines,
@@ -652,7 +740,7 @@ export function computeGradeBreakdown(params: {
  * Extracts and calculates the grade breakdown from a Firestore submission document.
  */
 export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
-  const tipo: "Quiz" | "Workbook" = sub?.Tipo === "Workbook" ? "Workbook" : "Quiz";
+  const tipo: "Quiz" | "Workbook" = String(sub?.Tipo || "").toLowerCase() === "workbook" ? "Workbook" : "Quiz";
 
   const safeParse = (data: any) => {
     if (!data) return null;
@@ -675,7 +763,10 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
     evaluation,
     punteggioMC: sub?.Punteggio_MC,
     punteggioFIB: sub?.Punteggio_FIB,
-    votoSuggerito: sub?.Voto_Suggerito
+    votoSuggerito: sub?.Voto_Suggerito,
+    // A deterministic reserve grade was computed on the objective part only:
+    // it must not start penalising the student for reflections nobody graded.
+    pendingSubjective: evaluation?.evaluationMode === "deterministic" ? "exclude" : "zero",
   });
 }
 

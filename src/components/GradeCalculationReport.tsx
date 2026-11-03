@@ -1,5 +1,5 @@
-import React, { useState } from "react";
-import { Calculator, Check, Copy, HelpCircle, Info, Layers } from "lucide-react";
+import React, { useEffect, useRef, useState } from "react";
+import { Calculator, Check, Copy, Info } from "lucide-react";
 import { GradeBreakdownResult } from "../utils";
 
 interface GradeCalculationReportProps {
@@ -13,20 +13,55 @@ export default function GradeCalculationReport({
   isPrintMode = false,
 }: GradeCalculationReportProps) {
   const [copied, setCopied] = useState(false);
+  const copyTimer = useRef<number | null>(null);
 
-  const handleCopyExplanation = () => {
+  useEffect(() => {
+    return () => {
+      if (copyTimer.current !== null) {
+        window.clearTimeout(copyTimer.current);
+      }
+    };
+  }, []);
+
+  const handleCopyExplanation = async () => {
     const text = [
       `DETTAGLIO CALCOLO VOTO: ${breakdown.finalGradeFormatted}`,
+      ...(breakdown.registeredGradeFormatted
+        ? [`Voto attualmente registrato: ${breakdown.registeredGradeFormatted}`]
+        : []),
       `Tipologia: ${breakdown.formulaTitle}`,
       `Formula: ${breakdown.formulaSummary}`,
       "",
       ...breakdown.explanationLines,
     ].join("\n");
 
-    navigator.clipboard.writeText(text);
+    try {
+      await navigator.clipboard.writeText(text);
+    } catch {
+      // Fallback for non-secure contexts or denied clipboard permission.
+      const area = document.createElement("textarea");
+      area.value = text;
+      area.style.position = "fixed";
+      area.style.opacity = "0";
+      document.body.appendChild(area);
+      area.select();
+      try {
+        document.execCommand("copy");
+      } finally {
+        document.body.removeChild(area);
+      }
+    }
+
     setCopied(true);
-    setTimeout(() => setCopied(false), 2000);
+    if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
+    copyTimer.current = window.setTimeout(() => setCopied(false), 2000);
   };
+
+  const hasSubjectiveWeights =
+    breakdown.subjectivePart?.isWeighted ??
+    (breakdown.subjectivePart?.items.some((item) => (item.weight ?? 1) !== 1) || false);
+  const hasPendingSubjective = (breakdown.pendingSubjectiveCount ?? 0) > 0;
+  const isSubjectivePendingOnly = breakdown.isSubjectivePendingOnly === true;
 
   if (isPrintMode) {
     return (
@@ -34,12 +69,18 @@ export default function GradeCalculationReport({
         <div className="flex items-center justify-between border-b border-slate-200 pb-2">
           <div className="flex items-center gap-1.5 font-bold text-slate-900 text-xs">
             <Calculator className="w-4 h-4 text-indigo-700 shrink-0" />
-            <span>Composizione del Voto e Media delle Valutazioni Singole</span>
+            <span>Composizione del Voto e Media delle Valutazioni Singole ({breakdown.finalGradeFormatted})</span>
           </div>
           <span className="px-2 py-0.5 rounded font-mono font-bold bg-indigo-100 text-indigo-800 text-[10px]">
             {breakdown.formulaTitle}
           </span>
         </div>
+
+        {breakdown.registeredGradeFormatted && (
+          <p className="px-2 py-1 rounded bg-amber-50 border border-amber-200 text-[10px] text-amber-800">
+            Voto attualmente registrato: <b>{breakdown.registeredGradeFormatted}</b> • Formula attuale: <b>{breakdown.finalGradeFormatted}</b>
+          </p>
+        )}
 
         {/* Formula summary */}
         <div className="p-2 bg-white border border-slate-200 rounded-lg font-mono text-[11px] text-indigo-900 font-bold text-center">
@@ -50,9 +91,14 @@ export default function GradeCalculationReport({
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[11px]">
           {breakdown.objectivePart && (
             <div className="p-2.5 bg-white border border-slate-200 rounded-lg space-y-1">
-              <span className="font-bold text-slate-900 block">{breakdown.objectivePart.name}</span>
+              <span className="font-bold text-slate-900 block">
+                {breakdown.objectivePart.name}
+                {breakdown.objectivePart.isWeighted && (
+                  <span className="ml-1 text-[9px] font-normal text-indigo-700">(pesi didattici)</span>
+                )}
+              </span>
               <p className="text-slate-600">
-                Esatte: <b>{breakdown.objectivePart.score}/{breakdown.objectivePart.total}</b> ({breakdown.objectivePart.percentage}%)
+                Esatte: <b>{breakdown.objectivePart.score}/{breakdown.objectivePart.total}</b> • Accuratezza: <b>{breakdown.objectivePart.percentage}%</b>
               </p>
               <p className="text-slate-600">
                 Voto componente: <b>{breakdown.objectivePart.gradeOutOf10}/10</b> • Peso: <b>{breakdown.objectivePart.weightPct}%</b> (<b>{breakdown.objectivePart.pointsEarned} pt</b>)
@@ -65,13 +111,20 @@ export default function GradeCalculationReport({
               <span className="font-bold text-slate-900 block">{breakdown.subjectivePart.name}</span>
               <div className="flex flex-wrap gap-1 my-1">
                 {breakdown.subjectivePart.items.map((it, idx) => (
-                  <span key={idx} className="px-1.5 py-0.5 rounded bg-slate-100 border border-slate-300 font-mono text-[10px] text-slate-800">
-                    Q{it.number}: <b>{it.score}/10</b>
+                  <span key={idx} className={`px-1.5 py-0.5 rounded border font-mono text-[10px] ${it.pending ? "bg-amber-50 border-amber-300 text-amber-800" : "bg-slate-100 border-slate-300 text-slate-800"}`}>
+                    Q{it.number}: <b>{it.pending ? "in attesa" : `${it.score}/10`}</b>
+                    {it.weight && it.weight !== 1 ? ` ·×${it.weight}` : ""}
                   </span>
                 ))}
               </div>
               <p className="text-slate-600">
-                Media quesiti: <b>{breakdown.subjectivePart.averageScore}/10</b> • Peso: <b>{breakdown.subjectivePart.weightPct}%</b> (<b>{breakdown.subjectivePart.pointsEarned} pt</b>)
+                {isSubjectivePendingOnly ? (
+                  <>Media: <b>N.V. (in attesa)</b> • Peso: <b>{breakdown.subjectivePart.weightPct}%</b></>
+                ) : (
+                  <>
+                    {hasSubjectiveWeights ? "Media ponderata" : "Media quesiti"}: <b>{breakdown.subjectivePart.averageScore}/10</b> • Peso: <b>{breakdown.subjectivePart.weightPct}%</b> (<b>{breakdown.subjectivePart.pointsEarned} pt</b>)
+                  </>
+                )}
               </p>
             </div>
           )}
@@ -103,6 +156,11 @@ export default function GradeCalculationReport({
               <span className="text-[10px] text-slate-400 font-normal">({breakdown.finalGradeFormatted})</span>
             </h4>
             <p className="text-[10px] text-indigo-300/80">{breakdown.formulaTitle}</p>
+            {breakdown.registeredGradeFormatted && (
+              <p className="text-[10px] text-amber-300/90">
+                Registrato: <b>{breakdown.registeredGradeFormatted}</b> · formula attuale: <b>{breakdown.finalGradeFormatted}</b>
+              </p>
+            )}
           </div>
         </div>
 
@@ -130,6 +188,9 @@ export default function GradeCalculationReport({
               <span className="text-xs font-bold text-teal-300 flex items-center gap-1.5">
                 <span className="w-2 h-2 rounded-full bg-teal-400" />
                 <span>{breakdown.objectivePart.name}</span>
+                {breakdown.objectivePart.isWeighted && (
+                  <span className="text-[9px] font-normal text-teal-200/70">(pesi didattici)</span>
+                )}
               </span>
               <span className="px-2 py-0.5 rounded text-[10px] font-mono font-bold bg-teal-500/15 text-teal-300 border border-teal-500/30">
                 Peso: {breakdown.objectivePart.weightPct}%
@@ -144,7 +205,9 @@ export default function GradeCalculationReport({
                 </span>
               </div>
               <div>
-                <span className="text-[9px] uppercase text-slate-500 block">Voto Base</span>
+                <span className="text-[9px] uppercase text-slate-500 block">
+                  {breakdown.objectivePart.isWeighted ? "Voto Ponderato" : "Voto Base"}
+                </span>
                 <span className="text-sm font-bold text-teal-400 font-mono">
                   {breakdown.objectivePart.gradeOutOf10}/10
                 </span>
@@ -179,10 +242,15 @@ export default function GradeCalculationReport({
                   {breakdown.subjectivePart.items.map((it, idx) => (
                     <span
                       key={idx}
-                      className="px-1.5 py-0.5 rounded text-[10px] font-mono font-bold bg-indigo-500/20 text-indigo-200 border border-indigo-500/30"
-                      title={it.label}
+                      className={`px-1.5 py-0.5 rounded text-[10px] font-mono font-bold border ${
+                        it.pending
+                          ? "bg-amber-500/15 text-amber-200 border-amber-500/40"
+                          : "bg-indigo-500/20 text-indigo-200 border-indigo-500/30"
+                      }`}
+                      title={it.pending ? `${it.label} — in attesa di valutazione` : it.label}
                     >
-                      Q{it.number}: <b>{it.score}/10</b>
+                      Q{it.number}: <b>{it.pending ? "in attesa" : `${it.score}/10`}</b>
+                      {it.weight && it.weight !== 1 ? ` ·×${it.weight}` : ""}
                     </span>
                   ))}
                 </div>
@@ -190,22 +258,39 @@ export default function GradeCalculationReport({
 
               <div className="grid grid-cols-2 gap-2 text-center pt-1 border-t border-white/5">
                 <div>
-                  <span className="text-[9px] uppercase text-slate-500 block">Media Aritmetica</span>
+                  <span className="text-[9px] uppercase text-slate-500 block">
+                    {hasSubjectiveWeights ? "Media Ponderata" : "Media Aritmetica"}
+                  </span>
                   <span className="text-sm font-bold text-indigo-400 font-mono">
-                    {breakdown.subjectivePart.averageScore}/10
+                    {isSubjectivePendingOnly ? "N.V." : `${breakdown.subjectivePart.averageScore}/10`}
                   </span>
                 </div>
                 <div>
                   <span className="text-[9px] uppercase text-slate-500 block">Punti</span>
                   <span className="text-sm font-bold text-amber-300 font-mono">
-                    +{breakdown.subjectivePart.pointsEarned} pt
+                    {isSubjectivePendingOnly ? "—" : `+${breakdown.subjectivePart.pointsEarned} pt`}
                   </span>
                 </div>
               </div>
+
+              {hasPendingSubjective && (
+                <p className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2 py-1">
+                  {breakdown.pendingSubjectiveCount} domanda/e in attesa di valutazione.
+                  {isSubjectivePendingOnly
+                    ? " Il voto resta N.V. fino alla correzione."
+                    : " Concorrono come 0/10 fino alla correzione."}
+                </p>
+              )}
             </div>
           </div>
         )}
       </div>
+
+      {hasPendingSubjective && !breakdown.subjectivePart && (
+        <p className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2 py-1">
+          {breakdown.pendingSubjectiveCount} domanda/e aperta/e in attesa: non incluse nel voto di riserva, calcolato sulla sola parte oggettiva.
+        </p>
+      )}
 
       {/* Step by step bullet list */}
       <div className="p-3 bg-slate-950/50 rounded-xl border border-white/5 space-y-1.5 text-xs text-slate-300">

@@ -474,70 +474,7 @@ const parseJsonResponse = (text: string) => {
 // Middleware for JSON parsing
 app.use(express.json({ limit: '10mb' }));
 
-// Helper to format grades in traditional Italian scholastic notations (e.g. 6-, 6½, 7+)
-const formatItalianScholasticGrade = (gradeNum: number): string => {
-  if (isNaN(gradeNum)) return "—";
-  if (gradeNum >= 10) return "10 (Eccellente)";
-  if (gradeNum < 2) return gradeNum.toFixed(1);
-
-  const rounded = Math.round(gradeNum * 10) / 10; // e.g. 5.8
-  const frac = gradeNum - Math.floor(gradeNum);
-  const base = Math.floor(gradeNum);
-
-  let notation = "";
-  if (frac < 0.15) {
-    notation = `${base}`;
-  } else if (frac >= 0.15 && frac < 0.35) {
-    notation = `${base}+`;
-  } else if (frac >= 0.35 && frac < 0.65) {
-    notation = `${base}½`;
-  } else if (frac >= 0.65 && frac < 0.85) {
-    notation = `${base + 1}-`;
-  } else {
-    notation = `${base + 1}`;
-  }
-
-  return `${rounded.toFixed(1)} (${notation})`;
-};
-
-// Helper to calculate mathematical grades
-const calculateQuizGrade = (mcScore: number, mcCount: number, oeScores: number[]): string => {
-  let finalGrade = 0;
-  
-  if (mcCount > 0 && oeScores.length > 0) {
-    const mcFraction = mcScore / mcCount; // 0 to 1
-    const oeFraction = oeScores.reduce((a, b) => a + b, 0) / (oeScores.length * 10); // 0 to 1
-    
-    // Balanced weight: 50% Multiple Choice, 50% Open Ended
-    finalGrade = (mcFraction * 5.0) + (oeFraction * 5.0);
-  } else if (mcCount > 0) {
-    finalGrade = (mcScore / mcCount) * 10;
-  } else if (oeScores.length > 0) {
-    finalGrade = oeScores.reduce((a, b) => a + b, 0) / oeScores.length;
-  }
-  
-  return formatItalianScholasticGrade(finalGrade);
-};
-
-const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: number[]): string => {
-  let finalGrade = 0;
-  
-  if (fibCount > 0 && rqScores.length > 0) {
-    const fibFraction = fibScore / fibCount; // 0 to 1
-    const rqFraction = rqScores.reduce((a, b) => a + b, 0) / (rqScores.length * 10); // 0 to 1
-    
-    // Balanced weight: 50% Fill-in-Blank, 50% Reflection Questions
-    finalGrade = (fibFraction * 5.0) + (rqFraction * 5.0);
-  } else if (fibCount > 0) {
-    finalGrade = (fibScore / fibCount) * 10;
-  } else if (rqScores.length > 0) {
-    finalGrade = rqScores.reduce((a, b) => a + b, 0) / rqScores.length;
-  }
-  
-  return formatItalianScholasticGrade(finalGrade);
-};
-
-import { weightedOpenAverage, computeGradeBreakdown, detectGibberish } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
@@ -684,16 +621,6 @@ async function runEvaluationCore(reqBody: any) {
     const oeList = report.domande?.openEnded || [];
     const oeCount = oeList.length;
 
-    // Didactic weights: prefer the client-computed weighted fraction when
-    // available (identical to plain counts when all weights are 1).
-    const mcWScore = Number(report.punteggioMCPesato);
-    const mcWTotal = Number(report.pesoMCTotale);
-    const useWeightedMC = !isNaN(mcWScore) && !isNaN(mcWTotal) && mcWTotal > 0;
-    const gradeMcScore = useWeightedMC
-      ? Math.min(1, Math.max(0, mcWScore / mcWTotal)) * 10
-      : mcScore;
-    const gradeMcCount = useWeightedMC ? 10 : mcCount;
-
     // CASE 1: QUIZ WITH ONLY MULTIPLE CHOICE QUESTIONS (No open-ended questions in exam)
     if (oeCount === 0) {
       const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
@@ -710,7 +637,13 @@ async function runEvaluationCore(reqBody: any) {
         }
       });
 
-      const mathGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
+      const mathBreakdown = computeGradeBreakdown({
+        tipo: "Quiz",
+        examData: report.domande,
+        answers: report.risposte,
+        punteggioMC: mcScore
+      });
+      const mathGrade = mathBreakdown.finalGradeFormatted;
 
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova è un Quiz composto ESCLUSIVAMENTE da domande a scelta multipla (crocette). In questo esame NON sono presenti domande aperte.
@@ -761,14 +694,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         evaluation.suggestedGrade = mathGrade;
         evaluation.openEndedDetails = [];
         evaluation.evaluationMode = "ai";
-        evaluation.gradeBreakdown = computeGradeBreakdown({
-          tipo: "Quiz",
-          examData: report.domande,
-          answers: report.risposte,
-          evaluation,
-          punteggioMC: mcScore,
-          votoSuggerito: mathGrade
-        });
+        evaluation.gradeBreakdown = mathBreakdown;
         return evaluation;
       } catch (aiErr) {
         // Fallback deterministico: se l'IA non è disponibile o fallisce, il voto
@@ -783,13 +709,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
           openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
           openEndedDetails: [],
           evaluationMode: "deterministic",
-          gradeBreakdown: computeGradeBreakdown({
-            tipo: "Quiz",
-            examData: report.domande,
-            answers: report.risposte,
-            punteggioMC: mcScore,
-            votoSuggerito: mathGrade
-          })
+          gradeBreakdown: mathBreakdown
         };
       }
     }
@@ -897,27 +817,32 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         });
       }
 
-      const hasOeDetails = (evaluation.openEndedDetails || []).length > 0;
-      const oeMean = hasOeDetails ? weightedOpenAverage(evaluation.openEndedDetails, oeList) : 0;
-      const oeScores = hasOeDetails ? [oeMean] : [];
-      evaluation.suggestedGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, oeScores);
       evaluation.evaluationMode = "ai";
-      evaluation.gradeBreakdown = computeGradeBreakdown({
+      const mixedBreakdown = computeGradeBreakdown({
         tipo: "Quiz",
         examData: report.domande,
         answers: report.risposte,
         evaluation,
-        punteggioMC: mcScore,
-        votoSuggerito: evaluation.suggestedGrade
+        punteggioMC: mcScore
       });
+      evaluation.suggestedGrade = mixedBreakdown.finalGradeFormatted;
+      evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr) {
       console.warn("[evaluate] Fallback deterministico quiz con aperte:", aiErr?.message || aiErr);
       // Voto di riserva basato sulle sole MC (le aperte richiedono revisione docente).
       // Senza crocette non c'è nulla da correggere in modo deterministico: meglio
       // "N.V." (da correggere) che uno 0 finito nel registro al posto del voto.
-      const hasObjectivePart = gradeMcCount > 0;
-      const fallbackGrade = hasObjectivePart ? calculateQuizGrade(gradeMcScore, gradeMcCount, []) : "N.V.";
+      const hasObjectivePart = mcCount > 0;
+      const fallbackBreakdown = computeGradeBreakdown({
+        tipo: "Quiz",
+        examData: report.domande,
+        answers: report.risposte,
+        punteggioMC: mcScore,
+        // Reserve grade: never punish the student for open answers nobody graded.
+        pendingSubjective: "exclude"
+      });
+      const fallbackGrade = hasObjectivePart ? fallbackBreakdown.finalGradeFormatted : "N.V.";
       return {
         suggestedGrade: fallbackGrade,
         mainErrors: hasObjectivePart
@@ -928,13 +853,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
           : `Valutazione deterministica (riserva senza IA): la prova non ha domande a scelta multipla, quindi nessun voto è stato calcolato automaticamente. Le domande aperte vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
         openEndedDetails: [],
         evaluationMode: "deterministic",
-        gradeBreakdown: computeGradeBreakdown({
-          tipo: "Quiz",
-          examData: report.domande,
-          answers: report.risposte,
-          punteggioMC: mcScore,
-          votoSuggerito: fallbackGrade
-        })
+        gradeBreakdown: fallbackBreakdown
       };
     }
 
@@ -946,18 +865,15 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
     const rqCount = rqList.length;
 
-    // Didactic weights (identical to plain counts when all weights are 1)
-    const fibWScore = Number(report.punteggioFIBPesato);
-    const fibWTotal = Number(report.pesoFIBTotale);
-    const useWeightedFIB = !isNaN(fibWScore) && !isNaN(fibWTotal) && fibWTotal > 0;
-    const gradeFibScore = useWeightedFIB
-      ? Math.min(1, Math.max(0, fibWScore / fibWTotal)) * 10
-      : fibScore;
-    const gradeFibCount = useWeightedFIB ? 10 : fibCount;
-
     // CASE 1: WORKBOOK WITH ONLY FILL-IN-THE-BLANK (No reflection questions)
     if (rqCount === 0) {
-      const mathGrade = formatItalianScholasticGrade(gradeFibCount > 0 ? (gradeFibScore / gradeFibCount) * 10 : 0);
+      const mathBreakdown = computeGradeBreakdown({
+        tipo: "Workbook",
+        examData: report.domande,
+        answers: report.risposte,
+        punteggioFIB: fibScore
+      });
+      const mathGrade = mathBreakdown.finalGradeFormatted;
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova di Workbook è composta ESCLUSIVAMENTE da completamenti terminologici (Fill-in-the-blank / frasi da completare). NON sono presenti domande di riflessione aperta.
 L'alunno ha completato correttamente ${fibScore} frasi su ${fibCount} (voto matematico: ${mathGrade}).
@@ -992,36 +908,23 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
         const evaluation = parseJsonResponse(responseText);
-        evaluation.suggestedGrade = mathGrade;
+        evaluation.evaluationMode = "ai";
+        evaluation.suggestedGrade = mathBreakdown.finalGradeFormatted;
         evaluation.fibScore = fibScore;
         evaluation.reflectionDetails = [];
-        evaluation.evaluationMode = "ai";
-        evaluation.gradeBreakdown = computeGradeBreakdown({
-          tipo: "Workbook",
-          examData: report.domande,
-          answers: report.risposte,
-          evaluation,
-          punteggioFIB: fibScore,
-          votoSuggerito: mathGrade
-        });
+        evaluation.gradeBreakdown = mathBreakdown;
         return evaluation;
       } catch (aiErr: any) {
         console.warn("[evaluate] Fallback deterministico workbook di soli completamenti:", aiErr?.message || aiErr);
         // Nessuna riflessione da valutare: il voto resta quello dei completamenti.
-        const reserveGrade = gradeFibCount > 0 ? mathGrade : "N.V.";
+        const reserveGrade = fibCount > 0 ? mathBreakdown.finalGradeFormatted : "N.V.";
         return {
           suggestedGrade: reserveGrade,
           overallFeedback: `Valutazione deterministica (riserva senza IA): frasi completate correttamente ${fibScore}/${fibCount}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
           reflectionDetails: [],
           fibScore: fibScore,
           evaluationMode: "deterministic",
-          gradeBreakdown: computeGradeBreakdown({
-            tipo: "Workbook",
-            examData: report.domande,
-            answers: report.risposte,
-            punteggioFIB: fibScore,
-            votoSuggerito: reserveGrade
-          })
+          gradeBreakdown: mathBreakdown
         };
       }
     }
@@ -1121,38 +1024,32 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         });
       }
 
-      // Check if Workbook also has multiple choice questions (sections or root)
-      const wbMcList: any[] = [];
-      if (Array.isArray(report.domande?.multipleChoice)) wbMcList.push(...report.domande.multipleChoice);
-      (report.domande?.sections || []).forEach((s: any) => {
-        if (Array.isArray(s.multipleChoice)) wbMcList.push(...s.multipleChoice);
-      });
-      const mcCount = wbMcList.length;
-      const mcScore = Number(report.punteggioMC || 0);
-      const totalObjScore = gradeFibScore + mcScore;
-      const totalObjCount = gradeFibCount + mcCount;
-
-      const hasRqDetails = (evaluation.reflectionDetails || []).length > 0;
-      const rqMean = hasRqDetails ? weightedOpenAverage(evaluation.reflectionDetails, rqList) : 0;
-      const rqScores = hasRqDetails ? [rqMean] : [];
-      evaluation.suggestedGrade = calculateWorkbookGrade(totalObjScore, totalObjCount, rqScores);
       evaluation.fibScore = fibScore;
       evaluation.evaluationMode = "ai";
-      evaluation.gradeBreakdown = computeGradeBreakdown({
+      const mixedBreakdown = computeGradeBreakdown({
         tipo: "Workbook",
         examData: report.domande,
         answers: report.risposte,
         evaluation,
         punteggioFIB: fibScore,
-        punteggioMC: mcScore,
-        votoSuggerito: evaluation.suggestedGrade
+        punteggioMC: Number(report.punteggioMC || 0)
       });
+      evaluation.suggestedGrade = mixedBreakdown.finalGradeFormatted;
+      evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr: any) {
       console.warn("[evaluate] Fallback deterministico workbook con riflessioni:", aiErr?.message || aiErr);
-      // Stessa regola del quiz: senza completamenti non si inventa un voto.
-      const hasObjectivePart = gradeFibCount > 0;
-      const fallbackGrade = hasObjectivePart ? calculateWorkbookGrade(gradeFibScore, gradeFibCount, []) : "N.V.";
+      // Stessa regola del quiz: senza parte oggettiva non si inventa un voto.
+      const fallbackBreakdown = computeGradeBreakdown({
+        tipo: "Workbook",
+        examData: report.domande,
+        answers: report.risposte,
+        punteggioFIB: fibScore,
+        punteggioMC: Number(report.punteggioMC || 0),
+        pendingSubjective: "exclude"
+      });
+      const hasObjectivePart = !!fallbackBreakdown.objectivePart;
+      const fallbackGrade = hasObjectivePart ? fallbackBreakdown.finalGradeFormatted : "N.V.";
       return {
         suggestedGrade: fallbackGrade,
         overallFeedback: hasObjectivePart
@@ -1161,13 +1058,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         reflectionDetails: [],
         fibScore: fibScore,
         evaluationMode: "deterministic",
-        gradeBreakdown: computeGradeBreakdown({
-          tipo: "Workbook",
-          examData: report.domande,
-          answers: report.risposte,
-          punteggioFIB: fibScore,
-          votoSuggerito: fallbackGrade
-        })
+        gradeBreakdown: fallbackBreakdown
       };
     }
   }

@@ -56,7 +56,7 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade } from "../utils";
+import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
@@ -1499,15 +1499,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const mcAnsNorm: Record<string, number> = {};
         for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
         const mcs = mcWeightedScore(mcList, mcAnsNorm);
-        const gradeMcScore = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0)
-          ? (mcs.weightedCorrect / mcs.weightedTotal) * 10
-          : correctCount;
-        const gradeMcCount = (mcs.weightedTotal !== mcs.total && mcs.weightedTotal > 0) ? 10 : mcList.length;
+        const hasMcAnswers = Object.keys(mcAnsNorm).length > 0;
 
         if (oeList.length === 0) {
-          newGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, []);
+          // Same unified formula used by the server, the report panel and the
+          // stored breakdown, so "Ricalcola voto" can no longer drift.
+          const breakdown = computeGradeBreakdown({
+            tipo: "Quiz",
+            examData: domandeObj,
+            answers: hasMcAnswers ? ansObj : undefined,
+            punteggioMC: correctCount
+          });
+          newGrade = breakdown.finalGradeFormatted;
           evalObj.openEndedDetails = [];
           evalObj.suggestedGrade = newGrade;
+          evalObj.gradeBreakdown = breakdown;
           evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
           newFeedback = evalObj.openEndedEvaluation;
 
@@ -1549,7 +1555,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
           evalObj = { ...evalObj, ...evaluation };
           evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
-          newGrade = evaluation.suggestedGrade ?? newGrade;
+          const breakdown = computeGradeBreakdown({
+            tipo: "Quiz",
+            examData: domandeObj,
+            answers: sanitizedAnswers,
+            evaluation: evalObj,
+            punteggioMC: correctCount
+          });
+          newGrade = breakdown.finalGradeFormatted;
+          evalObj.suggestedGrade = newGrade;
+          evalObj.gradeBreakdown = breakdown;
           newErrors = evaluation.mainErrors || newErrors;
           newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
         }
@@ -1569,10 +1584,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         updatedPunteggioFIB = correctFib;
 
         const fibs = fibWeightedScore(fibList, ansObj.wbFib || {}, isFibAnswerCorrect);
-        const gradeFibScore = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0)
-          ? (fibs.weightedCorrect / fibs.weightedTotal) * 10
-          : correctFib;
-        const gradeFibCount = (fibs.weightedTotal !== fibs.total && fibs.weightedTotal > 0) ? 10 : fibList.length;
+        const hasFibAnswers = Object.keys(ansObj.wbFib || {}).length > 0;
 
         // Check for multiple-choice questions in Workbook (sections + root)
         const wbMcList: any[] = [];
@@ -1595,13 +1607,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           updatedPunteggioMC = correctMc;
         }
 
-        const compositeObjScore = gradeFibScore + correctMc;
-        const compositeObjCount = gradeFibCount + wbMcList.length;
+        const breakdownAnswers: any = {};
+        if (hasFibAnswers) breakdownAnswers.wbFib = ansObj.wbFib;
+        if (Object.keys(ansObj.mc || {}).length > 0) breakdownAnswers.mc = ansObj.mc;
 
         if (rqList.length === 0) {
-          newGrade = calculateWorkbookGrade(compositeObjScore, compositeObjCount, []);
+          const breakdown = computeGradeBreakdown({
+            tipo: "Workbook",
+            examData: domandeObj,
+            answers: breakdownAnswers,
+            punteggioFIB: correctFib,
+            punteggioMC: correctMc
+          });
+          newGrade = breakdown.finalGradeFormatted;
           evalObj.reflectionDetails = [];
           evalObj.suggestedGrade = newGrade;
+          evalObj.gradeBreakdown = breakdown;
           evalObj.overallFeedback = wbMcList.length > 0
             ? `Valutazione completata del quaderno di lavoro: l'alunno ha conseguito ${correctFib}/${fibList.length} termini FIB e ${correctMc}/${wbMcList.length} risposte a scelta multipla (voto matematico: ${newGrade}).`
             : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
@@ -1638,7 +1659,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           evalObj = { ...evalObj, ...evaluation };
           evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
           evalObj.fibTotal = fibList.length;
-          newGrade = evaluation.suggestedGrade ?? newGrade;
+          const breakdown = computeGradeBreakdown({
+            tipo: "Workbook",
+            examData: domandeObj,
+            answers: breakdownAnswers,
+            evaluation: evalObj,
+            punteggioFIB: correctFib,
+            punteggioMC: correctMc
+          });
+          newGrade = breakdown.finalGradeFormatted;
+          evalObj.suggestedGrade = newGrade;
+          evalObj.gradeBreakdown = breakdown;
           newFeedback = evaluation.overallFeedback || newFeedback;
           if (!newErrors) {
             newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
@@ -2945,10 +2976,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         </button>
       </div>
 
-      <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+      <div className="flex flex-col gap-6">
         
-        {/* Left column: Controls & Setup */}
-        <div className="lg:col-span-1 space-y-6">
+        {/* Full-width block: Controls & Setup */}
+        <div className="space-y-6">
           
           {/* Section: Session creation */}
           <div className="bg-slate-900/40 border border-white/10 p-5 rounded-2xl space-y-4">
@@ -3856,8 +3887,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         </div>
 
-        {/* Right column: Database Submissions Explorer & Classroom Live Monitor */}
-        <div className="lg:col-span-2 space-y-6">
+        {/* Full-width block: Database Submissions Explorer & Classroom Live Monitor */}
+        <div className="space-y-6">
           <div className="bg-slate-900/40 border border-white/10 p-5 sm:p-6 rounded-3xl backdrop-blur-md space-y-6">
             
             {/* Tab switch between Registro Consegne, Gruppo per Prove and Monitoraggio Live */}

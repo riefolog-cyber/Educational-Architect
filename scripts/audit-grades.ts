@@ -150,6 +150,9 @@ function recomputeWorkbook(domande: AnyObj, risposte: AnyObj, evaluation: AnyObj
     rqCount: rqList.length,
     rqMean,
     expected,
+    objWeightedCorrect,
+    objWeightedTotal,
+    objFraction,
     hasCustomFibWeights: fibList.some((q) => Number(q?.weight) > 0 && Number(q?.weight) !== 1),
     hasCustomMcWeights: wbMcList.some((q) => Number(q?.weight) > 0 && Number(q?.weight) !== 1),
   };
@@ -160,18 +163,23 @@ function auditDetails(
   questions: AnyObj[],
   answers: AnyObj,
   details: AnyObj[],
-  issues: Issue[]
+  issues: Issue[],
+  opts: { skipMissingDetails?: boolean } = {}
 ) {
   const idKey = kind === "quiz" ? "questionId" : "id";
   const seen = new Set<string>();
   const validIds = new Set(questions.map((q) => String(q?.id ?? "")));
 
   if (details.length === 0 && questions.length > 0) {
-    issues.push({
-      severity: "error",
-      code: "missing_details",
-      message: `Nessun dettaglio di valutazione per ${questions.length} domanda/e aperta/e.`,
-    });
+    // A deterministic reserve grade deliberately leaves the open questions
+    // uncorrected: their absence is expected, not an error.
+    if (!opts.skipMissingDetails) {
+      issues.push({
+        severity: "error",
+        code: "missing_details",
+        message: `Nessun dettaglio di valutazione per ${questions.length} domanda/e aperta/e.`,
+      });
+    }
     return;
   }
 
@@ -363,18 +371,31 @@ async function main() {
     let questions: AnyObj[] = [];
     let answersForDetails: AnyObj = {};
 
+    const isDeterministicReserve = String(evaluation?.evaluationMode || "") === "deterministic";
+
     try {
       if (tipo === "quiz" && domande) {
         recomputed = recomputeQuiz(domande, risposte || {}, evaluation || {});
+        const details = Array.isArray(evaluation?.openEndedDetails) ? evaluation.openEndedDetails : [];
+        // A deterministic reserve grade is computed on the objective part only
+        // when the open questions were left uncorrected.
+        if (isDeterministicReserve && details.length === 0 && recomputed.mcWeightedTotal > 0) {
+          recomputed.expected = recomputed.mcFraction * 10;
+        }
         questions = Array.isArray(domande?.openEnded) ? domande.openEnded : [];
         answersForDetails = {
           ...(risposte?.oe || {}),
           ...(risposte?.openEnded || {}),
         };
-        const details = Array.isArray(evaluation?.openEndedDetails) ? evaluation.openEndedDetails : [];
-        auditDetails("quiz", questions, answersForDetails, details, issues);
+        auditDetails("quiz", questions, answersForDetails, details, issues, {
+          skipMissingDetails: isDeterministicReserve && details.length === 0,
+        });
       } else if (tipo === "workbook" && domande) {
         recomputed = recomputeWorkbook(domande, risposte || {}, evaluation || {});
+        const details = Array.isArray(evaluation?.reflectionDetails) ? evaluation.reflectionDetails : [];
+        if (isDeterministicReserve && details.length === 0 && recomputed.objWeightedTotal > 0) {
+          recomputed.expected = recomputed.objFraction * 10;
+        }
         const sections = Array.isArray(domande?.sections) ? domande.sections : [];
         questions = sections.flatMap((s: AnyObj) =>
           Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []
@@ -383,8 +404,9 @@ async function main() {
           ...(risposte?.wbRq || {}),
           ...(risposte?.oe || {}),
         };
-        const details = Array.isArray(evaluation?.reflectionDetails) ? evaluation.reflectionDetails : [];
-        auditDetails("workbook", questions, answersForDetails, details, issues);
+        auditDetails("workbook", questions, answersForDetails, details, issues, {
+          skipMissingDetails: isDeterministicReserve && details.length === 0,
+        });
       } else {
         issues.push({
           severity: "warning",

@@ -4,9 +4,8 @@
  */
 import assert from "node:assert/strict";
 import {
-  calculateQuizGrade,
-  calculateWorkbookGrade,
   computeGradeBreakdown,
+  extractBreakdownFromSubmission,
   detectGradeDiscrepancy,
   detectGibberish,
   formatItalianScholasticGrade,
@@ -72,75 +71,57 @@ test("parseItalianGrade: voti non quantificabili", () => {
   assert.ok(Number.isNaN(parseItalianGrade(null)));
 });
 
-// ---------- Grade calculators ----------
+// ---------- Unified grade breakdown ----------
 
-test("calculateQuizGrade: misto 50/50", () => {
-  // 9/10 crocette = 4.5 punti, media aperte 3/10 = 1.5 punti → 6.0
-  assert.equal(calculateQuizGrade(9, 10, [3]), formatItalianScholasticGrade(6));
-});
-
-test("calculateQuizGrade: sola parte oggettiva", () => {
-  // 5/10 è esattamente 5, non un caso anomalo
-  assert.equal(calculateQuizGrade(5, 10, []), formatItalianScholasticGrade(5));
-});
-
-test("calculateQuizGrade: solo domande aperte", () => {
-  near(parseItalianGrade(calculateQuizGrade(0, 0, [6, 8])), 7);
-});
-
-test("calculateQuizGrade: nessun dato", () => {
-  assert.equal(calculateQuizGrade(0, 0, []), "—");
-});
-
-test("calculateWorkbookGrade: misto 50/50", () => {
-  // 2/6 FIB = 1.67 punti, riflessioni 6/10 = 3 punti → 4.67
-  const formatted = calculateWorkbookGrade(2, 6, [6]);
-  near(parseItalianGrade(formatted), 4.67, 0.05);
-});
-
-// ---------- Breakdown consistency ----------
-
-test("computeGradeBreakdown: quiz misto coincide con calculateQuizGrade", () => {
+test("computeGradeBreakdown: quiz misto 50/50", () => {
   const examData = {
     multipleChoice: [
       { id: "mc1", correctIndex: 0 },
       { id: "mc2", correctIndex: 1 },
     ],
-    openEnded: [{ id: "oe1" }, { id: "oe2" }],
+    openEnded: [{ id: "oe1" }],
   };
   const answers = { mc: { mc1: 0, mc2: 1 } };
+  const evaluation = { openEndedDetails: [{ questionId: "oe1", score: 6 }] };
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, answers, evaluation });
+  // MC 2/2 = 5 punti, aperta 6/10 = 3 punti → 8
+  near(breakdown.finalNumeric, 8);
+  assert.equal(breakdown.isMixed, true);
+  assert.equal(breakdown.pendingSubjectiveCount, 0);
+});
+
+test("computeGradeBreakdown: puro MC rispetta i pesi didattici", () => {
+  const examData = {
+    multipleChoice: [
+      { id: "a", correctIndex: 0, weight: 3 },
+      { id: "b", correctIndex: 0, weight: 1 },
+    ],
+  };
+  const answers = { mc: { a: 0, b: 1 } }; // 3 pesi su 4
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, answers });
+  near(breakdown.finalNumeric, 7.5);
+  assert.equal(breakdown.objectivePart?.percentage, 75);
+  assert.equal(breakdown.objectivePart?.isWeighted, true);
+  assert.ok(breakdown.formulaSummary.includes("pesi"));
+});
+
+test("computeGradeBreakdown: solo aperte = media aritmetica", () => {
+  const examData = { openEnded: [{ id: "oe1" }, { id: "oe2" }] };
   const evaluation = {
     openEndedDetails: [
       { questionId: "oe1", score: 6 },
       { questionId: "oe2", score: 8 },
     ],
   };
-  const breakdown = computeGradeBreakdown({
-    tipo: "Quiz",
-    examData,
-    answers,
-    evaluation,
-  });
-  // MC 2/2 = 5 punti, aperte 7/10 = 3.5 punti → 8.5
-  near(breakdown.finalNumeric, 8.5);
-  near(parseItalianGrade(calculateQuizGrade(2, 2, [7])), breakdown.finalNumeric, 0.05);
-  assert.equal(breakdown.isMixed, true);
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, evaluation });
+  near(breakdown.finalNumeric, 7);
+  assert.equal(breakdown.isPureSubjective, true);
 });
 
-test("computeGradeBreakdown: i pesi didattici sono rispettati", () => {
-  const examData = {
-    multipleChoice: [
-      { id: "a", correctIndex: 0, weight: 3 },
-      { id: "b", correctIndex: 0, weight: 1 },
-    ],
-    openEnded: [{ id: "oe", weight: 1 }],
-  };
-  const answers = { mc: { a: 0, b: 1 } }; // 3 pesi su 4
-  const evaluation = { openEndedDetails: [{ questionId: "oe", score: 5 }] };
-  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, answers, evaluation });
-  // Obiettivo 3/4 = 7.5/10 → 3.75 punti; aperta 5/10 → 2.5 punti → 6.25
-  near(breakdown.finalNumeric, 6.25);
-  assert.equal(breakdown.objectivePart?.percentage, 75);
+test("computeGradeBreakdown: nessun dato → N.V.", () => {
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData: {}, answers: {} });
+  assert.equal(breakdown.finalGradeFormatted, "N.V.");
+  near(breakdown.finalNumeric, 0);
 });
 
 test("computeGradeBreakdown: workbook FIB + crocette + riflessioni", () => {
@@ -159,10 +140,92 @@ test("computeGradeBreakdown: workbook FIB + crocette + riflessioni", () => {
   const answers = { wbFib: { f1: "uno", f2: "sbagliato" }, mc: { m1: 0 } };
   const evaluation = { reflectionDetails: [{ id: "r1", score: 4 }] };
   const breakdown = computeGradeBreakdown({ tipo: "Workbook", examData, answers, evaluation });
-  // Obiettivo (1+1)/(2+1) = 4/6... in realtà 2 corrette su 3 → 6.67/10 → 3.33
-  // Riflessione 4/10 → 2 punti → 5.33
+  // Obiettivo 2 corrette su 3 → 6.67/10 → 3.33; riflessione 4/10 → 2 → 5.33
   near(breakdown.finalNumeric, 5.33, 0.01);
   assert.equal(breakdown.pendingSubjectiveCount, 0);
+});
+
+test("computeGradeBreakdown: workbook con pesi FIB usa la frazione ponderata", () => {
+  const examData = {
+    sections: [
+      {
+        fillInTheBlank: [
+          { id: "f1", answer: "uno", weight: 3 },
+          { id: "f2", answer: "due", weight: 1 },
+        ],
+        reflectionQuestions: [{ id: "r1" }],
+      },
+    ],
+  };
+  const answers = { wbFib: { f1: "uno", f2: "sbagliato" } };
+  const evaluation = { reflectionDetails: [{ id: "r1", score: 6 }] };
+  const breakdown = computeGradeBreakdown({ tipo: "Workbook", examData, answers, evaluation });
+  // Pesi 3/4 = 7.5/10 → 3.75; riflessione 6/10 → 3 → 6.75
+  near(breakdown.finalNumeric, 6.75);
+  assert.equal(breakdown.objectivePart?.percentage, 75);
+  assert.equal(breakdown.objectivePart?.isWeighted, true);
+});
+
+test("computeGradeBreakdown: valutazione parziale non gonfia il voto", () => {
+  const examData = {
+    openEnded: [{ id: "q1" }, { id: "q2" }, { id: "q3" }, { id: "q4" }, { id: "q5" }],
+  };
+  // L'IA ha valutato solo 3 quesiti su 5: i 2 mancanti devono contare 0.
+  const evaluation = {
+    openEndedDetails: [
+      { questionId: "q1", score: 10 },
+      { questionId: "q2", score: 10 },
+      { questionId: "q3", score: 10 },
+    ],
+  };
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, evaluation });
+  near(breakdown.finalNumeric, 6);
+  assert.equal(breakdown.pendingSubjectiveCount, 2);
+  assert.equal(breakdown.isSubjectivePendingOnly, false);
+  assert.ok(breakdown.explanationLines.some((l) => l.includes("non ancora valutata")));
+});
+
+test("computeGradeBreakdown: voto di riserva esclude le aperte non valutate", () => {
+  const examData = {
+    openEnded: [{ id: "q1" }, { id: "q2" }, { id: "q3" }],
+  };
+  const evaluation = { openEndedDetails: [{ questionId: "q1", score: 10 }] };
+  const breakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData,
+    evaluation,
+    pendingSubjective: "exclude",
+  });
+  // Solo il quesito valutato entra nella media; gli altri restano segnalati.
+  near(breakdown.finalNumeric, 10);
+  assert.equal(breakdown.pendingSubjectiveCount, 2);
+});
+
+test("computeGradeBreakdown: riserva oggettiva dichiara le aperte non valutate", () => {
+  const examData = {
+    multipleChoice: [{ id: "m1", correctIndex: 0 }],
+    openEnded: [{ id: "q1" }, { id: "q2" }],
+  };
+  const answers = { mc: { m1: 0 } };
+  const breakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData,
+    answers,
+    pendingSubjective: "exclude",
+  });
+  near(breakdown.finalNumeric, 10);
+  assert.equal(breakdown.isPureObjective, true);
+  assert.equal(breakdown.pendingSubjectiveCount, 2);
+  assert.ok(breakdown.explanationLines.some((l) => l.includes("non sono incluse")));
+  assert.ok(breakdown.explanationLines.some((l) => l.includes("parte oggettiva")));
+});
+
+test("computeGradeBreakdown: solo quesiti in attesa → N.V., non 0.0", () => {
+  const examData = { openEnded: [{ id: "q1" }, { id: "q2" }] };
+  const breakdown = computeGradeBreakdown({ tipo: "Quiz", examData, evaluation: {} });
+  assert.equal(breakdown.finalGradeFormatted, "N.V.");
+  assert.equal(breakdown.isSubjectivePendingOnly, true);
+  near(breakdown.finalNumeric, 0);
 });
 
 test("computeGradeBreakdown: riflessioni non valutate contano 0 e lo dichiara", () => {
@@ -180,7 +243,55 @@ test("computeGradeBreakdown: riflessioni non valutate contano 0 e lo dichiara", 
   // Obiettivo 1/1 = 5 punti, riflessioni 0 → 5
   near(breakdown.finalNumeric, 5);
   assert.equal(breakdown.pendingSubjectiveCount, 2);
-  assert.ok(breakdown.explanationLines.some((l) => l.includes("non ancora valutata")));
+  assert.ok(breakdown.explanationLines.some((l) => l.includes("in attesa")));
+});
+
+test("computeGradeBreakdown: voto registrato diverso viene affiancato, non sostituito", () => {
+  const examData = {
+    multipleChoice: [
+      { id: "a", correctIndex: 0 },
+      { id: "b", correctIndex: 0 },
+    ],
+  };
+  const answers = { mc: { a: 0, b: 1 } }; // 1/2 → 5
+  const breakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData,
+    answers,
+    votoSuggerito: "6.8 (7-)",
+  });
+  near(breakdown.finalNumeric, 5);
+  assert.equal(breakdown.registeredGradeFormatted, "6.8 (7-)");
+
+  const aligned = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData,
+    answers,
+    votoSuggerito: breakdown.finalGradeFormatted,
+  });
+  assert.equal(aligned.registeredGradeFormatted, undefined);
+});
+
+test("extractBreakdownFromSubmission: riserva deterministica esclude le aperte", () => {
+  const sub = {
+    Tipo: "workbook", // case-insensitive
+    Domande_Esame: JSON.stringify({
+      sections: [
+        {
+          fillInTheBlank: [{ id: "f1", answer: "uno" }],
+          reflectionQuestions: [{ id: "r1" }, { id: "r2" }],
+        },
+      ],
+    }),
+    Risposte_Studente: JSON.stringify({ wbFib: { f1: "uno" } }),
+    Full_Evaluation: JSON.stringify({ evaluationMode: "deterministic", fibScore: 1 }),
+    Punteggio_FIB: 1,
+  };
+  const breakdown = extractBreakdownFromSubmission(sub);
+  // Parte oggettiva perfetta (1/1 = 10); le riflessioni non correte non la azzerano.
+  near(breakdown.finalNumeric, 10);
+  assert.equal(breakdown.tipo, "Workbook");
+  assert.equal(breakdown.pendingSubjectiveCount, 2);
 });
 
 // ---------- Discrepancy detection ----------
