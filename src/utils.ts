@@ -54,6 +54,42 @@ export function detectGibberish(str: string | undefined): boolean {
   if (/^([a-z])\1{3,}$/i.test(cleanT)) return true;
   if (/^[bcdfghjklmnpqrstvwxyz]{6,}$/i.test(cleanT)) return true;
 
+  // Keyboard mashing that mixes a few vowels randomly (e.g. "sjisksjsjsjajajzhsjsijsjz")
+  // Legit Italian prose always has a healthy vowel ratio and a varied alphabet.
+  const letters = cleanT.replace(/[^a-zàèéìòù]/g, "");
+  if (letters.length >= 10) {
+    const vowels = (letters.match(/[aeiouàèéìòù]/g) || []).length;
+    const vowelRatio = vowels / letters.length;
+    const uniqueRatio = new Set(letters).size / letters.length;
+    const consonantRuns: string[] = letters.match(/[bcdfghjklmnpqrstvwxyz]+/g) || [];
+    const longestConsonantRun = consonantRuns.reduce(
+      (max, run) => Math.max(max, run.length),
+      0
+    );
+
+    // Long single token with very few vowels / low variety / absurd consonant runs.
+    if (!/\s/.test(t) && letters.length >= 14 && (vowelRatio < 0.28 || uniqueRatio < 0.4 || longestConsonantRun >= 8)) {
+      return true;
+    }
+    // Several "words" but still vowel-poor and repetitive: keyboard mashing.
+    if (vowelRatio < 0.18 && uniqueRatio < 0.5) return true;
+  }
+
+  // Repeated chunks such as "asdfasdf", "sjisjsjs".
+  if (/([a-z]{2,5})\1{2,}/i.test(cleanT)) return true;
+
+  // Classic keyboard rows mashed together ("asdfasdf", "qwertyuiop", ...)
+  if (/(asdf|sdfg|dfgh|fghj|ghjk|hjkl|qwer|wert|erty|rtyu|tyui|yuio|uiop|zxcv|xcvb|cvbn|vbnm)/i.test(cleanT)) {
+    return true;
+  }
+
+  // A 3-6 character chunk repeated at least twice with few vowels is mashing.
+  if (/([a-z]{3,6})\1/i.test(cleanT)) {
+    const ls = cleanT.replace(/[^a-z]/g, "");
+    const vr = ls.length ? (ls.match(/[aeiou]/g) || []).length / ls.length : 0;
+    if (vr <= 0.4) return true;
+  }
+
   return false;
 }
 
@@ -100,6 +136,67 @@ export function formatItalianScholasticGrade(gradeNum: number): string {
   }
 
   return `${rounded.toFixed(1)} (${notation})`;
+}
+
+/**
+ * Parses the many notations a school grade can take and returns a number.
+ *
+ * Handles: "6", "6,5", "6.5 (6½)", "6½", "7+", "8-", "7/8", "8/10",
+ * "10 e lode", "N.V."/N.D./"—" (→ NaN).
+ *
+ * Important: "6.5 (6½)" carries an exact decimal, so the symbolic notation in
+ * brackets must NOT shift the value again. Returns NaN when nothing numeric is
+ * present, so callers can distinguish "not assessable" from a real 0.
+ */
+export function parseItalianGrade(val: any): number {
+  if (val === null || val === undefined) return NaN;
+  const raw = String(val).replace(/\u00a0/g, " ").trim();
+  if (!raw) return NaN;
+  if (/^(n\.?\s*\/?\s*d\.?|n\.?\s*a\.?|n\.?\s*v\.?|nv|—|-|null|undefined)$/i.test(raw)) {
+    return NaN;
+  }
+
+  const lower = raw.toLowerCase();
+  if (lower.includes("lode")) return 10.5;
+
+  // Explicit scale, e.g. "8/10" or "7,5 / 10": the first number is the grade.
+  const outOfTen = raw.match(/(\d+(?:[.,]\d+)?)\s*\/\s*10\b/);
+  if (outOfTen) {
+    const n = parseFloat(outOfTen[1].replace(",", "."));
+    return Number.isFinite(n) ? n : NaN;
+  }
+
+  // Range "7-8" / "7–8" / "7/8" (an average is a sensible numeric view).
+  const range =
+    raw.match(/^(\d+(?:[.,]\d+)?)\s*[-–]\s*(\d+(?:[.,]\d+)?)\s*$/) ||
+    raw.match(/^(\d+(?:[.,]\d+)?)\s*\/\s*(\d+(?:[.,]\d+)?)\s*$/);
+  if (range) {
+    const a = parseFloat(range[1].replace(",", "."));
+    const b = parseFloat(range[2].replace(",", "."));
+    if (Number.isFinite(a) && Number.isFinite(b) && b > a && b <= 10) {
+      return (a + b) / 2;
+    }
+    if (Number.isFinite(a)) return a;
+  }
+
+  const match = raw.match(/(\d+(?:[.,]\d+)?)/);
+  if (!match) return NaN;
+  let num = parseFloat(match[1].replace(",", "."));
+  if (!Number.isFinite(num)) return NaN;
+
+  // Symbolic + / - / ½ applies only to bare notations ("7+", "8-", "6½").
+  const hasDecimal = /[.,]\d/.test(match[1]);
+  if (!hasDecimal) {
+    if (/½|mezz[oa]/i.test(raw)) {
+      num += 0.5;
+    } else if (raw.includes("+")) {
+      num += 0.25;
+    } else if (/\d\s*-\s*$/.test(raw) || raw.endsWith("-")) {
+      num -= 0.25;
+    }
+  }
+
+  return num;
 }
 
 // Helper to calculate mathematical grades for Quiz
@@ -202,6 +299,8 @@ export interface GradeBreakdownResult {
   };
   
   explanationLines: string[];
+  /** Open-ended questions with no evaluation yet (counted as 0 until reviewed). */
+  pendingSubjectiveCount?: number;
 }
 
 /**
@@ -220,53 +319,93 @@ export function computeGradeBreakdown(params: {
   const isWorkbook = String(params.tipo || "").toLowerCase() === "workbook";
   const tipo: "Quiz" | "Workbook" = isWorkbook ? "Workbook" : "Quiz";
 
-  let objScore = 0;
-  let objTotal = 0;
+  let objScore = 0; // raw number of correct objective answers (for display)
+  let objTotal = 0; // raw number of objective questions (for display)
+  let objWeightedCorrect = 0;
+  let objWeightedTotal = 0;
+  let objHasCustomWeights = false;
+  let pendingSubjectiveCount = 0;
   const subjectiveScores: number[] = [];
   const subjectiveDetails: GradeComponentItem[] = [];
+
+  const storedNumber = (v: any): number | null => {
+    if (v === undefined || v === null || v === "") return null;
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  };
+
+  /**
+   * Objective stats: when the student answers are available they are
+   * authoritative; the stored count is only a fallback for legacy documents.
+   * Weighted totals always come from the exam definition so a custom didactic
+   * weight is honoured exactly like the server-side calculation.
+   */
+  const buildStats = (
+    list: any[],
+    hasAnswers: boolean,
+    scored: { correct: number; total: number; weightedCorrect: number; weightedTotal: number },
+    storedCorrect: number | null
+  ) => {
+    const weightedTotal = (list || []).reduce((a, q) => a + itemWeight(q), 0);
+    if (hasAnswers) {
+      return { ...scored, weightedTotal: weightedTotal || scored.weightedTotal };
+    }
+    const total = (list || []).length;
+    const correct = storedCorrect === null ? 0 : Math.min(total, Math.max(0, storedCorrect));
+    const weightedCorrect = total > 0 ? (correct / total) * weightedTotal : 0;
+    return { correct, total, weightedCorrect, weightedTotal };
+  };
+
+  const hasMcAnswers = !!params.answers?.mc && typeof params.answers.mc === "object";
+  const hasFibAnswers = !!params.answers?.wbFib && typeof params.answers.wbFib === "object";
 
   if (tipo === "Quiz") {
     // 1. Multiple Choice
     const mcList = Array.isArray(params.examData?.multipleChoice) ? params.examData.multipleChoice : [];
-    objTotal = mcList.length;
-    if (params.punteggioMC !== undefined && params.punteggioMC !== null && !isNaN(Number(params.punteggioMC))) {
-      objScore = Number(params.punteggioMC);
-    } else if (params.answers?.mc && objTotal > 0) {
-      objScore = mcList.reduce((acc: number, q: any) => {
-        const u = params.answers.mc[q.id];
-        return acc + (u !== undefined && u !== null && Number(u) === Number(q.correctIndex) ? 1 : 0);
-      }, 0);
-    }
+    const mcStats = buildStats(
+      mcList,
+      hasMcAnswers,
+      mcWeightedScore(mcList, params.answers?.mc || {}),
+      storedNumber(params.punteggioMC)
+    );
+    objScore += mcStats.correct;
+    objTotal += mcStats.total;
+    objWeightedCorrect += mcStats.weightedCorrect;
+    objWeightedTotal += mcStats.weightedTotal;
+    objHasCustomWeights = objHasCustomWeights || mcList.some((q) => itemWeight(q) !== 1);
 
     // 2. Open-ended questions
     const oeList = Array.isArray(params.examData?.openEnded) ? params.examData.openEnded : [];
     const oeEvalList = Array.isArray(params.evaluation?.openEndedDetails) ? params.evaluation.openEndedDetails : [];
-    
+
     if (oeEvalList.length > 0) {
       oeEvalList.forEach((item: any, idx: number) => {
-        const s = Number(item.score);
-        const validScore = isNaN(s) ? 0 : Math.min(10, Math.max(0, s));
+        const validScore = Math.min(10, Math.max(0, Number(item.score) || 0));
         subjectiveScores.push(validScore);
         const qMeta = oeList.find((q: any) => q.id === item.questionId) || oeList[idx];
         subjectiveDetails.push({
-          id: item.questionId || `oe_${idx + 1}`,
+          id: item.questionId || qMeta?.id || `oe_${idx + 1}`,
           number: idx + 1,
           label: qMeta?.question ? (qMeta.question.length > 70 ? qMeta.question.slice(0, 70) + "..." : qMeta.question) : `Domanda Aperta ${idx + 1}`,
           score: validScore,
           maxScore: 10,
-          weight: qMeta?.weight ? Number(qMeta.weight) : 1,
+          weight: itemWeight(qMeta),
           feedback: item.feedback || ""
         });
       });
     } else if (oeList.length > 0) {
+      // Questions exist but the AI/teacher has not evaluated them yet: count
+      // them as 0 so the breakdown matches the grade that was actually saved.
+      pendingSubjectiveCount = oeList.length;
       oeList.forEach((q: any, idx: number) => {
+        subjectiveScores.push(0);
         subjectiveDetails.push({
           id: q.id || `oe_${idx + 1}`,
           number: idx + 1,
           label: q.question ? (q.question.length > 70 ? q.question.slice(0, 70) + "..." : q.question) : `Domanda Aperta ${idx + 1}`,
           score: 0,
           maxScore: 10,
-          weight: q.weight ? Number(q.weight) : 1,
+          weight: itemWeight(q),
           feedback: "In attesa di revisione docente"
         });
       });
@@ -276,7 +415,7 @@ export function computeGradeBreakdown(params: {
     const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
     const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
     const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-    
+
     // Check multiple choice in Workbook (both in sections and root level)
     const wbMcList: any[] = [];
     if (Array.isArray(params.examData?.multipleChoice)) {
@@ -288,68 +427,61 @@ export function computeGradeBreakdown(params: {
       }
     });
 
-    let fibScore = 0;
-    let fibTotal = fibList.length;
-    if (params.punteggioFIB !== undefined && params.punteggioFIB !== null && !isNaN(Number(params.punteggioFIB))) {
-      fibScore = Number(params.punteggioFIB);
-    } else if (params.evaluation?.fibScore !== undefined && !isNaN(Number(params.evaluation.fibScore))) {
-      fibScore = Number(params.evaluation.fibScore);
-      if (params.evaluation?.fibTotal) fibTotal = Number(params.evaluation.fibTotal);
-    } else if (params.answers?.wbFib) {
-      fibScore = fibList.reduce((acc: number, f: any) => {
-        return acc + (isFibAnswerCorrect(params.answers.wbFib[f.id], f.answer) ? 1 : 0);
-      }, 0);
-    }
+    const fibStats = buildStats(
+      fibList,
+      hasFibAnswers,
+      fibWeightedScore(fibList, params.answers?.wbFib || {}, isFibAnswerCorrect),
+      storedNumber(params.punteggioFIB) ?? storedNumber(params.evaluation?.fibScore)
+    );
+    const mcStats = buildStats(
+      wbMcList,
+      hasMcAnswers,
+      mcWeightedScore(wbMcList, params.answers?.mc || {}),
+      storedNumber(params.punteggioMC)
+    );
 
-    let mcScore = 0;
-    const mcTotal = wbMcList.length;
-    if (mcTotal > 0) {
-      if (params.punteggioMC !== undefined && params.punteggioMC !== null && !isNaN(Number(params.punteggioMC))) {
-        mcScore = Number(params.punteggioMC);
-      } else if (params.answers?.mc) {
-        mcScore = wbMcList.reduce((acc: number, q: any) => {
-          const u = params.answers.mc[q.id];
-          return acc + (u !== undefined && u !== null && Number(u) === Number(q.correctIndex) ? 1 : 0);
-        }, 0);
-      }
-    }
-
-    objTotal = fibTotal + mcTotal;
-    objScore = fibScore + mcScore;
+    objScore = fibStats.correct + mcStats.correct;
+    objTotal = fibStats.total + mcStats.total;
+    objWeightedCorrect = fibStats.weightedCorrect + mcStats.weightedCorrect;
+    objWeightedTotal = fibStats.weightedTotal + mcStats.weightedTotal;
+    objHasCustomWeights =
+      fibList.some((f: any) => itemWeight(f) !== 1) ||
+      wbMcList.some((q: any) => itemWeight(q) !== 1);
 
     const rqEvalList = Array.isArray(params.evaluation?.reflectionDetails) ? params.evaluation.reflectionDetails : [];
     if (rqEvalList.length > 0) {
       rqEvalList.forEach((item: any, idx: number) => {
-        const s = Number(item.score);
-        const validScore = isNaN(s) ? 0 : Math.min(10, Math.max(0, s));
+        const validScore = Math.min(10, Math.max(0, Number(item.score) || 0));
         subjectiveScores.push(validScore);
         const rMeta = rqList.find((r: any) => r.id === item.id) || rqList[idx];
         subjectiveDetails.push({
-          id: item.id || `rq_${idx + 1}`,
+          id: item.id || rMeta?.id || `rq_${idx + 1}`,
           number: idx + 1,
           label: rMeta?.question ? (rMeta.question.length > 70 ? rMeta.question.slice(0, 70) + "..." : rMeta.question) : `Riflessione ${idx + 1}`,
           score: validScore,
           maxScore: 10,
-          weight: rMeta?.weight ? Number(rMeta.weight) : 1,
+          weight: itemWeight(rMeta),
           feedback: item.feedback || ""
         });
       });
     } else if (rqList.length > 0) {
+      pendingSubjectiveCount = rqList.length;
       rqList.forEach((r: any, idx: number) => {
+        subjectiveScores.push(0);
         subjectiveDetails.push({
           id: r.id || `rq_${idx + 1}`,
           number: idx + 1,
           label: r.question ? (r.question.length > 70 ? r.question.slice(0, 70) + "..." : r.question) : `Riflessione ${idx + 1}`,
           score: 0,
           maxScore: 10,
-          weight: r.weight ? Number(r.weight) : 1,
+          weight: itemWeight(r),
           feedback: "In attesa di revisione docente"
         });
       });
     }
   }
 
-  const hasObj = objTotal > 0;
+  const hasObj = objWeightedTotal > 0;
   const hasSubj = subjectiveScores.length > 0;
   let finalNumeric = 0;
   let finalGradeFormatted = "";
@@ -359,6 +491,20 @@ export function computeGradeBreakdown(params: {
 
   let objPart: GradeBreakdownResult["objectivePart"];
   let subjPart: GradeBreakdownResult["subjectivePart"];
+
+  // Weighted objective fraction: this is exactly what the server and the
+  // "Ricalcola voto" flow use, so the report can no longer disagree with the
+  // grade that was actually stored.
+  const objFraction = hasObj ? Math.min(1, Math.max(0, objWeightedCorrect / objWeightedTotal)) : 0;
+  const objOutOf10 = objFraction * 10;
+
+  const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + itemWeight({ weight: d.weight }), 0);
+  const subjWeightedSum = subjectiveDetails.reduce(
+    (a, d) => a + d.score * itemWeight({ weight: d.weight }),
+    0
+  );
+  const hasCustomSubjWeights = subjectiveDetails.some((d) => itemWeight({ weight: d.weight }) !== 1);
+  const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
 
   // Determine user-facing label for objective section
   const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
@@ -378,16 +524,9 @@ export function computeGradeBreakdown(params: {
   }
 
   if (hasObj && hasSubj) {
-    // Mixed: 50% Objective + 50% Subjective
-    const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
-    const objOutOf10 = objFraction * 10;
-    const objPoints = objOutOf10 * 0.50;
-
-    const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + (d.weight || 1), 0);
-    const subjWeightedSum = subjectiveDetails.reduce((a, d) => a + d.score * (d.weight || 1), 0);
-    const hasCustomWeights = subjectiveDetails.some(d => (d.weight || 1) !== 1);
-    const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
-    const subjPoints = subjAvg * 0.50;
+    // Mixed: 50% Objective + 50% Subjective (both components weighted).
+    const objPoints = objFraction * 5.0;
+    const subjPoints = (subjAvg / 10) * 5.0;
 
     finalNumeric = Math.min(10, Math.max(0, objPoints + subjPoints));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
@@ -417,23 +556,23 @@ export function computeGradeBreakdown(params: {
       pointsEarned: Math.round(subjPoints * 100) / 100,
     };
 
-    const subjAvgLabel = hasCustomWeights ? `Media ponderata pesi didattici: ${subjAvg.toFixed(2)}/10` : `Media voti: ${subjAvg.toFixed(2)}/10`;
+    const subjAvgLabel = hasCustomSubjWeights ? `Media ponderata pesi didattici: ${subjAvg.toFixed(2)}/10` : `Media voti: ${subjAvg.toFixed(2)}/10`;
+    const objWeightLabel = objHasCustomWeights ? " (pesi didattici applicati)" : "";
 
     explanationLines.push(
-      `1. Parte Oggettiva (${objName}): ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 50% → ${objPoints.toFixed(2)} punti.`,
+      `1. Parte Oggettiva (${objName})${objWeightLabel}: ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 50% → ${objPoints.toFixed(2)} punti.`,
       `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. ${subjAvgLabel}. Incidenza 50% → ${subjPoints.toFixed(2)} punti.`,
       `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
 
   } else if (hasObj) {
     // Pure Objective: 100%
-    const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
     finalNumeric = Math.min(10, Math.max(0, objFraction * 10));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
 
     const objName = resolvedObjName;
     formulaTitle = "Valutazione Matematica Lineare (100% Oggettiva)";
-    formulaSummary = `(${objScore} esatte / ${objTotal} quesiti) × 10 = ${finalNumeric.toFixed(2)} / 10`;
+    formulaSummary = `(${objWeightedCorrect.toFixed(2)} / ${objWeightedTotal.toFixed(2)} pesi) × 10 = ${finalNumeric.toFixed(2)} / 10`;
 
     objPart = {
       name: objName,
@@ -446,23 +585,19 @@ export function computeGradeBreakdown(params: {
     };
 
     explanationLines.push(
-      `Prova esclusivamente oggettiva (senza domande aperte): il voto riflette al 100% la percentuale di risposte corrette.`,
+      `Prova esclusivamente oggettiva (senza domande aperte): il voto riflette al 100% la percentuale di risposte corrette${objHasCustomWeights ? ", calcolata sui pesi didattici" : ""}.`,
       `Risposte esatte: ${objScore} su ${objTotal} quesiti (accuratezza: ${objPart.percentage}%).`,
       `Formula matematica diretta: (${objScore} / ${objTotal}) × 10 = ${finalNumeric.toFixed(2)}/10 → Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
 
   } else if (hasSubj) {
     // Pure Subjective: 100%
-    const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + (d.weight || 1), 0);
-    const subjWeightedSum = subjectiveDetails.reduce((a, d) => a + d.score * (d.weight || 1), 0);
-    const hasCustomWeights = subjectiveDetails.some(d => (d.weight || 1) !== 1);
-    const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
     finalNumeric = Math.min(10, Math.max(0, subjAvg));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
 
     const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
-    formulaTitle = hasCustomWeights ? "Media Ponderata dei Voti Singoli (Pesi Didattici)" : "Media Aritmetica dei Voti Singoli (100% Aperte)";
-    formulaSummary = hasCustomWeights
+    formulaTitle = hasCustomSubjWeights ? "Media Ponderata dei Voti Singoli (Pesi Didattici)" : "Media Aritmetica dei Voti Singoli (100% Aperte)";
+    formulaSummary = hasCustomSubjWeights
       ? `Somma pesata (${subjWeightedSum.toFixed(2)}) / Pesi totali (${totalSubjWeight}) = ${subjAvg.toFixed(2)} / 10`
       : `(${subjectiveScores.join(" + ")}) / ${subjectiveScores.length} = ${subjAvg.toFixed(2)} / 10`;
 
@@ -476,7 +611,7 @@ export function computeGradeBreakdown(params: {
     };
 
     explanationLines.push(
-      `Prova esclusivamente a risposte aperte: il voto è dato dalla ${hasCustomWeights ? "media ponderata (in base ai pesi didattici impostati dal docente)" : "media aritmetica"} dei singoli quesiti.`,
+      `Prova esclusivamente a risposte aperte: il voto è dato dalla ${hasCustomSubjWeights ? "media ponderata (in base ai pesi didattici impostati dal docente)" : "media aritmetica"} dei singoli quesiti.`,
       `Voti singoli quesiti: [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10${subjectiveDetails[i]?.weight && subjectiveDetails[i].weight !== 1 ? ` (peso ${subjectiveDetails[i].weight})` : ""}`).join(", ")}].`,
       `Formula: ${formulaSummary} → Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
@@ -485,6 +620,12 @@ export function computeGradeBreakdown(params: {
     formulaTitle = "Valutazione Non Quantificabile";
     formulaSummary = "Dati insufficienti per il calcolo matematico del voto.";
     explanationLines.push("Nessun quesito oggettivo o aperto rilevato per comporre un voto matematico.");
+  }
+
+  if (pendingSubjectiveCount > 0) {
+    explanationLines.push(
+      `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: concorrono al calcolo come 0/10 fino alla correzione. Usa "Ricalcola voto" per ottenere una valutazione reale.`
+    );
   }
 
   if (params.votoSuggerito && params.votoSuggerito !== "N.V." && params.votoSuggerito !== "—") {
@@ -503,6 +644,7 @@ export function computeGradeBreakdown(params: {
     objectivePart: objPart,
     subjectivePart: subjPart,
     explanationLines,
+    pendingSubjectiveCount,
   };
 }
 
@@ -535,6 +677,32 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
     punteggioFIB: sub?.Punteggio_FIB,
     votoSuggerito: sub?.Voto_Suggerito
   });
+}
+
+/**
+ * True when the stored grade no longer matches the grade recomputed from the
+ * exam, the answers and the per-question evaluations.
+ *
+ * - Manual teacher retouches (`Voto_Originale_IA` present) are expected
+ *   discrepancies and therefore never flagged.
+ * - "N.V." / empty grades are not numeric and cannot be compared.
+ * - A tolerance of 0.3 absorbs the ± notation (6+, 6½, 6-) and rounding.
+ */
+export function detectGradeDiscrepancy(sub: any, tolerance = 0.3): boolean {
+  try {
+    if (!sub) return false;
+    if (sub.Voto_Originale_IA) return false;
+
+    const stored = parseItalianGrade(sub?.Voto_Suggerito);
+    if (!Number.isFinite(stored)) return false;
+
+    const breakdown = extractBreakdownFromSubmission(sub);
+    if (!Number.isFinite(breakdown.finalNumeric)) return false;
+
+    return Math.abs(stored - breakdown.finalNumeric) > tolerance;
+  } catch {
+    return false;
+  }
 }
 
 export interface SplitScreenDetection {
@@ -648,7 +816,7 @@ export function parseScoreNum(s: any): number {
  * Falls back to positional order if IDs don't match, or plain mean when no weights are present.
  */
 export function weightedOpenAverage(
-  details: Array<{ questionId?: string; id?: string; score: any }>,
+  details: Array<{ questionId?: string; id?: string; score?: any }>,
   questions: any[]
 ): number {
   const list = details || [];

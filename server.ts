@@ -569,6 +569,8 @@ const MAX_CONCURRENT_WORKERS = Math.min(12, Math.max(1, Number(process.env.EVAL_
 const MAX_QUEUE_LENGTH = Math.max(50, Number(process.env.EVAL_MAX_QUEUE) || 200);
 /** Un esito resta leggibile dal browser per 30 minuti, poi viene liberato. */
 const JOB_TTL_MS = 30 * 60 * 1000;
+/** Numero massimo di job conclusi mantenuti in memoria (oltre alla TTL). */
+const MAX_FINISHED_JOBS = Math.max(100, Number(process.env.EVAL_MAX_FINISHED_JOBS) || 300);
 /**
  * Piani di recupero: pochi in parallelo (sono testi lunghi) e una coda più
  * corta. Se tutta la classe li chiede insieme, si accodano qui e la correzione
@@ -584,14 +586,32 @@ const MAX_RECOVERY_QUEUE = Math.max(20, Number(process.env.RECOVERY_MAX_QUEUE) |
  */
 function purgeOldJobs(now = Date.now()) {
   if (jobStore.size === 0) return;
-  for (const [id, job] of jobStore) {
-    if (job.status !== "completed" && job.status !== "failed") continue;
-    if (now - job.createdAt < JOB_TTL_MS) continue;
+
+  const deleteJob = (id: string, job: EvaluationJob) => {
     jobStore.delete(id);
     job.reqBody = undefined;
     for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
       if (cachedJobId === id) reqToJobCache.delete(hashKey);
     }
+  };
+
+  for (const [id, job] of jobStore) {
+    if (job.status !== "completed" && job.status !== "failed") continue;
+    if (now - job.createdAt < JOB_TTL_MS) continue;
+    deleteJob(id, job);
+  }
+
+  // Hard cap as a second safety net: a burst of classes can create hundreds of
+  // finished jobs well before the TTL expires. Keep only the most recent ones.
+  const finished: Array<[string, EvaluationJob]> = [];
+  for (const [id, job] of jobStore) {
+    if (job.status === "completed" || job.status === "failed") finished.push([id, job]);
+  }
+  if (finished.length > MAX_FINISHED_JOBS) {
+    finished
+      .sort((a, b) => a[1].createdAt - b[1].createdAt)
+      .slice(0, finished.length - MAX_FINISHED_JOBS)
+      .forEach(([id, job]) => deleteJob(id, job));
   }
 }
 

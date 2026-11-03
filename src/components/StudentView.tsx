@@ -292,6 +292,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [examLocked, setExamLocked] = useState(false);
   const [lockReason, setLockReason] = useState("");
   const lockedRef = useRef(false);
+  const lockAppliedAtRef = useRef(0);
   const remoteUnlockSeenRef = useRef<string | null>(null);
 
   // Self assessment state
@@ -351,6 +352,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
   }, []);
 
+  // Original join time per session: heartbeats must not keep rewriting it,
+  // otherwise the teacher can no longer tell when the student actually joined.
+  const joinedAtBySessionRef = useRef<Record<string, string>>({});
+
   // Live progress synchronization to Firestore for Teacher Dashboard
   const syncLiveProgress = useCallback(async (
     status: "waiting" | "in_progress" | "self_evaluating" | "submitted" = "in_progress"
@@ -368,8 +373,26 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
       const progressPercent = Math.min(100, Math.round((answeredCount / (totalQuestions || 1)) * 100));
 
+      // Stable join time: first value wins for the whole session (also across
+      // a page reload within the same tab).
+      const joinedKey = `${sessionPin}|${user.email}`;
+      let joinedAt = joinedAtBySessionRef.current[joinedKey];
+      if (!joinedAt) {
+        try {
+          joinedAt = sessionStorage.getItem(`exam_joined_${sessionPin}_${safeKey}`) || "";
+        } catch {
+          joinedAt = "";
+        }
+        if (!joinedAt) joinedAt = new Date().toISOString();
+        joinedAtBySessionRef.current[joinedKey] = joinedAt;
+        try {
+          sessionStorage.setItem(`exam_joined_${sessionPin}_${safeKey}`, joinedAt);
+        } catch {
+          // Storage disabled: the in-memory ref still keeps it stable.
+        }
+      }
+
       const docRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey);
-      const joinedAt = new Date().toISOString();
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
@@ -378,7 +401,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         currentProgressPercent: progressPercent,
         tabSwitches: behavior.tabSwitches,
         pasteAttempts: behavior.pasteAttempts,
-        lastHeartbeat: joinedAt,
+        lastHeartbeat: new Date().toISOString(),
         joinedAt,
         sessionRunId,
         status
@@ -408,7 +431,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     syncLiveProgressRef.current("in_progress");
     const interval = setInterval(() => {
       syncLiveProgressRef.current("in_progress");
-    }, 10000);
+    }, 15000);
     return () => clearInterval(interval);
   }, [isExamActive, sessionPin, user?.email]);
 
@@ -479,6 +502,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       return;
     }
     lockedRef.current = true;
+    lockAppliedAtRef.current = Date.now();
     setExamLocked(true);
     setLockReason(reason);
     persistExamLock(true, reason);
@@ -533,19 +557,27 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         const currentId = remoteId ? String(remoteId) : "";
         const isDocLocked = data?.locked === true;
         if (remoteUnlockSeenRef.current === null) {
-          // First snapshot: record the baseline and release if server says unlocked
+          // First snapshot: record the baseline and release if server says
+          // unlocked. Never undo a lock that was just applied locally while
+          // the "locked" write is still in flight.
           remoteUnlockSeenRef.current = currentId;
-          if (lockedRef.current && (!isDocLocked || data?.lockState === "unlocked")) {
+          const freshlyAppliedLocalLock = Date.now() - lockAppliedAtRef.current < 5000;
+          if (
+            lockedRef.current &&
+            (!isDocLocked || data?.lockState === "unlocked") &&
+            !freshlyAppliedLocalLock
+          ) {
             releaseExamLockRef.current("remote");
           }
           return;
         }
         if (currentId !== remoteUnlockSeenRef.current) {
+          // Only an explicit teacher action (new remoteUnlockId) lifts the lock.
           remoteUnlockSeenRef.current = currentId;
           if (currentId && lockedRef.current) releaseExamLockRef.current("remote");
-        } else if (!isDocLocked && lockedRef.current) {
-          releaseExamLockRef.current("remote");
         }
+        // A stale `locked: false` snapshot (e.g. an older heartbeat write) must
+        // never release the block by itself.
       },
       (err) => console.warn("Ascolto sblocco docente non disponibile:", err)
     );

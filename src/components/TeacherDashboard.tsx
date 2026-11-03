@@ -56,7 +56,7 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
@@ -120,54 +120,14 @@ interface TeacherDashboardProps {
   onBack: () => void;
 }
 
+/**
+ * Backwards-compatible wrapper around the shared Italian grade parser.
+ * Sorting code expects -1 for "not assessable", while the shared parser
+ * returns NaN to stay honest about the absence of a numeric grade.
+ */
 export function parseSubmissionNumericGrade(val: any): number {
-  if (val === null || val === undefined) return -1;
-  const s = String(val).trim();
-  if (!s || s === "N/D" || s === "N/A" || s === "—" || s === "-" || s.toLowerCase() === "null") return -1;
-
-  const clean = s.replace(",", ".");
-
-  // Check 10 e lode / lode
-  if (clean.toLowerCase().includes("lode")) {
-    return 10.5;
-  }
-
-  // Check for range like "7-8", "7 - 8", "7/8"
-  const rangeMatch = clean.match(/^(\d+(?:\.\d+)?)\s*[-–/]\s*(\d+(?:\.\d+)?)/);
-  if (rangeMatch) {
-    const n1 = parseFloat(rangeMatch[1]);
-    const n2 = parseFloat(rangeMatch[2]);
-    // If it's 8/10 or 7.5/10, the second number is 10 (the scale), so it's n1
-    if (rangeMatch[0].includes("/") && n2 === 10) {
-      return n1;
-    }
-    if (!isNaN(n1) && !isNaN(n2) && n2 > n1 && n2 <= 10) {
-      return (n1 + n2) / 2;
-    }
-  }
-
-  const match = clean.match(/(\d+(?:\.\d+)?)/);
-  if (!match) return -1;
-
-  let num = parseFloat(match[1]);
-  if (isNaN(num)) return -1;
-
-  // Symbol adjustments (+ / - / ½) apply ONLY to bare notations like "7+",
-  // "8-" or "6½" (e.g. manual teacher overrides). When the grade already
-  // carries its exact decimal — e.g. "6.5 (6½)", "7.8 (8-)" — the number is
-  // complete and must NOT be shifted again.
-  const hasDecimal = match[1].includes(".");
-  if (!hasDecimal) {
-    if (s.includes("½") || s.toLowerCase().includes("mezzo") || s.toLowerCase().includes("mezza")) {
-      num += 0.5;
-    } else if (s.includes("+")) {
-      num += 0.25;
-    } else if (s.match(/\d\s*-\s*$/) || s.endsWith("-")) {
-      num -= 0.25;
-    }
-  }
-
-  return num;
+  const n = parseItalianGrade(val);
+  return Number.isFinite(n) ? n : -1;
 }
 
 function parseInfractionClock(t: any): number | null {
@@ -1475,47 +1435,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   const [recalculatingId, setRecalculatingId] = useState<string | null>(null);
 
-  // Helper to detect if an exam had grade calculation discrepancies
-  const hasGradeDiscrepancy = (sub: SavedSubmission): boolean => {
-    try {
-      const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
-      const evalObj = typeof sub.Full_Evaluation === "string" ? JSON.parse(sub.Full_Evaluation) : sub.Full_Evaluation;
-      const gradeVal = parseFloat(sub.Voto_Suggerito || "0");
-
-      if (sub.Tipo === "Quiz") {
-        const oeCount = (domande?.openEnded || []).length;
-        const mcCount = (domande?.multipleChoice || []).length;
-        // Pure MC test with MC score >= 50% but suggested grade < 6
-        if (oeCount === 0 && mcCount > 0 && (sub.Punteggio_MC || 0) >= mcCount * 0.5) {
-          if (gradeVal < 6.0) return true;
-        }
-        // Discrepancy where grade is 10 but student had wrong MC or lower open scores
-        if (gradeVal >= 9.8 && mcCount > 0 && (sub.Punteggio_MC || 0) < mcCount) {
-          return true;
-        }
-        if (gradeVal >= 9.8 && oeCount > 0) {
-          const oeDetails = evalObj?.openEndedDetails || [];
-          const oeMean = oeDetails.length > 0 ? oeDetails.reduce((a: number, d: any) => a + Number(d.score || 0), 0) / oeDetails.length : 0;
-          if (oeMean < 9.5) return true;
-        }
-      } else if (sub.Tipo === "Workbook") {
-        const sections = domande?.sections || [];
-        const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-        const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
-        // Pure FIB workbook with FIB score >= 50% but suggested grade < 6
-        if (rqList.length === 0 && fibList.length > 0 && (sub.Punteggio_FIB || 0) >= fibList.length * 0.5) {
-          if (gradeVal < 6.0) return true;
-        }
-        // Discrepancy where grade is 10 but student got 0 or low FIB and average reflections
-        if (gradeVal >= 9.8 && fibList.length > 0 && (sub.Punteggio_FIB || 0) < fibList.length) {
-          const rqDetails = evalObj?.reflectionDetails || [];
-          const rqMean = rqDetails.length > 0 ? rqDetails.reduce((a: number, d: any) => a + Number(d.score || 0), 0) / rqDetails.length : 0;
-          if (rqMean < 9.5) return true;
-        }
-      }
-    } catch {}
-    return false;
-  };
+  // Single source of truth: compare the stored grade with an independent
+  // recomputation from exam + answers + evaluations. This removes the old
+  // heuristics (which flagged a correct 5/10 pure-MC test as anomalous).
+  const hasGradeDiscrepancy = (sub: SavedSubmission): boolean =>
+    detectGradeDiscrepancy(sub);
 
   // Recalculates and repairs a submission if evaluation had discrepancies or hallucinated questions
   const handleRecalculateGrade = async (sub: SavedSubmission) => {
