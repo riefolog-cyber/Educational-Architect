@@ -42,6 +42,23 @@
         "teacherEmail": { "type": "string" }
       },
       "required": ["pin", "expiry"]
+    },
+    "exam_library_item": {
+      "title": "Verifica Salvata in Libreria",
+      "description": "Le verifiche salvate e riutilizzabili dai docenti.",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string" },
+        "teacherEmail": { "type": "string" },
+        "title": { "type": "string" },
+        "examType": { "type": "string" },
+        "examJson": { "type": "string" },
+        "source": { "type": "string" },
+        "questionCount": { "type": "integer" },
+        "createdAt": { "type": "string" },
+        "updatedAt": { "type": "string" }
+      },
+      "required": ["id", "title", "examJson"]
     }
   },
   "firestore": {
@@ -56,6 +73,10 @@
     "active_sessions/{sessionId}": {
       "schema": "active_session",
       "description": "Collezione delle sessioni attive d'esame."
+    },
+    "exam_library/{docId}": {
+      "schema": "exam_library_item",
+      "description": "Collezione delle prove salvate in libreria riutilizzabili."
     }
   }
 }

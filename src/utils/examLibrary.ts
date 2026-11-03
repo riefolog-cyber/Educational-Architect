@@ -579,6 +579,141 @@ export async function deleteLibraryExam(teacherEmail: string, id: string): Promi
   }
 }
 
+/**
+ * Renames an exam in both Cloud Firestore ('exam_library' collection and active_sessions if applicable)
+ * and the local browser cache, updating its title both in metadata and within examJson.
+ */
+export async function renameLibraryExam(
+  teacherEmail: string,
+  id: string,
+  newTitle: string
+): Promise<ExamLibraryItem | null> {
+  const cleanTitle = (newTitle || "").trim();
+  if (!cleanTitle) {
+    throw new Error("Il titolo della verifica non può essere vuoto.");
+  }
+
+  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const now = new Date().toISOString();
+  let updatedItem: ExamLibraryItem | null = null;
+
+  // 1. Update matching item across all local storage buckets
+  try {
+    for (let i = 0; i < localStorage.length; i++) {
+      const k = localStorage.key(i);
+      if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY) {
+        try {
+          const raw = localStorage.getItem(k);
+          if (raw) {
+            const arr = JSON.parse(raw);
+            if (Array.isArray(arr)) {
+              let changed = false;
+              for (const it of arr) {
+                if (it && (it.id === id || (id.startsWith("session_") && it.id === id.replace("session_", "")))) {
+                  it.title = cleanTitle;
+                  it.updatedAt = now;
+                  if (it.examJson) {
+                    try {
+                      const parsed = JSON.parse(it.examJson);
+                      if (parsed && typeof parsed === "object") {
+                        parsed.title = cleanTitle;
+                        it.examJson = JSON.stringify(parsed, null, 2);
+                      }
+                    } catch {}
+                  }
+                  changed = true;
+                  if (!updatedItem) {
+                    updatedItem = { ...it };
+                  }
+                }
+              }
+              if (changed) {
+                localStorage.setItem(k, JSON.stringify(arr));
+              }
+            }
+          }
+        } catch {}
+      }
+    }
+  } catch (err) {
+    console.warn("[examLibrary] Errore aggiornamento localStorage per rinomina:", err);
+  }
+
+  // 2. Update Cloud Firestore collection 'exam_library'
+  if (dbFirestore) {
+    try {
+      const docRef = doc(dbFirestore, "exam_library", id);
+      const snap = await getDoc(docRef);
+      let newExamJson = updatedItem?.examJson;
+
+      if (snap.exists()) {
+        const d = snap.data();
+        if (!newExamJson && d.examJson) {
+          try {
+            const parsed = JSON.parse(d.examJson);
+            if (parsed && typeof parsed === "object") {
+              parsed.title = cleanTitle;
+              newExamJson = JSON.stringify(parsed, null, 2);
+            }
+          } catch {}
+        }
+        await setDoc(
+          docRef,
+          {
+            title: cleanTitle,
+            updatedAt: now,
+            ...(newExamJson ? { examJson: newExamJson } : {}),
+          },
+          { merge: true }
+        );
+      } else if (updatedItem) {
+        await setDoc(
+          docRef,
+          {
+            id: updatedItem.id,
+            teacherEmail: updatedItem.teacherEmail || normEmail,
+            title: cleanTitle,
+            examType: updatedItem.examType,
+            examJson: updatedItem.examJson,
+            source: updatedItem.source,
+            questionCount: updatedItem.questionCount,
+            createdAt: updatedItem.createdAt || now,
+            updatedAt: now,
+          },
+          { merge: true }
+        );
+      }
+
+      // 3. If item is tied to an active session PIN, synchronize active_sessions too
+      const pin = id.startsWith("session_") ? id.replace("session_", "").trim().toUpperCase() : "";
+      if (pin) {
+        const sessRef = doc(dbFirestore, "active_sessions", pin);
+        const sSnap = await getDoc(sessRef);
+        if (sSnap.exists()) {
+          const sData = sSnap.data();
+          let sObj = sData.data || sData.examData;
+          if (sObj && typeof sObj === "object") {
+            sObj = { ...sObj, title: cleanTitle };
+          }
+          await setDoc(
+            sessRef,
+            {
+              title: cleanTitle,
+              data: sObj || { title: cleanTitle },
+              updatedAt: now,
+            },
+            { merge: true }
+          );
+        }
+      }
+    } catch (cloudErr) {
+      console.warn("[examLibrary] Aggiornamento Firestore fallito per rinomina:", cloudErr);
+    }
+  }
+
+  return updatedItem;
+}
+
 export function formatLibraryDate(iso: string): string {
   try {
     const d = new Date(iso);

@@ -50,7 +50,8 @@ import {
   PlusCircle,
   Undo2,
   FileUp,
-  Archive
+  Archive,
+  Pencil
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
@@ -67,6 +68,7 @@ import {
   listLibraryExams,
   saveLibraryExam,
   deleteLibraryExam,
+  renameLibraryExam,
   countLibraryQuestions,
   formatLibraryDate,
   libraryFilename,
@@ -259,6 +261,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [recoverPinInput, setRecoverPinInput] = useState("");
   const [isRecoveringPin, setIsRecoveringPin] = useState(false);
   const libraryImportRef = useRef<HTMLInputElement | null>(null);
+  const [renamingLibraryId, setRenamingLibraryId] = useState<string | null>(null);
+  const [renamingTitle, setRenamingTitle] = useState("");
+  const [isSavingRename, setIsSavingRename] = useState(false);
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -752,6 +757,64 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     } catch (e: any) {
       setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore locale"}.`);
       await loadLibrary();
+    }
+  };
+
+  const handleStartRename = (item: ExamLibraryItem) => {
+    setRenamingLibraryId(item.id);
+    setRenamingTitle(item.title || "");
+  };
+
+  const handleCancelRename = () => {
+    setRenamingLibraryId(null);
+    setRenamingTitle("");
+  };
+
+  const handleSaveRename = async (item: ExamLibraryItem) => {
+    const trimmedTitle = renamingTitle.trim();
+    if (!trimmedTitle) {
+      alert("⚠️ Il titolo della verifica non può essere vuoto.");
+      return;
+    }
+    if (trimmedTitle === item.title) {
+      setRenamingLibraryId(null);
+      return;
+    }
+
+    setIsSavingRename(true);
+    // Optimistic UI update
+    setLibrary((prev) =>
+      prev.map((it) =>
+        it.id === item.id
+          ? { ...it, title: trimmedTitle, updatedAt: new Date().toISOString() }
+          : it
+      )
+    );
+
+    try {
+      const teacherEmail = user?.email || "docente_sandbox@scuola.it";
+      await renameLibraryExam(teacherEmail, item.id, trimmedTitle);
+
+      // If this item is currently loaded in the editor, keep editor state in sync
+      if (loadedLibraryItemId === item.id) {
+        setMateria(trimmedTitle);
+        try {
+          const parsed = JSON.parse(jsonText);
+          if (parsed && typeof parsed === "object") {
+            parsed.title = trimmedTitle;
+            setJsonText(JSON.stringify(parsed, null, 2));
+          }
+        } catch {}
+      }
+
+      await loadLibrary();
+      setLibraryMsg(`✏️ Verifica rinominata in "${trimmedTitle}".`);
+      setRenamingLibraryId(null);
+    } catch (e: any) {
+      setLibraryMsg(`❌ Rinomina non riuscita: ${e.message || "errore imprevisto"}.`);
+      await loadLibrary();
+    } finally {
+      setIsSavingRename(false);
     }
   };
 
@@ -3475,16 +3538,75 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         className="p-2.5 bg-slate-950/60 border border-white/10 rounded-xl space-y-1.5"
                       >
                         <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0">
-                            <div className="flex items-center gap-1.5 flex-wrap">
-                              <p className="text-xs font-bold text-white truncate">{item.title}</p>
-                              {item.source?.includes("Cloud") && (
-                                <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                  ☁️ Cloud
-                                </span>
-                              )}
-                            </div>
-                            <p className="text-[10px] text-slate-400 font-mono">
+                          <div className="min-w-0 flex-1">
+                            {renamingLibraryId === item.id ? (
+                              <form
+                                onSubmit={(e) => {
+                                  e.preventDefault();
+                                  handleSaveRename(item);
+                                }}
+                                className="space-y-1 my-0.5"
+                              >
+                                <div className="flex items-center gap-1.5">
+                                  <input
+                                    type="text"
+                                    value={renamingTitle}
+                                    onChange={(e) => setRenamingTitle(e.target.value)}
+                                    onKeyDown={(e) => {
+                                      if (e.key === "Escape") {
+                                        e.preventDefault();
+                                        handleCancelRename();
+                                      }
+                                    }}
+                                    autoFocus
+                                    placeholder="Nuovo titolo della prova..."
+                                    className="flex-1 min-w-0 px-2 py-1 text-xs bg-slate-900 border border-teal-400 focus:border-teal-300 rounded-lg text-white font-medium outline-none shadow-inner"
+                                  />
+                                  <button
+                                    type="submit"
+                                    disabled={isSavingRename || !renamingTitle.trim()}
+                                    title="Salva nuovo nome (Invio)"
+                                    className="px-2 py-1 bg-teal-500 hover:bg-teal-400 text-teal-950 font-bold text-[10px] rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 shrink-0 shadow-sm"
+                                  >
+                                    {isSavingRename ? (
+                                      <RefreshCw className="w-3 h-3 animate-spin" />
+                                    ) : (
+                                      <Check className="w-3 h-3" />
+                                    )}
+                                    <span>Salva</span>
+                                  </button>
+                                  <button
+                                    type="button"
+                                    onClick={handleCancelRename}
+                                    disabled={isSavingRename}
+                                    title="Annulla modifica (Esc)"
+                                    className="p-1 text-slate-400 hover:text-white hover:bg-white/10 rounded-lg transition-colors cursor-pointer shrink-0"
+                                  >
+                                    <X className="w-3.5 h-3.5" />
+                                  </button>
+                                </div>
+                              </form>
+                            ) : (
+                              <div className="flex items-center gap-1.5 flex-wrap">
+                                <p className="text-xs font-bold text-white truncate max-w-[200px]" title={item.title}>
+                                  {item.title}
+                                </p>
+                                <button
+                                  type="button"
+                                  onClick={() => handleStartRename(item)}
+                                  title={`Rinomina "${item.title}"`}
+                                  className="p-0.5 text-slate-400 hover:text-teal-300 hover:bg-teal-500/10 rounded cursor-pointer transition-colors"
+                                >
+                                  <Pencil className="w-3 h-3" />
+                                </button>
+                                {item.source?.includes("Cloud") && (
+                                  <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                    ☁️ Cloud
+                                  </span>
+                                )}
+                              </div>
+                            )}
+                            <p className="text-[10px] text-slate-400 font-mono mt-0.5">
                               {item.examType} • {item.questionCount} quesiti • {formatLibraryDate(item.updatedAt)}
                             </p>
                             {item.source && (
@@ -3507,6 +3629,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           >
                             <Check className="w-3.5 h-3.5" />
                             <span>Carica</span>
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleStartRename(item)}
+                            title={`Rinomina "${item.title}"`}
+                            className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg cursor-pointer transition-colors"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
                           </button>
                           <button
                             type="button"

@@ -13,9 +13,11 @@ import {
   Unlock,
   KeyRound,
   AlertCircle,
-  Check
+  Check,
+  Trash2,
+  X
 } from "lucide-react";
-import { collection, onSnapshot, deleteDoc, doc, updateDoc } from "firebase/firestore";
+import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
 import type { LiveSessionSummary } from "./TeacherDashboard";
 
@@ -66,6 +68,9 @@ export default function ClassroomLiveMonitor({
   const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked">("in_progress");
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
+  const [confirmClear, setConfirmClear] = useState(false);
+  const [clearSuccess, setClearSuccess] = useState(false);
+  const [clearError, setClearError] = useState<string | null>(null);
   const [unlockingId, setUnlockingId] = useState<string | null>(null);
   const [unlockSuccessId, setUnlockSuccessId] = useState<string | null>(null);
   const [unlockingAll, setUnlockingAll] = useState(false);
@@ -207,21 +212,36 @@ export default function ClassroomLiveMonitor({
     });
 
   const handleClearRoom = async () => {
-    if (!dbFirestore || !pin || clearing) return;
-    const confirmMsg =
-      "Rimuovere tutti gli alunni dal monitoraggio di questa aula?\n\nLe scritture delle risposte non vengono cancellate: l'operazione svuota solo la lista live del PIN selezionato.";
-    if (typeof window !== "undefined" && !window.confirm(confirmMsg)) return;
+    const cleanPin = pin?.trim().toUpperCase();
+    if (!dbFirestore || !cleanPin || clearing) return;
 
     setClearing(true);
+    setClearError(null);
     try {
-      const stale = students.filter(s => s.status !== "submitted");
-      await Promise.all(
-        stale.map((s) =>
-          deleteDoc(doc(dbFirestore, "active_sessions", pin, "live_students", s.id))
-        )
-      );
-    } catch (err) {
+      const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
+      const snap = await getDocs(liveColRef);
+
+      if (!snap.empty) {
+        // Delete in batches of 400 to respect Firestore batch limit of 500
+        const docs = snap.docs;
+        const chunkSize = 400;
+        for (let i = 0; i < docs.length; i += chunkSize) {
+          const chunk = docs.slice(i, i + chunkSize);
+          const batch = writeBatch(dbFirestore);
+          chunk.forEach((d) => batch.delete(d.ref));
+          await batch.commit();
+        }
+      }
+
+      // Also ensure local state is immediately cleared without waiting for listener
+      setStudents([]);
+      setClearSuccess(true);
+      setConfirmClear(false);
+      setTimeout(() => setClearSuccess(false), 3500);
+    } catch (err: any) {
       console.warn("Svuotamento aula non riuscito:", err);
+      setClearError(err?.message || "Impossibile svuotare l'aula. Verifica i permessi o la connessione.");
+      setTimeout(() => setClearError(null), 5000);
     } finally {
       setClearing(false);
     }
@@ -358,6 +378,13 @@ export default function ClassroomLiveMonitor({
         </div>
       )}
 
+      {clearError && (
+        <div className="p-3 rounded-2xl bg-red-500/15 border border-red-500/40 text-red-200 text-xs flex items-start gap-2 animate-fadeIn">
+          <AlertTriangle className="w-4 h-4 shrink-0 text-red-400" />
+          <span>⚠️ {clearError}</span>
+        </div>
+      )}
+
       {/* Top Banner with PIN & Status */}
       <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/80 border border-indigo-500/20 shadow-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
@@ -390,16 +417,60 @@ export default function ClassroomLiveMonitor({
             <Wifi className="w-3.5 h-3.5 text-emerald-400" />
             <span>Feed Real-time Attivo</span>
           </div>
-          <button
-            type="button"
-            onClick={handleClearRoom}
-            disabled={clearing || students.length === 0}
-            className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-red-300 hover:border-red-500/40 text-xs font-mono flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-40"
-            title="Svuota la lista degli alunni non ancora consegnati"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${clearing ? "animate-spin" : ""}`} />
-            <span>Svuota aula</span>
-          </button>
+
+          {confirmClear ? (
+            <div className="flex items-center gap-1.5 animate-fadeIn bg-red-950/90 border border-red-500/50 p-1 rounded-xl shadow-lg">
+              <span className="text-[11px] text-red-200 font-semibold px-1.5 whitespace-nowrap">
+                Svuotare l'aula {pin ? `(PIN ${pin})` : ""}?
+              </span>
+              <button
+                type="button"
+                onClick={handleClearRoom}
+                disabled={clearing}
+                className="px-2.5 py-1 bg-red-600 hover:bg-red-500 text-white text-xs font-bold rounded-lg cursor-pointer transition-colors shadow-sm flex items-center gap-1 disabled:opacity-50"
+                title="Conferma eliminazione di tutti gli alunni dal monitoraggio live di quest'aula"
+              >
+                {clearing ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <Trash2 className="w-3.5 h-3.5" />
+                )}
+                <span>Sì, svuota ({students.length})</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setConfirmClear(false)}
+                disabled={clearing}
+                className="p-1 text-slate-400 hover:text-white hover:bg-white/10 rounded-lg cursor-pointer transition-colors"
+                title="Annulla"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          ) : clearSuccess ? (
+            <div className="px-3 py-1.5 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-xs font-semibold text-emerald-200 flex items-center gap-1.5 animate-fadeIn">
+              <Check className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Aula svuotata ✓</span>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => {
+                if (!pin) {
+                  setClearError("Seleziona prima una sessione d'aula dal riquadro sopra per svuotarla.");
+                  setTimeout(() => setClearError(null), 4000);
+                  return;
+                }
+                setConfirmClear(true);
+              }}
+              disabled={clearing}
+              className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-red-300 hover:border-red-500/40 text-xs font-mono flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-40"
+              title="Svuota la lista live di tutti gli alunni del PIN selezionato"
+            >
+              <Trash2 className="w-3.5 h-3.5 text-slate-400" />
+              <span>Svuota aula</span>
+            </button>
+          )}
         </div>
       </div>
 
