@@ -56,7 +56,7 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, weightedOpenAverage, extractBreakdownFromSubmission, detectGibberish } from "../utils";
+import { formatMarkdown, calculateQuizGrade, calculateWorkbookGrade, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
@@ -231,6 +231,66 @@ export function clusterInfractionsHint(log: any[]): string | null {
   maxBurst = Math.max(maxBurst, cur);
   if (bursts === 0) return null;
   return `⚠️ ${maxBurst} episodi ravvicinati${bursts > 1 ? ` in ${bursts} raffiche` : ""}: schema compatibile con consultazione esterna. Episodi isolati e brevi restano fisiologici (notifiche, rotazione schermo).`;
+}
+
+/**
+ * Re-runs the real AI evaluation through the same queue used by students.
+ * Teacher recalculation must never invent a grade: it waits for the AI verdict
+ * and returns the evaluation object produced by the server.
+ */
+async function requestAiReevaluation(payload: any): Promise<any> {
+  const enqueueResp = await fetch("/api/evaluate/enqueue", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload)
+  });
+
+  const enqueueRaw = await enqueueResp.text();
+  let enqueueData: any = {};
+  try {
+    enqueueData = enqueueRaw ? JSON.parse(enqueueRaw) : {};
+  } catch {}
+
+  if (!enqueueResp.ok) {
+    throw new Error(enqueueData?.error || `Errore di rete durante l'accodamento (HTTP ${enqueueResp.status}).`);
+  }
+  const jobId = enqueueData?.jobId;
+  if (!jobId) {
+    throw new Error("Il server non ha restituito un identificativo della correzione IA.");
+  }
+
+  const maxWaitMs = 10 * 60 * 1000;
+  const startedAt = Date.now();
+  let attempt = 0;
+
+  while (Date.now() - startedAt < maxWaitMs) {
+    if (attempt > 0) {
+      const delay = Math.min(800 + attempt * 150, 3000) + Math.random() * 300;
+      await new Promise((r) => setTimeout(r, delay));
+    }
+    attempt++;
+
+    const statusResp = await fetch(`/api/evaluate/status/${jobId}`);
+    if (statusResp.status === 404) {
+      throw new Error("La sessione di correzione IA è scaduta o il server è stato riavviato. Riprova.");
+    }
+    if (!statusResp.ok) {
+      throw new Error(`Errore di rete durante la verifica della correzione (HTTP ${statusResp.status}).`);
+    }
+
+    const statusData = await statusResp.json();
+    if (statusData.status === "completed") {
+      if (!statusData.evaluation) {
+        throw new Error("Il server non ha restituito la valutazione IA.");
+      }
+      return statusData.evaluation;
+    }
+    if (statusData.status === "failed") {
+      throw new Error(statusData.error || "La correzione IA è fallita sul server.");
+    }
+  }
+
+  throw new Error("Tempo di attesa per la correzione IA scaduto. Riprova tra qualche minuto.");
 }
 
 export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps) {
@@ -1535,17 +1595,39 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             newErrors = evalObj.mainErrors;
           }
         } else {
-          const details = evalObj.openEndedDetails || [];
-          details.forEach((det: any, idx: number) => {
-            const q = oeList.find((item: any) => item.id === det.questionId) || oeList[idx];
-            const rawAns = String(ansObj.oe?.[q?.id] || ansObj.openEnded?.[q?.id] || "").trim();
-            if (detectGibberish(rawAns)) {
-              det.score = 0;
+          // Real AI re-evaluation: never apply a fixed "dignity floor".
+          // Blank or gibberish answers are marked "[VUOTO]" so the AI scores
+          // them 0; every written answer is graded on its actual content.
+          const sanitizedAnswers = JSON.parse(JSON.stringify(ansObj || {}));
+          sanitizedAnswers.oe = sanitizedAnswers.oe || {};
+          oeList.forEach((q: any) => {
+            const text = String(ansObj.oe?.[q?.id] ?? ansObj.openEnded?.[q?.id] ?? "");
+            if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
+          });
+
+          const evaluation = await requestAiReevaluation({
+            tipo: "Quiz",
+            forceReevaluation: true,
+            prompt:
+              "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
+            studentEmail: sub.Email || "",
+            studentName: sub.Nome || "Studente",
+            sessionPin: sub.Pin || sub.Session_Id || "",
+            report: {
+              domande: domandeObj,
+              risposte: sanitizedAnswers,
+              punteggioMC: correctCount,
+              punteggioMCPesato: mcs.weightedCorrect,
+              pesoMCTotale: mcs.weightedTotal,
+              autovalutazione: sub.Autovalutazione || ""
             }
           });
-          const oeMean = details.length > 0 ? weightedOpenAverage(details, oeList) : 0;
-          newGrade = calculateQuizGrade(gradeMcScore, gradeMcCount, details.length > 0 ? [oeMean] : []);
-          evalObj.suggestedGrade = newGrade;
+
+          evalObj = { ...evalObj, ...evaluation };
+          evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
+          newGrade = evaluation.suggestedGrade ?? newGrade;
+          newErrors = evaluation.mainErrors || newErrors;
+          newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
         }
       } else if (sub.Tipo === "Workbook") {
         const sections = domandeObj?.sections || [];
@@ -1601,25 +1683,54 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
           newFeedback = evalObj.overallFeedback;
         } else {
-          const details = evalObj.reflectionDetails || [];
-          details.forEach((det: any, idx: number) => {
-            const r = rqList.find((item: any) => item.id === det.id) || rqList[idx];
-            const rawAns = String(ansObj.wbRq?.[r?.id] || "").trim();
-            if (detectGibberish(rawAns)) {
-              det.score = 0;
+          // Real AI re-evaluation of the reflections (same rule as the Quiz).
+          const sanitizedAnswers = JSON.parse(JSON.stringify(ansObj || {}));
+          sanitizedAnswers.wbRq = sanitizedAnswers.wbRq || {};
+          rqList.forEach((r: any) => {
+            const text = String(ansObj.wbRq?.[r?.id] ?? ansObj.oe?.[r?.id] ?? "");
+            if (detectGibberish(text)) sanitizedAnswers.wbRq[r.id] = "[VUOTO]";
+          });
+
+          const evaluation = await requestAiReevaluation({
+            tipo: "Workbook",
+            forceReevaluation: true,
+            prompt:
+              "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
+            studentEmail: sub.Email || "",
+            studentName: sub.Nome || "Studente",
+            sessionPin: sub.Pin || sub.Session_Id || "",
+            report: {
+              domande: domandeObj,
+              risposte: sanitizedAnswers,
+              punteggioMC: correctMc,
+              punteggioFIB: correctFib,
+              totaleFIB: fibList.length,
+              punteggioFIBPesato: fibs.weightedCorrect,
+              pesoFIBTotale: fibs.weightedTotal,
+              autovalutazione: sub.Autovalutazione || ""
             }
           });
-          const rqMean = details.length > 0 ? weightedOpenAverage(details, rqList) : 0;
-          newGrade = calculateWorkbookGrade(compositeObjScore, compositeObjCount, details.length > 0 ? [rqMean] : []);
-          evalObj.suggestedGrade = newGrade;
+
+          evalObj = { ...evalObj, ...evaluation };
+          evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
+          evalObj.fibTotal = fibList.length;
+          newGrade = evaluation.suggestedGrade ?? newGrade;
+          newFeedback = evaluation.overallFeedback || newFeedback;
+          if (!newErrors) {
+            newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
+              ? "Alcune riflessioni risultano senza risposta o non pertinenti."
+              : "Nessun errore grave rilevato nelle riflessioni critiche.";
+          }
         }
       }
 
+      // Firestore rejects documents containing `undefined`, so only include
+      // defined values (the old code crashed on a missing Errori_Principali).
       const updatePayload: any = {
-        Voto_Suggerito: newGrade,
+        Voto_Suggerito: newGrade ?? sub.Voto_Suggerito ?? "N.V.",
         Full_Evaluation: JSON.stringify(evalObj),
-        Errori_Principali: newErrors,
-        Feedback_Generale: newFeedback
+        Errori_Principali: typeof newErrors === "string" ? newErrors : "",
+        Feedback_Generale: typeof newFeedback === "string" ? newFeedback : ""
       };
       if (updatedPunteggioMC !== undefined) {
         updatePayload.Punteggio_MC = updatedPunteggioMC;
@@ -1627,6 +1738,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (updatedPunteggioFIB !== undefined) {
         updatePayload.Punteggio_FIB = updatedPunteggioFIB;
       }
+      Object.keys(updatePayload).forEach((k) => {
+        if (updatePayload[k] === undefined) delete updatePayload[k];
+      });
 
       await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
 
@@ -5230,7 +5344,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   onClick={() => handleRecalculateGrade(selectedSub)}
                   disabled={recalculatingId === selectedSub.id}
                   className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 hover:text-amber-200 border border-amber-500/30 text-[11px] font-bold rounded-xl transition-all cursor-pointer disabled:opacity-50"
-                  title="Ricalcola voto e valutazione escludendo penalità su domande aperte inesistenti"
+                  title="Rivaluta le domande aperte con una nuova correzione IA reale"
                 >
                   <Wand2 className={`w-3.5 h-3.5 ${recalculatingId === selectedSub.id ? 'animate-spin' : ''}`} />
                   <span>{recalculatingId === selectedSub.id ? "Ricalcolo..." : "Ricalcola Voto"}</span>

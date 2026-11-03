@@ -608,7 +608,10 @@ function getRequestHash(body: any): string {
     const tipo = body?.tipo || "";
     // Unique key consisting of student identifier, PIN, test type and content of answers
     const answersContent = JSON.stringify(body?.report?.risposte || {});
-    return `${student}_${pin}_${tipo}_${answersContent}`;
+    // Teacher recalculation asks for a genuinely new AI verdict: never reuse the
+    // job created by the original submission (dedup cache lasts 30 seconds).
+    const forceNonce = body?.forceReevaluation ? `_${Date.now()}_${Math.random().toString(36).slice(2, 8)}` : "";
+    return `${student}_${pin}_${tipo}_${answersContent}${forceNonce}`;
   } catch (err) {
     return "hash_" + Math.random().toString(36).substring(7);
   }
@@ -779,8 +782,9 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
    - Se lo studente dimostra di aver compreso e centrato il nucleo concettuale della domanda (anche se in sole 1-2 frasi sintetiche, o con un lessico quotidiano e diretto anziché enciclopedico), DEVI assegnare la sufficienza piena: 6/10 o 6½.
    - La brevità della risposta, la sintesi espositiva o uno stile semplice NON devono mai essere penalizzati se la risposta di fondo è corretta. Premia sempre la sostanza e la comprensione.
    - Non richiedere corollari accademici o nozioni secondarie non esplicitamente richieste dalla traccia della domanda.
-2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se lo studente ha digitato una risposta sensata e pertinente, mostrando di essersi applicato con impegno, NON assegnare mai un voto inferiore a 4 su 10 per questa singola domanda aperta.
+2. VALUTAZIONE REALE DEL CONTENUTO: assegna a ogni risposta il voto che merita in base alla sua qualità effettiva, senza voti fissi né arrotondamenti di comodo.
    - I voti 0 o 1 sono riservati TASSATIVAMENTE a: spazio vuoto, ammissioni esplicite di totale resa ("[VUOTO]", "non lo so", "boh"), risposte spazzatura, insulti o fuori tema totale.
+   - Una risposta scritta ma molto superficiale, confusa o con lacune rilevanti deve ricevere il voto basso che realmente merita (ad esempio 2-4), non un voto minimo garantito.
 3. PRIORITÀ AL MERITO ED EQUITÀ:
    - Valuta ciò che lo studente SA, non ciò che manca. Riconosci attivamente il nucleo valido della risposta e valorizzalo esplicitamente.
    - In caso di dubbio tra due livelli di voto, assegna il punteggio superiore coerente con l'impegno dimostrato (in dubio pro discipulo).
@@ -835,7 +839,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
                   properties: {
                     questionId: { type: Type.STRING },
                     feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della risposta e suggerisce un miglioramento concreto." },
-                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
+                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo la rubrica docimologica reale." }
                   },
                   required: ["questionId", "feedback", "score"]
                 }
@@ -860,7 +864,12 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         evaluation.openEndedDetails.forEach((det: any, idx: number) => {
           const q = oeList.find((item: any) => item.id === det.questionId) || oeList[idx];
           const qId = q?.id || det.questionId;
-          const rawAns = String(report.risposte?.oe?.[qId] || report.risposte?.openEnded?.[qId] || "").trim();
+          const rawAns = String(
+            report.risposte?.oe?.[qId] ||
+            report.risposte?.openEnded?.[qId] ||
+            report.risposte?.wbRq?.[qId] ||
+            ""
+          ).trim();
           if (detectGibberish(rawAns)) {
             det.score = 0;
             det.feedback = "🎯 **Competenza:** Spazio lasciato privo di trattazione o risposta non pertinente.\n✍️ **Proprietà lessicale:** Assente.\n💡 **Spunto di crescita:** Cerca di formulare una risposta anche sintetica per dimostrare le conoscenze di base.";
@@ -1005,7 +1014,7 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
    - Nel Workbook si valutano l'onestà intellettuale, la coerenza del ragionamento e lo sforzo di formulare un pensiero personale.
    - Se lo studente affronta il tema proposto con una riflessione pertinente e sensata, anche se sintetica o espressa in modo informale/disadorno, DEVI assegnare la sufficienza piena: 6/10 o 6½.
    - La brevità non è una colpa: segnala nel feedback uno spunto per approfondire, ma premia il nucleo valido del ragionamento.
-2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se c'è stato un tentativo sincero e coerente di riflettere e rispondere, non assegnare mai un voto inferiore a 4 su 10. I voti 0-2 sono riservati a spazi vuoti, risposte a casaccio o ammissioni di non aver affrontato l'argomento.
+2. VALUTAZIONE REALE DEL CONTENUTO: assegna a ogni riflessione il voto che merita in base alla sua qualità effettiva, senza voti fissi né arrotondamenti di comodo. I voti 0-2 sono riservati a spazi vuoti, risposte a casaccio o ammissioni di non aver affrontato l'argomento; una riflessione superficiale ma presente deve ricevere il voto reale che le compete.
 3. PRIORITÀ AL MERITO: Cerca il nucleo valido della riflessione anche quando è formulato in modo colloquiale, e valorizzalo esplicitamente nel feedback. In caso di dubbio sul livello raggiunto, scegli il punteggio superiore coerente con l'impegno.
 4. CRITERI DI VALUTAZIONE DELLE RIFLESSIONI (0-10):
    - 10: Eccellente. Riflessione profonda, matura, ricca di collegamenti con lo studio, l'attualità o l'esperienza personale. Spicca per maturità.
@@ -1056,7 +1065,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
                   properties: {
                     id: { type: Type.STRING },
                     feedback: { type: Type.STRING, description: "Spiegazione del punteggio che riconosce un punto di forza della riflessione e suggerisce come approfondirla." },
-                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo le regole docimologiche e il tetto minimo di dignità." }
+                    score: { type: Type.INTEGER, description: "Voto intero da 0 a 10 assegnato secondo la rubrica docimologica reale." }
                   },
                   required: ["id", "feedback", "score"]
                 }
@@ -1080,7 +1089,11 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         evaluation.reflectionDetails.forEach((det: any, idx: number) => {
           const r = rqList.find((item: any) => item.id === det.id) || rqList[idx];
           const rId = r?.id || det.id;
-          const rawAns = String(report.risposte?.wbRq?.[rId] || "").trim();
+          const rawAns = String(
+            report.risposte?.wbRq?.[rId] ||
+            report.risposte?.oe?.[rId] ||
+            ""
+          ).trim();
           if (detectGibberish(rawAns)) {
             det.score = 0;
             det.feedback = "Riflessione assente o priva di argomentazione concettuale.";

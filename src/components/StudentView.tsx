@@ -1988,7 +1988,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       - Non richiedere informazioni non presenti nel testo della domanda o che lo studente non poteva conoscere.
       - Se la risposta è parzialmente corretta, assegna il punteggio corrispondente a ciò che ha dimostrato di sapere, non un massimo teorico.
       - In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole che resta comunque coerente con quanto scritto.
-      - La valutazione finale non deve mai essere inferiore a 4 se lo studente ha mostrato un tentativo serio di rispondere.
+      - Valuta il contenuto reale della risposta: una risposta scritta ma superficiale o lacunosa deve ricevere il voto che merita, senza voti minimi garantiti.
 
       IMPORTANTE: Fornisci per ogni domanda un feedback estremamente SINTETICO E CONCISO (massimo 2-3 frasi) in italiano impeccabile. Inizia sempre riconoscendo un punto di forza della risposta, poi suggerisci un miglioramento concreto. Rivolgiti direttamente allo studente (ad es. "Hai colto bene il punto...", "Per approfondire potresti...").`;
     } else {
@@ -1999,7 +1999,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       Atteggiamento pedagogico: Fai da guida incoraggiante. Valorizza sempre chi si mette in gioco e segnala le riflessioni sbrigative come occasione di crescita, non come colpa. Non penalizzare mai la forma o la lunghezza: una risposta breve ma ragionata vale più di una lunga ma generica.
       
       Regole di valutazione:
-      - Se la risposta è breve, verifica se sia un concentrato di verità o se manchi profondità. Se ci sono elementi validi, non scendere sotto il 4.
+      - Se la risposta è breve, verifica se sia un concentrato di verità o se manchi profondità, e assegnale il voto reale che merita.
       - Assegna 0 per "[VUOTO]", "non lo so" o chi non ha affrontato l'argomento.
       - Dai valutazioni elevate (8-10) a chi elabora vere argomentazioni personali collegandole con la propria esperienza e la realtà, mostrando aver elaborato interiormente l'oggetto di studio.
       
