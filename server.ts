@@ -508,8 +508,8 @@ const calculateQuizGrade = (mcScore: number, mcCount: number, oeScores: number[]
     const mcFraction = mcScore / mcCount; // 0 to 1
     const oeFraction = oeScores.reduce((a, b) => a + b, 0) / (oeScores.length * 10); // 0 to 1
     
-    // Balanced weight: 40% Multiple Choice, 60% Open Ended
-    finalGrade = (mcFraction * 4.0) + (oeFraction * 6.0);
+    // Balanced weight: 50% Multiple Choice, 50% Open Ended
+    finalGrade = (mcFraction * 5.0) + (oeFraction * 5.0);
   } else if (mcCount > 0) {
     finalGrade = (mcScore / mcCount) * 10;
   } else if (oeScores.length > 0) {
@@ -526,8 +526,8 @@ const calculateWorkbookGrade = (fibScore: number, fibCount: number, rqScores: nu
     const fibFraction = fibScore / fibCount; // 0 to 1
     const rqFraction = rqScores.reduce((a, b) => a + b, 0) / (rqScores.length * 10); // 0 to 1
     
-    // Balanced weight: 40% Fill-in-Blank, 60% Reflection Questions
-    finalGrade = (fibFraction * 4.0) + (rqFraction * 6.0);
+    // Balanced weight: 50% Fill-in-Blank, 50% Reflection Questions
+    finalGrade = (fibFraction * 5.0) + (rqFraction * 5.0);
   } else if (fibCount > 0) {
     finalGrade = (fibScore / fibCount) * 10;
   } else if (rqScores.length > 0) {
@@ -774,16 +774,24 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
     // CASE 2: QUIZ WITH OPEN ENDED QUESTIONS (Mixed or pure open-ended)
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana (scuola superiore). Valuta le risposte aperte dello studente in base alle domande del test e ai criteri impostati dal docente. Il tuo stile valutativo deve riflettere la docimologia scolastica italiana moderna.
 
-[REGOLE DI VALUTAZIONE E DOCIMOLOGIA]
-1. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se lo studente ha digitato una risposta sensata e pertinente, mostrando di essersi applicato, NON assegnare mai un voto inferiore a 4 su 10 per questa singola domanda aperta. Assegna 0 o 1 SOLO se lo spazio è vuoto, contiene risposte palesemente fuori tema ("risposta spazzatura"), insulti, o ammissioni di totale vuoto conoscitivo (come "[VUOTO]" o "non lo so").
-2. PRIORITÀ AL MERITO (EQUITÀ): valuta ciò che lo studente SA, non ciò che manca. Cerca attivamente il nucleo valido della risposta anche quando è formulato in modo impreciso o lacunoso, e valorizzalo esplicitamente. Non penalizzare mai la forma, l'ortografia o la lunghezza del testo: una risposta breve ma corretta vale più di una lunga ma generica. Non richiedere informazioni non presenti nel testo della domanda o che lo studente non poteva conoscere. Se la risposta è parzialmente corretta, assegna il punteggio corrispondente a ciò che ha effettivamente dimostrato, non un massimo teorico. In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole che resta coerente con quanto scritto.
-3. CRITERI DI ASSEGNAZIONE DEL PUNTEGGIO (0-10):
-   - 10: Eccellente. Analisi esaustiva, uso impeccabile del lessico specifico, spiccate capacità argomentative e rielaborazione personale.
-   - 8-9: Molto buono / Ottimo. Risposta precisa, completa, con lievissime imprecisioni non sostanziali.
-   - 7: Buono. Risposta sostanzialmente corretta e centrata, ma semplice, priva di rielaborazione critica personale.
-   - 6: Sufficiente. Mostra le conoscenze di base necessarie per superare la prova, sebbene l'esposizione sia minimale.
-   - 5: Quasi sufficiente. Risposta abbozzata o con lacune concettuali, ma con nuclei di comprensione riconoscibili.
-   - 4-3: Contenuto superficiale o molto impreciso, con almeno un elemento di pertinenza recuperabile.
+[REGOLE DI VALUTAZIONE E DOCIMOLOGIA SCOLASTICA FORMATIVA]
+1. LA SUFFICIENZA DI CONCETTO ESSENZIALE (PRINCIPIO GUIDA FONDAMENTALE):
+   - Se lo studente dimostra di aver compreso e centrato il nucleo concettuale della domanda (anche se in sole 1-2 frasi sintetiche, o con un lessico quotidiano e diretto anziché enciclopedico), DEVI assegnare la sufficienza piena: 6/10 o 6½.
+   - La brevità della risposta, la sintesi espositiva o uno stile semplice NON devono mai essere penalizzati se la risposta di fondo è corretta. Premia sempre la sostanza e la comprensione.
+   - Non richiedere corollari accademici o nozioni secondarie non esplicitamente richieste dalla traccia della domanda.
+2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se lo studente ha digitato una risposta sensata e pertinente, mostrando di essersi applicato con impegno, NON assegnare mai un voto inferiore a 4 su 10 per questa singola domanda aperta.
+   - I voti 0 o 1 sono riservati TASSATIVAMENTE a: spazio vuoto, ammissioni esplicite di totale resa ("[VUOTO]", "non lo so", "boh"), risposte spazzatura, insulti o fuori tema totale.
+3. PRIORITÀ AL MERITO ED EQUITÀ:
+   - Valuta ciò che lo studente SA, non ciò che manca. Riconosci attivamente il nucleo valido della risposta e valorizzalo esplicitamente.
+   - In caso di dubbio tra due livelli di voto, assegna il punteggio superiore coerente con l'impegno dimostrato (in dubio pro discipulo).
+4. CRITERI DI ASSEGNAZIONE DEL PUNTEGGIO (0-10):
+   - 10: Eccellente. Padronanza concettuale impeccabile, ottima proprietà lessicale, argomentazione matura e spunti personali.
+   - 8-9: Molto buono / Ottimo. Risposta precisa, completa e ben strutturata, con lessico tecnico appropriato.
+   - 7: Discreto / Buono. Risposta corretta, chiara e centrata, con dettagli adeguati anche se lineare.
+   - 6-6½: SUFFICIENTE FORMATIVO. Risponde all'essenza del quesito ed evidenzia la comprensione dei concetti chiave di base, anche se con linguaggio semplice o sintesi stringata.
+   - 5-5½: Quasi sufficiente. Risposta incompleta o con lieve confusione concettuale, ma con nuclei di comprensione e studio chiaramente riconoscibili.
+   - 4-3: Tentativo con contenuto superficiale, frammentario o con lacune rilevanti, ma con un minimo nucleo di pertinenza recuperabile.
+   - 0-2: Scena muta, fuori tema totale, risposte vuote o prive di senso.
 
 [STRUTTURA DEL FEEDBACK FORMATIVO SULLE RISPOSTE]
 Per ogni singola risposta valutata ("openEndedDetails[...].feedback"), DEVI organizzare il testo in modo chiaro strutturandolo tassativamente con queste tre chiavi visive (utilizza queste precise icone ed evidenziazioni):
@@ -794,8 +802,8 @@ Per ogni singola risposta valutata ("openEndedDetails[...].feedback"), DEVI orga
 [DIRETTIVA CRITICA DI COERENZA DIDATTICA]
 ${mcCount > 0
   ? `L'alunno ha ottenuto un punteggio di ${mcScore} su ${mcCount} nella sezione strutturata a scelta multipla (crocette).
-Il voto finale complessivo dell'intera prova viene calcolato matematicamente sul server integrando questo punteggio con i voti che deciderai per le domande aperte (peso: 40% crocette, 60% domande aperte).
-Nel tuo giudizio generale complessivo ("openEndedEvaluation"), devi essere estremamente coerente: se il voto finale complessivo risulterà sufficiente (voto >= 6.0) ad esempio per via del punteggio massimo alle crocette, EVITA di definire l'esito generale come stroncato o "insufficiente" in modo totalizzante. Sii invece specifico ed equilibrato: chiarisci che l'alunno consolida un buon livello nella parte a scelta multipla, sebbene le risposte aperte qui evidenziate mostrino lacune ed elementi di insufficienza. Non produrre testi che neghino il buon risultato delle crocette o che creino paradossi logici tra il giudizio descrittivo e il voto numerico passante.`
+Il voto finale complessivo dell'intera prova viene calcolato matematicamente sul server integrando questo punteggio con i voti che deciderai per le domande aperte (peso: 50% crocette, 50% domande aperte).
+Nel tuo giudizio generale complessivo ("openEndedEvaluation"), devi essere estremamente coerente: se il voto finale complessivo risulterà sufficiente (voto >= 6.0) ad esempio per via del punteggio positivo alle crocette unito a risposte aperte sufficienti o in miglioramento, EVITA di definire l'esito generale come stroncato o "insufficiente" in modo totalizzante. Sii invece specifico ed equilibrato: valorizza il buon risultato della parte oggettiva e sprona con empatia a consolidare le risposte aperte. Non produrre testi che neghino il buon risultato delle crocette o che creino paradossi logici tra il giudizio descrittivo e il voto numerico passante.`
   : `Questa prova NON include domande a scelta multipla, ma è composta esclusivamente da domande aperte. Il voto finale complessivo dell'intera prova sarà determinato al 100% dalla valutazione di queste risposte aperte. Nel tuo giudizio ("openEndedEvaluation"), concentrati unicamente sulla qualità delle risposte fornite, senza fare riferimento ad altre sezioni o a crocette non presenti.`}
 
 [ANALISI METACOGNITIVA]
@@ -993,16 +1001,20 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
     const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana. Valuta le riflessioni critiche e personali contenute nel Workbook/Quaderno dello studente sottoforma di risposte aperte.
 
 [REGOLE DI VALUTAZIONE E DOCIMOLOGIA DEL WORKBOOK]
-1. MATURITÀ DI RIFLESSIONE VS SBRIGATIVITÀ: Nel Workbook si valuta l'onestà intellettuale e la logica argomentativa, ma privilegia sempre il merito rispetto alla forma. Se la riflessione è breve o poco approfondita, segnalalo come occasione di crescita e proponi uno spunto concreto per allungarla, invece di trattarla come una colpa. Non penalizzare la scrittura disordinata se il ragionamento è chiaro.
-2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se c'è stato un tentativo sincero e coerente di rispondere, non assegnare mai un voto inferiore a 4 su 10. I voti 0-2 sono riservati a spazi vuoti, risposte fuori tema o ammissioni di non aver affrontato l'argomento.
-3. PRIORITÀ AL MERITO (EQUITÀ): cerca il nucleo valido della riflessione anche quando è formulato in modo impreciso, e valorizzalo esplicitamente nel feedback. Assegna il punteggio corrispondente a ciò che lo studente ha dimostrato di aver elaborato, non un massimo teorico. In caso di dubbio sul livello raggiunto, scegli il punteggio più favorevole coerente con quanto scritto.
+1. LA SUFFICIENZA DI RIFLESSIONE SINCERA (PRINCIPIO GUIDA):
+   - Nel Workbook si valutano l'onestà intellettuale, la coerenza del ragionamento e lo sforzo di formulare un pensiero personale.
+   - Se lo studente affronta il tema proposto con una riflessione pertinente e sensata, anche se sintetica o espressa in modo informale/disadorno, DEVI assegnare la sufficienza piena: 6/10 o 6½.
+   - La brevità non è una colpa: segnala nel feedback uno spunto per approfondire, ma premia il nucleo valido del ragionamento.
+2. VOTO MINIMO DI DIGNITÀ (ATTEMPT FLOOR): Se c'è stato un tentativo sincero e coerente di riflettere e rispondere, non assegnare mai un voto inferiore a 4 su 10. I voti 0-2 sono riservati a spazi vuoti, risposte a casaccio o ammissioni di non aver affrontato l'argomento.
+3. PRIORITÀ AL MERITO: Cerca il nucleo valido della riflessione anche quando è formulato in modo colloquiale, e valorizzalo esplicitamente nel feedback. In caso di dubbio sul livello raggiunto, scegli il punteggio superiore coerente con l'impegno.
 4. CRITERI DI VALUTAZIONE DELLE RIFLESSIONI (0-10):
-   - 10: Eccellente. Riflessione matura, argomentatissima, ricca di collegamenti con lo studio, l'attualità o l'esperienza personale. Spicca per maturità.
+   - 10: Eccellente. Riflessione profonda, matura, ricca di collegamenti con lo studio, l'attualità o l'esperienza personale. Spicca per maturità.
    - 8-9: Ottimo livello. Argomentazione strutturata, convincente, lessico adeguato e ben espresso.
-   - 7: Discreto/Buono. Contenuti corretti, argomenti ordinati ma privi di un vero approfondimento personale originale.
-   - 6: Sufficiente. Lo studente risponde adeguatamente alla consegna, ma l'esposizione è basica o scolastica.
-   - 5: Quasi sufficiente. Riflessione incompleta o poco focalizzata, con nuclei di comprensione riconoscibili.
+   - 7: Discreto / Buono. Contenuti corretti, argomenti ordinati e pertinenti, buona aderenza al tema.
+   - 6-6½: SUFFICIENTE FORMATIVO. Risponde alla riflessione in modo pertinente e sensato, dimostrando di aver compreso il tema anche se con considerazioni semplici o brevi.
+   - 5-5½: Quasi sufficiente. Riflessione incompleta o poco focalizzata, con spunti validi ma poco sviluppati.
    - 4-3: Contenuto generico o disarticolato, ma con almeno un elemento di pertinenza recuperabile.
+   - 0-2: Spazio vuoto, testo privo di senso o fuori tema totale.
 
 [STRUTTURA DEL FEEDBACK FORMATIVO SULLE RIFLESSIONI]
 Ogni feedback per ciascuna risposta a domanda di riflessione ("reflectionDetails[...].feedback") deve essere strutturato inserendo esattamente questi due badge visivi:
@@ -1012,8 +1024,8 @@ Ogni feedback per ciascuna risposta a domanda di riflessione ("reflectionDetails
 [DIRETTIVA CRITICA DI COERENZA DIDATTICA]
 ${fibCount > 0
   ? `L'alunno ha totalizzato un punteggio di ${fibScore} su ${fibCount} nella sezione delle frasi da completare (Fill-in-the-blank / parole mancanti).
-Il voto finale complessivo viene calcolato matematicamente sul server integrando questo punteggio con i voti che assegnerai alle riflessioni critiche (peso: 40% parole mancanti, 60% riflessioni scritte).
-Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie ad un punteggio perfetto nei completamenti delle frasi, EVITA di definire l'andamento della prova come globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci che lo studente mostra un'ottima comprensione dei concetti oggettivi (frasi completate correttamente), sebbene le riflessioni personali debbano essere maggiormente ampliate o argomentate. Custodisci la coerenza logica tra il voto finale numerico e la valutazione qualitativa complessiva.`
+Il voto finale complessivo viene calcolato matematicamente sul server integrando questo punteggio con i voti che assegnerai alle riflessioni critiche (peso: 50% parole mancanti/FIB, 50% riflessioni scritte).
+Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie ad un punteggio positivo nei completamenti delle frasi, EVITA di definire l'andamento della prova come globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci che lo studente mostra un'ottima comprensione dei concetti oggettivi (frasi completate correttamente), valorizzando con tatto i progressi anche nella parte di riflessione. Custodisci la coerenza logica tra il voto finale numerico e la valutazione qualitativa complessiva.`
   : `Questa prova di Workbook è composta ESCLUSIVAMENTE da domande di riflessione critica (non sono presenti completamenti di frasi o parole mancanti). Il voto finale sarà determinato al 100% dalla profondità, onestà e maturità delle riflessioni scritte. Non menzionare esercizi di completamento.`}
 
 [ANALISI METACOGNITIVA]

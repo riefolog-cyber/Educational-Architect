@@ -119,8 +119,8 @@ export function calculateQuizGrade(mcScore: number, mcCount: number, oeScores: n
     const mcFraction = Math.min(1, Math.max(0, mcScore / mcCount)); // 0 to 1
     const oeFraction = Math.min(1, Math.max(0, validOeScores.reduce((a, b) => a + b, 0) / (validOeScores.length * 10))); // 0 to 1
     
-    // Balanced weight: 40% Multiple Choice, 60% Open Ended
-    finalGrade = (mcFraction * 4.0) + (oeFraction * 6.0);
+    // Balanced weight: 50% Multiple Choice, 50% Open Ended
+    finalGrade = (mcFraction * 5.0) + (oeFraction * 5.0);
   } else if (mcCount > 0) {
     // Pure multiple-choice test: 100% based on multiple choice questions
     finalGrade = Math.min(1, Math.max(0, mcScore / mcCount)) * 10;
@@ -149,8 +149,8 @@ export function calculateWorkbookGrade(fibScore: number, fibCount: number, rqSco
     const fibFraction = Math.min(1, Math.max(0, fibScore / fibCount)); // 0 to 1
     const rqFraction = Math.min(1, Math.max(0, validRqScores.reduce((a, b) => a + b, 0) / (validRqScores.length * 10))); // 0 to 1
     
-    // Balanced weight: 40% Fill-in-Blank, 60% Reflection Questions
-    finalGrade = (fibFraction * 4.0) + (rqFraction * 6.0);
+    // Balanced weight: 50% Fill-in-Blank, 50% Reflection Questions
+    finalGrade = (fibFraction * 5.0) + (rqFraction * 5.0);
   } else if (fibCount > 0) {
     // Pure fill-in-the-blank test
     finalGrade = Math.min(1, Math.max(0, fibScore / fibCount)) * 10;
@@ -378,16 +378,16 @@ export function computeGradeBreakdown(params: {
   }
 
   if (hasObj && hasSubj) {
-    // Mixed: 40% Objective + 60% Subjective
+    // Mixed: 50% Objective + 50% Subjective
     const objFraction = Math.min(1, Math.max(0, objScore / objTotal));
     const objOutOf10 = objFraction * 10;
-    const objPoints = objOutOf10 * 0.40;
+    const objPoints = objOutOf10 * 0.50;
 
     const totalSubjWeight = subjectiveDetails.reduce((a, d) => a + (d.weight || 1), 0);
     const subjWeightedSum = subjectiveDetails.reduce((a, d) => a + d.score * (d.weight || 1), 0);
     const hasCustomWeights = subjectiveDetails.some(d => (d.weight || 1) !== 1);
     const subjAvg = totalSubjWeight > 0 ? subjWeightedSum / totalSubjWeight : 0;
-    const subjPoints = subjAvg * 0.60;
+    const subjPoints = subjAvg * 0.50;
 
     finalNumeric = Math.min(10, Math.max(0, objPoints + subjPoints));
     finalGradeFormatted = formatItalianScholasticGrade(finalNumeric);
@@ -395,8 +395,8 @@ export function computeGradeBreakdown(params: {
     const objName = resolvedObjName;
     const subjName = tipo === "Quiz" ? "Domande a risposta aperta" : "Riflessioni critiche";
 
-    formulaTitle = "Valutazione Mista Ponderata (40% Oggettiva + 60% Aperte)";
-    formulaSummary = `(${objOutOf10.toFixed(2)} × 40%) + (${subjAvg.toFixed(2)} × 60%) = ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)} / 10`;
+    formulaTitle = "Valutazione Mista Ponderata (50% Oggettiva + 50% Aperte)";
+    formulaSummary = `(${objOutOf10.toFixed(2)} × 50%) + (${subjAvg.toFixed(2)} × 50%) = ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)} / 10`;
 
     objPart = {
       name: objName,
@@ -404,7 +404,7 @@ export function computeGradeBreakdown(params: {
       total: objTotal,
       percentage: Math.round(objFraction * 1000) / 10,
       gradeOutOf10: Math.round(objOutOf10 * 10) / 10,
-      weightPct: 40,
+      weightPct: 50,
       pointsEarned: Math.round(objPoints * 100) / 100,
     };
 
@@ -413,15 +413,15 @@ export function computeGradeBreakdown(params: {
       count: subjectiveScores.length,
       items: subjectiveDetails,
       averageScore: Math.round(subjAvg * 10) / 10,
-      weightPct: 60,
+      weightPct: 50,
       pointsEarned: Math.round(subjPoints * 100) / 100,
     };
 
     const subjAvgLabel = hasCustomWeights ? `Media ponderata pesi didattici: ${subjAvg.toFixed(2)}/10` : `Media voti: ${subjAvg.toFixed(2)}/10`;
 
     explanationLines.push(
-      `1. Parte Oggettiva (${objName}): ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 40% → ${objPoints.toFixed(2)} punti.`,
-      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. ${subjAvgLabel}. Incidenza 60% → ${subjPoints.toFixed(2)} punti.`,
+      `1. Parte Oggettiva (${objName}): ${objScore}/${objTotal} esatte (${objPart.percentage}%). Voto componente: ${objOutOf10.toFixed(1)}/10. Incidenza 50% → ${objPoints.toFixed(2)} punti.`,
+      `2. Parte Argomentativa (${subjName}): ${subjectiveScores.length} quesiti valutati singolarmente con voti [${subjectiveScores.map((s, i) => `Q${i + 1}: ${s}/10`).join(", ")}]. ${subjAvgLabel}. Incidenza 50% → ${subjPoints.toFixed(2)} punti.`,
       `3. Sintesi Calcolo Ponderato: ${objPoints.toFixed(2)} + ${subjPoints.toFixed(2)} = ${finalNumeric.toFixed(2)}/10. Voto scolastico assegnato: ${finalGradeFormatted}.`
     );
 
