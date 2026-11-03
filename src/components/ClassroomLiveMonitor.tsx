@@ -15,7 +15,8 @@ import {
   AlertCircle,
   Check,
   Trash2,
-  X
+  X,
+  StopCircle
 } from "lucide-react";
 import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
@@ -47,6 +48,10 @@ interface ClassroomLiveMonitorProps {
   loadingSessions?: boolean;
   onSelectPin?: (pin: string) => void;
   onRefreshSessions?: () => void;
+  onTerminateSession?: (pin: string) => void;
+  onTerminateAllSessions?: () => void;
+  terminatingPin?: string | null;
+  terminatingAll?: boolean;
 }
 
 // A student is considered truly "in exam" only while the heartbeat keeps flowing
@@ -59,7 +64,11 @@ export default function ClassroomLiveMonitor({
   isSessionLive,
   loadingSessions = false,
   onSelectPin,
-  onRefreshSessions
+  onRefreshSessions,
+  onTerminateSession,
+  onTerminateAllSessions,
+  terminatingPin = null,
+  terminatingAll = false
 }: ClassroomLiveMonitorProps) {
   const [students, setStudents] = useState<LiveStudentData[]>([]);
   const [loading, setLoading] = useState(true);
@@ -315,15 +324,33 @@ export default function ClassroomLiveMonitor({
               Ogni PIN è un'aula separata: seleziona la classe da monitorare per non mescolare le due prove.
             </p>
           </div>
-          <button
-            type="button"
-            onClick={onRefreshSessions}
-            className="px-2.5 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors"
-            title="Ricarica l'elenco delle sessioni"
-          >
-            <RefreshCw className={`w-3.5 h-3.5 ${loadingSessions ? "animate-spin" : ""}`} />
-            <span>Aggiorna</span>
-          </button>
+          <div className="flex items-center gap-1.5 flex-wrap">
+            {liveSessions.length > 0 && onTerminateAllSessions && (
+              <button
+                type="button"
+                onClick={onTerminateAllSessions}
+                disabled={terminatingAll}
+                className="px-2.5 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                title="Termina e annulla tutte le sessioni d'aula attive"
+              >
+                {terminatingAll ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <StopCircle className="w-3.5 h-3.5" />
+                )}
+                <span>{terminatingAll ? "Terminazione..." : "Termina e annulla tutte"}</span>
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={onRefreshSessions}
+              className="px-2.5 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Ricarica l'elenco delle sessioni"
+            >
+              <RefreshCw className={`w-3.5 h-3.5 ${loadingSessions ? "animate-spin" : ""}`} />
+              <span>Aggiorna</span>
+            </button>
+          </div>
         </div>
 
         {loadingSessions && liveSessions.length === 0 ? (
@@ -339,32 +366,52 @@ export default function ClassroomLiveMonitor({
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {liveSessions.map((s) => {
               const selected = s.pin === pin;
+              const isTerminating = terminatingPin === s.pin;
               return (
-                <button
-                  key={s.pin}
-                  type="button"
-                  onClick={() => onSelectPin?.(s.pin)}
-                  className={`text-left px-3 py-2.5 rounded-xl border transition-all cursor-pointer ${
-                    selected
-                      ? "bg-indigo-950/50 border-indigo-500/50 ring-1 ring-indigo-500/30"
-                      : "bg-slate-950/50 border-white/10 hover:border-white/25"
-                  }`}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <span className="font-mono font-bold text-sm text-white">PIN {s.pin}</span>
-                    {selected && (
-                      <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/25 text-indigo-200 font-bold uppercase">
-                        In monitoraggio
-                      </span>
+                <div key={s.pin} className="relative group">
+                  <button
+                    type="button"
+                    onClick={() => onSelectPin?.(s.pin)}
+                    className={`w-full text-left px-3 py-2.5 rounded-xl border transition-all cursor-pointer ${
+                      selected
+                        ? "bg-indigo-950/50 border-indigo-500/50 ring-1 ring-indigo-500/30"
+                        : "bg-slate-950/50 border-white/10 hover:border-white/25"
+                    }`}
+                  >
+                    <div className="flex items-center justify-between gap-2 pr-7">
+                      <span className="font-mono font-bold text-sm text-white">PIN {s.pin}</span>
+                      {selected && (
+                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/25 text-indigo-200 font-bold uppercase">
+                          In monitoraggio
+                        </span>
+                      )}
+                    </div>
+                    <p className="text-[11px] text-slate-300 truncate">{s.title}</p>
+                    {s.expiry && (
+                      <p className="text-[10px] text-slate-500 font-mono">
+                        Scadenza: {new Date(s.expiry).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
+                      </p>
                     )}
-                  </div>
-                  <p className="text-[11px] text-slate-300 truncate">{s.title}</p>
-                  {s.expiry && (
-                    <p className="text-[10px] text-slate-500 font-mono">
-                      Scadenza: {new Date(s.expiry).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
-                    </p>
+                  </button>
+                  {onTerminateSession && (
+                    <button
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onTerminateSession(s.pin);
+                      }}
+                      disabled={isTerminating || terminatingAll}
+                      className="absolute top-2 right-2 p-1 rounded-lg bg-slate-950/80 border border-white/10 text-slate-400 hover:text-red-300 hover:border-red-500/40 hover:bg-red-950/60 transition-colors cursor-pointer disabled:opacity-50"
+                      title="Termina e annulla questa sessione d'aula"
+                    >
+                      {isTerminating ? (
+                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                      ) : (
+                        <StopCircle className="w-3.5 h-3.5" />
+                      )}
+                    </button>
                   )}
-                </button>
+                </div>
               );
             })}
           </div>
@@ -417,6 +464,23 @@ export default function ClassroomLiveMonitor({
             <Wifi className="w-3.5 h-3.5 text-emerald-400" />
             <span>Feed Real-time Attivo</span>
           </div>
+
+          {pin && onTerminateSession && (
+            <button
+              type="button"
+              onClick={() => onTerminateSession(pin)}
+              disabled={terminatingPin === pin || terminatingAll}
+              className="px-3 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+              title="Termina e annulla la sessione d'aula selezionata"
+            >
+              {terminatingPin === pin ? (
+                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+              ) : (
+                <StopCircle className="w-3.5 h-3.5" />
+              )}
+              <span>{terminatingPin === pin ? "Terminazione..." : "Termina sessione"}</span>
+            </button>
+          )}
 
           {confirmClear ? (
             <div className="flex items-center gap-1.5 animate-fadeIn bg-red-950/90 border border-red-500/50 p-1 rounded-xl shadow-lg">

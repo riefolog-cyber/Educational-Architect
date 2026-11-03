@@ -38,6 +38,7 @@ const keyFor = (teacherEmail: string) =>
   `exam_library_${(teacherEmail || "anon").toLowerCase().trim()}`;
 
 const DELETED_SESSIONS_KEY = "exam_library_deleted_sessions";
+const DELETED_TITLES_KEY = "exam_library_deleted_titles";
 
 function getDeletedSessionIds(): Set<string> {
   try {
@@ -48,6 +49,27 @@ function getDeletedSessionIds(): Set<string> {
   } catch {
     return new Set();
   }
+}
+
+function getDeletedTitles(): Set<string> {
+  try {
+    const raw = localStorage.getItem(DELETED_TITLES_KEY);
+    if (!raw) return new Set();
+    const arr = JSON.parse(raw);
+    return new Set(Array.isArray(arr) ? arr.map((t: any) => String(t).toLowerCase().trim()) : []);
+  } catch {
+    return new Set();
+  }
+}
+
+function addDeletedTitle(title: string): void {
+  try {
+    const clean = cleanExamTitle(title);
+    if (!clean) return;
+    const titles = getDeletedTitles();
+    titles.add(clean);
+    localStorage.setItem(DELETED_TITLES_KEY, JSON.stringify([...titles]));
+  } catch {}
 }
 
 /**
@@ -222,6 +244,7 @@ export async function syncActiveSessionsToLibrary(teacherEmail?: string): Promis
   try {
     const snap = await getDocs(collection(dbFirestore, "active_sessions"));
     const deleted = getDeletedSessionIds();
+    const deletedTitles = getDeletedTitles();
 
     snap.forEach((d) => {
       const pinId = d.id;
@@ -234,6 +257,7 @@ export async function syncActiveSessionsToLibrary(teacherEmail?: string): Promis
 
       const { type, count } = countLibraryQuestions(examObj);
       let title = data.title || examObj.title || `Verifica PIN ${pinId}`;
+      if (deletedTitles.has(cleanExamTitle(title))) return;
       if (pinId === "12" && (title === "sicurezza" || title === "sicurezza 3ao 3bo")) {
         title = "sicurezza 3ao 3bo (PIN 12)";
       }
@@ -315,13 +339,17 @@ export async function fetchExamFromSessionPin(pin: string): Promise<ExamLibraryI
 export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
   const deleted = getDeletedSessionIds();
+  const deletedTitles = getDeletedTitles();
 
   // Map keyed by ID or cleanTitle to avoid duplicate/conflicting entries
   const itemsMap = new Map<string, ExamLibraryItem>();
 
   // 1. Load local cache
   const localItems = readLocalAll(normEmail).filter(
-    (it) => !deleted.has(it.id) && !deleted.has(it.id.replace("session_", ""))
+    (it) =>
+      !deleted.has(it.id) &&
+      !deleted.has(it.id.replace("session_", "")) &&
+      !deletedTitles.has(cleanExamTitle(it.title))
   );
   for (const it of localItems) {
     itemsMap.set(it.id, it);
@@ -336,6 +364,7 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
         if (deleted.has(id) || deleted.has(id.replace("session_", ""))) return;
         const data = d.data() as any;
         if (!data || !data.examJson) return;
+        if (deletedTitles.has(cleanExamTitle(data.title || ""))) return;
 
         let questionCount = Number(data.questionCount) || 0;
         if (!questionCount) {
@@ -381,6 +410,7 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
     const cloudSessions = await syncActiveSessionsToLibrary(normEmail);
     for (const cs of cloudSessions) {
       if (deleted.has(cs.id) || deleted.has(cs.id.replace("session_", ""))) continue;
+      if (deletedTitles.has(cleanExamTitle(cs.title))) continue;
 
       const csCleanTitle = cleanExamTitle(cs.title);
       const csPin = cs.id.replace("session_", "").trim().toLowerCase();
@@ -533,8 +563,33 @@ export async function saveLibraryExam(
 /**
  * Permanently deletes an exam from both Cloud Firestore and local storage.
  */
-export async function deleteLibraryExam(teacherEmail: string, id: string): Promise<void> {
+export async function deleteLibraryExam(teacherEmail: string, id: string, title?: string): Promise<void> {
   const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+
+  // Resolve the exam title (for title-based resurrection protection) from local storage if not provided
+  let resolvedTitle = title;
+  if (!resolvedTitle) {
+    try {
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY && k !== DELETED_TITLES_KEY) {
+          try {
+            const raw = localStorage.getItem(k);
+            if (raw) {
+              const parsed = JSON.parse(raw);
+              if (Array.isArray(parsed)) {
+                const found = parsed.find((it: any) => it && it.id === id);
+                if (found && found.title) {
+                  resolvedTitle = found.title;
+                  break;
+                }
+              }
+            }
+          } catch {}
+        }
+      }
+    } catch {}
+  }
 
   // 1. Track deleted IDs so cloud auto-sync and readAll never resurrect intentionally deleted items
   try {
@@ -545,6 +600,11 @@ export async function deleteLibraryExam(teacherEmail: string, id: string): Promi
     }
     localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...deleted]));
   } catch {}
+
+  // 1b. Track deleted title so any session/cloud exam with the same title cannot resurrect it
+  if (resolvedTitle) {
+    addDeletedTitle(resolvedTitle);
+  }
 
   // 2. Remove from all local storage library keys
   try {

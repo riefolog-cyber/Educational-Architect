@@ -446,6 +446,121 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     return new Date(s.expiry).getTime() > Date.now();
   };
 
+  const [terminatingPin, setTerminatingPin] = useState<string | null>(null);
+  const [terminatingAll, setTerminatingAll] = useState(false);
+
+  // Terminates (ends) and cancels a single active classroom session:
+  // removes its live students, deletes the active_session document and the
+  // RTDB backup, then refreshes the teacher's session list.
+  const handleTerminateSession = async (targetPin: string) => {
+    const cleanPin = (targetPin || "").trim().toUpperCase();
+    if (!cleanPin || !dbFirestore) return;
+    const confirmed = window.confirm(
+      `Terminare e annullare la sessione d'aula con PIN ${cleanPin}?\\n\\nGli studenti non potranno più accedere e la sessione verrà rimossa dall'elenco delle sessioni attive.`
+    );
+    if (!confirmed) return;
+
+    setTerminatingPin(cleanPin);
+    try {
+      // 1. Purge live students
+      try {
+        const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
+        const snap = await getDocs(liveColRef);
+        if (!snap.empty) {
+          const docs = snap.docs;
+          const chunkSize = 400;
+          for (let i = 0; i < docs.length; i += chunkSize) {
+            const chunk = docs.slice(i, i + chunkSize);
+            const batch = writeBatch(dbFirestore);
+            chunk.forEach((d) => batch.delete(d.ref));
+            await batch.commit();
+          }
+        }
+      } catch (purgeErr) {
+        console.warn("Pulizia alunni live non riuscita (continuo):", purgeErr);
+      }
+
+      // 2. Delete the active_session document
+      await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+
+      // 3. Remove RTDB backup (best effort)
+      if (db) {
+        try {
+          await fbSet(fbRef(db, `sessions/${cleanPin}`), null);
+        } catch (rtdbErr) {
+          console.warn("Rimozione sessione RTDB non riuscita (non bloccante):", rtdbErr);
+        }
+      }
+
+      // 4. Update local state
+      setActiveSessions((prev) => prev.filter((s) => s.pin !== cleanPin));
+      if (monitorPin === cleanPin) {
+        setMonitorPin("");
+        setPin("");
+      }
+    } catch (err: any) {
+      console.error("Terminazione sessione fallita:", err);
+      alert(`❌ Impossibile terminare la sessione ${cleanPin}: ${err?.message || "errore sconosciuto"}`);
+    } finally {
+      setTerminatingPin(null);
+      await handleLoadActiveSessions();
+    }
+  };
+
+  // Terminates and cancels ALL active classroom sessions owned by this teacher.
+  const handleTerminateAllSessions = async () => {
+    const live = activeSessions.filter((s) => isSessionLive(s));
+    if (live.length === 0) return;
+    const confirmed = window.confirm(
+      `Terminare e annullare TUTTE le ${live.length} sessioni d'aula attive?\\n\\nGli studenti non potranno più accedere e tutte le sessioni verranno rimosse.`
+    );
+    if (!confirmed) return;
+
+    setTerminatingAll(true);
+    try {
+      for (const s of live) {
+        const cleanPin = s.pin.trim().toUpperCase();
+        try {
+          const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
+          const snap = await getDocs(liveColRef);
+          if (!snap.empty) {
+            const docs = snap.docs;
+            const chunkSize = 400;
+            for (let i = 0; i < docs.length; i += chunkSize) {
+              const chunk = docs.slice(i, i + chunkSize);
+              const batch = writeBatch(dbFirestore);
+              chunk.forEach((d) => batch.delete(d.ref));
+              await batch.commit();
+            }
+          }
+        } catch (purgeErr) {
+          console.warn("Pulizia alunni live non riuscita (continuo):", purgeErr);
+        }
+        try {
+          await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+        } catch (delErr) {
+          console.warn("Eliminazione sessione fallita:", delErr);
+        }
+        if (db) {
+          try {
+            await fbSet(fbRef(db, `sessions/${cleanPin}`), null);
+          } catch (rtdbErr) {
+            console.warn("Rimozione RTDB non riuscita:", rtdbErr);
+          }
+        }
+      }
+      setActiveSessions([]);
+      setMonitorPin("");
+      setPin("");
+    } catch (err: any) {
+      console.error("Terminazione massiva fallita:", err);
+      alert(`❌ Errore durante la terminazione delle sessioni: ${err?.message || "errore sconosciuto"}`);
+    } finally {
+      setTerminatingAll(false);
+      await handleLoadActiveSessions();
+    }
+  };
+
   // Diagnostic checklist for JSON validation
   const validateExamJSON = (text: string): any => {
     setValidationError(null);
@@ -751,7 +866,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     // Optimistic UI removal so the list updates immediately without delay
     setLibrary(prev => prev.filter(it => it.id !== item.id));
     try {
-      await deleteLibraryExam(teacherEmail, item.id);
+      await deleteLibraryExam(teacherEmail, item.id, item.title);
       await loadLibrary();
       setLibraryMsg(`🗑️ "${item.title}" eliminata definitivamente dalla libreria.`);
     } catch (e: any) {
@@ -3774,6 +3889,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   setPin(next);
                 }}
                 onRefreshSessions={handleLoadActiveSessions}
+                onTerminateSession={handleTerminateSession}
+                onTerminateAllSessions={handleTerminateAllSessions}
+                terminatingPin={terminatingPin}
+                terminatingAll={terminatingAll}
               />
             ) : (
               <>
