@@ -84,6 +84,14 @@ export default function ClassroomLiveMonitor({
   const [unlockSuccessId, setUnlockSuccessId] = useState<string | null>(null);
   const [unlockingAll, setUnlockingAll] = useState(false);
   const [unlockAllSuccess, setUnlockAllSuccess] = useState(false);
+  const [confirmingPin, setConfirmingPin] = useState<string | null>(null);
+  const [confirmingAll, setConfirmingAll] = useState(false);
+
+  // Reset any pending confirmation when a termination actually starts.
+  useEffect(() => {
+    if (terminatingPin) setConfirmingPin(null);
+    if (terminatingAll) setConfirmingAll(false);
+  }, [terminatingPin, terminatingAll]);
 
   // Update clock every 5s to refresh relative time ("10s fa")
   useEffect(() => {
@@ -326,20 +334,44 @@ export default function ClassroomLiveMonitor({
           </div>
           <div className="flex items-center gap-1.5 flex-wrap">
             {liveSessions.length > 0 && onTerminateAllSessions && (
-              <button
-                type="button"
-                onClick={onTerminateAllSessions}
-                disabled={terminatingAll}
-                className="px-2.5 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
-                title="Termina e annulla tutte le sessioni d'aula attive"
-              >
-                {terminatingAll ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : (
-                  <StopCircle className="w-3.5 h-3.5" />
-                )}
-                <span>{terminatingAll ? "Terminazione..." : "Termina e annulla tutte"}</span>
-              </button>
+              confirmingAll ? (
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={() => { setConfirmingAll(false); onTerminateAllSessions(); }}
+                    disabled={terminatingAll}
+                    className="px-2.5 py-1.5 rounded-xl bg-red-600 border border-red-500 text-white hover:bg-red-500 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                    title="Conferma terminazione di tutte le sessioni"
+                  >
+                    {terminatingAll ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <StopCircle className="w-3.5 h-3.5" />}
+                    <span>{terminatingAll ? "Terminazione..." : "Conferma tutte"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setConfirmingAll(false)}
+                    disabled={terminatingAll}
+                    className="px-2 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white text-xs font-semibold cursor-pointer transition-colors disabled:opacity-50"
+                    title="Annulla"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setConfirmingAll(true)}
+                  disabled={terminatingAll}
+                  className="px-2.5 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                  title="Termina e annulla tutte le sessioni d'aula attive"
+                >
+                  {terminatingAll ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : (
+                    <StopCircle className="w-3.5 h-3.5" />
+                  )}
+                  <span>{terminatingAll ? "Terminazione..." : "Termina e annulla tutte"}</span>
+                </button>
+              )
             )}
             <button
               type="button"
@@ -394,22 +426,52 @@ export default function ClassroomLiveMonitor({
                     )}
                   </button>
                   {onTerminateSession && (
-                    <button
-                      type="button"
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onTerminateSession(s.pin);
-                      }}
-                      disabled={isTerminating || terminatingAll}
-                      className="absolute top-2 right-2 p-1 rounded-lg bg-slate-950/80 border border-white/10 text-slate-400 hover:text-red-300 hover:border-red-500/40 hover:bg-red-950/60 transition-colors cursor-pointer disabled:opacity-50"
-                      title="Termina e annulla questa sessione d'aula"
-                    >
-                      {isTerminating ? (
-                        <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                      ) : (
-                        <StopCircle className="w-3.5 h-3.5" />
-                      )}
-                    </button>
+                    confirmingPin === s.pin ? (
+                      <div className="absolute top-2 right-2 flex items-center gap-1">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            onTerminateSession(s.pin);
+                            setConfirmingPin(null);
+                          }}
+                          disabled={isTerminating || terminatingAll}
+                          className="px-2 py-1 rounded-lg bg-red-600 border border-red-500 text-white hover:bg-red-500 text-[10px] font-bold cursor-pointer transition-colors disabled:opacity-50"
+                          title="Conferma terminazione"
+                        >
+                          {isTerminating ? <RefreshCw className="w-3 h-3 animate-spin" /> : "Conferma"}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConfirmingPin(null);
+                          }}
+                          disabled={isTerminating || terminatingAll}
+                          className="px-1.5 py-1 rounded-lg bg-slate-950/80 border border-white/10 text-slate-300 hover:text-white text-[10px] font-bold cursor-pointer transition-colors disabled:opacity-50"
+                          title="Annulla"
+                        >
+                          ✕
+                        </button>
+                      </div>
+                    ) : (
+                      <button
+                        type="button"
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          setConfirmingPin(s.pin);
+                        }}
+                        disabled={isTerminating || terminatingAll}
+                        className="absolute top-2 right-2 p-1 rounded-lg bg-slate-950/80 border border-white/10 text-slate-400 hover:text-red-300 hover:border-red-500/40 hover:bg-red-950/60 transition-colors cursor-pointer disabled:opacity-50"
+                        title="Termina e annulla questa sessione d'aula"
+                      >
+                        {isTerminating ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                        ) : (
+                          <StopCircle className="w-3.5 h-3.5" />
+                        )}
+                      </button>
+                    )
                   )}
                 </div>
               );
@@ -466,20 +528,44 @@ export default function ClassroomLiveMonitor({
           </div>
 
           {pin && onTerminateSession && (
-            <button
-              type="button"
-              onClick={() => onTerminateSession(pin)}
-              disabled={terminatingPin === pin || terminatingAll}
-              className="px-3 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
-              title="Termina e annulla la sessione d'aula selezionata"
-            >
-              {terminatingPin === pin ? (
-                <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-              ) : (
-                <StopCircle className="w-3.5 h-3.5" />
-              )}
-              <span>{terminatingPin === pin ? "Terminazione..." : "Termina sessione"}</span>
-            </button>
+            confirmingPin === pin ? (
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={() => { onTerminateSession(pin); setConfirmingPin(null); }}
+                  disabled={terminatingPin === pin || terminatingAll}
+                  className="px-3 py-1.5 rounded-xl bg-red-600 border border-red-500 text-white hover:bg-red-500 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                  title="Conferma terminazione"
+                >
+                  {terminatingPin === pin ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <StopCircle className="w-3.5 h-3.5" />}
+                  <span>{terminatingPin === pin ? "Terminazione..." : "Conferma termina"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setConfirmingPin(null)}
+                  disabled={terminatingPin === pin || terminatingAll}
+                  className="px-2 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white text-xs font-semibold cursor-pointer transition-colors disabled:opacity-50"
+                  title="Annulla"
+                >
+                  ✕
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={() => setConfirmingPin(pin)}
+                disabled={terminatingPin === pin || terminatingAll}
+                className="px-3 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
+                title="Termina e annulla la sessione d'aula selezionata"
+              >
+                {terminatingPin === pin ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : (
+                  <StopCircle className="w-3.5 h-3.5" />
+                )}
+                <span>{terminatingPin === pin ? "Terminazione..." : "Termina sessione"}</span>
+              </button>
+            )
           )}
 
           {confirmClear ? (
