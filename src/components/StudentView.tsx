@@ -37,7 +37,9 @@ import {
   Printer,
   Eye,
   GraduationCap,
-  Wifi
+  Wifi,
+  AlertCircle,
+  ArrowRight
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
@@ -70,6 +72,16 @@ import {
   recoveryProgressPercent,
   type RecoveryProgress
 } from "../utils/recoveryProgress";
+
+export interface MissingQuestionItem {
+  id: string;
+  label: string;
+  type: "mc" | "oe" | "wbFib" | "wbRq";
+  domandaTipoLabel: string;
+  domandaText: string;
+  sectionTitle?: string;
+  anchorId: string;
+}
 
 interface StudentViewProps {
   user: any;
@@ -264,6 +276,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [isExamActive, setIsExamActive] = useState(false);
   const [infractionModalMsg, setInfractionModalMsg] = useState<string | null>(null);
   const [submitWarningMsg, setSubmitWarningMsg] = useState<string | null>(null);
+  const [missingQuestionsList, setMissingQuestionsList] = useState<MissingQuestionItem[]>([]);
+  const [showMissingQuestionsModal, setShowMissingQuestionsModal] = useState(false);
+  const isInteractingWithInAppDialogRef = useRef(false);
   const [appAlert, setAppAlert] = useState<{ msg: string; onOk?: () => void } | null>(null);
   
   // Real-time split screen and display integrity state
@@ -459,6 +474,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   const applyExamLock = useCallback((reason: string) => {
     if (lockedRef.current) return;
+    if (isInteractingWithInAppDialogRef.current) {
+      console.warn("applyExamLock ignorato: lo studente sta consultando un dialogo didattico interno dell'applicazione.");
+      return;
+    }
     lockedRef.current = true;
     setExamLocked(true);
     setLockReason(reason);
@@ -508,19 +527,23 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const unsubscribe = onSnapshot(
       studentDocRef,
       (snap) => {
+        if (!snap.exists()) return;
         const data = snap.data();
         const remoteId = data?.remoteUnlockId;
         const currentId = remoteId ? String(remoteId) : "";
         const isDocLocked = data?.locked === true;
         if (remoteUnlockSeenRef.current === null) {
-          // First snapshot: record the baseline without acting.
+          // First snapshot: record the baseline and release if server says unlocked
           remoteUnlockSeenRef.current = currentId;
+          if (lockedRef.current && (!isDocLocked || data?.lockState === "unlocked")) {
+            releaseExamLockRef.current("remote");
+          }
           return;
         }
         if (currentId !== remoteUnlockSeenRef.current) {
           remoteUnlockSeenRef.current = currentId;
           if (currentId && lockedRef.current) releaseExamLockRef.current("remote");
-        } else if (!isDocLocked && lockedRef.current && (data?.lockState === "unlocked" || data?.unlockedAt)) {
+        } else if (!isDocLocked && lockedRef.current) {
           releaseExamLockRef.current("remote");
         }
       },
@@ -1026,8 +1049,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const GRACE_MS = sev.graceMs;
 
     const scheduleLeave = (reason: string) => {
+      if (isInteractingWithInAppDialogRef.current) return;
       if (leaveTime || graceTimer) return;
       graceTimer = setTimeout(() => {
+        if (isInteractingWithInAppDialogRef.current) {
+          graceTimer = null;
+          return;
+        }
         graceTimer = null;
         leaveTime = Date.now();
         triggerInfraction("abbandono_pagina", reason);
@@ -1057,6 +1085,15 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     };
 
     const handleReturn = () => {
+      if (isInteractingWithInAppDialogRef.current) {
+        leaveTime = null;
+        if (graceTimer) {
+          clearTimeout(graceTimer);
+          graceTimer = null;
+        }
+        return;
+      }
+
       if (leaveTime) {
         const duration = Math.round((Date.now() - leaveTime) / 1000);
         leaveTime = null;
@@ -1103,6 +1140,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     // Window Blur (Crucial for split-screen or dual monitors on desktop PC!)
     const handleWindowBlur = () => {
+      // If student is interacting with an in-app dialog (e.g. missing questions guidance)
+      if (isInteractingWithInAppDialogRef.current) return;
+      // If document still actually has focus (e.g. internal click/focus shift)
+      if (typeof document !== "undefined" && document.hasFocus && document.hasFocus()) return;
+
       const isDualScreenOrTiled = !document.hidden && document.visibilityState === "visible";
       if (isDualScreenOrTiled) {
         handleLeave("Click su secondo monitor o applicazione affiancata (perdita del focus visivo)");
@@ -1117,6 +1159,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     // Fullscreen change listener
     const handleFullscreenChange = () => {
+      if (isInteractingWithInAppDialogRef.current) return;
       if (!isAppFullScreen()) {
         if (!isAppleMobile()) {
           setIsFullscreenBlocked(true);
@@ -1480,40 +1523,118 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     saveDraft(sessionPin, updatedAnswers);
   };
 
-  // Verify that student answered everything and return missing items list
-  const getMissingQuestions = (): string[] => {
-    const missing: string[] = [];
+  // Verify that student answered everything and return structured missing items list
+  const getMissingQuestions = (): MissingQuestionItem[] => {
+    const missing: MissingQuestionItem[] = [];
 
     if (examType === "quiz") {
       const mcList = examData?.multipleChoice || [];
       mcList.forEach((q: any, idx: number) => {
         if (answers.mc[q.id] === undefined) {
-          missing.push(`Domanda ${idx + 1} (a scelta multipla)`);
+          missing.push({
+            id: q.id || `mc_${idx}`,
+            label: `Domanda ${idx + 1}`,
+            type: "mc",
+            domandaTipoLabel: "Scelta multipla",
+            domandaText: q.question || "",
+            anchorId: `q_mc_${q.id || idx}`,
+          });
         }
       });
 
       const oeList = examData?.openEnded || [];
       oeList.forEach((q: any, idx: number) => {
         if (!(answers.oe[q.id] || "").trim()) {
-          missing.push(`Domanda Aperta ${mcList.length + idx + 1}`);
+          missing.push({
+            id: q.id || `oe_${idx}`,
+            label: `Domanda Aperta ${mcList.length + idx + 1}`,
+            type: "oe",
+            domandaTipoLabel: "Domanda aperta",
+            domandaText: q.question || "",
+            anchorId: `q_oe_${q.id || idx}`,
+          });
+        }
+      });
+
+      const rqList = examData?.reflectionQuestions || [];
+      rqList.forEach((q: any, idx: number) => {
+        const val = (answers.oe[q.id] || answers.wbRq[q.id] || "").trim();
+        if (!val) {
+          missing.push({
+            id: q.id || `rq_${idx}`,
+            label: `Riflessione Critica ${mcList.length + oeList.length + idx + 1}`,
+            type: "wbRq",
+            domandaTipoLabel: "Riflessione critica",
+            domandaText: q.question || "",
+            anchorId: `q_rq_${q.id || idx}`,
+          });
         }
       });
     } else {
+      // Workbook structure
+      // 1. Root level multiple choice if present
+      const rootMc = examData?.multipleChoice || [];
+      rootMc.forEach((q: any, idx: number) => {
+        if (answers.mc[q.id] === undefined) {
+          missing.push({
+            id: q.id || `root_mc_${idx}`,
+            label: `Quesito Generale ${idx + 1}`,
+            type: "mc",
+            domandaTipoLabel: "Scelta multipla",
+            domandaText: q.question || "",
+            anchorId: `wb_root_mc_${q.id || idx}`,
+          });
+        }
+      });
+
+      // 2. Sections
       const sections = examData?.sections || [];
       let fibIdx = 1;
       let rqIdx = 1;
 
-      sections.forEach((sec: any) => {
-        (sec.fillInTheBlank || []).forEach((f: any) => {
+      sections.forEach((sec: any, sIdx: number) => {
+        const secTitle = sec.title || `Sezione ${sIdx + 1}`;
+
+        (sec.fillInTheBlank || []).forEach((f: any, fIdx: number) => {
           if (!(answers.wbFib[f.id] || "").trim()) {
-            missing.push(`Termine ${fibIdx} da completare ("${f.clue || 'Parola mancante'}")`);
+            missing.push({
+              id: f.id || `fib_${sIdx}_${fIdx}`,
+              label: `Termine da inserire #${fibIdx}`,
+              type: "wbFib",
+              domandaTipoLabel: "Completamento testo",
+              domandaText: f.clue ? `Indizio: "${f.clue}"` : (f.sentence ? f.sentence.slice(0, 90) + "..." : "Termine mancante"),
+              sectionTitle: secTitle,
+              anchorId: `wb_sec_${sIdx}_fib_${f.id || fIdx}`,
+            });
           }
           fibIdx++;
         });
 
-        (sec.reflectionQuestions || []).forEach((r: any) => {
+        (sec.multipleChoice || []).forEach((q: any, mIdx: number) => {
+          if (answers.mc[q.id] === undefined) {
+            missing.push({
+              id: q.id || `mc_${sIdx}_${mIdx}`,
+              label: `Quesito a scelta multipla #${mIdx + 1}`,
+              type: "mc",
+              domandaTipoLabel: "Scelta multipla",
+              domandaText: q.question || "",
+              sectionTitle: secTitle,
+              anchorId: `wb_sec_${sIdx}_mc_${q.id || mIdx}`,
+            });
+          }
+        });
+
+        (sec.reflectionQuestions || []).forEach((r: any, rIdx: number) => {
           if (!(answers.wbRq[r.id] || "").trim()) {
-            missing.push(`Riflessione Critica ${rqIdx}`);
+            missing.push({
+              id: r.id || `rq_${sIdx}_${rIdx}`,
+              label: `Riflessione critica #${rqIdx}`,
+              type: "wbRq",
+              domandaTipoLabel: "Riflessione critica",
+              domandaText: r.question || "",
+              sectionTitle: secTitle,
+              anchorId: `wb_sec_${sIdx}_rq_${r.id || rIdx}`,
+            });
           }
           rqIdx++;
         });
@@ -1523,18 +1644,44 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return missing;
   };
 
+  const handleCloseMissingModal = () => {
+    setShowMissingQuestionsModal(false);
+    setTimeout(() => {
+      isInteractingWithInAppDialogRef.current = false;
+    }, 2000);
+  };
+
+  const handleJumpToMissingQuestion = (anchorId: string) => {
+    setShowMissingQuestionsModal(false);
+    setTimeout(() => {
+      isInteractingWithInAppDialogRef.current = false;
+    }, 2500);
+    setTimeout(() => {
+      const el = document.getElementById(anchorId);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.add("ring-4", "ring-amber-400", "ring-offset-2", "ring-offset-slate-900", "shadow-amber-500/30", "transition-all", "duration-500");
+        setTimeout(() => {
+          el.classList.remove("ring-4", "ring-amber-400", "ring-offset-2", "ring-offset-slate-900", "shadow-amber-500/30");
+        }, 4000);
+        const inputEl = el.querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea");
+        if (inputEl) {
+          inputEl.focus();
+        }
+      }
+    }, 150);
+  };
+
   const handleSubmitQuizPrompt = () => {
+    // Flag dialog interaction so anti-cheat listeners never lock the exam during validation
+    isInteractingWithInAppDialogRef.current = true;
     const missing = getMissingQuestions();
     if (missing.length > 0) {
-      const displayMissing = missing.slice(0, 5);
-      const remainingCount = missing.length - displayMissing.length;
-      let msg = "⚠️ Attenzione: per completare la consegna devi rispondere a tutte le domande.\n\nMancano:\n• " + displayMissing.join("\n• ");
-      if (remainingCount > 0) {
-        msg += `\n...e altre ${remainingCount} domande`;
-      }
-      setSubmitWarningMsg(msg);
+      setMissingQuestionsList(missing);
+      setShowMissingQuestionsModal(true);
       return;
     }
+    isInteractingWithInAppDialogRef.current = false;
     setActiveScreen("self-assessment");
     syncLiveProgress("self_evaluating");
   };
@@ -2806,7 +2953,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                       {examData.multipleChoice.map((q: any, qIdx: number) => {
                         const userSel = answers.mc[q.id];
                         return (
-                          <div key={q.id} className="p-5 bg-slate-950/30 border border-white/5 rounded-2xl space-y-4">
+                          <div key={q.id} id={`q_mc_${q.id || qIdx}`} className="p-5 bg-slate-950/30 border border-white/5 rounded-2xl space-y-4 transition-all">
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
@@ -2854,7 +3001,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         const savedValue = answers.oe[q.id] || "";
                         const wordCount = savedValue.trim() ? savedValue.trim().split(/\s+/).length : 0;
                         return (
-                          <div key={q.id} className="space-y-3">
+                          <div key={q.id} id={`q_oe_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">
                                 {((examData?.multipleChoice || []).length) + qIdx + 1}.
@@ -2896,7 +3043,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         const savedValue = answers.oe[q.id] || answers.wbRq[q.id] || "";
                         const wordCount = savedValue.trim() ? savedValue.trim().split(/\s+/).length : 0;
                         return (
-                          <div key={q.id} className="space-y-3">
+                          <div key={q.id} id={`q_rq_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
                             <p className="font-medium text-slate-200">
                               <span className="text-teal-400 font-bold mr-2">
                                 {((examData?.multipleChoice || []).length) + ((examData?.openEnded || []).length) + qIdx + 1}.
@@ -2942,7 +3089,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                       {examData.multipleChoice.map((q: any, qIdx: number) => {
                         const userSel = answers.mc[q.id];
                         return (
-                          <div key={q.id} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3">
+                          <div key={q.id} id={`wb_root_mc_${q.id || qIdx}`} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3 transition-all">
                             <p className="font-medium text-slate-200 text-sm">
                               <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
@@ -3016,12 +3163,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           Riempi gli spazi vuoti:
                         </p>
                         <div className="space-y-3.5">
-                          {sec.fillInTheBlank.map((fib: any) => {
+                          {sec.fillInTheBlank.map((fib: any, fIdx: number) => {
                             const userText = answers.wbFib[fib.id] || "";
                             const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
                             
                             return (
-                              <div key={fib.id} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300">
+                              <div key={fib.id} id={`wb_sec_${sIdx}_fib_${fib.id || fIdx}`} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300 transition-all">
                                 <span>{before}</span>
                                 <input
                                   type="text"
@@ -3050,7 +3197,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           {sec.multipleChoice.map((q: any, qIdx: number) => {
                             const userSel = answers.mc[q.id];
                             return (
-                              <div key={q.id} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3">
+                              <div key={q.id} id={`wb_sec_${sIdx}_mc_${q.id || qIdx}`} className="p-4 bg-slate-950/40 border border-white/5 rounded-xl space-y-3 transition-all">
                                 <p className="font-medium text-slate-200 text-sm">
                                   <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
                                   {q.question}
@@ -3098,7 +3245,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             const rqValue = answers.wbRq[rq.id] || "";
                             const wordCount = rqValue.trim() ? rqValue.trim().split(/\s+/).length : 0;
                             return (
-                              <div key={rq.id} className="space-y-2">
+                              <div key={rq.id} id={`wb_sec_${sIdx}_rq_${rq.id || rIdx}`} className="space-y-2 transition-all rounded-xl p-2 -m-2">
                                 <p className="text-xs font-semibold text-slate-300">
                                   {rIdx + 1}. {rq.question}
                                   <QuestionMeta q={rq} tone="teal" />
@@ -3781,25 +3928,88 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         </div>
       )}
 
-      {/* Submit warning (unanswered questions) - in-app, avoids exiting fullscreen */}
-      {submitWarningMsg && (
-        <div className="fixed inset-0 bg-slate-950/80 z-[9999] flex flex-col justify-center items-center p-6 text-center leading-relaxed">
-          <div className="bg-slate-900 border border-amber-500/40 rounded-2xl p-6 max-w-md w-full shadow-2xl">
-            <div className="flex justify-center mb-4">
-              <AlertTriangle className="w-10 h-10 text-amber-400" />
+      {/* Didactic guidance for incomplete questions - in-app, completely isolated from anti-cheat flags */}
+      {showMissingQuestionsModal && (
+        <div className="fixed inset-0 bg-slate-950/85 z-[9999] flex flex-col justify-center items-center p-4 sm:p-6 backdrop-blur-md animate-fadeIn text-left">
+          <div className="bg-slate-900 border border-amber-500/50 rounded-3xl p-6 sm:p-8 max-w-xl w-full shadow-2xl flex flex-col max-h-[90vh]">
+            {/* Modal Header */}
+            <div className="flex items-start gap-4 mb-4 pb-4 border-b border-white/10">
+              <div className="p-3 bg-amber-500/15 border border-amber-500/30 text-amber-400 rounded-2xl shrink-0">
+                <AlertCircle className="w-7 h-7" />
+              </div>
+              <div className="flex-1">
+                <h3 className="text-lg sm:text-xl font-display font-bold text-white">
+                  Completa tutti i quesiti prima di consegnare
+                </h3>
+                <p className="text-xs sm:text-sm text-slate-300 mt-1 leading-relaxed">
+                  Per procedere con la consegna ufficiale e ricevere la correzione, devi fornire una risposta a ogni domanda della prova.
+                </p>
+              </div>
             </div>
-            <h2 className="text-xl font-display font-medium text-white mb-3 uppercase tracking-wide">
-              Domande non completate
-            </h2>
-            <p className="text-sm text-amber-100 max-w-md mb-6 whitespace-pre-line text-left">
-              {submitWarningMsg}
-            </p>
-            <button
-              onClick={() => setSubmitWarningMsg(null)}
-              className="px-8 py-3 bg-amber-500 text-slate-950 font-bold hover:bg-amber-400 rounded-xl max-w-xs transition-colors shadow-lg active:scale-95"
-            >
-              Ho capito, torno al test
-            </button>
+
+            {/* Missing Questions Badge Count */}
+            <div className="flex items-center justify-between mb-3 text-xs">
+              <span className="font-semibold text-amber-300">
+                Quesiti ancora senza risposta ({missingQuestionsList.length}):
+              </span>
+              <span className="text-[11px] text-slate-400 hidden sm:inline">
+                Clicca su &quot;Vai al quesito&quot; per rispondere subito
+              </span>
+            </div>
+
+            {/* Scrollable Missing Questions List */}
+            <div className="flex-1 overflow-y-auto space-y-2.5 pr-1.5 mb-6 max-h-[380px] scrollbar-thin">
+              {missingQuestionsList.map((item, idx) => (
+                <div
+                  key={item.id || idx}
+                  className="p-3.5 bg-slate-950/70 border border-white/10 hover:border-amber-500/40 rounded-2xl flex items-center justify-between gap-3 transition-colors group"
+                >
+                  <div className="space-y-1 min-w-0 flex-1">
+                    <div className="flex items-center gap-2 flex-wrap">
+                      <span className="text-xs font-bold text-white font-mono">
+                        {item.label}
+                      </span>
+                      <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-300 border border-amber-500/30 font-medium">
+                        {item.domandaTipoLabel}
+                      </span>
+                      {item.sectionTitle && (
+                        <span className="text-[10px] text-slate-400">
+                          ({item.sectionTitle})
+                        </span>
+                      )}
+                    </div>
+                    {item.domandaText && (
+                      <p className="text-xs text-slate-300 truncate">
+                        {item.domandaText}
+                      </p>
+                    )}
+                  </div>
+
+                  <button
+                    type="button"
+                    onClick={() => handleJumpToMissingQuestion(item.anchorId)}
+                    className="px-3 py-1.5 rounded-xl bg-amber-500/15 hover:bg-amber-500 text-amber-300 hover:text-slate-950 text-xs font-bold transition-all border border-amber-500/30 hover:border-amber-500 shrink-0 flex items-center gap-1 cursor-pointer active:scale-95"
+                  >
+                    <span>Vai al quesito</span>
+                    <ArrowRight className="w-3.5 h-3.5" />
+                  </button>
+                </div>
+              ))}
+            </div>
+
+            {/* Modal Actions */}
+            <div className="pt-4 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-3">
+              <span className="text-[11px] text-slate-400 text-center sm:text-left">
+                💡 Tutte le tue risposte digitate finora sono già salvate automaticamente.
+              </span>
+              <button
+                type="button"
+                onClick={handleCloseMissingModal}
+                className="w-full sm:w-auto px-6 py-3 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold text-sm rounded-xl transition-all shadow-lg cursor-pointer active:scale-95 text-center shrink-0"
+              >
+                Torna alla prova e completa i quesiti
+              </button>
+            </div>
           </div>
         </div>
       )}

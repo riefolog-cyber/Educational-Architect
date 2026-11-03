@@ -11,7 +11,9 @@ import {
   Wifi,
   Lock,
   Unlock,
-  KeyRound
+  KeyRound,
+  AlertCircle,
+  Check
 } from "lucide-react";
 import { collection, onSnapshot, deleteDoc, doc, updateDoc } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
@@ -32,6 +34,7 @@ export interface LiveStudentData {
   /** True while the student is stuck on the "prova bloccata" screen. */
   locked?: boolean;
   lockReason?: string;
+  lockedAt?: string;
 }
 
 interface ClassroomLiveMonitorProps {
@@ -60,11 +63,13 @@ export default function ClassroomLiveMonitor({
   const [loading, setLoading] = useState(true);
   const [snapshotError, setSnapshotError] = useState("");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts">("in_progress");
+  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked">("in_progress");
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
   const [unlockingId, setUnlockingId] = useState<string | null>(null);
+  const [unlockSuccessId, setUnlockSuccessId] = useState<string | null>(null);
   const [unlockingAll, setUnlockingAll] = useState(false);
+  const [unlockAllSuccess, setUnlockAllSuccess] = useState(false);
 
   // Update clock every 5s to refresh relative time ("10s fa")
   useEffect(() => {
@@ -102,7 +107,8 @@ export default function ClassroomLiveMonitor({
             status: data.status || "in_progress",
             joinedAt: data.joinedAt,
             locked: !!data.locked,
-            lockReason: data.lockReason || ""
+            lockReason: data.lockReason || "",
+            lockedAt: data.lockedAt || ""
           });
         });
 
@@ -160,6 +166,7 @@ export default function ClassroomLiveMonitor({
   ).length;
   const submittedCount = resolvedStudents.filter(s => s.status === "submitted").length;
   const waitingCount = resolvedStudents.filter(s => s.status === "waiting").length;
+  const lockedCount = resolvedStudents.filter(s => s.locked && s.status !== "offline").length;
   const alertsCount = resolvedStudents.filter(
     s => isSendingSignal(s.lastHeartbeat) && (s.tabSwitches > 0 || s.pasteAttempts > 0)
   ).length;
@@ -181,6 +188,7 @@ export default function ClassroomLiveMonitor({
 
       if (!matchesSearch) return false;
 
+      if (filter === "locked") return s.locked && s.status !== "offline";
       if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
       if (filter === "submitted") return s.status === "submitted";
       if (filter === "alerts") return s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0;
@@ -231,6 +239,8 @@ export default function ClassroomLiveMonitor({
         locked: false,
         unlockedAt: new Date().toISOString()
       });
+      setUnlockSuccessId(studentId);
+      setTimeout(() => setUnlockSuccessId(null), 3500);
     } catch (err) {
       console.warn("Sblocco remoto non riuscito:", err);
     } finally {
@@ -258,6 +268,8 @@ export default function ClassroomLiveMonitor({
           })
         )
       );
+      setUnlockAllSuccess(true);
+      setTimeout(() => setUnlockAllSuccess(false), 3500);
     } catch (err) {
       console.warn("Sblocco cumulativo aula non riuscito:", err);
     } finally {
@@ -393,32 +405,58 @@ export default function ClassroomLiveMonitor({
 
       {/* Banner if any student is currently locked */}
       {students.some((s) => s.locked) && (
-        <div className="p-3.5 bg-red-950/40 border border-red-500/40 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-red-200 animate-fadeIn">
-          <div className="flex items-center gap-2.5">
-            <Lock className="w-4 h-4 text-red-400 shrink-0 animate-bounce" />
-            <span className="text-xs font-bold">
-              {students.filter((s) => s.locked).length === 1
-                ? "1 studente ha la prova bloccata: puoi sbloccarlo direttamente con 1 click."
-                : `${students.filter((s) => s.locked).length} studenti hanno la prova bloccata: puoi sbloccare tutta l'aula insieme.`}
-            </span>
+        <div className="p-4 bg-red-950/60 border-2 border-red-500/60 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-red-100 animate-fadeIn shadow-xl shadow-red-950/40">
+          <div className="flex items-center gap-3">
+            <div className="p-2 rounded-xl bg-red-500/20 border border-red-500/40 text-red-400">
+              <Lock className="w-5 h-5 animate-bounce" />
+            </div>
+            <div>
+              <p className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
+                <span>{lockedCount === 1 ? "1 studente ha la prova attualmente bloccata" : `${lockedCount} studenti hanno la prova attualmente bloccata`}</span>
+                <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/30 text-red-200 border border-red-500/50 uppercase font-mono font-bold">
+                  Intervento Richiesto
+                </span>
+              </p>
+              <p className="text-[11px] text-red-200/90 mt-0.5">
+                Gli studenti bloccati visualizzano la schermata di attesa e possono riprendere solo con il tuo sblocco.
+              </p>
+            </div>
           </div>
           <div className="flex items-center gap-2 w-full sm:w-auto">
             <button
               type="button"
               onClick={handleUnlockAll}
               disabled={unlockingAll}
-              className="flex-1 sm:flex-initial px-3.5 py-1.5 bg-emerald-600 hover:bg-emerald-500 text-white font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-md cursor-pointer disabled:opacity-50"
+              className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-50"
               title="Sblocca simultaneamente tutti gli studenti bloccati di questa sessione"
             >
-              <Unlock className="w-3.5 h-3.5" />
-              <span>{unlockingAll ? "Sblocco in corso..." : `Sblocca Tutta l'Aula (${students.filter(s => s.locked).length})`}</span>
+              {unlockAllSuccess ? (
+                <>
+                  <Check className="w-4 h-4" />
+                  <span>Tutta l'Aula Sbloccata ✓</span>
+                </>
+              ) : unlockingAll ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>Sblocco in corso...</span>
+                </>
+              ) : (
+                <>
+                  <Unlock className="w-4 h-4" />
+                  <span>Sblocca Tutta l'Aula ({lockedCount})</span>
+                </>
+              )}
             </button>
             <button
               type="button"
-              onClick={() => setFilter("alerts")}
-              className="px-3 py-1.5 bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-100 rounded-xl text-[11px] font-semibold shrink-0 transition-colors cursor-pointer"
+              onClick={() => setFilter("locked")}
+              className={`px-3 py-2 rounded-xl text-xs font-bold shrink-0 transition-colors cursor-pointer border ${
+                filter === "locked"
+                  ? "bg-white text-slate-950 border-white"
+                  : "bg-red-500/20 hover:bg-red-500/30 border-red-500/40 text-red-100"
+              }`}
             >
-              Mostra bloccati
+              Filtra Bloccati ({lockedCount})
             </button>
           </div>
         </div>
@@ -469,17 +507,30 @@ export default function ClassroomLiveMonitor({
         </div>
 
         <div 
-          onClick={() => setFilter("alerts")}
+          onClick={() => setFilter(lockedCount > 0 ? "locked" : "alerts")}
           className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
-            filter === "alerts" ? "bg-red-950/40 border-red-500/40 ring-1 ring-red-500/30" : "bg-slate-900/40 border-white/10 hover:border-white/20"
+            filter === "locked" || filter === "alerts" ? "bg-red-950/50 border-red-500/50 ring-1 ring-red-500/40" : "bg-slate-900/40 border-white/10 hover:border-white/20"
           }`}
         >
           <div className="flex items-center justify-between text-slate-400 mb-1">
-            <span className="text-[10px] uppercase font-bold tracking-wider">Allarmi Anti-Copia</span>
-            <ShieldAlert className="w-4 h-4 text-red-400" />
+            <span className="text-[10px] uppercase font-bold tracking-wider">Allarmi & Blocchi</span>
+            {lockedCount > 0 ? (
+              <Lock className="w-4 h-4 text-red-400 animate-bounce" />
+            ) : (
+              <ShieldAlert className="w-4 h-4 text-red-400" />
+            )}
           </div>
-          <p className="text-2xl font-bold font-mono text-red-400">{alertsCount}</p>
-          <p className="text-[10px] text-slate-500 mt-0.5">Uscite / Copia-incolla</p>
+          <div className="flex items-baseline gap-2">
+            <p className="text-2xl font-bold font-mono text-red-400">{alertsCount}</p>
+            {lockedCount > 0 && (
+              <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-600 text-white font-bold animate-pulse">
+                {lockedCount} bloccati
+              </span>
+            )}
+          </div>
+          <p className="text-[10px] text-slate-400 mt-0.5">
+            {lockedCount > 0 ? "Richiedono sblocco 1-click" : "Uscite / Copia-incolla"}
+          </p>
         </div>
       </div>
 
@@ -498,11 +549,24 @@ export default function ClassroomLiveMonitor({
 
         <div className="flex items-center gap-1.5 flex-wrap w-full sm:w-auto">
           <span className="text-[10px] text-slate-500 uppercase font-bold mr-1">Filtra:</span>
+          {lockedCount > 0 && (
+            <button
+              onClick={() => setFilter("locked")}
+              className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+                filter === "locked"
+                  ? "bg-red-600 text-white shadow-md ring-1 ring-red-400"
+                  : "bg-red-950/70 text-red-300 hover:text-white border border-red-500/50 animate-pulse"
+              }`}
+            >
+              <Lock className="w-3.5 h-3.5 text-red-400" />
+              <span>Bloccati ({lockedCount})</span>
+            </button>
+          )}
           {(["in_progress", "all", "submitted", "alerts"] as const).map((mode) => (
             <button
               key={mode}
               onClick={() => setFilter(mode)}
-              className={`px-2.5 py-1 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
+              className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
                 filter === mode
                   ? "bg-indigo-600 text-white shadow-sm"
                   : "bg-slate-900/80 text-slate-400 hover:text-white border border-white/5"
@@ -538,6 +602,8 @@ export default function ClassroomLiveMonitor({
             <p className="text-sm font-semibold text-slate-400">
               {resolvedStudents.length === 0
                 ? "Nessun alunno ha ancora iniziato questa sessione."
+                : filter === "locked"
+                ? "Nessun alunno ha attualmente la prova bloccata."
                 : filter === "in_progress"
                 ? "Nessun alunno sta attualmente compilando."
                 : "Nessun alunno corrisponde ai filtri selezionati."}
@@ -558,61 +624,79 @@ export default function ClassroomLiveMonitor({
                   key={student.id}
                   className={`p-4 transition-colors flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-xl mx-2 my-1.5 ${
                     student.locked && !isOffline
-                      ? "bg-red-950/35 border border-red-500/40 ring-1 ring-red-500/30 hover:bg-red-950/45"
+                      ? "bg-red-950/45 border-2 border-red-500/60 ring-1 ring-red-500/40 hover:bg-red-950/55"
                       : hasAlerts
                       ? "bg-red-500/5 hover:bg-red-500/10"
                       : "hover:bg-white/5"
                   } ${isOffline ? "opacity-50" : ""}`}
                 >
                   {/* Student identity */}
-                  <div className="flex items-center gap-3 min-w-[200px]">
-                    <div
-                      className={`w-3 h-3 rounded-full shrink-0 ${
-                        student.status === "submitted"
-                          ? "bg-emerald-400"
-                          : isOffline
-                          ? "bg-slate-600"
-                          : student.locked
-                          ? "bg-red-500 animate-ping"
-                          : "bg-emerald-500 animate-pulse"
-                      }`}
-                      title={isOffline ? "Segnale perso: alunno non connesso" : student.locked ? "Prova bloccata" : "Connesso e attivo"}
-                    />
-                    <div>
-                      <h4 className="text-xs font-bold text-white flex items-center gap-1.5">
-                        <span>{student.studentName}</span>
-                        {student.status === "submitted" && (
-                          <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
-                            Consegnato ✓
-                          </span>
-                        )}
-                        {student.status === "self_evaluating" && (
-                          <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                            Autovalutazione
-                          </span>
-                        )}
-                        {student.status === "waiting" && (
-                          <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                            In attesa di inizio
-                          </span>
-                        )}
-                        {student.locked && !isOffline && (
-                          <span
-                            className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-red-500/25 text-red-200 border border-red-500/50 flex items-center gap-1 animate-pulse"
-                            title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
-                          >
-                            <Lock className="w-3 h-3 text-red-400" />
-                            BLOCCATO
-                          </span>
-                        )}
-                        {isOffline && (
-                          <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300 border border-slate-500/30">
-                            Non connesso
-                          </span>
-                        )}
-                      </h4>
-                      <p className="text-[10px] text-slate-400 font-mono">{student.studentEmail}</p>
+                  <div className="min-w-[220px] max-w-md">
+                    <div className="flex items-center gap-3">
+                      <div
+                        className={`w-3.5 h-3.5 rounded-full shrink-0 ${
+                          student.status === "submitted"
+                            ? "bg-emerald-400"
+                            : isOffline
+                            ? "bg-slate-600"
+                            : student.locked
+                            ? "bg-red-500 animate-ping"
+                            : "bg-emerald-500 animate-pulse"
+                        }`}
+                        title={isOffline ? "Segnale perso: alunno non connesso" : student.locked ? "Prova bloccata" : "Connesso e attivo"}
+                      />
+                      <div>
+                        <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
+                          <span>{student.studentName}</span>
+                          {student.status === "submitted" && (
+                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                              Consegnato ✓
+                            </span>
+                          )}
+                          {student.status === "self_evaluating" && (
+                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                              Autovalutazione
+                            </span>
+                          )}
+                          {student.status === "waiting" && (
+                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                              In attesa di inizio
+                            </span>
+                          )}
+                          {student.locked && !isOffline && (
+                            <span
+                              className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
+                              title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
+                            >
+                              <Lock className="w-3 h-3 text-red-300" />
+                              PROVA BLOCCATA
+                            </span>
+                          )}
+                          {isOffline && (
+                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300 border border-slate-500/30">
+                              Non connesso
+                            </span>
+                          )}
+                        </h4>
+                        <p className="text-[10px] text-slate-400 font-mono mt-0.5">{student.studentEmail}</p>
+                      </div>
                     </div>
+
+                    {/* Prominent lock details banner if student is locked */}
+                    {student.locked && !isOffline && (
+                      <div className="mt-2.5 p-2 rounded-xl bg-red-950/80 border border-red-500/40 text-[11px] text-red-100 flex items-start gap-2">
+                        <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                        <div>
+                          <span className="font-bold text-red-300">Motivo del blocco: </span>
+                          <span className="text-red-100">{student.lockReason || "Perdita di focus dalla finestra o uscita schermo intero"}</span>
+                          {student.lockedAt && (
+                            <span className="text-[10px] text-red-300/80 font-mono ml-2">
+                              (bloccato da {getRelativeTime(student.lockedAt)})
+                            </span>
+                          )}
+                        </div>
+                      </div>
+                    )}
                   </div>
 
                   {/* Progress bar */}
@@ -639,18 +723,32 @@ export default function ClassroomLiveMonitor({
                     </div>
                   </div>
 
-                  {/* Anti-cheat report */}
-                  <div className="flex items-center gap-2">
+                  {/* Anti-cheat report & Actions */}
+                  <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap justify-between sm:justify-end w-full sm:w-auto">
                     {student.locked && !isOffline && (
                       <button
                         type="button"
                         onClick={() => handleRemoteUnlock(student.id)}
                         disabled={unlockingId === student.id}
-                        className="px-3 py-1.5 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
+                        className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
                         title="Sblocca la prova di questo studente con 1 click"
                       >
-                        <Unlock className="w-3.5 h-3.5" />
-                        <span>{unlockingId === student.id ? "Sblocco..." : "Sblocca"}</span>
+                        {unlockSuccessId === student.id ? (
+                          <>
+                            <Check className="w-4 h-4 text-emerald-950" />
+                            <span>Sbloccato ✓</span>
+                          </>
+                        ) : unlockingId === student.id ? (
+                          <>
+                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                            <span>Sblocco...</span>
+                          </>
+                        ) : (
+                          <>
+                            <Unlock className="w-3.5 h-3.5" />
+                            <span>Sblocca Alunno</span>
+                          </>
+                        )}
                       </button>
                     )}
                     {hasAlerts ? (
