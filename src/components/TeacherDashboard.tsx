@@ -475,10 +475,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleTerminateSession = async (targetPin: string) => {
     const cleanPin = (targetPin || "").trim().toUpperCase();
     if (!cleanPin || !dbFirestore) return;
-    const confirmed = window.confirm(
-      `Terminare e annullare la sessione d'aula con PIN ${cleanPin}?\\n\\nGli studenti non potranno più accedere e la sessione verrà rimossa dall'elenco delle sessioni attive.`
-    );
-    if (!confirmed) return;
 
     setTerminatingPin(cleanPin);
     try {
@@ -531,10 +527,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleTerminateAllSessions = async () => {
     const live = activeSessions.filter((s) => isSessionLive(s));
     if (live.length === 0) return;
-    const confirmed = window.confirm(
-      `Terminare e annullare TUTTE le ${live.length} sessioni d'aula attive?\\n\\nGli studenti non potranno più accedere e tutte le sessioni verranno rimosse.`
-    );
-    if (!confirmed) return;
 
     setTerminatingAll(true);
     try {
