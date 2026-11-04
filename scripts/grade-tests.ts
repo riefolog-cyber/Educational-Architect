@@ -10,6 +10,7 @@ import {
   detectGibberish,
   formatItalianScholasticGrade,
   parseItalianGrade,
+  isFibAnswerCorrect,
 } from "../src/utils";
 
 let passed = 0;
@@ -376,6 +377,55 @@ test("detectGibberish: tastiera a caso e rese sono spazzatura", () => {
   assert.equal(detectGibberish("non lo so"), true);
   assert.equal(detectGibberish("...."), true);
   assert.equal(detectGibberish(""), true);
+});
+
+// ---------- FIB Synonym & Inflection Verification ----------
+
+test("isFibAnswerCorrect: corrispondenze esatte, accenti e articoli", () => {
+  assert.equal(isFibAnswerCorrect("autodeterminazione", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("Autodeterminazione ", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("l'autodeterminazione", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("Rosso", "Rosso"), true);
+});
+
+test("isFibAnswerCorrect: sinonimi didattici e varianti concettuali", () => {
+  // Giorgio: documentario al posto di docuserie, prove per fonti
+  assert.equal(isFibAnswerCorrect("documentario", "docuserie"), true);
+  assert.equal(isFibAnswerCorrect("Docufilm", "docuserie"), true);
+  assert.equal(isFibAnswerCorrect("doc-serie", "docuserie"), true);
+  assert.equal(isFibAnswerCorrect("prove", "fonti"), true);
+  assert.equal(isFibAnswerCorrect("testimonianze", "fonti"), true);
+  assert.equal(isFibAnswerCorrect("indagini", "fonti"), true);
+
+  // Etica vs deontologia ed etichetta
+  assert.equal(isFibAnswerCorrect("etiquette", "etica"), true);
+  assert.equal(isFibAnswerCorrect("etichetta", "etica"), true);
+  assert.equal(isFibAnswerCorrect("deontologia", "etica"), true);
+
+  // Autodeterminazione vs indipendenza e autonomia
+  assert.equal(isFibAnswerCorrect("Indipendenza", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("autonomia", "autodeterminazione"), true);
+
+  // Consenso vs arbitrio / assenso
+  assert.equal(isFibAnswerCorrect("Arbitrio", "consenso"), true);
+  assert.equal(isFibAnswerCorrect("assenso", "consenso"), true);
+
+  // Codice Rosso vs Penale
+  assert.equal(isFibAnswerCorrect("Penale", "Rosso"), true);
+});
+
+test("isFibAnswerCorrect: flessione singolare e plurale italiana", () => {
+  assert.equal(isFibAnswerCorrect("fonte", "fonti"), true);
+  assert.equal(isFibAnswerCorrect("prova", "prove"), true);
+  assert.equal(isFibAnswerCorrect("documentari", "documentario"), true);
+  assert.equal(isFibAnswerCorrect("indagine", "indagini"), true);
+});
+
+test("isFibAnswerCorrect: risposte non pertinenti rifiutate", () => {
+  assert.equal(isFibAnswerCorrect("amore", "autodeterminazione"), false);
+  assert.equal(isFibAnswerCorrect("ambiente", "etica"), false);
+  assert.equal(isFibAnswerCorrect("onore", "autodeterminazione"), false);
+  assert.equal(isFibAnswerCorrect("", "etica"), false);
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

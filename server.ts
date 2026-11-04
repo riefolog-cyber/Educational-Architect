@@ -474,7 +474,7 @@ const parseJsonResponse = (text: string) => {
 // Middleware for JSON parsing
 app.use(express.json({ limit: '10mb' }));
 
-import { computeGradeBreakdown, detectGibberish } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
@@ -861,7 +861,13 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const sections = report.domande?.sections || [];
     const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
     const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-    const fibScore = report.punteggioFIB || 0;
+    
+    // Calculate or re-verify FIB score using flexible pedagogical synonym matching
+    let fibScore = report.punteggioFIB || 0;
+    if (fibList.length > 0 && report.risposte?.wbFib) {
+      const fibCalc = fibWeightedScore(fibList, report.risposte.wbFib, isFibAnswerCorrect);
+      fibScore = Math.max(fibScore, fibCalc.correct);
+    }
     const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
     const rqCount = rqList.length;
 

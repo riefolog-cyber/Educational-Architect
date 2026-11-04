@@ -1567,7 +1567,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         let correctFib = 0;
         fibList.forEach((fib: any) => {
-          if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer)) correctFib++;
+          if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer, fib.sentence)) correctFib++;
         });
 
         if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
@@ -2154,8 +2154,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           fibList.forEach((fib: any, fIdx: number) => {
             const rawVal = ansObj.wbFib?.[fib.id];
             const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
-            const isCorrect = isFibAnswerCorrect(val, fib.answer);
-            const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+            const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
+            const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
+            const { before, after } = getFibSentenceParts(fib.sentence, expected);
             const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
 
             checkPageBreak(15);
@@ -5609,8 +5610,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         {fibList.map((fib: any, fIdx: number) => {
                                           const rawVal = ansObj.wbFib?.[fib.id];
                                           const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
-                                          const isCorrect = isFibAnswerCorrect(val, fib.answer);
-                                          const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+                                          const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
+                                          const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
+                                          const { before, after } = getFibSentenceParts(fib.sentence, expected);
 
                                           return (
                                             <div key={fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
@@ -5620,7 +5622,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                                 <span className={`px-1 rounded font-bold ${isCorrect ? 'bg-teal-500/20 text-teal-300' : 'bg-rose-500/20 text-rose-300'}`}>[{val || "____"}]</span>
                                                 <span>{after}</span>
                                               </p>
-                                              <p className="text-[9px] text-slate-500 mt-1">Accettate: {fib.answer}</p>
+                                              <div className="flex items-center gap-2 mt-1">
+                                                <p className="text-[9px] text-slate-500">Accettate: {expected || fib.answer}</p>
+                                                {isCorrect && val && expected && val.toLowerCase().trim() !== expected.toLowerCase().trim() && (
+                                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-300 border border-teal-500/20">
+                                                    ✓ Variante/Sinonimo
+                                                  </span>
+                                                )}
+                                              </div>
                                             </div>
                                           );
                                         })}

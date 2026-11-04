@@ -874,7 +874,8 @@ export function fibWeightedScore(
   for (const fib of fibList || []) {
     const w = itemWeight(fib);
     weightedTotal += w;
-    if (isCorrect(answersWbFib?.[fib.id], fib.answer)) {
+    const target = fib?.answer || (typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : undefined);
+    if (isCorrect(answersWbFib?.[fib?.id], target)) {
       correct++;
       weightedCorrect += w;
     }
@@ -1212,18 +1213,160 @@ function parseNumericFibValue(s: string): number | null {
   return null;
 }
 
-// Teacher-like verdict: exact match after normalization, plus a narrow typo
-// tolerance for genuine words (never for pure numbers like "12" vs "13").
-// Also checks mathematical/decimal equality ("3,5" == "3.5" == "3.50").
-// NOTE: an incomplete answer ("costituzione" for "costituzione italiana")
-// is NOT correct — a partial word is not the required term.
-export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer: string | undefined | null): boolean {
+// Common pedagogical synonym clusters for Italian secondary school assessments.
+// Enables teachers to flexibly accept valid synonyms and conceptual equivalents in cloze tests.
+export const FIB_SYNONYM_CLUSTERS: readonly string[][] = [
+  // Audiovisivo, cinema e formati multimediali
+  ["docuserie", "docuseries", "docserie", "doc serie", "docu serie", "docu-serie", "documentario", "documentari", "docufilm", "docu film", "serie documentario", "serie documentaria", "film documentario", "reportage"],
+  // Diritto, atti, prove, fonti e ricostruzione processuale
+  ["fonti", "fonte", "prove", "prova", "testimonianze", "testimonianza", "indagini", "indagine", "evidenze", "evidenza", "documenti", "documento", "atti", "atto", "riscontri", "riscontro", "elementi", "materiali"],
+  // Etica, deontologia professionale, codice di condotta
+  ["etica", "deontologia", "etichetta", "etiquette", "morale", "correttezza", "integrita", "deontologia professionale", "etica professionale", "codice deontologico", "condotta"],
+  // Autodeterminazione, indipendenza, libertà personale, autonomia
+  ["autodeterminazione", "auto determinazione", "indipendenza", "autonomia", "liberta", "liberta personale", "liberta individuale", "libera scelta", "emancipazione"],
+  // Consenso, accordo, libero arbitrio, assenso
+  ["consenso", "assenso", "accordo", "approvazione", "arbitrio", "libero arbitrio", "volere", "volonta", "intesa", "patto"],
+  // Codice Rosso, codice penale, tutela vittime di genere
+  ["rosso", "codice rosso", "penale", "codice penale", "antiviolenza", "legge antiviolenza"],
+  // Istituzioni e Diritto Costituzionale
+  ["costituzione", "carta costituzionale", "statuto", "legge fondamentale", "testo costituzionale"],
+  ["parlamento", "camere", "assemblea", "camera", "senato"],
+  ["governo", "esecutivo", "consiglio dei ministri"],
+  ["magistratura", "giudici", "tribunale", "corte", "giustizia"],
+  ["presidente", "capo dello stato", "quirinale"],
+  ["uguaglianza", "parita", "equita"],
+  ["democrazia", "sistema democratico", "regime democratico", "repubblica"],
+  ["tutela", "protezione", "difesa", "salvaguardia"],
+  ["violazione", "infrazione", "trasgressione", "lesione"],
+  ["reato", "delitto", "crimine", "illecito"],
+  ["sanzione", "pena", "punizione", "condanna"],
+  ["vittima", "persona offesa", "parte offesa"],
+  // Scienze biologiche e naturali
+  ["fotosintesi", "fotosintesi clorofilliana"],
+  ["mitocondrio", "mitocondri"],
+  ["nucleo", "nucleo cellulare"],
+  ["cloroplasto", "cloroplasti"],
+  ["osmosi", "diffusione"],
+  ["respirazione", "respirazione cellulare"],
+  ["enzima", "enzimi", "catalizzatore", "catalizzatori"],
+  ["proteina", "proteine", "polipeptide"],
+  ["genoma", "dna", "patrimonio genetico"],
+  // Fisica e Chimica
+  ["velocita", "rapidita"],
+  ["forza", "spinta", "trazione"],
+  ["atomo", "atomi"],
+  ["molecola", "molecole"],
+  ["soluzione", "miscuglio omogeneo", "miscela omogenea"],
+  ["reazione", "trasformazione"],
+  // Storia e Narrativa
+  ["trattato", "accordo", "patto", "intesa", "convenzione"],
+  ["alleanza", "coalizione", "intesa", "blocco"],
+  ["rivoluzione", "rivolta", "insurrezione", "sollevazione"],
+  ["monarchia", "regno", "corona"],
+  ["protagonista", "personaggio principale", "eroe"],
+  ["antagonista", "oppositore", "rivale", "nemico"],
+  ["metafora", "analogia", "similitudine"],
+  ["narratore", "voce narrante"],
+  ["cronaca", "racconto", "narrazione", "resoconto"],
+];
+
+/**
+ * Checks morphological equivalence for Italian words (singular/plural, compact hyphens/spaces).
+ */
+export function areItalianInflectionsEqual(w1: string, w2: string): boolean {
+  if (!w1 || !w2) return false;
+  if (w1 === w2) return true;
+  const c1 = w1.replace(/[\s-_]/g, "");
+  const c2 = w2.replace(/[\s-_]/g, "");
+  if (c1 === c2) return true;
+
+  // Single-letter slip on compound forms (e.g. docserie vs docuserie)
+  if (Math.min(c1.length, c2.length) >= 5 && fibLevenshtein(c1, c2) === 1) {
+    return true;
+  }
+
+  // Common Italian noun & adjective morphological inflections (singular <-> plural):
+  const isSingularPluralPair = (a: string, b: string) => {
+    // -o <-> -i (documentario <-> documentari, indizio <-> indizi)
+    if (a.endsWith("o") && b.endsWith("i")) {
+      if (a.slice(0, -1) === b.slice(0, -1)) return true;
+      if (a.endsWith("io") && a.slice(0, -2) === b.slice(0, -1)) return true;
+    }
+    // -a <-> -e (prova <-> prove, testimonianza <-> testimonianze)
+    if (a.endsWith("a") && b.endsWith("e") && a.slice(0, -1) === b.slice(0, -1)) return true;
+    // -e <-> -i (fonte <-> fonti, indagine <-> indagini, legge <-> leggi)
+    if (a.endsWith("e") && b.endsWith("i") && a.slice(0, -1) === b.slice(0, -1)) return true;
+    return false;
+  };
+
+  return isSingularPluralPair(c1, c2) || isSingularPluralPair(c2, c1);
+}
+
+/**
+ * Checks if two terms belong to an accepted pedagogical synonym cluster in Italian.
+ */
+export function areFibSynonyms(user: string, expected: string): boolean {
+  if (!user || !expected) return false;
+  const u = normalizeFibAnswer(user);
+  const e = normalizeFibAnswer(expected);
+  if (!u || !e) return false;
+
+  for (const cluster of FIB_SYNONYM_CLUSTERS) {
+    const userMatches = cluster.some((item) => areItalianInflectionsEqual(u, normalizeFibAnswer(item)));
+    if (!userMatches) continue;
+    const expMatches = cluster.some((item) => areItalianInflectionsEqual(e, normalizeFibAnswer(item)));
+    if (expMatches) return true;
+  }
+  return false;
+}
+
+/**
+ * Extracts expected FIB solution from either item.answer or [bracketed] text inside sentence.
+ */
+export function extractFibExpected(fibOrSentence: any, rawAnswer?: string): string {
+  if (typeof rawAnswer === "string" && rawAnswer.trim()) {
+    return rawAnswer.trim();
+  }
+  if (typeof fibOrSentence === "object" && fibOrSentence !== null) {
+    if (typeof fibOrSentence.answer === "string" && fibOrSentence.answer.trim()) {
+      return fibOrSentence.answer.trim();
+    }
+    if (typeof fibOrSentence.sentence === "string") {
+      const match = fibOrSentence.sentence.match(/\[([^\]]+)\]/);
+      if (match) return match[1].trim();
+    }
+  } else if (typeof fibOrSentence === "string") {
+    const match = fibOrSentence.match(/\[([^\]]+)\]/);
+    if (match) return match[1].trim();
+  }
+  return "";
+}
+
+// Teacher-like verdict: exact match after normalization, morphological plural/singular,
+// pedagogical synonym tolerance, plus a narrow typo tolerance for genuine words.
+export function isFibAnswerCorrect(
+  userAns: string | undefined | null,
+  fibAnswer: string | undefined | null,
+  sentenceFallback?: string
+): boolean {
   const user = normalizeFibAnswer(userAns);
   if (!user) return false;
-  // Legacy "," plus "|" and ";" as alternative-answer separators
-  // ("/" is intentionally NOT a separator: it appears in fractions like "1/2")
-  const alternatives = String(fibAnswer || "")
-    .split(/[,|;]/)
+
+  let rawTarget = fibAnswer;
+  if (!rawTarget && sentenceFallback) {
+    rawTarget = extractFibExpected(sentenceFallback);
+  }
+  if (!rawTarget) return false;
+
+  // Also if rawTarget contains bracketed word like "[Rosso]"
+  if (/\[([^\]]+)\]/.test(rawTarget)) {
+    const m = rawTarget.match(/\[([^\]]+)\]/);
+    if (m) rawTarget = `${rawTarget.replace(/\[[^\]]+\]/g, "")}|${m[1]}`;
+  }
+
+  // Legacy "," plus "|", ";" and "/" as alternative-answer separators
+  const alternatives = String(rawTarget || "")
+    .split(/[,|;/]/)
     .map((s) => normalizeFibAnswer(s))
     .filter((s) => s.length > 0);
   if (alternatives.length === 0) return false;
@@ -1232,6 +1375,8 @@ export function isFibAnswerCorrect(userAns: string | undefined | null, fibAnswer
 
   for (const ans of alternatives) {
     if (user === ans) return true;
+    if (areItalianInflectionsEqual(user, ans)) return true;
+    if (areFibSynonyms(user, ans)) return true;
 
     // Check numeric equivalence (e.g. "3,5" vs "3.5" or "04" vs "4")
     if (numUser !== null) {

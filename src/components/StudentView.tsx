@@ -2515,6 +2515,83 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           </div>
                         )}
 
+                        {/* Detailed Workbook Fill-in-the-Blank (FIB) / Completamento Review */}
+                        {parsedExamData?.sections && parsedExamData.sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0) && (
+                          <div className="space-y-4 pt-2">
+                            <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                              Dettaglio Risposte & Correzioni Singole: Completamento
+                            </h4>
+                            <div className="space-y-4">
+                              {parsedExamData.sections.map((sec: any, sIdx: number) => {
+                                const fibList = sec.fillInTheBlank || [];
+                                if (fibList.length === 0) return null;
+                                return (
+                                  <div key={`past-fib-sec-${sIdx}`} className="space-y-3">
+                                    {parsedExamData.sections.length > 1 && (
+                                      <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-white/5 pb-1">
+                                        {sec.title || `Sezione ${sIdx + 1}`}
+                                      </p>
+                                    )}
+                                    <div className="grid grid-cols-1 gap-2.5">
+                                      {fibList.map((fib: any, fIdx: number) => {
+                                        const rawVal = parsedAnswers?.wbFib?.[fib.id] ?? parsedAnswers?.fib?.[fib.id] ?? "";
+                                        const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
+                                        const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                                        const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
+                                        const { before, after } = getFibSentenceParts(fib.sentence, expected);
+                                        const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
+
+                                        return (
+                                          <div
+                                            key={fib.id || fIdx}
+                                            className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
+                                              isCorrect
+                                                ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
+                                                : "bg-red-950/15 border-red-500/20 text-red-300"
+                                            }`}
+                                          >
+                                            <span className="font-bold text-sm shrink-0">{isCorrect ? "✅" : "❌"}</span>
+                                            <div className="space-y-1.5 flex-1">
+                                              <p className="font-semibold text-slate-200">
+                                                {before}
+                                                <span
+                                                  className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
+                                                    isCorrect
+                                                      ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                                      : "bg-red-500/20 text-red-200 border-red-500/30"
+                                                  }`}
+                                                >
+                                                  {val || "[Nessuna risposta]"}
+                                                </span>
+                                                {after}
+                                              </p>
+                                              <div className="text-[11px] space-y-0.5">
+                                                <p className="text-slate-400">
+                                                  La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
+                                                </p>
+                                                {!isCorrect && expected && (
+                                                  <p className="text-emerald-400">
+                                                    Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
+                                                  </p>
+                                                )}
+                                                {isSynonymAcceptance && (
+                                                  <p className="text-teal-300 text-[10.5px] italic">
+                                                    💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
+                                                  </p>
+                                                )}
+                                              </div>
+                                            </div>
+                                          </div>
+                                        );
+                                      })}
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          </div>
+                        )}
+
                         {/* Detailed Open Ended Review Mapping */}
                         {selectedPastSub.Tipo === "Quiz" && parsedExamData?.openEnded && parsedExamData.openEnded.length > 0 && (
                           <div className="space-y-4 pt-2">
@@ -3740,6 +3817,83 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           }`}>
                             Voto: {score}/10
                           </div>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            )}
+
+            {/* Workbook Detailed Fill-in-the-Blank (FIB) / Completamento Review */}
+            {examType === "workbook" && examData?.sections && examData.sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0) && (
+              <div className="space-y-4 pt-2">
+                <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                  Dettaglio Risposte & Correzioni Singole: Completamento
+                </h4>
+                <div className="space-y-4">
+                  {examData.sections.map((sec: any, sIdx: number) => {
+                    const fibList = sec.fillInTheBlank || [];
+                    if (fibList.length === 0) return null;
+                    return (
+                      <div key={`active-fib-sec-${sIdx}`} className="space-y-3">
+                        {examData.sections.length > 1 && (
+                          <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-white/5 pb-1">
+                            {sec.title || `Sezione ${sIdx + 1}`}
+                          </p>
+                        )}
+                        <div className="grid grid-cols-1 gap-2.5">
+                          {fibList.map((fib: any, fIdx: number) => {
+                            const rawVal = answers.wbFib?.[fib.id] ?? "";
+                            const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
+                            const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                            const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
+                            const { before, after } = getFibSentenceParts(fib.sentence, expected);
+                            const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
+
+                            return (
+                              <div
+                                key={fib.id || fIdx}
+                                className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
+                                  isCorrect
+                                    ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
+                                    : "bg-red-950/15 border-red-500/20 text-red-300"
+                                }`}
+                              >
+                                <span className="font-bold text-sm shrink-0">{isCorrect ? "✅" : "❌"}</span>
+                                <div className="space-y-1.5 flex-1">
+                                  <p className="font-semibold text-slate-200">
+                                    {before}
+                                    <span
+                                      className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
+                                        isCorrect
+                                          ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                          : "bg-red-500/20 text-red-200 border-red-500/30"
+                                      }`}
+                                    >
+                                      {val || "[Nessuna risposta]"}
+                                    </span>
+                                    {after}
+                                  </p>
+                                  <div className="text-[11px] space-y-0.5">
+                                    <p className="text-slate-400">
+                                      La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
+                                    </p>
+                                    {!isCorrect && expected && (
+                                      <p className="text-emerald-400">
+                                        Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
+                                      </p>
+                                    )}
+                                    {isSynonymAcceptance && (
+                                      <p className="text-teal-300 text-[10.5px] italic">
+                                        💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
+                                      </p>
+                                    )}
+                                  </div>
+                                </div>
+                              </div>
+                            );
+                          })}
                         </div>
                       </div>
                     );
