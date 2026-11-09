@@ -499,13 +499,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const persistExamLock = (locked: boolean, reason?: string) => {
     if (!sessionPin) return;
     try {
+      const payload = JSON.stringify({ locked: true, reason: reason || "", at: new Date().toISOString() });
       if (locked) {
-        sessionStorage.setItem(
-          lockStorageKey(sessionPin),
-          JSON.stringify({ locked: true, reason: reason || "", at: new Date().toISOString() })
-        );
+        sessionStorage.setItem(lockStorageKey(sessionPin), payload);
+        localStorage.setItem(lockStorageKey(sessionPin), payload);
       } else {
         sessionStorage.removeItem(lockStorageKey(sessionPin));
+        localStorage.removeItem(lockStorageKey(sessionPin));
       }
     } catch {
       // Storage disabled (private mode): the lock still applies for this tab.
@@ -611,6 +611,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             !freshlyAppliedLocalLock
           ) {
             releaseExamLockRef.current("remote");
+          } else if (!lockedRef.current && isDocLocked && data?.lockState === "locked") {
+            // Se lo studente ha ricaricato o riaperto l'app mentre era bloccato, ripristina subito il blocco da Firestore
+            applyExamLockRef.current(data?.lockReason || "Prova precedentemente bloccata dal sistema o dal docente");
           }
           return;
         }
@@ -618,6 +621,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           // Only an explicit teacher action (new remoteUnlockId) lifts the lock.
           remoteUnlockSeenRef.current = currentId;
           if (currentId && lockedRef.current) releaseExamLockRef.current("remote");
+        } else if (!lockedRef.current && isDocLocked && data?.lockState === "locked") {
+          applyExamLockRef.current(data?.lockReason || "Prova bloccata dal docente");
         }
         // A stale `locked: false` snapshot (e.g. an older heartbeat write) must
         // never release the block by itself.
@@ -943,7 +948,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setExamLocked(false);
           setLockReason("");
           try {
-            const storedLock = sessionStorage.getItem(`exam_lock_${formattedPin}`);
+            const storedLock = localStorage.getItem(`exam_lock_${formattedPin}`) || sessionStorage.getItem(`exam_lock_${formattedPin}`);
             if (storedLock) {
               const parsedLock = JSON.parse(storedLock);
               if (parsedLock?.locked) {
@@ -954,6 +959,21 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             }
           } catch {
             // Ignore unreadable lock markers.
+          }
+
+          if (dbFirestore && user?.email) {
+            try {
+              const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+              const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", safeKey));
+              if (studentSnap.exists()) {
+                const sData = studentSnap.data();
+                if (sData?.locked === true && sData?.lockState === "locked") {
+                  lockedRef.current = true;
+                  setExamLocked(true);
+                  setLockReason(String(sData?.lockReason || "Prova bloccata dal sistema di integrità"));
+                }
+              }
+            } catch {}
           }
 
           loadDraft(formattedPin);
@@ -2241,7 +2261,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   const handleRestart = () => {
     try {
-      if (sessionPin) sessionStorage.removeItem(`exam_lock_${sessionPin}`);
+      if (sessionPin) {
+        sessionStorage.removeItem(`exam_lock_${sessionPin}`);
+        localStorage.removeItem(`exam_lock_${sessionPin}`);
+      }
     } catch {}
     lockedRef.current = false;
     setExamLocked(false);
