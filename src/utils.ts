@@ -1222,10 +1222,10 @@ export const FIB_SYNONYM_CLUSTERS: readonly string[][] = [
   ["fonti", "fonte", "prove", "prova", "testimonianze", "testimonianza", "indagini", "indagine", "evidenze", "evidenza", "documenti", "documento", "atti", "atto", "riscontri", "riscontro", "elementi", "materiali"],
   // Etica, deontologia professionale, codice di condotta
   ["etica", "deontologia", "etichetta", "etiquette", "morale", "correttezza", "integrita", "deontologia professionale", "etica professionale", "codice deontologico", "condotta"],
-  // Autodeterminazione, indipendenza, libertà personale, autonomia
-  ["autodeterminazione", "auto determinazione", "indipendenza", "autonomia", "liberta", "liberta personale", "liberta individuale", "libera scelta", "emancipazione"],
-  // Consenso, accordo, libero arbitrio, assenso
-  ["consenso", "assenso", "accordo", "approvazione", "arbitrio", "libero arbitrio", "volere", "volonta", "intesa", "patto"],
+  // Autodeterminazione, indipendenza, libertà personale, autonomia, scelta
+  ["autodeterminazione", "auto determinazione", "autodetermination", "auto determination", "indipendenza", "autonomia", "liberta", "liberta personale", "liberta individuale", "libera scelta", "scelta", "emancipazione"],
+  // Consenso, accordo, libero arbitrio, assenso, accettazione
+  ["consenso", "assenso", "accordo", "approvazione", "accettazione", "accetto", "arbitrio", "libero arbitrio", "volere", "volonta", "intesa", "patto"],
   // Codice Rosso, codice penale, tutela vittime di genere
   ["rosso", "codice rosso", "penale", "codice penale", "antiviolenza", "legge antiviolenza"],
   // Istituzioni e Diritto Costituzionale
@@ -1296,6 +1296,8 @@ export function areItalianInflectionsEqual(w1: string, w2: string): boolean {
     if (a.endsWith("a") && b.endsWith("e") && a.slice(0, -1) === b.slice(0, -1)) return true;
     // -e <-> -i (fonte <-> fonti, indagine <-> indagini, legge <-> leggi)
     if (a.endsWith("e") && b.endsWith("i") && a.slice(0, -1) === b.slice(0, -1)) return true;
+    // -zione <-> -tion (calco linguistico frequente: autodeterminazione <-> autodetermination)
+    if (a.endsWith("zione") && b.endsWith("tion") && a.slice(0, -5) === b.slice(0, -4)) return true;
     return false;
   };
 

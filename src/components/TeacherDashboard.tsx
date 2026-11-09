@@ -4476,7 +4476,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                       })
                                       .map((sub, idx) => {
-                                      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                                      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
                                       return (
                                         <div 
                                           key={sub.id}
@@ -4916,7 +4916,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                             return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                           })
                                           .map((sub, sIdx) => {
-                                            const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                                            const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
                                             return (
                                               <tr key={sub.id} className="hover:bg-white/5 transition-colors">
                                                 <td className="p-2 text-center font-mono font-bold text-xs">
@@ -5122,7 +5122,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                             </tr>
                           ) : (
                             filteredSubmissions.map((sub, sIdx) => {
-                              const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0);
+                              const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
                               return (
                                 <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
                                   <td className="p-2 sm:p-3 text-center font-mono font-bold text-xs">
@@ -5403,66 +5403,100 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               )}
 
               {/* Anticopy statistics */}
-              <div className="bg-yellow-500/5 border border-yellow-500/20 p-4 rounded-xl space-y-2">
-                <p className="font-semibold text-yellow-400 flex items-center gap-1.5 text-xs">
-                  <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                  Statistiche Monitoraggio Integrità Autore
-                </p>
-                <div className="grid grid-cols-3 gap-2 text-[11px] text-slate-300">
-                  <p>Uscite / Focus: <b>{selectedSub.AntiCopia_TabSwitch || 0}</b></p>
-                  <p>Incolla bloccati: <b>{selectedSub.AntiCopia_IncollaBloccato || 0}</b></p>
-                  <p>Schermo diviso: <b className={(selectedSub.AntiCopia_SchermoDiviso || 0) > 0 ? "text-rose-400 font-bold" : ""}>{selectedSub.AntiCopia_SchermoDiviso || 0}</b></p>
-                </div>
+              {(() => {
+                let infractions: any[] = [];
+                try {
+                  if (selectedSub.AntiCopia_InfractionsLog) {
+                    const parsed = JSON.parse(selectedSub.AntiCopia_InfractionsLog);
+                    if (Array.isArray(parsed)) infractions = parsed;
+                  }
+                } catch {}
 
-                {selectedSub.AntiCopia_InfractionsLog && (
-                  <div className="mt-2 text-[10px] text-slate-400 font-mono">
-                    <p className="font-bold uppercase text-yellow-500/80">Cronologia Completa:</p>
-                    {(() => {
-                      try {
-                        const _parsed = JSON.parse(selectedSub.AntiCopia_InfractionsLog);
-                        const _hint = clusterInfractionsHint(Array.isArray(_parsed) ? _parsed : []);
-                        return _hint ? (
-                          <p className="mt-1 p-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-200 text-[10px] font-sans leading-relaxed">
-                            {_hint}
-                          </p>
-                        ) : null;
-                      } catch {
-                        return null;
-                      }
-                    })()}
-                    <div className="max-h-28 overflow-y-auto mt-1 space-y-0 pr-1">
-                      {JSON.parse(selectedSub.AntiCopia_InfractionsLog).map((inf: any, idx: number) => {
-                        let label = inf.type.replace(/_/g, " ");
-                        if (inf.type === "schermo_diviso") label = "Schermo Diviso (Multi-Window)";
-                        else if (inf.type === "uscita_schermo_intero") label = "Uscita Schermo Intero";
-                        else if (inf.type === "abbandono_pagina") label = "Abbandono Finestra / Cambio App";
-                        else if (inf.type === "copia_incolla") label = "Tentativo Copia/Incolla";
-                        else if (inf.type === "tasto_destro") label = "Click Tasto Destro";
-                        else if (inf.type === "tasto_vietato") label = "Scorciatoia / Ispezione";
+                const totalOutsideSeconds = infractions.reduce((acc, inf) => {
+                  return acc + (Number(inf?.durationSeconds) || 0);
+                }, 0);
 
-                        return (
-                          <div key={idx} className="flex items-start gap-1.5 py-0.5 border-l-2 border-white/10 pl-2">
-                            <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${
-                              inf.severity === "lieve" ? "bg-amber-400" : inf.severity === "grave" ? "bg-rose-400" : "bg-slate-500"
-                            }`} />
-                            <p>
-                              • [{inf.time}] <span className="font-bold text-slate-300">{label}</span>
-                              {inf.severity === "lieve" && (
-                                <span className="ml-1 px-1 py-px rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold">avviso</span>
-                              )}
-                              {inf.severity === "grave" && (
-                                <span className="ml-1 px-1 py-px rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold">violazione</span>
-                              )}
-                              {inf.durationSeconds ? ` (${inf.durationSeconds}s fuori app)` : ""}
-                              {inf.details ? ` - ${inf.details}` : ""}
-                            </p>
-                          </div>
-                        );
-                      })}
+                const formatDuration = (seconds?: number) => {
+                  if (seconds === undefined || seconds === null) return "";
+                  if (seconds === 0) return "< 1s (immediato)";
+                  if (seconds < 60) return `${seconds}s`;
+                  const m = Math.floor(seconds / 60);
+                  const s = seconds % 60;
+                  return s > 0 ? `${m}m ${s}s` : `${m}m`;
+                };
+
+                const hint = clusterInfractionsHint(infractions);
+
+                return (
+                  <div className="bg-yellow-500/5 border border-yellow-500/20 p-4 rounded-xl space-y-2.5">
+                    <p className="font-semibold text-yellow-400 flex items-center gap-1.5 text-xs">
+                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
+                      Statistiche Monitoraggio Integrità Autore
+                    </p>
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-slate-300">
+                      <p>Uscite / Focus: <b>{selectedSub.AntiCopia_TabSwitch || 0}</b></p>
+                      <p>Incolla bloccati: <b>{selectedSub.AntiCopia_IncollaBloccato || 0}</b></p>
+                      <p>Schermo diviso / intero: <b className={(selectedSub.AntiCopia_SchermoDiviso || 0) > 0 ? "text-rose-400 font-bold" : ""}>{selectedSub.AntiCopia_SchermoDiviso || 0}</b></p>
+                      <p>Tempo tot. fuori pagina: <b className={totalOutsideSeconds > 0 ? "text-amber-300 font-bold" : ""}>{totalOutsideSeconds > 0 ? formatDuration(totalOutsideSeconds) : "0s"}</b></p>
                     </div>
+
+                    {infractions.length > 0 && (
+                      <div className="mt-2 text-[10px] text-slate-400 font-mono">
+                        <p className="font-bold uppercase text-yellow-500/80">Cronologia Completa:</p>
+                        {hint && (
+                          <p className="mt-1 p-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-200 text-[10px] font-sans leading-relaxed">
+                            {hint}
+                          </p>
+                        )}
+                        <div className="max-h-36 overflow-y-auto mt-1 space-y-1 pr-1">
+                          {infractions.map((inf: any, idx: number) => {
+                            let label = String(inf.type || "").replace(/_/g, " ");
+                            if (inf.type === "schermo_diviso") label = "Schermo Diviso (Multi-Window)";
+                            else if (inf.type === "uscita_schermo_intero") label = "Uscita Schermo Intero";
+                            else if (inf.type === "abbandono_pagina") label = "Abbandono Finestra / Cambio App";
+                            else if (inf.type === "copia_incolla") label = "Tentativo Copia/Incolla";
+                            else if (inf.type === "tasto_destro") label = "Click Tasto Destro";
+                            else if (inf.type === "tasto_vietato") label = "Scorciatoia / Ispezione";
+
+                            const hasDuration = inf.durationSeconds !== undefined && inf.durationSeconds !== null;
+                            const isAbsence = inf.type === "uscita_schermo_intero" || inf.type === "abbandono_pagina";
+
+                            return (
+                              <div key={idx} className="flex items-start gap-1.5 py-0.5 border-l-2 border-white/10 pl-2">
+                                <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${
+                                  inf.severity === "lieve" ? "bg-amber-400" : inf.severity === "grave" ? "bg-rose-400" : "bg-slate-500"
+                                }`} />
+                                <div className="text-[11px] leading-snug">
+                                  <span className="font-mono text-slate-400">[{inf.time}]</span>{" "}
+                                  <span className="font-bold text-slate-200">{label}</span>
+                                  {inf.severity === "lieve" && (
+                                    <span className="ml-1.5 px-1 py-px rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold text-[9px]">avviso</span>
+                                  )}
+                                  {inf.severity === "grave" && (
+                                    <span className="ml-1.5 px-1 py-px rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold text-[9px]">violazione</span>
+                                  )}
+                                  {isAbsence && (
+                                    <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-sans font-medium inline-flex items-center gap-1 ${
+                                      hasDuration && inf.durationSeconds > 0
+                                        ? "bg-amber-500/20 text-amber-200 border border-amber-500/40 font-semibold"
+                                        : "bg-slate-800 text-slate-400 border border-slate-700"
+                                    }`}>
+                                      ⏱️ Tempo fuori pagina: {hasDuration ? formatDuration(inf.durationSeconds) : "non registrato"}
+                                    </span>
+                                  )}
+                                  {inf.details && !isAbsence && (
+                                    <span className="text-slate-400 text-[10px]"> - {inf.details}</span>
+                                  )}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
                   </div>
-                )}
-              </div>
+                );
+              })()}
 
               {/* AI Details parsing */}
               {(() => {

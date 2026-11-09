@@ -402,13 +402,19 @@ test("isFibAnswerCorrect: sinonimi didattici e varianti concettuali", () => {
   assert.equal(isFibAnswerCorrect("etichetta", "etica"), true);
   assert.equal(isFibAnswerCorrect("deontologia", "etica"), true);
 
-  // Autodeterminazione vs indipendenza e autonomia
+  // Autodeterminazione vs indipendenza, autonomia, scelta e calco inglese
   assert.equal(isFibAnswerCorrect("Indipendenza", "autodeterminazione"), true);
   assert.equal(isFibAnswerCorrect("autonomia", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("auto determination", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("autodetermination", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("scelta", "autodeterminazione"), true);
+  assert.equal(isFibAnswerCorrect("scielta", "autodeterminazione"), true);
 
-  // Consenso vs arbitrio / assenso
+  // Consenso vs arbitrio / assenso / accettazione / accetto
   assert.equal(isFibAnswerCorrect("Arbitrio", "consenso"), true);
   assert.equal(isFibAnswerCorrect("assenso", "consenso"), true);
+  assert.equal(isFibAnswerCorrect("accettazione", "consenso"), true);
+  assert.equal(isFibAnswerCorrect("Accetto", "consenso"), true);
 
   // Codice Rosso vs Penale
   assert.equal(isFibAnswerCorrect("Penale", "Rosso"), true);

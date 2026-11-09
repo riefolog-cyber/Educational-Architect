@@ -318,11 +318,11 @@ function auditAntiCheat(sub: AnyObj, issues: Issue[]) {
   }
 
   list.forEach((l, idx) => {
-    if (l?.type === "abbandono_pagina" && l?.durationSeconds === undefined) {
+    if ((l?.type === "abbandono_pagina" || l?.type === "uscita_schermo_intero") && l?.durationSeconds === undefined) {
       issues.push({
         severity: "warning",
         code: "anticheat_leave_without_duration",
-        message: `Abbandono #${idx + 1} senza durata registrata.`,
+        message: `Assenza (${l?.type}) #${idx + 1} senza durata registrata.`,
       });
     }
   });

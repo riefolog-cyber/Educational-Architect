@@ -443,6 +443,43 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [infractionToastMsg, setInfractionToastMsg] = useState<string | null>(null);
   const splitHitsRef = useRef(0);
   const lastOrientationRef = useRef(0);
+  const fullscreenExitTimeRef = useRef<number | null>(null);
+  const fullscreenLockTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const leaveTimeRef = useRef<number | null>(null);
+
+  const closeFullscreenExit = useCallback(() => {
+    if (fullscreenLockTimerRef.current) {
+      clearTimeout(fullscreenLockTimerRef.current);
+      fullscreenLockTimerRef.current = null;
+    }
+    if (fullscreenExitTimeRef.current) {
+      const duration = Math.max(1, Math.round((Date.now() - fullscreenExitTimeRef.current) / 1000));
+      fullscreenExitTimeRef.current = null;
+      setBehavior(prev => {
+        const logs = [...prev.infractionsLog];
+        for (let i = logs.length - 1; i >= 0; i--) {
+          if (logs[i].type === "uscita_schermo_intero" && logs[i].durationSeconds === undefined) {
+            logs[i] = {
+              ...logs[i],
+              durationSeconds: duration,
+              details: `Uscita dalla modalità a schermo intero (${duration}s fuori schermo intero/pagina)`,
+            };
+            break;
+          }
+        }
+        return {
+          ...prev,
+          infractionsLog: logs,
+        };
+      });
+
+      // Se l'uscita supera i 10 secondi, la prova si blocca e serve lo sblocco del docente
+      if (duration > 10) {
+        applyExamLockRef.current(`Uscita da schermo intero superiore a 10s (${duration}s)`);
+      }
+    }
+  }, []);
+
   // Anti-cheat strictness chosen by the teacher at session activation
   const [severityPreset, setSeverityPreset] = useState<SeverityPreset>("normale");
   const sev = SEVERITY_PRESETS[severityPreset];
@@ -516,6 +553,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setLockReason("");
     persistExamLock(false);
     void syncLockState(false, "");
+    if (fullscreenLockTimerRef.current) {
+      clearTimeout(fullscreenLockTimerRef.current);
+      fullscreenLockTimerRef.current = null;
+    }
+    fullscreenExitTimeRef.current = null;
+    setIsFullscreenBlocked(false);
     // Back to fullscreen as soon as the block is lifted
     if (!isAppleMobile()) void requestAppFullScreen();
     setInfractionToastMsg(
@@ -1076,20 +1119,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // iOS fires blur/hidden for benign transient UI (notification peek, Control
     // Center, incoming-call banner, Shake-to-Undo sheet, screenshot): only a
     // loss lasting longer than GRACE_MS counts as leaving the exam.
-    let leaveTime: number | null = null;
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
     const GRACE_MS = sev.graceMs;
 
     const scheduleLeave = (reason: string) => {
       if (isInteractingWithInAppDialogRef.current) return;
-      if (leaveTime || graceTimer) return;
+      if (leaveTimeRef.current || graceTimer) return;
       graceTimer = setTimeout(() => {
         if (isInteractingWithInAppDialogRef.current) {
           graceTimer = null;
           return;
         }
         graceTimer = null;
-        leaveTime = Date.now();
+        leaveTimeRef.current = Date.now();
         triggerInfraction("abbandono_pagina", reason);
       }, GRACE_MS);
     };
@@ -1118,7 +1160,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
     const handleReturn = () => {
       if (isInteractingWithInAppDialogRef.current) {
-        leaveTime = null;
+        leaveTimeRef.current = null;
         if (graceTimer) {
           clearTimeout(graceTimer);
           graceTimer = null;
@@ -1126,9 +1168,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         return;
       }
 
-      if (leaveTime) {
-        const duration = Math.round((Date.now() - leaveTime) / 1000);
-        leaveTime = null;
+      if (leaveTimeRef.current) {
+        const duration = Math.round((Date.now() - leaveTimeRef.current) / 1000);
+        leaveTimeRef.current = null;
 
         // Two-tier severity: brief absences are mild warnings (log only),
         // longer ones are real violations (counter++).
@@ -1196,17 +1238,48 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         if (!isAppleMobile()) {
           setIsFullscreenBlocked(true);
         }
+        if (!fullscreenExitTimeRef.current) {
+          fullscreenExitTimeRef.current = Date.now();
+        }
         triggerInfraction("uscita_schermo_intero", "Uscita dalla modalità a schermo intero su PC o monitor");
+
+        // Arm 10-second timer: se l'uscita supera i 10 secondi, la prova si blocca e serve lo sblocco del docente
+        if (fullscreenLockTimerRef.current) {
+          clearTimeout(fullscreenLockTimerRef.current);
+        }
+        fullscreenLockTimerRef.current = setTimeout(() => {
+          if (!isAppFullScreen() && fullscreenExitTimeRef.current) {
+            const currentDur = Math.max(10, Math.round((Date.now() - fullscreenExitTimeRef.current) / 1000));
+            setBehavior(prev => {
+              const logs = [...prev.infractionsLog];
+              for (let i = logs.length - 1; i >= 0; i--) {
+                if (logs[i].type === "uscita_schermo_intero" && logs[i].durationSeconds === undefined) {
+                  logs[i] = {
+                    ...logs[i],
+                    durationSeconds: currentDur,
+                    details: `Uscita dalla modalità a schermo intero superiore a 10s (${currentDur}s)`,
+                  };
+                  break;
+                }
+              }
+              return { ...prev, infractionsLog: logs };
+            });
+            applyExamLockRef.current(`Uscita da schermo intero superiore a 10s (${currentDur}s fuori schermo)`);
+          }
+        }, 10000);
+
         // The exam must always go back to fullscreen: try immediately.
         // Chrome allows a programmatic re-entry right after an exit;
         // if refused, the dedicated blocking overlay captures the next user gesture.
         void requestAppFullScreen().then(() => {
           if (isAppFullScreen()) {
             setIsFullscreenBlocked(false);
+            closeFullscreenExit();
           }
         });
       } else {
         setIsFullscreenBlocked(false);
+        closeFullscreenExit();
       }
     };
 
@@ -1358,6 +1431,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       document.removeEventListener("contextmenu", handleContextMenu);
       document.removeEventListener("keydown", handleKeyDown);
       
+      if (fullscreenLockTimerRef.current) {
+        clearTimeout(fullscreenLockTimerRef.current);
+        fullscreenLockTimerRef.current = null;
+      }
       if (wakeLockRef.current) {
         wakeLockRef.current.release().then(() => { wakeLockRef.current = null; });
       }
@@ -1940,6 +2017,35 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setIsExamActive(false); // Disable timers & monitoring
     setActiveScreen("evaluating");
     setSavingStatus("Generazione della valutazione tramite IA e registrazione sessione...");
+
+    if (fullscreenLockTimerRef.current) {
+      clearTimeout(fullscreenLockTimerRef.current);
+      fullscreenLockTimerRef.current = null;
+    }
+
+    // Finalize any ongoing leave or fullscreen exit durations at submit time
+    if (fullscreenExitTimeRef.current) {
+      const dur = Math.max(1, Math.round((Date.now() - fullscreenExitTimeRef.current) / 1000));
+      fullscreenExitTimeRef.current = null;
+      for (let i = behavior.infractionsLog.length - 1; i >= 0; i--) {
+        if (behavior.infractionsLog[i].type === "uscita_schermo_intero" && behavior.infractionsLog[i].durationSeconds === undefined) {
+          behavior.infractionsLog[i].durationSeconds = dur;
+          behavior.infractionsLog[i].details = `Uscita dalla modalità a schermo intero (${dur}s fuori schermo intero/pagina fino alla consegna)`;
+          break;
+        }
+      }
+    }
+    if (leaveTimeRef.current) {
+      const dur = Math.max(1, Math.round((Date.now() - leaveTimeRef.current) / 1000));
+      leaveTimeRef.current = null;
+      for (let i = behavior.infractionsLog.length - 1; i >= 0; i--) {
+        if (behavior.infractionsLog[i].type === "abbandono_pagina" && behavior.infractionsLog[i].durationSeconds === undefined) {
+          behavior.infractionsLog[i].durationSeconds = dur;
+          behavior.infractionsLog[i].details = (behavior.infractionsLog[i].details || "") + ` (${dur}s fuori app fino alla consegna)`;
+          break;
+        }
+      }
+    }
 
     // Evaluation scores math pre-calculation (count + didactic weights)
     const allExamMC: any[] = [];
@@ -4003,7 +4109,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           </h2>
           <p className="text-sm text-amber-200/90 max-w-lg mb-4 leading-relaxed">
             Sui computer fissi e postazioni PC scolastiche la prova deve svolgersi esclusivamente a <b>Schermo Intero</b> per garantire la regolarità del test ed impedire l'accesso ad altre finestre o applicazioni.
-            L'uscita dalla modalità a schermo intero è stata segnalata nel registro antifrode del docente.
+            <br />
+            <span className="text-rose-300 font-semibold mt-1.5 inline-block">
+              ⚠️ Attenzione: hai 10 secondi per rientrare a schermo intero. Oltre i 10 secondi la prova si bloccherà e richiederà lo sblocco del docente.
+            </span>
           </p>
           <div className="p-3 bg-slate-900 border border-white/10 rounded-xl text-xs text-slate-300 font-mono mb-6 max-w-md">
             Clicca sul pulsante qui sotto per riattivare immediatamente la modalità a Schermo Intero e continuare il test.
@@ -4013,6 +4122,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               await requestAppFullScreen();
               if (isAppFullScreen()) {
                 setIsFullscreenBlocked(false);
+                closeFullscreenExit();
               }
             }}
             className="px-6 py-3.5 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-xl transition-all shadow-lg flex items-center gap-2 cursor-pointer active:scale-95 text-sm"
