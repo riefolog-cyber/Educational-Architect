@@ -2565,6 +2565,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                                 </span>
                                                 {after}
                                               </p>
+                                              <QuestionFigure src={parsedExamData?.images?.[fib.id]} />
                                               <div className="text-[11px] space-y-0.5">
                                                 <p className="text-slate-400">
                                                   La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
@@ -3875,6 +3876,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     </span>
                                     {after}
                                   </p>
+                                  <QuestionFigure src={examData?.images?.[fib.id]} />
                                   <div className="text-[11px] space-y-0.5">
                                     <p className="text-slate-400">
                                       La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
