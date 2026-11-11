@@ -494,18 +494,39 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   }, [infractionToastMsg]);
 
   // ---- Hard exam lock (released only by the teacher) ----------------------
-  const lockStorageKey = (pinValue: string) => `exam_lock_${pinValue}`;
+  const lockStorageKey = (pinValue: string) => `exam_lock_${pinValue.trim().toUpperCase()}`;
 
   const persistExamLock = (locked: boolean, reason?: string) => {
-    if (!sessionPin) return;
+    const pinToUse = (sessionPin || pin || "").trim().toUpperCase();
     try {
-      const payload = JSON.stringify({ locked: true, reason: reason || "", at: new Date().toISOString() });
       if (locked) {
-        sessionStorage.setItem(lockStorageKey(sessionPin), payload);
-        localStorage.setItem(lockStorageKey(sessionPin), payload);
+        const payload = JSON.stringify({
+          locked: true,
+          pin: pinToUse,
+          reason: reason || "",
+          at: new Date().toISOString()
+        });
+        if (pinToUse) {
+          sessionStorage.setItem(lockStorageKey(pinToUse), payload);
+          localStorage.setItem(lockStorageKey(pinToUse), payload);
+        }
+        localStorage.setItem("active_exam_lock", payload);
+        sessionStorage.setItem("active_exam_lock", payload);
       } else {
-        sessionStorage.removeItem(lockStorageKey(sessionPin));
-        localStorage.removeItem(lockStorageKey(sessionPin));
+        if (pinToUse) {
+          sessionStorage.removeItem(lockStorageKey(pinToUse));
+          localStorage.removeItem(lockStorageKey(pinToUse));
+        }
+        localStorage.removeItem("active_exam_lock");
+        sessionStorage.removeItem("active_exam_lock");
+        try {
+          const keysToRemove: string[] = [];
+          for (let i = 0; i < localStorage.length; i++) {
+            const k = localStorage.key(i);
+            if (k && k.startsWith("exam_lock_")) keysToRemove.push(k);
+          }
+          keysToRemove.forEach((k) => localStorage.removeItem(k));
+        } catch {}
       }
     } catch {
       // Storage disabled (private mode): the lock still applies for this tab.
@@ -513,11 +534,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   const syncLockState = async (locked: boolean, reason: string) => {
-    if (!dbFirestore || !sessionPin || !user?.email) return;
+    const pinToUse = (sessionPin || pin || "").trim().toUpperCase();
+    if (!dbFirestore || !pinToUse || !user?.email) return;
     try {
       const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
       await setDoc(
-        doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey),
+        doc(dbFirestore, "active_sessions", pinToUse, "live_students", safeKey),
         {
           locked,
           lockState: locked ? "locked" : "unlocked",
@@ -545,7 +567,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     persistExamLock(true, reason);
     void syncLockState(true, reason);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionPin, user?.email]);
+  }, [sessionPin, pin, user?.email]);
 
   const releaseExamLock = useCallback((via: "remote" | "direct" = "remote") => {
     lockedRef.current = false;
@@ -567,7 +589,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         : "🔓 Prova sbloccata: puoi riprendere a rispondere."
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [sessionPin, user?.email]);
+  }, [sessionPin, pin, user?.email]);
 
   // Keep the latest callbacks reachable from effects without re-subscribing.
   const applyExamLockRef = useRef(applyExamLock);
@@ -577,12 +599,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     releaseExamLockRef.current = releaseExamLock;
   }, [applyExamLock, releaseExamLock]);
 
-  // The lock only protects the active exam: once the prova is over (submitted,
-  // time expired, results) blocking the student would serve no purpose.
+  // The lock only protects the active exam: once the prova is officially over and graded (results screen)
+  // blocking the student would serve no purpose.
+  // CRITICAL: NEVER release on enter-pin, during page reload, or during normal screen transitions!
   useEffect(() => {
     if (!examLocked) return;
-    if (activeScreen === "exam-space" || activeScreen === "warning") return;
-    releaseExamLockRef.current("direct");
+    if (activeScreen === "results") {
+      releaseExamLockRef.current("direct");
+    }
   }, [activeScreen, examLocked]);
 
   // Remote unlock: the teacher presses "Sblocca" in the live monitor, which
@@ -674,6 +698,88 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       localStorage.removeItem(`draft_${currPin}`);
     } catch {}
   };
+
+  // Automatic recovery of locked exam session across page reloads / app restarts
+  const restoreLockedSession = async (savedPin: string) => {
+    if (!dbFirestore) return;
+    try {
+      const sessionDocRef = doc(dbFirestore, "active_sessions", savedPin);
+      const sessionSnap = await getDoc(sessionDocRef);
+      if (sessionSnap.exists()) {
+        const sessionData = sessionSnap.data();
+        let examContent = sessionData.examData;
+        if (examContent) {
+          setExamData(examContent);
+          setExamType(examContent.sections ? "workbook" : "quiz");
+        }
+        setExpiryTime(sessionData.expiry || null);
+        setBackendUrl(sessionData.backendUrl || null);
+        setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
+        setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
+        setSessionRunId(sessionData.sessionRunId || "");
+        loadDraft(savedPin);
+
+        // Check if teacher has already unlocked this student in Firestore
+        if (user?.email) {
+          const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+          const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", savedPin, "live_students", safeKey));
+          if (studentSnap.exists()) {
+            const sData = studentSnap.data();
+            if (sData?.locked === false && sData?.lockState === "unlocked") {
+              releaseExamLockRef.current("remote");
+              return;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      console.warn("Ripristino sessione bloccata:", e);
+    }
+  };
+
+  // Restore locked session on mount if any lock marker is present
+  useEffect(() => {
+    let savedPin = "";
+    let savedReason = "";
+    try {
+      const activeLockRaw = localStorage.getItem("active_exam_lock") || sessionStorage.getItem("active_exam_lock");
+      if (activeLockRaw) {
+        const parsed = JSON.parse(activeLockRaw);
+        if (parsed?.locked) {
+          savedPin = String(parsed.pin || "").trim().toUpperCase();
+          savedReason = String(parsed.reason || "Prova precedentemente bloccata dal docente o dal sistema");
+        }
+      }
+      if (!savedPin) {
+        for (let i = 0; i < localStorage.length; i++) {
+          const k = localStorage.key(i);
+          if (k && k.startsWith("exam_lock_")) {
+            const raw = localStorage.getItem(k);
+            if (raw) {
+              const p = JSON.parse(raw);
+              if (p?.locked) {
+                savedPin = k.replace("exam_lock_", "").trim().toUpperCase();
+                savedReason = String(p.reason || "Prova bloccata");
+                break;
+              }
+            }
+          }
+        }
+      }
+    } catch {}
+
+    if (savedPin) {
+      lockedRef.current = true;
+      setExamLocked(true);
+      setLockReason(savedReason);
+      setSessionPin(savedPin);
+      setPin(savedPin);
+      setIsExamActive(true);
+      setActiveScreen("exam-space");
+      void restoreLockedSession(savedPin);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // Optimization 2 & 3: Load history of submissions and generate personalized support plans
   const loadHistory = async () => {
@@ -944,17 +1050,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
           // Restore a lock applied before a page reload: refreshing must not
           // be a way to get back into the exam without the teacher.
-          lockedRef.current = false;
-          setExamLocked(false);
-          setLockReason("");
+          let isLockedNow = false;
+          let currentLockReason = "";
           try {
-            const storedLock = localStorage.getItem(`exam_lock_${formattedPin}`) || sessionStorage.getItem(`exam_lock_${formattedPin}`);
+            const storedLock = localStorage.getItem(`exam_lock_${formattedPin}`) ||
+                               sessionStorage.getItem(`exam_lock_${formattedPin}`) ||
+                               localStorage.getItem("active_exam_lock") ||
+                               sessionStorage.getItem("active_exam_lock");
             if (storedLock) {
               const parsedLock = JSON.parse(storedLock);
               if (parsedLock?.locked) {
-                lockedRef.current = true;
-                setExamLocked(true);
-                setLockReason(String(parsedLock.reason || ""));
+                isLockedNow = true;
+                currentLockReason = String(parsedLock.reason || "Prova precedentemente bloccata per allontanamento");
               }
             }
           } catch {
@@ -968,16 +1075,31 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               if (studentSnap.exists()) {
                 const sData = studentSnap.data();
                 if (sData?.locked === true && sData?.lockState === "locked") {
-                  lockedRef.current = true;
-                  setExamLocked(true);
-                  setLockReason(String(sData?.lockReason || "Prova bloccata dal sistema di integrità"));
+                  isLockedNow = true;
+                  currentLockReason = String(sData?.lockReason || currentLockReason || "Prova bloccata dal docente o dal sistema di integrità");
+                } else if (sData?.locked === false && sData?.lockState === "unlocked") {
+                  isLockedNow = false;
                 }
               }
             } catch {}
           }
 
-          loadDraft(formattedPin);
-          setActiveScreen("warning");
+          if (isLockedNow) {
+            lockedRef.current = true;
+            setExamLocked(true);
+            setLockReason(currentLockReason);
+            persistExamLock(true, currentLockReason);
+            setIsExamActive(true);
+            loadDraft(formattedPin);
+            setActiveScreen("exam-space");
+          } else {
+            lockedRef.current = false;
+            setExamLocked(false);
+            setLockReason("");
+            persistExamLock(false);
+            loadDraft(formattedPin);
+            setActiveScreen("warning");
+          }
         } else {
           setPinError("PIN non trovato nel database d'istituto.");
         }
@@ -2265,6 +2387,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         sessionStorage.removeItem(`exam_lock_${sessionPin}`);
         localStorage.removeItem(`exam_lock_${sessionPin}`);
       }
+      sessionStorage.removeItem("active_exam_lock");
+      localStorage.removeItem("active_exam_lock");
+      const keysToRemove: string[] = [];
+      for (let i = 0; i < localStorage.length; i++) {
+        const k = localStorage.key(i);
+        if (k && k.startsWith("exam_lock_")) keysToRemove.push(k);
+      }
+      keysToRemove.forEach((k) => {
+        try {
+          localStorage.removeItem(k);
+          sessionStorage.removeItem(k);
+        } catch {}
+      });
     } catch {}
     lockedRef.current = false;
     setExamLocked(false);
