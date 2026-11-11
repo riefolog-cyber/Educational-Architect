@@ -43,7 +43,8 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                   <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-teal-400">
                     GDPR & Privacy by Design
                   </span>
-                  <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                  <span className="text-slate-500 text-xs" aria-hidden="true">·</span>
+                  <span className="text-[11px] font-mono font-semibold text-amber-300">
                     Blind Grading Attivo
                   </span>
                 </div>
@@ -267,7 +268,8 @@ export function PrivacyBannerBox({ onOpenModal }: { onOpenModal: () => void }) {
               <span className="text-xs font-bold text-white group-hover:text-teal-300 transition-colors">
                 Garanzia Privacy & Correzione in Cieco (Blind Grading)
               </span>
-              <span className="px-2 py-0.5 rounded-full text-[9px] font-mono font-bold bg-teal-500/10 text-teal-300 border border-teal-500/20">
+              <span className="text-slate-500 text-xs" aria-hidden="true">·</span>
+              <span className="text-[11px] font-mono text-teal-400 font-medium">
                 Conforme GDPR
               </span>
             </div>

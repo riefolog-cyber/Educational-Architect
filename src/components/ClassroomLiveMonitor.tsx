@@ -314,6 +314,20 @@ export default function ClassroomLiveMonitor({
     }
   };
 
+  const [removingId, setRemovingId] = useState<string | null>(null);
+
+  const handleRemoveStudent = async (studentId: string) => {
+    if (!dbFirestore || !pin || removingId) return;
+    setRemovingId(studentId);
+    try {
+      await deleteDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId));
+    } catch (err) {
+      console.warn("Rimozione studente non riuscita:", err);
+    } finally {
+      setRemovingId(null);
+    }
+  };
+
   const liveSessions = sessions.filter((s) => (isSessionLive ? isSessionLive(s) : s.active));
 
   return (
@@ -641,8 +655,8 @@ export default function ClassroomLiveMonitor({
                         ? `1 studente bloccato: ${lockedList[0].studentName}`
                         : `${lockedList.length} studenti hanno la prova attualmente bloccata`}
                     </span>
-                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/30 text-red-200 border border-red-500/50 uppercase font-mono font-bold">
-                      Intervento Richiesto
+                    <span className="text-[11px] uppercase font-mono font-bold text-red-300 tracking-wider">
+                      [Intervento Richiesto]
                     </span>
                   </p>
                   <p className="text-[11px] text-red-200/90 mt-0.5">
@@ -816,8 +830,8 @@ export default function ClassroomLiveMonitor({
           <div className="flex items-baseline gap-2">
             <p className="text-2xl font-bold font-mono text-red-400">{alertsCount}</p>
             {lockedCount > 0 && (
-              <span className="text-[11px] px-2 py-0.5 rounded-full bg-red-600 text-white font-bold animate-pulse">
-                {lockedCount} bloccati
+              <span className="text-xs font-mono font-bold text-red-400">
+                ({lockedCount} con blocco attivo)
               </span>
             )}
           </div>
@@ -1069,6 +1083,19 @@ export default function ClassroomLiveMonitor({
                     <span className="text-[10px] text-slate-500 font-mono w-16 text-right shrink-0">
                       {getRelativeTime(student.lastHeartbeat)}
                     </span>
+
+                    {/* Remove single student button (for offline, finished or ghost entries) */}
+                    {(isOffline || student.status === "submitted") && (
+                      <button
+                        type="button"
+                        onClick={() => handleRemoveStudent(student.id)}
+                        disabled={removingId === student.id}
+                        title={`Rimuovi ${student.studentName} da questo monitor d'aula`}
+                        className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-40"
+                      >
+                        <Trash2 className="w-3.5 h-3.5" />
+                      </button>
+                    )}
                   </div>
                 </div>
               );

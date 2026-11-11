@@ -39,55 +39,84 @@ export function formatMarkdown(text: string | undefined): string {
 export function detectGibberish(str: string | undefined): boolean {
   if (!str) return true;
   const t = str.trim().toLowerCase();
-  if (!t || t === "[vuoto]") return true;
+  if (!t || t === "[vuoto]" || t === "[assente]" || t === "null" || t === "undefined") return true;
 
-  // Strip punctuation and symbols to isolate letters/digits
-  const cleanT = t.replace(/[.,/#!$%^&*;:{}=\-_`~()?\\/|<>@+='"\s]/g, "").trim(); 
-  if (!cleanT || cleanT.length <= 1) return true;
-  
-  // Pattern for giving up easily
+  // Clean punctuation but PRESERVE SPACES
+  const cleanWithSpaces = t.replace(/[.,/#!$%^&*;:{}=\-_`~()?\\/|<>@+='"\s]/g, (match) => /\s/.test(match) ? " " : "").replace(/\s+/g, " ").trim();
+  if (!cleanWithSpaces || cleanWithSpaces.length <= 1) return true;
+
+  // Check letters
+  const lettersOnly = cleanWithSpaces.replace(/[^a-zàèéìòù]/gi, "");
+  if (lettersOnly.length === 0) return true;
+
+  // Pattern for giving up easily (surrender)
   const rinuncePattern = /^(?:(?:no(n)?|nn)\s*(?:lo\s*)?so|boh+|bho+|bo+|(?:no(n)?|nn)\s*saprei|(?:no(n)?|nn)\s*(?:mi\s*)?ricordo|niente|nessuna|(?:no(n)?|nn)\s*h?o\s*studiato|(?:no(n)?|nn)\s*(?:l')?h?o\s*capit[oa]|(?:no(n)?|nn)\s*capisco|(?:no(n)?|nn)\s*h?o\s*idea|(?:no(n)?|nn)\s*ne\s*ho\s*idea|non\s*saprei\s*proprio|ma\s*che\s*ne\s*so|boh|non\s*lo\s*so\s*proprio|mi\s*sa\s*di\s*cavolata|non\s*serve\s*a\s*niente|non\s*so\s*nulla)$/i;
-  
-  if (rinuncePattern.test(cleanT) || rinuncePattern.test(t)) return true;
-  
-  // Repetitive single character or consonant mashing (e.g. "aaaaa", "asdfasdf", "sjisksjsjsj...")
-  if (/^([a-z])\1{3,}$/i.test(cleanT)) return true;
-  if (/^[bcdfghjklmnpqrstvwxyz]{6,}$/i.test(cleanT)) return true;
+  if (rinuncePattern.test(cleanWithSpaces) || rinuncePattern.test(t)) return true;
 
-  // Keyboard mashing that mixes a few vowels randomly (e.g. "sjisksjsjsjajajzhsjsijsjz")
-  // Legit Italian prose always has a healthy vowel ratio and a varied alphabet.
-  const letters = cleanT.replace(/[^a-zàèéìòù]/g, "");
-  if (letters.length >= 10) {
-    const vowels = (letters.match(/[aeiouàèéìòù]/g) || []).length;
-    const vowelRatio = vowels / letters.length;
-    const uniqueRatio = new Set(letters).size / letters.length;
-    const consonantRuns: string[] = letters.match(/[bcdfghjklmnpqrstvwxyz]+/g) || [];
-    const longestConsonantRun = consonantRuns.reduce(
-      (max, run) => Math.max(max, run.length),
-      0
-    );
+  const words = cleanWithSpaces.split(/\s+/).filter(w => w.length > 0);
 
-    // Long single token with very few vowels / low variety / absurd consonant runs.
-    if (!/\s/.test(t) && letters.length >= 14 && (vowelRatio < 0.28 || uniqueRatio < 0.4 || longestConsonantRun >= 8)) {
-      return true;
-    }
-    // Several "words" but still vowel-poor and repetitive: keyboard mashing.
-    if (vowelRatio < 0.18 && uniqueRatio < 0.5) return true;
-  }
-
-  // Repeated chunks such as "asdfasdf", "sjisjsjs".
-  if (/([a-z]{2,5})\1{2,}/i.test(cleanT)) return true;
-
-  // Classic keyboard rows mashed together ("asdfasdf", "qwertyuiop", ...)
-  if (/(asdf|sdfg|dfgh|fghj|ghjk|hjkl|qwer|wert|erty|rtyu|tyui|yuio|uiop|zxcv|xcvb|cvbn|vbnm)/i.test(cleanT)) {
+  // If all words are identical surrender-like or trivial tokens (e.g. "boh boh", "no no")
+  if (words.length <= 3 && words.every(w => /^(?:boh+|bho+|bo+|no|non|nn|niente|so|cosa)$/i.test(w))) {
     return true;
   }
 
-  // A 3-6 character chunk repeated at least twice with few vowels is mashing.
-  if (/([a-z]{3,6})\1/i.test(cleanT)) {
-    const ls = cleanT.replace(/[^a-z]/g, "");
-    const vr = ls.length ? (ls.match(/[aeiou]/g) || []).length / ls.length : 0;
-    if (vr <= 0.4) return true;
+  // Keyboard row patterns
+  const keyboardRowPattern = /(asdf|sdfg|dfgh|fghj|ghjk|hjkl|qwer|wert|erty|rtyu|tyui|yuio|uiop|zxcv|xcvb|cvbn|vbnm)/i;
+
+  // Check individual words for obvious mashing
+  let mashingWordsCount = 0;
+  for (const w of words) {
+    const wLetters = w.replace(/[^a-zàèéìòù]/g, "");
+    if (!wLetters) continue;
+    // 4+ repeated single char e.g. "aaaa", "zzzz"
+    if (/^([a-z])\1{3,}$/i.test(wLetters)) {
+      mashingWordsCount++;
+      continue;
+    }
+    // 6+ consonants in a row e.g. "sdfghj", "bcdfgh"
+    if (/[bcdfghjklmnpqrstvwxyz]{6,}/i.test(wLetters)) {
+      mashingWordsCount++;
+      continue;
+    }
+    // Keyboard row mash inside a word
+    if (keyboardRowPattern.test(wLetters)) {
+      mashingWordsCount++;
+      continue;
+    }
+    // Repeated chunk inside a word e.g. "sjsjsj"
+    if (/([a-z]{2,5})\1{2,}/i.test(wLetters)) {
+      mashingWordsCount++;
+      continue;
+    }
+    // 3-6 char chunk repeated twice with low vowel ratio
+    if (/([a-z]{3,6})\1/i.test(wLetters)) {
+      const vr = (wLetters.match(/[aeiouàèéìòù]/g) || []).length / wLetters.length;
+      if (vr <= 0.4) {
+        mashingWordsCount++;
+        continue;
+      }
+    }
+  }
+
+  // If all words (or majority in short text) are mashing
+  if (words.length > 0 && mashingWordsCount === words.length) return true;
+  if (words.length <= 3 && mashingWordsCount >= 1) return true;
+
+  // Global linguistic statistics
+  const vowels = (lettersOnly.match(/[aeiouàèéìòù]/g) || []).length;
+  const vowelRatio = vowels / lettersOnly.length;
+  const uniqueRatio = new Set(lettersOnly).size / lettersOnly.length;
+
+  // Single long token without spaces
+  if (words.length === 1) {
+    const w = words[0];
+    if (w.length >= 10 && (vowelRatio < 0.28 || uniqueRatio < 0.4)) return true;
+    if (w.length >= 7 && mashingWordsCount > 0) return true;
+  }
+
+  // Multi-word text that is vowel-poor and highly repetitive
+  if (lettersOnly.length >= 10 && vowelRatio < 0.18 && uniqueRatio < 0.4) {
+    return true;
   }
 
   return false;

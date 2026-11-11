@@ -294,14 +294,18 @@ export default function AiExamGeneratorModal({
               <div className="space-y-1.5">
                 <label className="font-bold uppercase tracking-wider text-slate-400 text-[10px] flex items-center justify-between">
                   <span>{sourceTab === "transcript" ? "Testo della trascrizione (modificabile) *" : "Argomento della Verifica o Testo Didattico *"}</span>
-                  <span className="text-slate-500 font-normal">Italiano, Storia, Scienze, Diritto, ecc.</span>
+                  <span className="text-slate-400 font-mono text-[10px]">
+                    {topic.length > 0
+                      ? `${topic.length.toLocaleString("it-IT")} / ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri`
+                      : "Italiano, Storia, Scienze, Diritto, ecc."}
+                  </span>
                 </label>
                 <textarea
-                  rows={4}
+                  rows={sourceTab === "transcript" ? 6 : 4}
                   value={topic}
                   onChange={(e) => setTopic(e.target.value)}
                   placeholder="Es. I primi 12 articoli della Costituzione Italiana: principi di democrazia, sovranità popolare, uguaglianza formale e sostanziale, diritto al lavoro e libertà personale... oppure incolla un riassunto o un capitolo."
-                  className="w-full p-3 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-2xl text-white outline-none resize-none leading-relaxed placeholder:text-slate-600 font-sans"
+                  className="w-full p-3 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-2xl text-white outline-none resize-y leading-relaxed placeholder:text-slate-600 font-sans"
                 />
               </div>
 

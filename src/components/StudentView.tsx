@@ -96,19 +96,21 @@ function QuestionMeta({ q, tone }: { q: any; tone?: "amber" | "teal" }) {
   const weight = Number(q?.weight);
   const criteria = typeof q?.criteria === "string" ? q.criteria.trim() : "";
   if (!(weight > 1) && !criteria) return null;
-  const badge =
-    tone === "teal"
-      ? "text-teal-300 border-teal-500/30 bg-teal-500/10"
-      : "text-amber-300 border-amber-500/30 bg-amber-500/10";
+  const color = tone === "teal" ? "text-teal-400" : "text-amber-400";
   return (
-    <span className="block mt-1 space-y-1">
+    <span className="block mt-1 text-xs text-slate-400">
       {weight > 1 && (
-        <span className={`inline-block text-[10px] font-bold px-2 py-0.5 rounded-full border ${badge}`}>
-          ★ Domanda fondamentale · peso {weight}
+        <span className={`font-semibold ${color} inline-flex items-center gap-1.5`}>
+          <span>★ Domanda fondamentale</span>
+          <span aria-hidden="true" className="text-slate-600">·</span>
+          <span>peso {weight}</span>
         </span>
       )}
+      {weight > 1 && criteria && (
+        <span aria-hidden="true" className="text-slate-600 mx-1.5">·</span>
+      )}
       {criteria && (
-        <span className="block text-[11px] text-slate-400 italic">Criteri di valutazione: {criteria}</span>
+        <span className="italic text-slate-400">Criteri: {criteria}</span>
       )}
     </span>
   );
@@ -777,6 +779,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       setIsExamActive(true);
       setActiveScreen("exam-space");
       void restoreLockedSession(savedPin);
+    } else {
+      try {
+        const rawActive = localStorage.getItem("active_student_session");
+        if (rawActive) {
+          const parsed = JSON.parse(rawActive);
+          if (parsed?.pin) {
+            setPin(String(parsed.pin).trim().toUpperCase());
+          }
+        }
+      } catch {}
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
@@ -1262,6 +1274,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     // Center, incoming-call banner, Shake-to-Undo sheet, screenshot): only a
     // loss lasting longer than GRACE_MS counts as leaving the exam.
     let graceTimer: ReturnType<typeof setTimeout> | null = null;
+    let pageLeaveLockTimer: ReturnType<typeof setTimeout> | null = null;
     const GRACE_MS = sev.graceMs;
 
     const scheduleLeave = (reason: string) => {
@@ -1275,6 +1288,35 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         graceTimer = null;
         leaveTimeRef.current = Date.now();
         triggerInfraction("abbandono_pagina", reason);
+
+        // Blocco proattivo in tempo reale: se l'assenza supera la soglia di tolleranza (10s),
+        // blocca immediatamente la prova e notifica Firestore senza attendere che l'alunno rientri!
+        if (pageLeaveLockTimer) clearTimeout(pageLeaveLockTimer);
+        pageLeaveLockTimer = setTimeout(() => {
+          if (leaveTimeRef.current && !lockedRef.current) {
+            const elapsed = Math.max(sev.avvisoMaxSec, Math.round((Date.now() - leaveTimeRef.current) / 1000));
+            setBehavior(prev => {
+              const logs = [...prev.infractionsLog];
+              for (let i = logs.length - 1; i >= 0; i--) {
+                if (logs[i].type === "abbandono_pagina" && logs[i].durationSeconds === undefined) {
+                  logs[i] = {
+                    ...logs[i],
+                    durationSeconds: elapsed,
+                    severity: "grave",
+                    details: (logs[i].details || "") + ` (${elapsed}s fuori app)`,
+                  };
+                  break;
+                }
+              }
+              return {
+                ...prev,
+                tabSwitches: prev.tabSwitches + 1,
+                infractionsLog: logs,
+              };
+            });
+            applyExamLockRef.current(`Assenza prolungata dalla pagina di ${elapsed}s`);
+          }
+        }, sev.avvisoMaxSec * 1000);
       }, GRACE_MS);
     };
 
@@ -1282,6 +1324,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (graceTimer) {
         clearTimeout(graceTimer);
         graceTimer = null;
+      }
+      if (pageLeaveLockTimer) {
+        clearTimeout(pageLeaveLockTimer);
+        pageLeaveLockTimer = null;
       }
       // Re-acquire screen wake lock on return (iOS may have dropped it,
       // letting the display auto-lock mid-exam on the next idle period).
@@ -1307,12 +1353,20 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           clearTimeout(graceTimer);
           graceTimer = null;
         }
+        if (pageLeaveLockTimer) {
+          clearTimeout(pageLeaveLockTimer);
+          pageLeaveLockTimer = null;
+        }
         return;
       }
 
       if (leaveTimeRef.current) {
         const duration = Math.round((Date.now() - leaveTimeRef.current) / 1000);
         leaveTimeRef.current = null;
+        if (pageLeaveLockTimer) {
+          clearTimeout(pageLeaveLockTimer);
+          pageLeaveLockTimer = null;
+        }
 
         // Two-tier severity: brief absences are mild warnings (log only),
         // longer ones are real violations (counter++).
@@ -1559,6 +1613,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         clearTimeout(graceTimer);
         graceTimer = null;
       }
+      if (pageLeaveLockTimer) {
+        clearTimeout(pageLeaveLockTimer);
+        pageLeaveLockTimer = null;
+      }
       document.removeEventListener("visibilitychange", handleVisibility);
       window.removeEventListener("blur", handleWindowBlur);
       window.removeEventListener("focus", handleWindowFocus);
@@ -1727,6 +1785,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setIsExamActive(true);
     setActiveScreen("exam-space");
     syncLiveProgress("in_progress");
+    try {
+      localStorage.setItem("active_student_session", JSON.stringify({
+        pin: sessionPin,
+        sessionRunId,
+        startedAt: new Date().toISOString()
+      }));
+    } catch {}
   };
 
   // MCQ handler
@@ -2042,6 +2107,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       setEvaluation(finalEval);
       clearDraft(rescue.sessionPin);
       localStorage.removeItem("active_eval_rescue"); // Clean the rescue token on successful completion!
+      try {
+        localStorage.removeItem("active_student_session");
+        sessionStorage.removeItem("active_student_session");
+      } catch {}
       setActiveScreen("results");
       setSavingStatus("");
 
@@ -2389,6 +2458,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
       sessionStorage.removeItem("active_exam_lock");
       localStorage.removeItem("active_exam_lock");
+      sessionStorage.removeItem("active_student_session");
+      localStorage.removeItem("active_student_session");
       const keysToRemove: string[] = [];
       for (let i = 0; i < localStorage.length; i++) {
         const k = localStorage.key(i);
@@ -2423,23 +2494,28 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     <div className="w-full max-w-3xl mx-auto">
       {/* Timer persistent floating banner during exam taking */}
       {isExamActive && (
-        <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-5 py-2.5 rounded-full border shadow-2xl backdrop-blur-md flex items-center gap-2.5 font-display font-bold text-xs sm:text-sm tracking-wide z-50 transition-all ${
+        <div className={`fixed top-4 left-1/2 -translate-x-1/2 px-4 py-2 rounded-2xl border shadow-2xl backdrop-blur-md flex items-center gap-3 text-xs sm:text-sm tracking-wide z-50 transition-all ${
           timerUrgent 
             ? "bg-red-950/90 border-red-500/40 text-red-100 animate-pulse" 
             : "bg-slate-900/90 border-white/10 text-white"
         }`}>
-          <Timer className={`w-4 h-4 ${timerUrgent ? "text-red-400" : "text-emerald-400"}`} />
-          <span>{remainingTimeText}</span>
-          <span className="hidden sm:inline-block text-[11px] bg-emerald-500/10 text-emerald-400 px-2 py-0.5 rounded-full font-mono border border-emerald-500/20">
-            Bozza salvata ✓
+          <div className="flex items-center gap-1.5 font-bold font-mono">
+            <Timer className={`w-4 h-4 ${timerUrgent ? "text-red-400" : "text-emerald-400"}`} />
+            <span>{remainingTimeText}</span>
+          </div>
+          <span className="text-slate-600 hidden sm:inline" aria-hidden="true">·</span>
+          <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
+            <span>Bozza salvata</span>
+            <span>✓</span>
           </span>
+          <span className="text-slate-600" aria-hidden="true">·</span>
           <div 
-            className="flex items-center gap-1.5 px-2 py-0.5 rounded-full text-[10px] font-mono border bg-slate-950/80 border-white/10" 
+            className="flex items-center gap-1.5 text-[11px] font-mono" 
             title={isOnline ? "Connesso al server d'istituto" : "Connessione scolastica momentaneamente assente: risposte salvate in locale"}
           >
             <span className={`w-2 h-2 rounded-full ${isOnline ? "bg-emerald-400" : "bg-amber-400 animate-ping"}`} />
-            <span className={isOnline ? "text-slate-300" : "text-amber-300 font-bold"}>
-              {isOnline ? "Server Connesso" : "Offline"}
+            <span className={isOnline ? "text-slate-300" : "text-amber-300 font-semibold"}>
+              {isOnline ? "Online" : "Offline (salvato locale)"}
             </span>
           </div>
         </div>

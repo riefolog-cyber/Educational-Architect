@@ -633,7 +633,9 @@ async function main() {
   console.log(`Report Markdown: ${mdPath}`);
 }
 
-main().catch((err) => {
-  console.error("Audit fallito:", err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch((err) => {
+    console.error("Audit fallito:", err);
+    process.exit(1);
+  });

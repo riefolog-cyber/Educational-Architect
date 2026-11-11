@@ -12,7 +12,8 @@
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist",
     "lint": "tsc --noEmit",
-    "test:grades": "tsx scripts/grade-tests.ts"
+    "test:grades": "tsx scripts/grade-tests.ts",
+    "audit:grades": "tsx scripts/audit-grades.ts"
   },
   "dependencies": {
     "@google/genai": "^2.4.0",

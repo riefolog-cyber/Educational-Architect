@@ -48,14 +48,14 @@ const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 // lists: no other code changes needed.
 const TASK_MODEL_PREFERENCE: Record<string, string[]> = {
   // Long structured generation: most capable flash model first
-  "generate-exam": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  "generate-exam": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
   // Grading: fast deterministic models
-  "evaluate": ["gemini-3.5-flash", "gemini-2.5-flash-lite", "gemini-3.1-flash-lite"],
+  "evaluate": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
   // Analysis / extension: light tasks, lite models first
-  "analyze-exam": ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"],
-  "extend-exam": ["gemini-3.1-flash-lite", "gemini-3.5-flash", "gemini-2.5-flash-lite"],
+  "analyze-exam": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
+  "extend-exam": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
   // Free prose: balanced default
-  "recovery-plan": ["gemini-3.5-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  "recovery-plan": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
 };
 
 // Robust Generate Content Wrapper for Handling Availability issues

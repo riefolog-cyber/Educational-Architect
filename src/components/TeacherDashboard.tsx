@@ -3965,8 +3965,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         <>
                           <Layers className="w-5 h-5 text-purple-400" />
                           <span>Gruppo per Prove Didattiche</span>
-                          <span className="px-2 py-0.5 rounded-full text-xs font-mono font-bold bg-purple-500/20 text-purple-300 border border-purple-500/30">
-                            {filteredExamSummaries.length} {filteredExamSummaries.length === 1 ? "prova" : "prove"}
+                          <span className="text-xs font-mono text-slate-400 font-normal">
+                            ({filteredExamSummaries.length} {filteredExamSummaries.length === 1 ? "prova" : "prove"})
                           </span>
                         </>
                       ) : (
@@ -4084,8 +4084,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     >
                       <Clock className="w-3.5 h-3.5" />
                       <span>Tutte le Consegne</span>
-                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-indigo-200 font-mono">
-                        {filteredSubmissions.length}
+                      <span className="text-[11px] font-mono opacity-80">
+                        ({filteredSubmissions.length})
                       </span>
                     </button>
                     <button
@@ -4102,8 +4102,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     >
                       <Users className="w-3.5 h-3.5" />
                       <span>Per Studente</span>
-                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-teal-200 font-mono">
-                        {filteredStudentSummaries.length}
+                      <span className="text-[11px] font-mono opacity-80">
+                        ({filteredStudentSummaries.length})
                       </span>
                     </button>
                     <button
@@ -4120,8 +4120,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     >
                       <Layers className="w-3.5 h-3.5" />
                       <span>Gruppo per Prove</span>
-                      <span className="px-1.5 py-0.2 rounded-full text-[10px] bg-black/40 text-purple-200 font-mono">
-                        {filteredExamSummaries.length}
+                      <span className="text-[11px] font-mono opacity-80">
+                        ({filteredExamSummaries.length})
                       </span>
                     </button>
                   </div>
@@ -4396,19 +4396,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         {blindGradingMode ? `Studente #${stu.key.slice(-4).toUpperCase()}` : stu.name}
                                       </p>
                                       {studentSortBy === "highest_avg" && sIdx < 3 && (
-                                        <span className="px-1.5 py-0.5 rounded-full text-[9px] font-extrabold font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                          {sIdx === 0 ? "🥇 1° Posto Voto IA" : sIdx === 1 ? "🥈 2° Posto Voto IA" : "🥉 3° Posto Voto IA"}
+                                        <span className="text-[11px] font-semibold text-amber-300">
+                                          {sIdx === 0 ? "🥇 1°" : sIdx === 1 ? "🥈 2°" : "🥉 3°"} per media
                                         </span>
                                       )}
-                                      {stu.totalTests >= 2 ? (
-                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-500/15 text-emerald-300 border border-emerald-500/30">
-                                          {stu.totalTests} prove svolte
-                                        </span>
-                                      ) : (
-                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold bg-slate-800 text-slate-300 border border-white/10">
-                                          1 prova svolta
-                                        </span>
-                                      )}
+                                      <span className="text-slate-600 text-xs" aria-hidden="true">·</span>
+                                      <span className="text-slate-400 text-xs">
+                                        {stu.totalTests} {stu.totalTests === 1 ? "prova svolta" : "prove svolte"}
+                                      </span>
                                     </div>
                                     <p className="text-[11px] text-slate-400 mt-0.5">
                                       {blindGradingMode ? "• Identità anonimizzata (GDPR) •" : stu.email}
@@ -4417,22 +4412,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                 </div>
 
                                 <div className="flex items-center gap-2.5 sm:gap-4 w-full sm:w-auto justify-between sm:justify-end border-t sm:border-t-0 border-white/5 pt-2 sm:pt-0">
-                                  {/* Mini pills */}
-                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                  <div className="flex items-center gap-1.5 text-xs text-slate-400 flex-wrap">
                                     {stu.quizCount > 0 && (
-                                      <span className="px-2 py-0.5 rounded text-[10px] bg-teal-500/10 text-teal-400 border border-teal-500/20 font-medium">
-                                        {stu.quizCount} Quiz
-                                      </span>
+                                      <span className="text-teal-400 font-medium">{stu.quizCount} Quiz</span>
+                                    )}
+                                    {stu.quizCount > 0 && stu.workbookCount > 0 && (
+                                      <span className="text-slate-600" aria-hidden="true">·</span>
                                     )}
                                     {stu.workbookCount > 0 && (
-                                      <span className="px-2 py-0.5 rounded text-[10px] bg-purple-500/10 text-purple-400 border border-purple-500/20 font-medium">
-                                        {stu.workbookCount} Workbook
-                                      </span>
+                                      <span className="text-purple-400 font-medium">{stu.workbookCount} Workbook</span>
                                     )}
                                     {stu.uniquePins.length > 0 && (
-                                      <span className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-slate-300 font-mono border border-white/5">
-                                        PIN: {stu.uniquePins.join(", ")}
-                                      </span>
+                                      <>
+                                        <span className="text-slate-600" aria-hidden="true">·</span>
+                                        <span className="font-mono text-slate-400 text-[11px]">PIN: {stu.uniquePins.join(", ")}</span>
+                                      </>
                                     )}
                                   </div>
 
@@ -4827,7 +4821,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         <span>Elenco Studenti che hanno svolto questa prova ({exam.submissions.length})</span>
                                       </p>
                                       {examRosterSort === "grade_desc" && (
-                                        <span className="px-2 py-0.5 rounded-full text-[10px] font-bold font-mono bg-teal-500/15 text-teal-300 border border-teal-500/30 flex items-center gap-1">
+                                        <span className="text-[11px] font-semibold text-teal-300 flex items-center gap-1">
                                           <span>🏆 Ordinati per Voto IA decrescente (10 ➔ 1)</span>
                                         </span>
                                       )}

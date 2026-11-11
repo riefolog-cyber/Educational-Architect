@@ -369,12 +369,25 @@ test("detectGibberish: testo reale non è spazzatura", () => {
     ),
     false
   );
+  // Regressione Alice Antonini: le parole "social media sono: non dare" non devono innescare falsi positivi
+  assert.equal(
+    detectGibberish(
+      "Per me delle misure efficaci per proteggere i giovani dagli effetti negativi dei social media sono: non dare assolutamente il telefono già da quando si è piccoli, sennò si crea già una dipendenza; secondo me una cosa efficace può essere anche mettere un blocco, ovvero un app con limite di tempo esempio family link; controllare i proprio figli quotidianamente "
+    ),
+    false
+  );
+  assert.equal(
+    detectGibberish("Limitare il tempo sui social e fare attività fisica all'aperto."),
+    false
+  );
 });
 
 test("detectGibberish: tastiera a caso e rese sono spazzatura", () => {
   assert.equal(detectGibberish("sjisksjsjsjajajzhsjsijsjzbzjzjanzkkzkakks"), true);
   assert.equal(detectGibberish("asdfasdf"), true);
+  assert.equal(detectGibberish("asdf asdf asdf"), true);
   assert.equal(detectGibberish("non lo so"), true);
+  assert.equal(detectGibberish("boh"), true);
   assert.equal(detectGibberish("...."), true);
   assert.equal(detectGibberish(""), true);
 });
