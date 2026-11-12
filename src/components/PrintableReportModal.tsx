@@ -1,6 +1,6 @@
 import React, { useRef } from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 
 interface PrintableReportModalProps {
@@ -49,6 +49,33 @@ export default function PrintableReportModal({
       }
     }
   }
+
+  const parseMaybe = (value: any) => {
+    if (!value) return null;
+    if (typeof value === "object") return value;
+    try { return JSON.parse(value); } catch { return null; }
+  };
+  const examObj = parseMaybe(submission.Domande_Esame);
+  const answersObj = parseMaybe(submission.Risposte_Studente);
+  const isQuiz = String(submission.Tipo || "").toLowerCase() === "quiz";
+  const pendingEvaluation =
+    isEvaluationPending(evaluationObj) ||
+    getPendingSubjectiveCount(submission) > 0 ||
+    String(submission.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+  const subjectiveEntries = buildSubjectiveReviewEntries(
+    isQuiz
+      ? (examObj?.openEnded || [])
+      : (examObj?.sections || []).flatMap((s: any) => s.reflectionQuestions || []),
+    isQuiz
+      ? (evaluationObj?.openEndedDetails || [])
+      : (evaluationObj?.reflectionDetails || []),
+    (id) => String(
+      isQuiz
+        ? (answersObj?.oe?.[id] ?? answersObj?.openEnded?.[id] ?? "")
+        : (answersObj?.wbRq?.[id] ?? answersObj?.oe?.[id] ?? "")
+    ),
+    (d) => (isQuiz ? d.questionId : d.id)
+  );
 
   const handlePrint = () => {
     window.print();
@@ -143,12 +170,14 @@ export default function PrintableReportModal({
                   </span>
                   <div className="flex items-baseline gap-2 mt-1">
                     <span className="text-3xl font-black text-indigo-700 font-serif">
-                      {submission.Voto_Suggerito || "N.D."}
+                      {pendingEvaluation ? "N.V." : submission.Voto_Suggerito || "N.D."}
                     </span>
-                    <span className="text-xs text-indigo-900 font-semibold">/ 10</span>
+                    {!pendingEvaluation && <span className="text-xs text-indigo-900 font-semibold">/ 10</span>}
                   </div>
                   <p className="text-[10px] text-indigo-800 mt-1">
-                    Valutazione pesata secondo i criteri didattici stabiliti dal docente.
+                    {pendingEvaluation
+                      ? "Valutazione sospesa: nessun voto assegnato finché le domande aperte non saranno corrette."
+                      : "Valutazione pesata secondo i criteri didattici stabiliti dal docente."}
                   </p>
                 </div>
                 <Award className="w-12 h-12 text-indigo-300 shrink-0" />
@@ -199,24 +228,32 @@ export default function PrintableReportModal({
                 </div>
               )}
 
-              {/* Details of reflections or open-ended answers */}
-              {((evaluationObj?.openEndedDetails && evaluationObj.openEndedDetails.length > 0) ||
-                (evaluationObj?.reflectionDetails && evaluationObj.reflectionDetails.length > 0)) && (
+              {/* Details of reflections or open-ended answers: every question is
+                  listed, including those still waiting for an AI evaluation. */}
+              {subjectiveEntries.length > 0 && (
                 <div className="space-y-2.5">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
                     Dettaglio Valutazione Quesiti Aperti e Argomentazioni:
                   </h3>
                   <div className="space-y-2">
-                    {(evaluationObj.openEndedDetails || evaluationObj.reflectionDetails).map((item: any, idx: number) => (
-                      <div key={idx} className="p-3 bg-white border border-slate-200 rounded-xl space-y-1">
+                    {subjectiveEntries.map((entry, idx) => (
+                      <div key={entry.id || idx} className="p-3 bg-white border border-slate-200 rounded-xl space-y-1">
                         <div className="flex items-center justify-between text-xs font-bold text-slate-900">
-                          <span>Quesito {idx + 1}</span>
-                          <span className="px-2 py-0.5 rounded bg-indigo-100 text-indigo-800 font-mono">
-                            Punteggio: {item.score}/10
+                          <span>{isQuiz ? `Quesito Aperto ${idx + 1}` : `Riflessione Critica ${idx + 1}`}</span>
+                          <span className={`px-2 py-0.5 rounded font-mono ${entry.detail ? "bg-indigo-100 text-indigo-800" : "bg-amber-100 text-amber-800"}`}>
+                            Punteggio: {entry.detail ? `${entry.detail.score ?? 0}/10` : "N.V. (in attesa)"}
                           </span>
                         </div>
+                        {entry.question?.question && (
+                          <p className="text-slate-900 text-[11px] font-semibold leading-relaxed">{entry.question.question}</p>
+                        )}
+                        <p className="text-slate-700 text-[11px] leading-relaxed italic">
+                          Risposta: &ldquo;{entry.answer === "[VUOTO]" ? "[Nessuna risposta valida]" : (entry.answer || "Assente")}&rdquo;
+                        </p>
                         <p className="text-slate-700 text-[11px] leading-relaxed">
-                          {item.feedback}
+                          {entry.detail
+                            ? entry.detail.feedback
+                            : "Valutazione IA non disponibile: la risposta è stata consegnata e richiede la correzione del docente."}
                         </p>
                       </div>
                     ))}

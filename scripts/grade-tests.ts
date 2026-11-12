@@ -11,6 +11,10 @@ import {
   formatItalianScholasticGrade,
   parseItalianGrade,
   isFibAnswerCorrect,
+  buildSubjectiveReviewEntries,
+  getPendingSubjectiveCount,
+  auditSubjectiveEvaluation,
+  isEvaluationPending,
 } from "../src/utils";
 
 let passed = 0;
@@ -445,6 +449,206 @@ test("isFibAnswerCorrect: risposte non pertinenti rifiutate", () => {
   assert.equal(isFibAnswerCorrect("ambiente", "etica"), false);
   assert.equal(isFibAnswerCorrect("onore", "autodeterminazione"), false);
   assert.equal(isFibAnswerCorrect("", "etica"), false);
+});
+
+// ---------- Open-ended review entries ----------
+
+test("buildSubjectiveReviewEntries: le domande senza valutazione restano visibili", () => {
+  // Regressione PIN 16: correzione IA non riuscita → reflectionDetails vuoto.
+  // Le 4 riflessioni devono comunque comparire con la risposta dello studente.
+  const questions = [
+    { id: "rq_1", question: "Prima" },
+    { id: "rq_2", question: "Seconda" },
+    { id: "ref_1", question: "Aggiunta a mano 1" },
+    { id: "ref_2", question: "Aggiunta a mano 2" },
+  ];
+  const answers: Record<string, string> = {
+    rq_1: "Risposta uno",
+    rq_2: "Risposta due",
+    ref_1: "Risposta tre",
+    ref_2: "Risposta quattro",
+  };
+  const entries = buildSubjectiveReviewEntries(
+    questions,
+    [],
+    (id) => answers[id] || "",
+    (d) => d.id
+  );
+  assert.equal(entries.length, 4);
+  assert.deepEqual(
+    entries.map((e) => e.id),
+    ["rq_1", "rq_2", "ref_1", "ref_2"]
+  );
+  assert.ok(entries.every((e) => e.detail === null));
+  assert.equal(entries[2].answer, "Risposta tre");
+  assert.equal(entries[2].question?.question, "Aggiunta a mano 1");
+});
+
+test("buildSubjectiveReviewEntries: valutazione parziale non nasconde le altre domande", () => {
+  const questions = [{ id: "q1" }, { id: "q2" }, { id: "q3" }];
+  const details = [{ questionId: "q2", score: 7, feedback: "Buona" }];
+  const entries = buildSubjectiveReviewEntries(
+    questions,
+    details,
+    (id) => `risposta ${id}`,
+    (d) => d.questionId
+  );
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].detail, null);
+  assert.equal(entries[1].detail?.score, 7);
+  assert.equal(entries[2].detail, null);
+  assert.equal(entries[2].answer, "risposta q3");
+});
+
+test("buildSubjectiveReviewEntries: abbinamento posizionale per valutazioni legacy", () => {
+  const questions = [{ id: "a", question: "A" }, { id: "b", question: "B" }];
+  const details = [{ score: 4 }, { score: 9 }];
+  const entries = buildSubjectiveReviewEntries(
+    questions,
+    details,
+    () => "",
+    (d) => d.id
+  );
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].detail?.score, 4);
+  assert.equal(entries[1].detail?.score, 9);
+});
+
+test("buildSubjectiveReviewEntries: dettagli orfani conservati in coda", () => {
+  const entries = buildSubjectiveReviewEntries(
+    [{ id: "q1" }],
+    [{ questionId: "q1", score: 5 }, { questionId: "vecchio", score: 3 }],
+    () => "",
+    (d) => d.questionId
+  );
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].detail?.score, 5);
+  assert.equal(entries[1].id, "vecchio");
+  assert.equal(entries[1].detail?.score, 3);
+});
+
+test("getPendingSubjectiveCount: conta le aperte non valutate", () => {
+  const sub = {
+    Tipo: "Workbook",
+    Domande_Esame: JSON.stringify({
+      sections: [
+        { reflectionQuestions: [{ id: "r1" }, { id: "r2" }] },
+        { reflectionQuestions: [{ id: "r3" }] },
+      ],
+    }),
+    Risposte_Studente: JSON.stringify({ wbRq: { r1: "Risposta uno", r2: "Risposta due", r3: "Risposta tre" } }),
+    // Correzione IA fallita: nessun dettaglio disponibile.
+    Full_Evaluation: JSON.stringify({ reflectionDetails: [], evaluationMode: "deterministic" }),
+  };
+  assert.equal(getPendingSubjectiveCount(sub), 3);
+
+  const graded = {
+    ...sub,
+    Full_Evaluation: JSON.stringify({
+      reflectionDetails: [
+        { id: "r1", score: 6 },
+        { id: "r2", score: 7 },
+        { id: "r3", score: 8 },
+      ],
+      evaluationMode: "ai",
+    }),
+  };
+  assert.equal(getPendingSubjectiveCount(graded), 0);
+});
+
+// ---------- Evaluation safety gate (regressione PIN 16) ----------
+
+test("computeGradeBreakdown: hold sospende il voto se una risposta scritta non è valutata", () => {
+  // Anche con una parte oggettiva perfetta, la presenza di una domanda aperta
+  // scritta e non corretta deve produrre N.V., mai un voto numerico.
+  const examData = {
+    multipleChoice: [
+      { id: "mc1", correctIndex: 0 },
+      { id: "mc2", correctIndex: 0 },
+    ],
+    openEnded: [{ id: "oe1" }, { id: "oe2" }],
+  };
+  const breakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData,
+    answers: { mc: { mc1: 0, mc2: 0 }, oe: { oe1: "Testo scritto", oe2: "" } },
+    evaluation: { openEndedDetails: [] },
+    punteggioMC: 2,
+    votoSuggerito: "N.V.",
+    pendingSubjective: "hold",
+  });
+  assert.equal(breakdown.finalGradeFormatted, "N.V.");
+  assert.equal(breakdown.pendingSubjectiveCount, 2);
+  assert.ok(breakdown.explanationLines.some((l) => l.includes("Nessun voto viene assegnato")));
+  // La vecchia spiegazione "concorrono come 0/10" non deve mai ricomparire
+  // quando il voto è sospeso: era proprio ciò che legittimava lo 0 silenzioso.
+  assert.ok(!breakdown.explanationLines.some((l) => l.includes("concorrono")));
+});
+
+test("auditSubjectiveEvaluation: rileva una risposta scritta rimasta senza voto", () => {
+  const audit = auditSubjectiveEvaluation({
+    questions: [{ id: "q1", question: "Prima" }, { id: "q2", question: "Seconda" }],
+    details: [{ questionId: "q1", score: 7 }],
+    getAnswer: (id) => (id === "q1" ? "Risposta uno" : "Risposta due"),
+    getDetailId: (d) => d.questionId,
+  });
+  assert.equal(audit.complete, false);
+  assert.equal(audit.missing.length, 1);
+  assert.equal(audit.missing[0].id, "q2");
+});
+
+test("auditSubjectiveEvaluation: risposta vuota diventa 0 legittimo, non un errore", () => {
+  const audit = auditSubjectiveEvaluation({
+    questions: [{ id: "q1", question: "Prima" }, { id: "q2", question: "Seconda" }],
+    details: [{ questionId: "q1", score: 7 }],
+    getAnswer: (id) => (id === "q1" ? "Risposta uno" : ""),
+    getDetailId: (d) => d.questionId,
+  });
+  assert.equal(audit.complete, true);
+  assert.equal(audit.missing.length, 0);
+  assert.equal(audit.details.length, 2);
+  assert.equal(audit.details[1].score, 0);
+  assert.equal(audit.details[1].synthesized, true);
+});
+
+test("auditSubjectiveEvaluation: correzione completa passa il controllo", () => {
+  const audit = auditSubjectiveEvaluation({
+    questions: [{ id: "q1", question: "Prima" }],
+    details: [{ questionId: "q1", score: 8, feedback: "Buona" }],
+    getAnswer: () => "Risposta",
+    getDetailId: (d) => d.questionId,
+  });
+  assert.equal(audit.complete, true);
+  assert.equal(audit.details[0].score, 8);
+});
+
+test("extractBreakdownFromSubmission: valutazione sospesa mostra N.V., non un voto di riserva", () => {
+  const sub = {
+    Tipo: "Quiz",
+    Voto_Suggerito: "N.V.",
+    Domande_Esame: JSON.stringify({
+      multipleChoice: [{ id: "mc1", correctIndex: 0 }],
+      openEnded: [{ id: "oe1" }],
+    }),
+    Risposte_Studente: JSON.stringify({ mc: { mc1: 0 }, oe: { oe1: "Risposta scritta" } }),
+    Full_Evaluation: JSON.stringify({
+      evaluationMode: "pending",
+      requiresManualReview: true,
+      suggestedGrade: "N.V.",
+      openEndedDetails: [],
+    }),
+    Punteggio_MC: 1,
+  };
+  const breakdown = extractBreakdownFromSubmission(sub);
+  assert.equal(breakdown.finalGradeFormatted, "N.V.");
+  assert.equal(breakdown.pendingSubjectiveCount, 1);
+});
+
+test("isEvaluationPending: riconosce il blocco e non declassa le valutazioni AI", () => {
+  assert.equal(isEvaluationPending({ evaluationMode: "pending" }), true);
+  assert.equal(isEvaluationPending({ requiresManualReview: true }), true);
+  assert.equal(isEvaluationPending({ evaluationMode: "ai" }), false);
+  assert.equal(isEvaluationPending(null), false);
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

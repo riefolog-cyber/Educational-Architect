@@ -56,7 +56,7 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown } from "../utils";
+import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, buildSubjectiveReviewEntries, getPendingSubjectiveCount, auditSubjectiveEvaluation, isEvaluationPending } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
@@ -163,6 +163,25 @@ export function isBorderlineSubmission(sub: SavedSubmission): boolean {
   if (isNaN(n) || n < 5.5 || n >= 6) return false;
   const acc = submissionStructuredAccuracy(sub);
   return acc !== null && acc >= 0.7;
+}
+
+/**
+ * Grade to show in the registry, in the exports and in the header.
+ *
+ * A submission whose written open answers were never scored must read "N.V."
+ * everywhere: showing the old numeric value (e.g. "2.0" stored before the fix)
+ * would defeat the safety gate and let a wrong grade reach the registry/CSV.
+ */
+export function displaySubmissionGrade(sub: any): string {
+  try {
+    let ev = sub?.Full_Evaluation;
+    if (typeof ev === "string") ev = JSON.parse(ev);
+    if (isEvaluationPending(ev)) return "N.V.";
+    if (getPendingSubjectiveCount(sub) > 0) return "N.V.";
+  } catch {
+    // Malformed document: fall through to the stored value below.
+  }
+  return sub?.Voto_Suggerito || "N/A";
 }
 
 // Suspicious-pattern hint: bursts of 3+ episodes within 2 minutes suggest// real external consultation; isolated brief episodes are physiological
@@ -1545,6 +1564,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             }
           });
 
+          // Safety gate: do NOT save a partial AI correction. A written answer
+          // without a score must block the update, not silently become 0.
+          const audit = auditSubjectiveEvaluation({
+            questions: oeList,
+            details: evaluation?.openEndedDetails || [],
+            getAnswer: (id) => String(sanitizedAnswers.oe?.[id] ?? ""),
+            getDetailId: (d) => d?.questionId,
+          });
+          if (!audit.complete) {
+            throw new Error(
+              `Correzione IA incompleta: ${audit.missing.length} domanda/e aperta/e non ha/hanno ricevuto un voto. ` +
+              `La valutazione NON è stata salvata` +
+              (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
+              `. Riprova tra qualche minuto.`
+            );
+          }
+          evaluation.openEndedDetails = audit.details;
+
           evalObj = { ...evalObj, ...evaluation };
           evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
           const breakdown = computeGradeBreakdown({
@@ -1647,6 +1684,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               autovalutazione: sub.Autovalutazione || ""
             }
           });
+
+          // Safety gate: never overwrite a submission with a partial correction.
+          const audit = auditSubjectiveEvaluation({
+            questions: rqList,
+            details: evaluation?.reflectionDetails || [],
+            getAnswer: (id) => String(sanitizedAnswers.wbRq?.[id] ?? sanitizedAnswers.oe?.[id] ?? ""),
+            getDetailId: (d) => d?.id,
+          });
+          if (!audit.complete) {
+            throw new Error(
+              `Correzione IA incompleta: ${audit.missing.length} riflessione/i critica/he non ha/hanno ricevuto un voto. ` +
+              `La valutazione NON è stata salvata` +
+              (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
+              `. Riprova tra qualche minuto.`
+            );
+          }
+          evaluation.reflectionDetails = audit.details;
 
           evalObj = { ...evalObj, ...evaluation };
           evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
@@ -1911,13 +1965,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     doc.rect(15, currentY, 180, 26, "F");
 
     // Stats 1: Voto IA
+    const gradeIsPending = displaySubmissionGrade(sub) === "N.V.";
+    const gradeText = gradeIsPending ? "N.V." : `${sub.Voto_Suggerito || "N/A"}/10`;
+
     doc.setFont("Helvetica", "bold");
     doc.setFontSize(8);
     doc.setTextColor(71, 85, 105);
-    doc.text("VOTO CONSIGLIATO IA", 20, currentY + 8);
+    doc.text(gradeIsPending ? "VOTO (IN ATTESA DI CORREZIONE)" : "VOTO CONSIGLIATO IA", 20, currentY + 8);
     doc.setFontSize(16);
-    doc.setTextColor(13, 148, 136); // Teal
-    doc.text(`${sub.Voto_Suggerito || "N/A"}/10`, 20, currentY + 18);
+    doc.setTextColor(gradeIsPending ? 185 : 13, gradeIsPending ? 28 : 148, gradeIsPending ? 28 : 136);
+    doc.text(gradeText, 20, currentY + 18);
 
     // Stats 2: Autovalutazione
     doc.setFont("Helvetica", "bold");
@@ -2091,8 +2148,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         currentY += 2;
       }
 
-      // Domande Aperte (render solo se la prova includeva effettivamente domande aperte)
-      if (details && details.length > 0 && oeList && oeList.length > 0) {
+      // Domande Aperte: mostra sempre tutti i quesiti della prova, anche quando
+      // la correzione IA è assente o parziale (le risposte restano correggibili).
+      const oeEntries = buildSubjectiveReviewEntries(
+        oeList,
+        details,
+        (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
+        (d) => d.questionId
+      );
+      if (oeEntries.length > 0) {
         checkPageBreak(15);
         doc.setFont("Helvetica", "bold");
         doc.setFontSize(10);
@@ -2100,16 +2164,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         doc.text("B) Sezione Sviluppo Domande Aperte & Correzione Didattica", 15, currentY);
         currentY += 6;
 
-        details.forEach((det: any, idx: number) => {
-          const ansText = ansObj.oe?.[det.questionId] || "Assente";
-          const questionRef = oeList.find((q: any) => q.id === det.questionId);
-          const questionText = questionRef ? questionRef.question : `Quesito Aperto ${idx + 1}`;
+        oeEntries.forEach((entry: any, idx: number) => {
+          const ansText = entry.answer || "Assente";
+          const questionText = entry.question?.question || `Quesito Aperto ${idx + 1}`;
 
           checkPageBreak(25);
           writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
           currentY += 1;
 
-          const oeImg = domandeObj?.images?.[questionRef?.id];
+          const oeImg = domandeObj?.images?.[entry.id];
           if (oeImg) {
             checkPageBreak(70);
             try {
@@ -2124,12 +2187,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
           currentY += 1.5;
 
-          // Tutor IA Corrective detail
-          checkPageBreak(12);
-          writeText(`Analisi Correttiva Tutor IA (Voto: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
-          currentY += 1;
+          if (entry.detail) {
+            // Tutor IA Corrective detail
+            checkPageBreak(12);
+            writeText(`Analisi Correttiva Tutor IA (Voto: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
+            currentY += 1;
 
-          writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
+            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          } else {
+            checkPageBreak(12);
+            writeText("Valutazione IA non disponibile: la risposta va corretta dal docente (usa \"Ricalcola Voto\").", 8.5, true, [185, 28, 28], 15);
+          }
           currentY += 4;
         });
       }
@@ -2182,9 +2250,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         currentY += 3;
       }
 
-      // Reflection questions (render solo se presenti nel workbook)
-      const hasReflections = sections.some((s: any) => s.reflectionQuestions && s.reflectionQuestions.length > 0);
-      if (details && details.length > 0 && hasReflections) {
+      // Reflection questions: always list every reflection of the workbook,
+      // even if the AI did not return a score for some of them.
+      const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+      const rqEntries = buildSubjectiveReviewEntries(
+        rqList,
+        details,
+        (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
+        (d) => d.id
+      );
+      if (rqEntries.length > 0) {
         checkPageBreak(15);
         doc.setFont("Helvetica", "bold");
         doc.setFontSize(10);
@@ -2192,25 +2267,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         doc.text("B) Domande di Riflessione Critica & Metacognitiva", 15, currentY);
         currentY += 6;
 
-        details.forEach((det: any, idx: number) => {
-          const ansText = ansObj.wbRq?.[det.id] || "Assente";
-          let questionText = `Riflessione Critica ${idx + 1}`;
-          
-          if (sections.length > 0) {
-            for (const sec of sections) {
-              const found = sec.reflectionQuestions?.find((r: any) => r.id === det.id);
-              if (found) {
-                questionText = found.question;
-                break;
-              }
-            }
-          }
+        rqEntries.forEach((entry: any, idx: number) => {
+          const ansText = entry.answer || "Assente";
+          const questionText = entry.question?.question || `Riflessione Critica ${idx + 1}`;
 
           checkPageBreak(25);
           writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
           currentY += 1;
 
-          const reflImg = domandeObj?.images?.[det.id];
+          const reflImg = domandeObj?.images?.[entry.id];
           if (reflImg) {
             checkPageBreak(70);
             try {
@@ -2225,12 +2290,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
           currentY += 1.5;
 
-          // Tutor IA evaluation detail
-          checkPageBreak(12);
-          writeText(`Feedback Didattico Customizzato (Punteggio: ${det.score || 0}/10):`, 8.5, true, [79, 70, 229], 15);
-          currentY += 1;
+          if (entry.detail) {
+            // Tutor IA evaluation detail
+            checkPageBreak(12);
+            writeText(`Feedback Didattico Customizzato (Punteggio: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
+            currentY += 1;
 
-          writeParagraphs(det.feedback || "", 8.5, [79, 70, 229], 15);
+            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          } else {
+            checkPageBreak(12);
+            writeText("Valutazione IA non disponibile: la riflessione va corretta dal docente (usa \"Ricalcola Voto\").", 8.5, true, [185, 28, 28], 15);
+          }
           currentY += 4;
         });
       }
@@ -2415,7 +2485,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       escapeCSVString(sub.Pin || exam.pin),
       escapeCSVString(exam.title),
       escapeCSVString(sub.Tipo || ""),
-      escapeCSVString(sub.Voto_Suggerito || ""),
+      escapeCSVString(displaySubmissionGrade(sub)),
       escapeCSVString(sub.Autovalutazione || ""),
       escapeCSVString(sub.AntiCopia_TabSwitch || 0),
       escapeCSVString(sub.AntiCopia_IncollaBloccato || 0),
@@ -2479,7 +2549,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         escapeCSVString(stu.quizCount),
         escapeCSVString(stu.workbookCount),
         escapeCSVString(stu.averageGradeFormatted),
-        escapeCSVString(stu.latestSubmission?.Voto_Suggerito || ""),
+        escapeCSVString(
+          stu.latestSubmission ? displaySubmissionGrade(stu.latestSubmission) : ""
+        ),
         escapeCSVString(stu.latestDate ? new Date(stu.latestDate).toLocaleString("it-IT") : ""),
         escapeCSVString(stu.uniquePins.join("; ")),
         escapeCSVString(stu.totalTabSwitches),
@@ -2577,7 +2649,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       escapeCSVString(sub.Tipo || ""),
       escapeCSVString(sub.Pin || ""),
       escapeCSVString(sub.Timestamp || ""),
-      escapeCSVString(sub.Voto_Suggerito || ""),
+      escapeCSVString(displaySubmissionGrade(sub)),
       escapeCSVString(sub.Autovalutazione || ""),
       escapeCSVString(sub.AntiCopia_TabSwitch || 0),
       escapeCSVString(sub.AntiCopia_IncollaBloccato || 0),
@@ -4500,8 +4572,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                           <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-end">
                                             <div className="text-left sm:text-right">
                                               <span className="text-[10px] text-slate-400 block">Voto</span>
-                                              <span className="font-extrabold text-teal-400 font-mono text-xs">
-                                                {sub.Voto_Suggerito || "N/A"}
+                                              <span className={`font-extrabold font-mono text-xs ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                                {displaySubmissionGrade(sub)}
                                               </span>
                                             </div>
 
@@ -4935,8 +5007,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                                   </div>
                                                 )}
                                               </td>
-                                              <td className="p-2 text-center font-extrabold text-teal-400 font-mono text-xs sm:text-sm">
-                                                {sub.Voto_Suggerito || "N/A"}
+                                              <td className={`p-2 text-center font-extrabold font-mono text-xs sm:text-sm ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                                {displaySubmissionGrade(sub)}
                                               </td>
                                               <td className="p-2 text-center text-indigo-300 font-mono text-xs">
                                                 {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
@@ -5117,6 +5189,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           ) : (
                             filteredSubmissions.map((sub, sIdx) => {
                               const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
+                              const pendingOpen = getPendingSubjectiveCount(sub);
                               return (
                                 <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
                                   <td className="p-2 sm:p-3 text-center font-mono font-bold text-xs">
@@ -5166,8 +5239,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                     <span className="hidden sm:inline"> {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}</span>
                                   </p>
                                 </td>
-                                <td className="p-2 sm:p-3 text-center font-display font-extrabold text-teal-400 text-xs sm:text-sm">
-                                  {sub.Voto_Suggerito || "N/A"}
+                                <td className={`p-2 sm:p-3 text-center font-display font-extrabold text-xs sm:text-sm ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                  {displaySubmissionGrade(sub)}
                                   {hasGradeDiscrepancy(sub) && (
                                     <button
                                       onClick={(e) => {
@@ -5179,6 +5252,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                       title="Discrepanza rilevata: Prova a 15 crocette con 0 domande aperte. Clicca per correggere il voto automaticamente"
                                     >
                                       {recalculatingId === sub.id ? "..." : "⚠️ Correggi Voto"}
+                                    </button>
+                                  )}
+                                  {pendingOpen > 0 && (
+                                    <button
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        setSelectedSub(sub);
+                                      }}
+                                      className="block mx-auto mt-1 px-1.5 py-0.5 bg-sky-500/15 hover:bg-sky-500/25 text-sky-300 border border-sky-500/40 text-[9px] rounded font-mono cursor-pointer transition-colors"
+                                      title={`${pendingOpen} domanda/e aperta/e consegnata/e ma non ancora valutata/e. Apri la scheda e usa "Ricalcola Voto".`}
+                                    >
+                                      {pendingOpen} aperte da valutare
                                     </button>
                                   )}
                                 </td>
@@ -5310,6 +5395,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
             {/* Modal Body scroll content */}
             <div className="p-6 overflow-y-auto space-y-6 text-slate-100 text-xs leading-relaxed text-left">
+              {/* Evaluation suspended banner: never grade a written answer as 0 */}
+              {(() => {
+                let ev: any = selectedSub.Full_Evaluation;
+                if (typeof ev === "string") {
+                  try { ev = JSON.parse(ev); } catch { ev = null; }
+                }
+                if (!isEvaluationPending(ev)) return null;
+                return (
+                  <div className="p-4 bg-rose-500/10 border-2 border-rose-500/40 rounded-xl space-y-2 animate-fadeIn">
+                    <div className="flex items-start gap-2.5">
+                      <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
+                      <div>
+                        <p className="font-bold text-xs text-rose-300">Valutazione sospesa: la prova non è stata valutata</p>
+                        <p className="text-[11px] text-rose-100/80 mt-0.5">
+                          {ev?.manualReviewReason ||
+                            "La correzione automatica non ha valutato tutte le domande aperte. Il voto resta N.V. per non assegnare 0 a risposte scritte."}
+                        </p>
+                        <p className="text-[11px] text-rose-100/70 mt-1">
+                          Controlla qui sotto le risposte (tutte visibili, anche quelle senza voto) e usa <b>Ricalcola Voto</b> o assegna tu il voto.
+                        </p>
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
+
               {/* Discrepancy warning banner */}
               {hasGradeDiscrepancy(selectedSub) && (
                 <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-200 animate-fadeIn">
@@ -5336,7 +5447,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               <div className="grid grid-cols-2 gap-4">
                 <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
                   <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">Voto Assegnato dall'A.I.</p>
-                  <p className="text-3xl font-display font-bold text-teal-400 mt-1">{selectedSub.Voto_Suggerito}</p>
+                  <p className={`text-3xl font-display font-bold mt-1 ${displaySubmissionGrade(selectedSub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>{displaySubmissionGrade(selectedSub)}</p>
                   {selectedSub.Voto_Originale_IA && (
                     <p className="text-[10px] text-slate-500 mt-1">
                       Originale IA: {selectedSub.Voto_Originale_IA} (ritoccato dal docente)
@@ -5561,6 +5672,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           const mcqList = domandeObj?.multipleChoice || [];
                           const oeList = domandeObj?.openEnded || [];
                           const details = evalObj.openEndedDetails || [];
+                          const oeEntries = buildSubjectiveReviewEntries(
+                            oeList,
+                            details,
+                            (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
+                            (d) => d.questionId
+                          );
 
                           return (
                             <div className="space-y-4">
@@ -5593,23 +5710,31 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                 </div>
                               )}
 
-                              {/* Open Ended Sections */}
-                              {oeList && oeList.length > 0 ? (
+                              {/* Open Ended Sections: sempre visibili, anche se la IA non ha ancora corretto */}
+                              {oeEntries.length > 0 ? (
                                 <div className="space-y-2">
                                   <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">Domande Aperte</p>
-                                  {details.map((det: any, idx: number) => {
-                                    const ansText = ansObj.oe?.[det.questionId] || "Assente";
-                                    const questionRef = oeList.find((q: any) => q.id === det.questionId);
+                                  {oeEntries.map((entry: any, idx: number) => {
+                                    const ansText = entry.answer || "Assente";
+                                    const hasEvaluation = !!entry.detail;
+                                    const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
 
                                     return (
-                                      <div key={idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
+                                      <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
                                         <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA APERTA {idx + 1}</p>
-                                        {questionRef && <p className="text-slate-300 text-[11px] mb-1">{questionRef.question}</p>}
+                                        {entry.question?.question && <p className="text-slate-300 text-[11px] mb-1">{entry.question.question}</p>}
                                         <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
-                                        <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
-                                          <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({det.score}/10)</p>
-                                          <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(det.feedback) }} />
-                                        </div>
+                                        {hasEvaluation ? (
+                                          <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
+                                            <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({score}/10)</p>
+                                            <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
+                                          </div>
+                                        ) : (
+                                          <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-lg text-amber-200 text-[11px]">
+                                            <p className="font-bold text-[9px] uppercase text-amber-300">Valutazione non disponibile (N.V.)</p>
+                                            <p className="mt-1">La risposta è stata consegnata ma non è stata corretta dall'IA. Usa &ldquo;Ricalcola Voto&rdquo; per ottenere la valutazione, oppure valuta tu il contenuto.</p>
+                                          </div>
+                                        )}
                                       </div>
                                     );
                                   })}
@@ -5625,6 +5750,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         } else {
                           const sections = domandeObj?.sections || [];
                           const details = evalObj.reflectionDetails || [];
+                          const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+                          const rqEntries = buildSubjectiveReviewEntries(
+                            rqList,
+                            details,
+                            (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
+                            (d) => d.id
+                          );
 
                           return (
                             <div className="space-y-4">
@@ -5669,28 +5801,29 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                               
                               <div className="space-y-2">
                                 <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">Riflessioni Critiche</p>
-                                {details.map((det: any, idx: number) => {
-                                  const ansText = ansObj.wbRq?.[det.id] || "Assente";
-                                  let questionRef: any = null;
-                                  if (sections.length > 0) {
-                                    for (const sec of sections) {
-                                      const found = sec.reflectionQuestions?.find((r: any) => r.id === det.id);
-                                      if (found) {
-                                        questionRef = found;
-                                        break;
-                                      }
-                                    }
-                                  }
+                                {rqEntries.length === 0 ? (
+                                  <p className="text-[11px] text-slate-500 italic">Nessuna riflessione critica presente in questo quaderno.</p>
+                                ) : rqEntries.map((entry: any, idx: number) => {
+                                  const ansText = entry.answer || "Assente";
+                                  const hasEvaluation = !!entry.detail;
+                                  const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
 
                                   return (
-                                    <div key={idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
+                                    <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
                                       <p className="font-bold text-slate-300 font-mono text-[10px]">RIFLESSIONE CRITICA {idx + 1}</p>
-                                      {questionRef && <p className="text-slate-300 text-[11px] mb-1">{questionRef.question}</p>}
+                                      {entry.question?.question && <p className="text-slate-300 text-[11px] mb-1">{entry.question.question}</p>}
                                       <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
-                                      <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
-                                        <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({det.score}/10)</p>
-                                        <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(det.feedback) }} />
-                                      </div>
+                                      {hasEvaluation ? (
+                                        <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
+                                          <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({score}/10)</p>
+                                          <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
+                                        </div>
+                                      ) : (
+                                        <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-lg text-amber-200 text-[11px]">
+                                          <p className="font-bold text-[9px] uppercase text-amber-300">Valutazione non disponibile (N.V.)</p>
+                                          <p className="mt-1">La riflessione è stata consegnata ma non è stata corretta dall'IA. Usa &ldquo;Ricalcola Voto&rdquo; per ottenere la valutazione, oppure valuta tu il contenuto.</p>
+                                        </div>
+                                      )}
                                     </div>
                                   );
                                 })}

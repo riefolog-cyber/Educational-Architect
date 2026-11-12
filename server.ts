@@ -474,7 +474,7 @@ const parseJsonResponse = (text: string) => {
 // Middleware for JSON parsing
 app.use(express.json({ limit: '10mb' }));
 
-import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
@@ -599,6 +599,63 @@ function humanAiError(raw: string): string {
     }
   }
   return text;
+}
+
+/**
+ * Builds the "evaluation suspended" result used whenever the AI could not
+ * score every written open answer.
+ *
+ * The grade is deliberately "N.V.": publishing a deterministic reserve grade
+ * (or, worse, treating the missing details as zeros) is exactly the bug that
+ * gave students 0 on answers they had actually written. The teacher will see
+ * the submission in the registry with the "aperte da valutare" badge.
+ */
+function buildPendingEvaluation(params: {
+  tipo: "Quiz" | "Workbook";
+  examData: any;
+  answers: any;
+  missing: Array<{ id: string; question: string }>;
+  punteggioMC?: number;
+  punteggioFIB?: number;
+  cause?: string;
+}) {
+  const { tipo, examData, answers, missing } = params;
+  const count = missing.length;
+  const label = tipo === "Quiz" ? "domanda/e aperta/e" : "riflessione/i critica/he";
+  const cause = params.cause ? ` (${params.cause})` : "";
+  const reason =
+    count > 0
+      ? `Valutazione sospesa${cause}: ${count} ${label} con una risposta scritta dallo studente ` +
+        `non ha/hanno ricevuto una valutazione numerica. Per evitare un voto errato, ` +
+        `la prova NON è stata valutata: il voto resta "N.V." fino alla correzione del docente.`
+      : `Valutazione sospesa${cause}: la correzione automatica non è stata completata. ` +
+        `Per evitare un voto errato, la prova resta "N.V." fino alla verifica del docente.`;
+
+  const breakdown = computeGradeBreakdown({
+    tipo,
+    examData,
+    answers,
+    punteggioMC: params.punteggioMC,
+    punteggioFIB: params.punteggioFIB,
+    votoSuggerito: "N.V.",
+    // Never turn a missing evaluation into a zero.
+    pendingSubjective: "hold",
+  });
+
+  return {
+    suggestedGrade: "N.V.",
+    evaluationMode: "pending",
+    requiresManualReview: true,
+    manualReviewReason: reason,
+    // Only the feedback field actually rendered by the relative view is set,
+    // so the same notice is not repeated three times.
+    mainErrors: tipo === "Quiz" ? "" : undefined,
+    openEndedEvaluation: tipo === "Quiz" ? reason : undefined,
+    overallFeedback: tipo === "Workbook" ? reason : undefined,
+    openEndedDetails: [],
+    reflectionDetails: [],
+    gradeBreakdown: breakdown,
+  };
 }
 
 async function runEvaluationCore(reqBody: any) {
@@ -794,9 +851,6 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
       const evaluation = parseJsonResponse(responseText);
-      if (oeList.length > 0 && (!Array.isArray(evaluation.openEndedDetails) || evaluation.openEndedDetails.length === 0)) {
-        throw new Error("L'IA non ha fornito la valutazione delle domande aperte.");
-      }
 
       // Deterministic zero enforcement: if an answer is blank, [VUOTO], pure punctuation (like "...."),
       // or detected gibberish, the score MUST be 0 and the feedback pedagogical.
@@ -817,6 +871,38 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         });
       }
 
+      // SAFETY GATE: every written open answer must have a numeric score.
+      // A partial/empty AI response must never be turned into zeros.
+      const audit = auditSubjectiveEvaluation({
+        questions: oeList,
+        details: evaluation.openEndedDetails,
+        getAnswer: (id) =>
+          String(
+            report.risposte?.oe?.[id] ??
+            report.risposte?.openEnded?.[id] ??
+            report.risposte?.wbRq?.[id] ??
+            ""
+          ),
+        getDetailId: (d) => d?.questionId,
+        blankFeedback:
+          "🎯 **Competenza:** Risposta non compilata.\n✍️ **Proprietà lessicale:** Assente.\n💡 **Spunto di crescita:** Prova a formulare una risposta, anche breve, per mostrare ciò che hai capito.",
+      });
+      if (!audit.complete) {
+        console.warn(
+          "[evaluate] Correzione IA incompleta per il quiz: domande non valutate:",
+          audit.missing.map((m) => m.id).join(", ")
+        );
+        return buildPendingEvaluation({
+          tipo: "Quiz",
+          examData: report.domande,
+          answers: report.risposte,
+          missing: audit.missing,
+          punteggioMC: mcScore,
+          cause: "correzione IA incompleta",
+        });
+      }
+      evaluation.openEndedDetails = audit.details;
+
       evaluation.evaluationMode = "ai";
       const mixedBreakdown = computeGradeBreakdown({
         tipo: "Quiz",
@@ -829,32 +915,24 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr) {
-      console.warn("[evaluate] Fallback deterministico quiz con aperte:", aiErr?.message || aiErr);
-      // Voto di riserva basato sulle sole MC (le aperte richiedono revisione docente).
-      // Senza crocette non c'è nulla da correggere in modo deterministico: meglio
-      // "N.V." (da correggere) che uno 0 finito nel registro al posto del voto.
-      const hasObjectivePart = mcCount > 0;
-      const fallbackBreakdown = computeGradeBreakdown({
+      console.warn("[evaluate] Correzione IA fallita per quiz con aperte (nessun voto assegnato):", (aiErr as any)?.message || aiErr);
+      // Never publish a deterministic reserve grade here: the students wrote
+      // open answers that nobody evaluated. The exam stays "N.V." and the
+      // teacher is warned in the registry.
+      const audit = auditSubjectiveEvaluation({
+        questions: oeList,
+        details: [],
+        getAnswer: (id) => String(report.risposte?.oe?.[id] ?? report.risposte?.openEnded?.[id] ?? ""),
+        getDetailId: (d) => d?.questionId,
+      });
+      return buildPendingEvaluation({
         tipo: "Quiz",
         examData: report.domande,
         answers: report.risposte,
+        missing: audit.missing,
         punteggioMC: mcScore,
-        // Reserve grade: never punish the student for open answers nobody graded.
-        pendingSubjective: "exclude"
+        cause: "servizio IA non disponibile",
       });
-      const fallbackGrade = hasObjectivePart ? fallbackBreakdown.finalGradeFormatted : "N.V.";
-      return {
-        suggestedGrade: fallbackGrade,
-        mainErrors: hasObjectivePart
-          ? "Valutazione in modalità riserva: le risposte aperte non sono state corrette dall'IA e richiedono revisione del docente. Il voto è basato sulle sole domande a scelta multipla."
-          : "Valutazione in modalità riserva: la prova è composta solo da domande aperte e l'IA non ha potuto correggerle. Il voto sarà assegnato dal docente.",
-        openEndedEvaluation: hasObjectivePart
-          ? `Valutazione deterministica (riserva senza IA): punteggio MC ${mcScore}/${mcCount}, voto scolastico ${fallbackGrade}. Le domande aperte vanno revisionate manualmente dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`
-          : `Valutazione deterministica (riserva senza IA): la prova non ha domande a scelta multipla, quindi nessun voto è stato calcolato automaticamente. Le domande aperte vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
-        openEndedDetails: [],
-        evaluationMode: "deterministic",
-        gradeBreakdown: fallbackBreakdown
-      };
     }
 
   } else if (normalizedTipo === "workbook") {
@@ -1009,9 +1087,6 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
       const evaluation = parseJsonResponse(responseText);
-      if (rqList.length > 0 && (!Array.isArray(evaluation.reflectionDetails) || evaluation.reflectionDetails.length === 0)) {
-        throw new Error("L'IA non ha fornito la valutazione delle riflessioni critiche.");
-      }
 
       // Deterministic zero enforcement for blank, pure punctuation or gibberish reflections
       if (Array.isArray(evaluation.reflectionDetails)) {
@@ -1030,6 +1105,32 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         });
       }
 
+      // SAFETY GATE: every written reflection must have a numeric score.
+      const audit = auditSubjectiveEvaluation({
+        questions: rqList,
+        details: evaluation.reflectionDetails,
+        getAnswer: (id) => String(report.risposte?.wbRq?.[id] ?? report.risposte?.oe?.[id] ?? ""),
+        getDetailId: (d) => d?.id,
+        blankFeedback:
+          "✍️ **Esposizione & Maturità:** Riflessione non compilata.\n💡 **Spunto di riflessione:** Prova a scrivere un pensiero personale, anche breve, sul tema proposto.",
+      });
+      if (!audit.complete) {
+        console.warn(
+          "[evaluate] Correzione IA incompleta per il workbook: riflessioni non valutate:",
+          audit.missing.map((m) => m.id).join(", ")
+        );
+        return buildPendingEvaluation({
+          tipo: "Workbook",
+          examData: report.domande,
+          answers: report.risposte,
+          missing: audit.missing,
+          punteggioFIB: fibScore,
+          punteggioMC: Number(report.punteggioMC || 0),
+          cause: "correzione IA incompleta",
+        });
+      }
+      evaluation.reflectionDetails = audit.details;
+
       evaluation.fibScore = fibScore;
       evaluation.evaluationMode = "ai";
       const mixedBreakdown = computeGradeBreakdown({
@@ -1044,28 +1145,24 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr: any) {
-      console.warn("[evaluate] Fallback deterministico workbook con riflessioni:", aiErr?.message || aiErr);
-      // Stessa regola del quiz: senza parte oggettiva non si inventa un voto.
-      const fallbackBreakdown = computeGradeBreakdown({
+      console.warn("[evaluate] Correzione IA fallita per workbook con riflessioni (nessun voto assegnato):", aiErr?.message || aiErr);
+      // Same rule as the quiz: better an unevaluated exam than reflections
+      // silently scored 0 because the AI output was missing.
+      const audit = auditSubjectiveEvaluation({
+        questions: rqList,
+        details: [],
+        getAnswer: (id) => String(report.risposte?.wbRq?.[id] ?? report.risposte?.oe?.[id] ?? ""),
+        getDetailId: (d) => d?.id,
+      });
+      return buildPendingEvaluation({
         tipo: "Workbook",
         examData: report.domande,
         answers: report.risposte,
+        missing: audit.missing,
         punteggioFIB: fibScore,
         punteggioMC: Number(report.punteggioMC || 0),
-        pendingSubjective: "exclude"
+        cause: "servizio IA non disponibile",
       });
-      const hasObjectivePart = !!fallbackBreakdown.objectivePart;
-      const fallbackGrade = hasObjectivePart ? fallbackBreakdown.finalGradeFormatted : "N.V.";
-      return {
-        suggestedGrade: fallbackGrade,
-        overallFeedback: hasObjectivePart
-          ? `Valutazione deterministica (riserva senza IA): punteggio completamento frasi ${fibScore}/${fibCount}, voto scolastico calcolato sulla parte oggettiva: ${fallbackGrade}. Le domande di riflessione critica richiedono revisione manuale del docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`
-          : `Valutazione deterministica (riserva senza IA): la prova non ha frasi da completare, quindi nessun voto è stato calcolato automaticamente. Le riflessioni vanno corrette dal docente. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
-        reflectionDetails: [],
-        fibScore: fibScore,
-        evaluationMode: "deterministic",
-        gradeBreakdown: fallbackBreakdown
-      };
     }
   }
 

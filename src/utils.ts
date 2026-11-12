@@ -314,6 +314,8 @@ export interface GradeBreakdownResult {
   isPureSubjective: boolean;
   /** True when every subjective question is still unevaluated. */
   isSubjectivePendingOnly?: boolean;
+  /** True when the grade is "N.V." because a written answer has no score. */
+  isEvaluationHeld?: boolean;
   
   objectivePart?: {
     name: string;
@@ -360,13 +362,22 @@ export function computeGradeBreakdown(params: {
    * - "zero" (default): they count as 0/10 and are flagged as pending, which is
    *   what an AI-gradeable exam does until the teacher/AI reviews them;
    * - "exclude": they are left out of the grade (used by deterministic reserve
-   *   grades, which are based on the objective part only).
+   *   grades, which are based on the objective part only);
+   * - "hold": the whole grade becomes "N.V." as soon as one answered open
+   *   question is still ungraded. This is the safe default of the evaluation
+   *   gate: better an unevaluated exam than a grade that silently treats a
+   *   written answer as a zero.
    */
-  pendingSubjective?: "zero" | "exclude";
+  pendingSubjective?: "zero" | "exclude" | "hold";
 }): GradeBreakdownResult {
   const isWorkbook = String(params.tipo || "").toLowerCase() === "workbook";
   const tipo: "Quiz" | "Workbook" = isWorkbook ? "Workbook" : "Quiz";
-  const pendingMode = params.pendingSubjective === "exclude" ? "exclude" : "zero";
+  const pendingMode =
+    params.pendingSubjective === "exclude"
+      ? "exclude"
+      : params.pendingSubjective === "hold"
+      ? "hold"
+      : "zero";
 
   let objScore = 0; // raw number of correct objective answers (for display)
   let objTotal = 0; // raw number of objective questions (for display)
@@ -718,6 +729,21 @@ export function computeGradeBreakdown(params: {
     explanationLines.push("Nessun quesito oggettivo o aperto rilevato per comporre un voto matematico.");
   }
 
+  // "hold": an answered open question without a score blocks the whole grade.
+  // The student must never see a numeric (or worse, zeroed) grade for an exam
+  // whose open answers have not been evaluated.
+  if (pendingMode === "hold" && pendingSubjectiveCount > 0) {
+    finalNumeric = 0;
+    finalGradeFormatted = "N.V.";
+    formulaTitle = "Valutazione sospesa: domande aperte non corrette";
+    formulaSummary = `${pendingSubjectiveCount} domanda/e aperta/e con risposta presente non ha/hanno una valutazione. Il voto resta "N.V." finché il docente non la/le corregge.`;
+    explanationLines.length = 0;
+    explanationLines.push(
+      `Nessun voto viene assegnato finché tutte le domande aperte con una risposta non sono state corrette: una risposta scritta non può valere 0 solo perché manca la valutazione.`,
+      `La prova è stata consegnata regolarmente. Il docente può correggerla dal pannello (Ricalcola Voto) o assegnare manualmente il voto.`
+    );
+  }
+
   if (pendingSubjectiveCount > 0) {
     if (pendingMode === "exclude") {
       // Reserve grade: the pending questions are deliberately left out, but the
@@ -728,7 +754,7 @@ export function computeGradeBreakdown(params: {
           ? `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: non sono incluse nel voto di riserva, calcolato sulla sola parte oggettiva.`
           : `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: il voto resta "N.V." fino alla correzione.`
       );
-    } else if (!isSubjectivePendingOnly) {
+    } else if (pendingMode === "zero" && !isSubjectivePendingOnly) {
       explanationLines.push(
         `⚠️ ${pendingSubjectiveCount} domanda/e aperta/e non ancora valutata/e: concorrono al calcolo come 0/10 fino alla correzione. Usa "Ricalcola voto" per ottenere una valutazione reale.`
       );
@@ -758,11 +784,189 @@ export function computeGradeBreakdown(params: {
     isPureObjective: hasObj && !hasSubj,
     isPureSubjective: !hasObj && hasSubj,
     isSubjectivePendingOnly,
+    isEvaluationHeld: pendingMode === "hold" && pendingSubjectiveCount > 0,
     objectivePart: objPart,
     subjectivePart: subjPart,
     explanationLines,
     pendingSubjectiveCount,
   };
+}
+
+/**
+ * One open-ended / reflection question paired with the student's answer and,
+ * when available, the AI evaluation detail.
+ *
+ * `detail` is null when the question has not been evaluated yet: the UI must
+ * still show the question and the answer, marking it as "in attesa" instead of
+ * silently hiding it or pretending it scored 0.
+ */
+export interface SubjectiveReviewEntry {
+  id: string;
+  question: any | null;
+  answer: string;
+  detail: any | null;
+}
+
+/**
+ * Merges the exam's subjective questions with the evaluation details.
+ *
+ * The previous UI iterated only over `openEndedDetails` / `reflectionDetails`,
+ * so a partial or failed AI evaluation made the missing questions disappear
+ * from the teacher panel (and their answers became impossible to review).
+ * This helper always returns one entry per exam question, plus any legacy
+ * detail that has no matching question.
+ */
+export function buildSubjectiveReviewEntries(
+  questions: any[],
+  details: any[],
+  getAnswer: (id: string) => string,
+  getDetailId: (detail: any) => any
+): SubjectiveReviewEntry[] {
+  const qList = Array.isArray(questions) ? questions : [];
+  const dList = Array.isArray(details) ? details : [];
+  const idOfQuestion = (q: any): string =>
+    q?.id !== undefined && q?.id !== null ? String(q.id) : "";
+
+  // First pass: exact id matches, so a detail is never stolen by a positional
+  // fallback meant for a legacy document.
+  const exactMatch = new Map<number, number>();
+  const claimed = new Set<number>();
+  qList.forEach((q, qIdx) => {
+    const qid = idOfQuestion(q);
+    if (!qid) return;
+    const dIdx = dList.findIndex((d, i) => {
+      if (claimed.has(i)) return false;
+      const did = getDetailId(d);
+      return did !== undefined && did !== null && String(did) === qid;
+    });
+    if (dIdx >= 0) {
+      exactMatch.set(qIdx, dIdx);
+      claimed.add(dIdx);
+    }
+  });
+
+  const used = new Set<number>(claimed);
+  const entries: SubjectiveReviewEntry[] = qList.map((q, qIdx) => {
+    let dIdx = exactMatch.has(qIdx) ? exactMatch.get(qIdx)! : -1;
+    // Legacy fallback: evaluations saved without ids, or with a different id
+    // convention, are matched by position only when that slot is still free.
+    if (dIdx < 0 && qIdx < dList.length && !used.has(qIdx)) {
+      dIdx = qIdx;
+    }
+    if (dIdx >= 0) used.add(dIdx);
+    const qid = idOfQuestion(q) || `subj_${qIdx + 1}`;
+    return {
+      id: qid,
+      question: q ?? null,
+      answer: getAnswer(qid),
+      detail: dIdx >= 0 ? dList[dIdx] : null,
+    };
+  });
+
+  // Keep legacy evaluations that cannot be mapped to an exam question.
+  dList.forEach((detail, idx) => {
+    if (used.has(idx)) return;
+    const rawId = getDetailId(detail);
+    const id = rawId !== undefined && rawId !== null ? String(rawId) : `subj_extra_${idx + 1}`;
+    entries.push({
+      id,
+      question: null,
+      answer: getAnswer(id),
+      detail,
+    });
+  });
+
+  return entries;
+}
+
+/**
+ * Result of the safety audit that runs before any grade is computed.
+ *
+ * A written answer must never silently become 0 because the AI forgot to
+ * return its score. The audit marks such questions as `missing`; the caller
+ * must then suspend the evaluation (grade "N.V.") instead of publishing a
+ * number. Blank/surrender answers, on the other hand, legitimately get a
+ * synthesized 0 so the teacher still sees the full question list.
+ */
+export interface SubjectiveEvaluationAudit {
+  complete: boolean;
+  missing: Array<{ id: string; question: string }>;
+  /** Details aligned with the exam questions, including synthesized zeros. */
+  details: any[];
+}
+
+/**
+ * Verifies that every open-ended/reflection question the student actually
+ * answered has a numeric evaluation.
+ *
+ * This is the single guard that prevents the PIN 16 regression: when the AI
+ * call failed, the evaluation contained no details at all, yet the grade was
+ * still computed and every open question effectively became 0.
+ */
+export function auditSubjectiveEvaluation(params: {
+  questions: any[];
+  details: any[];
+  getAnswer: (id: string) => string;
+  getDetailId: (detail: any) => any;
+  /** Feedback used for blank answers that the AI omitted. */
+  blankFeedback?: string;
+}): SubjectiveEvaluationAudit {
+  const entries = buildSubjectiveReviewEntries(
+    params.questions,
+    params.details,
+    params.getAnswer,
+    params.getDetailId
+  );
+  const blankFeedback =
+    params.blankFeedback ||
+    "Risposta non compilata: nessun contenuto da valutare (0/10).";
+  const details: any[] = [];
+  const missing: Array<{ id: string; question: string }> = [];
+
+  entries.forEach((entry) => {
+    const hasDetail =
+      entry.detail !== null &&
+      entry.detail !== undefined &&
+      Number.isFinite(Number(entry.detail.score));
+    if (hasDetail) {
+      details.push({
+        ...entry.detail,
+        score: Math.min(10, Math.max(0, Number(entry.detail.score))),
+      });
+      return;
+    }
+
+    const answer = String(entry.answer ?? "").trim();
+    const blank = detectGibberish(answer);
+    if (blank) {
+      // An empty or surrender answer is a legitimate zero: synthesize the
+      // detail so the UI still shows the question instead of hiding it.
+      details.push({
+        id: entry.id,
+        questionId: entry.id,
+        score: 0,
+        feedback: blankFeedback,
+        synthesized: true,
+      });
+      return;
+    }
+    if (entry.question) {
+      missing.push({
+        id: entry.id,
+        question: String(entry.question?.question || ""),
+      });
+    }
+  });
+
+  return { complete: missing.length === 0, missing, details };
+}
+
+/** True when an evaluation has been intentionally left for manual review. */
+export function isEvaluationPending(evaluation: any): boolean {
+  return (
+    !!evaluation &&
+    (evaluation.evaluationMode === "pending" || evaluation.requiresManualReview === true)
+  );
 }
 
 /**
@@ -785,6 +989,33 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
   const examData = safeParse(sub?.Domande_Esame);
   const answers = safeParse(sub?.Risposte_Studente);
 
+  // Detect legacy/AI documents where a written open answer has no score: those
+  // must never be displayed as "0". Blanks are fine (a legitimate zero).
+  let hasWrittenPending = false;
+  try {
+    const questions =
+      tipo === "Workbook"
+        ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
+        : examData?.openEnded || [];
+    if (Array.isArray(questions) && questions.length > 0) {
+      const audit = auditSubjectiveEvaluation({
+        questions,
+        details:
+          tipo === "Workbook"
+            ? evaluation?.reflectionDetails || []
+            : evaluation?.openEndedDetails || [],
+        getAnswer: (id) =>
+          tipo === "Workbook"
+            ? String(answers?.wbRq?.[id] ?? answers?.oe?.[id] ?? "")
+            : String(answers?.oe?.[id] ?? answers?.openEnded?.[id] ?? ""),
+        getDetailId: (d) => (tipo === "Workbook" ? d?.id : d?.questionId),
+      });
+      hasWrittenPending = !audit.complete;
+    }
+  } catch {
+    hasWrittenPending = false;
+  }
+
   return computeGradeBreakdown({
     tipo,
     examData,
@@ -795,8 +1026,65 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
     votoSuggerito: sub?.Voto_Suggerito,
     // A deterministic reserve grade was computed on the objective part only:
     // it must not start penalising the student for reflections nobody graded.
-    pendingSubjective: evaluation?.evaluationMode === "deterministic" ? "exclude" : "zero",
+    // A pending evaluation has no grade at all, and a written answer left
+    // without a score blocks the whole grade ("hold") instead of showing 0.
+    pendingSubjective:
+      evaluation?.evaluationMode === "pending" ||
+      evaluation?.requiresManualReview ||
+      hasWrittenPending
+        ? "hold"
+        : evaluation?.evaluationMode === "deterministic"
+        ? "exclude"
+        : "zero",
   });
+}
+
+/**
+ * Number of open-ended / reflection questions that the student actually
+ * answered but that still have no score. Used by the teacher registry to
+ * surface submissions that need a manual review or a "Ricalcola voto".
+ *
+ * Blank/surrender answers are not counted: their 0 is legitimate and does not
+ * require the teacher's attention.
+ */
+export function getPendingSubjectiveCount(sub: any): number {
+  try {
+    const parseMaybe = (data: any) => {
+      if (!data) return null;
+      if (typeof data === "object") return data;
+      try {
+        return JSON.parse(data);
+      } catch {
+        return null;
+      }
+    };
+    const tipo: "Quiz" | "Workbook" =
+      String(sub?.Tipo || "").toLowerCase() === "workbook" ? "Workbook" : "Quiz";
+    const examData = parseMaybe(sub?.Domande_Esame);
+    const answers = parseMaybe(sub?.Risposte_Studente);
+    const evaluation = parseMaybe(sub?.Full_Evaluation);
+    const questions =
+      tipo === "Workbook"
+        ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
+        : examData?.openEnded || [];
+    if (!Array.isArray(questions) || questions.length === 0) return 0;
+
+    const audit = auditSubjectiveEvaluation({
+      questions,
+      details:
+        tipo === "Workbook"
+          ? evaluation?.reflectionDetails || []
+          : evaluation?.openEndedDetails || [],
+      getAnswer: (id) =>
+        tipo === "Workbook"
+          ? String(answers?.wbRq?.[id] ?? answers?.oe?.[id] ?? "")
+          : String(answers?.oe?.[id] ?? answers?.openEnded?.[id] ?? ""),
+      getDetailId: (d) => (tipo === "Workbook" ? d?.id : d?.questionId),
+    });
+    return audit.missing.length;
+  } catch {
+    return 0;
+  }
 }
 
 /**

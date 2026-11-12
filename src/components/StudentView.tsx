@@ -63,7 +63,11 @@ import {
   isAppleMobile,
   type SeverityPreset,
   SplitScreenDetection,
-  computeGradeBreakdown
+  computeGradeBreakdown,
+  buildSubjectiveReviewEntries,
+  auditSubjectiveEvaluation,
+  isEvaluationPending,
+  getPendingSubjectiveCount
 } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
@@ -2104,6 +2108,39 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         finalEval.fibTotal = rescue.totalFIB;
       }
 
+      // Defense in depth: even if an older server returned a partial evaluation,
+      // never publish a grade when a written open answer has no numeric score.
+      const openQuestions = rescue.examType === "quiz"
+        ? (rescue.examData?.openEnded || [])
+        : (rescue.examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []);
+      if (openQuestions.length > 0) {
+        const audit = auditSubjectiveEvaluation({
+          questions: openQuestions,
+          details: rescue.examType === "quiz"
+            ? (finalEval.openEndedDetails || [])
+            : (finalEval.reflectionDetails || []),
+          getAnswer: (id) => String(
+            rescue.examType === "quiz"
+              ? (rescue.answers?.oe?.[id] ?? "")
+              : (rescue.answers?.wbRq?.[id] ?? rescue.answers?.oe?.[id] ?? "")
+          ),
+          getDetailId: (d) => (rescue.examType === "quiz" ? d?.questionId : d?.id),
+        });
+        if (!audit.complete) {
+          finalEval.evaluationMode = "pending";
+          finalEval.requiresManualReview = true;
+          finalEval.suggestedGrade = "N.V.";
+          finalEval.manualReviewReason =
+            `Valutazione sospesa: ${audit.missing.length} domanda/e aperta/e con una risposta scritta ` +
+            `non ha/hanno ricevuto una valutazione. Per non assegnarti un voto errato, la prova resta "N.V." ` +
+            `e verrà corretta dal docente.`;
+        } else if (rescue.examType === "quiz") {
+          finalEval.openEndedDetails = audit.details;
+        } else {
+          finalEval.reflectionDetails = audit.details;
+        }
+      }
+
       setEvaluation(finalEval);
       clearDraft(rescue.sessionPin);
       localStorage.removeItem("active_eval_rescue"); // Clean the rescue token on successful completion!
@@ -2113,6 +2150,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       } catch {}
       setActiveScreen("results");
       setSavingStatus("");
+
+      if (isEvaluationPending(finalEval)) {
+        setAppAlert({
+          msg: `⚠️ ${finalEval.manualReviewReason || "Valutazione sospesa: la correzione automatica non è riuscita."}\n\n` +
+            `Le tue risposte sono state consegnate e salvate: non devi rifare la prova. Riceverai il voto dopo la correzione del docente.`
+        });
+      }
 
       // Automatically store final grades into Cloud Firestore!
       if (dbFirestore) {
@@ -2661,6 +2705,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                       parsedExamData = selectedPastSub.Domande_Esame || {};
                     }
 
+                    const pastIsPending =
+                      isEvaluationPending(parsedEval) ||
+                      getPendingSubjectiveCount(selectedPastSub) > 0;
+                    const pastGrade = pastIsPending
+                      ? "N.V."
+                      : selectedPastSub.Voto_Suggerito || "N/A";
+
                     return (
                       <div className="space-y-6 animate-fadeIn text-left text-slate-100">
                         <button
@@ -2686,11 +2737,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             <p className="text-xs text-slate-400 mt-1.5">Svolto il: {selectedPastSub.Timestamp ? new Date(selectedPastSub.Timestamp).toLocaleString("it-IT") : "N/D"}</p>
                           </div>
                           <div className="text-left sm:text-right">
-                            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">Voto Consigliato IA</p>
-                            <p className="text-2xl font-display font-bold text-teal-400 mt-0.5">{selectedPastSub.Voto_Suggerito || "N/A"}</p>
+                            <p className="text-[10px] text-slate-500 uppercase tracking-widest font-bold">
+                              {pastIsPending ? "Voto della Prova" : "Voto Consigliato IA"}
+                            </p>
+                            <p className={`text-2xl font-display font-bold mt-0.5 ${pastIsPending ? "text-rose-400" : "text-teal-400"}`}>{pastGrade}</p>
                             {parsedEval?.evaluationMode === "deterministic" && (
                               <span className="mt-1 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border bg-amber-500/10 text-amber-300 border-amber-500/30">
                                 Valutazione di riserva (senza IA) – da revisionare
+                              </span>
+                            )}
+                            {pastIsPending && (
+                              <span className="mt-1 inline-block text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-full border bg-rose-500/10 text-rose-300 border-rose-500/30">
+                                Valutazione sospesa – in attesa del docente
                               </span>
                             )}
                           </div>
@@ -2703,7 +2761,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               <Sparkles className="w-5 h-5 text-indigo-400 animate-pulse" />
                               <h4 className="text-xs font-bold uppercase tracking-wider">Docenza Tutor: Piano di Recupero IA</h4>
                             </div>
-                            {!selectedPastSub.Piano_Recupero && (
+                            {!selectedPastSub.Piano_Recupero && !isEvaluationPending(parsedEval) && (
                               <button
                                 onClick={() => handleGenerateRecoveryPlan(selectedPastSub.id, selectedPastSub)}
                                 disabled={generatingPlan}
@@ -2933,94 +2991,115 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           </div>
                         )}
 
-                        {/* Detailed Open Ended Review Mapping */}
-                        {selectedPastSub.Tipo === "Quiz" && parsedExamData?.openEnded && parsedExamData.openEnded.length > 0 && (
-                          <div className="space-y-4 pt-2">
-                            <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                              Dettaglio Punteggi Domande Aperte:
-                            </h4>
-                            <div className="space-y-4">
-                              {parsedExamData.openEnded.map((q: any, iIdx: number) => {
-                                const ansValue = parsedAnswers?.oe?.[q.id] || "";
-                                const itemEval = (parsedEval?.openEndedDetails || []).find((det: any) => det.questionId === q.id) || 
-                                  (parsedEval?.openEndedDetails || [])[iIdx] || { score: 0, feedback: "Valutazione non disponibile." };
-                                
-                                const score = itemEval.score || 0;
-                                const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
+                        {/* Detailed Open Ended Review Mapping (all questions, also pending) */}
+                        {selectedPastSub.Tipo === "Quiz" && (() => {
+                          const entries = buildSubjectiveReviewEntries(
+                            parsedExamData?.openEnded || [],
+                            parsedEval?.openEndedDetails || [],
+                            (id) => String(parsedAnswers?.oe?.[id] ?? ""),
+                            (d) => d.questionId
+                          );
+                          if (entries.length === 0) return null;
+                          return (
+                            <div className="space-y-4 pt-2">
+                              <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                                Dettaglio Punteggi Domande Aperte:
+                              </h4>
+                              <div className="space-y-4">
+                                {entries.map((entry: any, iIdx: number) => {
+                                  const ansValue = entry.answer || "";
+                                  const itemEval = entry.detail;
+                                  const hasEvaluation = !!itemEval;
+                                  const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                                  const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
-                                return (
-                                  <div key={q.id} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
-                                    <p className="text-xs font-bold font-mono text-slate-300">
-                                      DOMANDA APERTA {((parsedExamData?.multipleChoice || []).length) + iIdx + 1}
-                                    </p>
-                                    <p className="font-semibold text-slate-200 text-sm leading-relaxed">{q.question}</p>
-                                    <QuestionFigure src={parsedExamData?.images?.[q.id]} />
-                                    <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
-                                      &ldquo;{displayAnswer}&rdquo;
-                                    </div>
-                                    <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
-                                      <div className="flex-1 space-y-1 leading-relaxed text-left">
-                                        <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                                        <p dangerouslySetInnerHTML={{ __html: formatMarkdown(itemEval.feedback) }} />
+                                  return (
+                                    <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
+                                      <p className="text-xs font-bold font-mono text-slate-300">
+                                        DOMANDA APERTA {((parsedExamData?.multipleChoice || []).length) + iIdx + 1}
+                                      </p>
+                                      {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
+                                      <QuestionFigure src={parsedExamData?.images?.[entry.id]} />
+                                      <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
+                                        &ldquo;{displayAnswer}&rdquo;
                                       </div>
-                                      <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
-                                        score >= 6 
-                                          ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" 
-                                          : "bg-red-500/10 text-red-100 border-red-500/20"
-                                      }`}>
-                                        Voto: {score}/10
+                                      <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
+                                        <div className="flex-1 space-y-1 leading-relaxed text-left">
+                                          <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
+                                          <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                                        </div>
+                                        <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
+                                          !hasEvaluation
+                                            ? "bg-slate-500/10 text-slate-300 border-slate-500/30"
+                                            : (score ?? 0) >= 6
+                                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                            : "bg-red-500/10 text-red-100 border-red-500/20"
+                                        }`}>
+                                          Voto: {hasEvaluation ? `${score}/10` : "N.V."}
+                                        </div>
                                       </div>
                                     </div>
-                                  </div>
-                                );
-                              })}
+                                  );
+                                })}
+                              </div>
                             </div>
-                          </div>
-                        )}
+                          );
+                        })()}
 
-                        {/* Workbook Detailed Reflections Reviews Mapping */}
-                        {selectedPastSub.Tipo !== "Quiz" && parsedExamData?.sections && (
-                          <div className="space-y-4 pt-2">
-                            <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                              Dettaglio Punteggi Riflessioni Workbook:
-                            </h4>
-                            <div className="space-y-4">
-                              {parsedExamData.sections.flatMap((sec: any) => sec.reflectionQuestions || []).map((rq: any, iIdx: number) => {
-                                const ansValue = parsedAnswers?.wbRq?.[rq.id] || "";
-                                const itemEval = (parsedEval?.reflectionDetails || []).find((det: any) => det.id === rq.id) || 
-                                  (parsedEval?.reflectionDetails || [])[iIdx] || { score: 0, feedback: "Valutazione non disponibile." };
+                        {/* Workbook Detailed Reflections Reviews Mapping (all questions, also pending) */}
+                        {selectedPastSub.Tipo !== "Quiz" && parsedExamData?.sections && (() => {
+                          const rqList = parsedExamData.sections.flatMap((sec: any) => sec.reflectionQuestions || []);
+                          const entries = buildSubjectiveReviewEntries(
+                            rqList,
+                            parsedEval?.reflectionDetails || [],
+                            (id) => String(parsedAnswers?.wbRq?.[id] ?? parsedAnswers?.oe?.[id] ?? ""),
+                            (d) => d.id
+                          );
+                          if (entries.length === 0) return null;
+                          return (
+                            <div className="space-y-4 pt-2">
+                              <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                                Dettaglio Punteggi Riflessioni Workbook:
+                              </h4>
+                              <div className="space-y-4">
+                                {entries.map((entry: any, iIdx: number) => {
+                                  const ansValue = entry.answer || "";
+                                  const itemEval = entry.detail;
+                                  const hasEvaluation = !!itemEval;
+                                  const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                                  const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
-                                const score = itemEval.score || 0;
-                                const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
-
-                                return (
-                                  <div key={rq.id} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
-                                    <p className="text-xs font-bold font-mono text-slate-300">
-                                      RIFLESSIONE CRITICA {iIdx + 1}
-                                    </p>
-                                    <p className="font-semibold text-slate-200 text-sm leading-relaxed">{rq.question}</p>
-                                    <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
-                                      &ldquo;{displayAnswer}&rdquo;
-                                    </div>
-                                    <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
-                                      <div className="flex-1 space-y-1 leading-relaxed text-left">
-                                        <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                                        <p dangerouslySetInnerHTML={{ __html: formatMarkdown(itemEval.feedback) }} />
+                                  return (
+                                    <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
+                                      <p className="text-xs font-bold font-mono text-slate-300">
+                                        RIFLESSIONE CRITICA {iIdx + 1}
+                                      </p>
+                                      {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
+                                      <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
+                                        &ldquo;{displayAnswer}&rdquo;
                                       </div>
-                                      <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
-                                        score >= 6 
-                                          ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" 
-                                          : "bg-red-500/10 text-red-100 border-red-500/20"
-                                      }`}>
-                                        Voto: {score}/10
+                                      <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
+                                        <div className="flex-1 space-y-1 leading-relaxed text-left">
+                                          <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
+                                          <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                                        </div>
+                                        <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
+                                          !hasEvaluation
+                                            ? "bg-slate-500/10 text-slate-300 border-slate-500/30"
+                                            : (score ?? 0) >= 6
+                                            ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                            : "bg-red-500/10 text-red-100 border-red-500/20"
+                                        }`}>
+                                          Voto: {hasEvaluation ? `${score}/10` : "N.V."}
+                                        </div>
                                       </div>
                                     </div>
-                                  </div>
-                                );
-                              })}
+                                  );
+                                })}
+                              </div>
                             </div>
-                          </div>
-                        )}
+                          );
+                        })()}
                       </div>
                     );
                   })()
@@ -3055,6 +3134,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             hour: "2-digit",
                             minute: "2-digit"
                           }) : "N/D";
+                          const listIsPending =
+                            isEvaluationPending(sub.Full_Evaluation) ||
+                            getPendingSubjectiveCount(sub) > 0;
                           return (
                             <div
                               key={sub.id}
@@ -3083,8 +3165,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
                               <div className="flex items-center gap-2 text-right shrink-0">
                                 <div>
-                                  <p className="text-[9px] text-slate-500 uppercase font-mono">Voto IA</p>
-                                  <p className="text-sm font-display font-semibold text-teal-400 leading-tight">{sub.Voto_Suggerito || "N/A"}</p>
+                                  <p className="text-[9px] text-slate-500 uppercase font-mono">
+                                    {listIsPending ? "In attesa" : "Voto IA"}
+                                  </p>
+                                  <p className={`text-sm font-display font-semibold leading-tight ${listIsPending ? "text-rose-400" : "text-teal-400"}`}>
+                                    {listIsPending ? "N.V." : sub.Voto_Suggerito || "N/A"}
+                                  </p>
                                 </div>
                                 <ChevronRight className="w-4 h-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
                               </div>
@@ -3873,13 +3959,31 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </button>
             </div>
 
+            {/* Evaluation suspended: the automatic correction could not score
+                every written answer. No grade is published. */}
+            {isEvaluationPending(evaluation) && (
+              <div className="bg-amber-950/40 border-2 border-amber-500/40 rounded-2xl p-5 space-y-2">
+                <div className="flex items-center gap-2 text-amber-300">
+                  <AlertTriangle className="w-5 h-5 shrink-0" />
+                  <h4 className="text-sm font-bold uppercase tracking-wider">Valutazione sospesa — prova non ancora valutata</h4>
+                </div>
+                <p className="text-sm text-amber-100/90 leading-relaxed">
+                  {evaluation?.manualReviewReason ||
+                    "La correzione automatica non è riuscita a valutare tutte le domande aperte. Per non assegnarti un voto errato, la prova resta N.V. e verrà corretta dal docente."}
+                </p>
+                <p className="text-xs text-amber-200/80">
+                  Le risposte sono state consegnate e salvate correttamente. Non è necessario rifare la prova.
+                </p>
+              </div>
+            )}
+
             {/* Score box and self-assessment matching */}
             <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
               <div className="bg-slate-950/60 p-5 rounded-2xl border border-white/5 text-center flex flex-col justify-center">
                 <p className="text-[11px] uppercase tracking-wider text-slate-500 font-bold">
-                  Voto IA Consigliato
+                  {isEvaluationPending(evaluation) ? "Voto della Prova" : "Voto IA Consigliato"}
                 </p>
-                <p className="text-4xl font-display font-bold text-teal-400 mt-2">
+                <p className={`text-4xl font-display font-bold mt-2 ${isEvaluationPending(evaluation) ? "text-amber-300" : "text-teal-400"}`}>
                   {evaluation?.suggestedGrade || "—"}
                 </p>
               </div>
@@ -3928,7 +4032,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   examData,
                   answers,
                   evaluation,
-                  votoSuggerito: evaluation.suggestedGrade
+                  votoSuggerito: evaluation.suggestedGrade,
+                  // A suspended evaluation must show "N.V." (hold): never a
+                  // reserve grade and never zeros on ungraded open answers.
+                  // A deterministic reserve grade was computed on the objective
+                  // part only: the ungraded open questions must not look like
+                  // zeros and drag the displayed grade below the stored one.
+                  pendingSubjective: isEvaluationPending(evaluation)
+                    ? "hold"
+                    : evaluation.evaluationMode === "deterministic"
+                    ? "exclude"
+                    : "zero"
                 })}
               />
             )}
@@ -3978,7 +4092,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   <Sparkles className="w-5 h-5 text-indigo-400 animate-pulse" />
                   <h4 className="text-xs font-bold uppercase tracking-wider">Docenza Tutor: Piano di Recupero Personalizzato</h4>
                 </div>
-                {!activePlanHtml && (
+                {!activePlanHtml && !isEvaluationPending(evaluation) && (
                   <button
                     onClick={async () => {
                       if (generatingPlan) return;
@@ -4121,50 +4235,61 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
-            {/* Detailed open-ended reviews mapping (only if openEnded questions exist) */}
-            {examType === "quiz" && (examData?.openEnded || []).length > 0 && (
-              <div className="space-y-4 pt-2">
-                <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                  Dettaglio Punteggi Domande Aperte:
-                </h4>
-                <div className="space-y-4">
-                  {examData.openEnded.map((q: any, iIdx: number) => {
-                    const ansValue = answers.oe[q.id] || "";
-                    const itemEval = (evaluation?.openEndedDetails || []).find((det: any) => det.questionId === q.id) || 
-                      (evaluation?.openEndedDetails || [])[iIdx] || { score: 0, feedback: "Valutazione mancante." };
-                    
-                    const score = itemEval.score || 0;
-                    const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
+            {/* Detailed open-ended reviews mapping (always show every question,
+                even when the AI did not return a score for it) */}
+            {examType === "quiz" && (() => {
+              const entries = buildSubjectiveReviewEntries(
+                examData?.openEnded || [],
+                evaluation?.openEndedDetails || [],
+                (id) => String(answers.oe?.[id] ?? ""),
+                (d) => d.questionId
+              );
+              if (entries.length === 0) return null;
+              return (
+                <div className="space-y-4 pt-2">
+                  <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                    Dettaglio Punteggi Domande Aperte:
+                  </h4>
+                  <div className="space-y-4">
+                    {entries.map((entry: any, iIdx: number) => {
+                      const ansValue = entry.answer || "";
+                      const itemEval = entry.detail;
+                      const hasEvaluation = !!itemEval;
+                      const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
 
-                    return (
-                      <div key={q.id} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
-                        <p className="text-xs font-bold font-mono text-slate-300">
-                          DOMANDA APERTA {((examData?.multipleChoice || []).length) + iIdx + 1}
-                        </p>
-                        <p className="font-semibold text-slate-200 text-sm leading-relaxed">{q.question}</p>
-                        <QuestionFigure src={examData?.images?.[q.id]} />
-                        <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5 line-clamp-3">
-                          &ldquo;{displayAnswer}&rdquo;
-                        </div>
-                        <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
-                          <div className="flex-1 space-y-1 leading-relaxed">
-                            <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                            <p dangerouslySetInnerHTML={{ __html: formatMarkdown(itemEval.feedback) }} />
+                      const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
+
+                      return (
+                        <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
+                          <p className="text-xs font-bold font-mono text-slate-300">
+                            DOMANDA APERTA {((examData?.multipleChoice || []).length) + iIdx + 1}
+                          </p>
+                          {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
+                          <QuestionFigure src={examData?.images?.[entry.id]} />
+                          <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5 line-clamp-3">
+                            &ldquo;{displayAnswer}&rdquo;
                           </div>
-                          <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
-                            score >= 6 
-                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" 
-                              : "bg-red-500/10 text-red-400 border-red-500/20"
-                          }`}>
-                            Voto: {score}/10
+                          <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
+                            <div className="flex-1 space-y-1 leading-relaxed">
+                              <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
+                              <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                            </div>
+                            <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
+                              !hasEvaluation
+                                ? "bg-slate-500/10 text-slate-300 border-slate-500/30"
+                                : (score ?? 0) >= 6
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"                                : "bg-red-500/10 text-red-400 border-red-500/20"
+                            }`}>
+                              Voto: {hasEvaluation ? `${score}/10` : "N.V."}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Workbook Detailed Fill-in-the-Blank (FIB) / Completamento Review */}
             {examType === "workbook" && examData?.sections && examData.sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0) && (
@@ -4244,49 +4369,62 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
-            {/* Workbook detailed reflections reviews mapping (only if reflection questions exist) */}
-            {examType === "workbook" && examData?.sections && (examData.sections.flatMap((sec: any) => sec.reflectionQuestions || []).length > 0) && (
-              <div className="space-y-4 pt-2">
-                <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                  Dettaglio Punteggi Riflessioni Workbook:
-                </h4>
-                <div className="space-y-4">
-                  {examData.sections.flatMap((sec: any) => sec.reflectionQuestions || []).map((rq: any, iIdx: number) => {
-                    const ansValue = answers.wbRq[rq.id] || "";
-                    const itemEval = (evaluation?.reflectionDetails || []).find((det: any) => det.id === rq.id) || 
-                      (evaluation?.reflectionDetails || [])[iIdx] || { score: 0, feedback: "Valutazione mancante." };
+            {/* Workbook detailed reflections reviews mapping (always show every
+                reflection, even when the AI did not return a score for it) */}
+            {examType === "workbook" && examData?.sections && (() => {
+              const rqList = examData.sections.flatMap((sec: any) => sec.reflectionQuestions || []);
+              const entries = buildSubjectiveReviewEntries(
+                rqList,
+                evaluation?.reflectionDetails || [],
+                (id) => String(answers.wbRq?.[id] ?? answers.oe?.[id] ?? ""),
+                (d) => d.id
+              );
+              if (entries.length === 0) return null;
+              return (
+                <div className="space-y-4 pt-2">
+                  <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                    Dettaglio Punteggi Riflessioni Workbook:
+                  </h4>
+                  <div className="space-y-4">
+                    {entries.map((entry: any, iIdx: number) => {
+                      const ansValue = entry.answer || "";
+                      const itemEval = entry.detail;
+                      const hasEvaluation = !!itemEval;
+                      const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
 
-                    const score = itemEval.score || 0;
-                    const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
+                      const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
-                    return (
-                      <div key={rq.id} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
-                        <p className="text-xs font-bold font-mono text-slate-300">
-                          RIFLESSIONE CRITICA {iIdx + 1}
-                        </p>
-                        <p className="font-semibold text-slate-200 text-sm leading-relaxed">{rq.question}</p>
-                        <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
-                          &ldquo;{displayAnswer}&rdquo;
-                        </div>
-                        <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
-                          <div className="flex-1 space-y-1 leading-relaxed">
-                            <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                            <p dangerouslySetInnerHTML={{ __html: formatMarkdown(itemEval.feedback) }} />
+                      return (
+                        <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
+                          <p className="text-xs font-bold font-mono text-slate-300">
+                            RIFLESSIONE CRITICA {iIdx + 1}
+                          </p>
+                          {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
+                          <div className="p-3 bg-black/30 text-slate-400 text-xs italic rounded-xl border border-white/5">
+                            &ldquo;{displayAnswer}&rdquo;
                           </div>
-                          <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
-                            score >= 6 
-                              ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20" 
-                              : "bg-red-500/10 text-red-400 border-red-500/20"
-                          }`}>
-                            Voto: {score}/10
+                          <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
+                            <div className="flex-1 space-y-1 leading-relaxed">
+                              <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
+                              <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                            </div>
+                            <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
+                              !hasEvaluation
+                                ? "bg-slate-500/10 text-slate-300 border-slate-500/30"
+                                : (score ?? 0) >= 6
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                : "bg-red-500/10 text-red-400 border-red-500/20"
+                            }`}>
+                              Voto: {hasEvaluation ? `${score}/10` : "N.V."}
+                            </div>
                           </div>
                         </div>
-                      </div>
-                    );
-                  })}
+                      );
+                    })}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Anti copy violation overview on final report card */}
             <div className="bg-yellow-500/5 border border-yellow-500/25 p-5 rounded-2xl space-y-3 text-xs leading-relaxed text-slate-300">

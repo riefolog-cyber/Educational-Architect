@@ -276,7 +276,9 @@ export default function GradeCalculationReport({
               {hasPendingSubjective && (
                 <p className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2 py-1">
                   {breakdown.pendingSubjectiveCount} domanda/e in attesa di valutazione.
-                  {isSubjectivePendingOnly
+                  {breakdown.isEvaluationHeld
+                    ? " Il voto resta N.V. fino alla correzione."
+                    : isSubjectivePendingOnly
                     ? " Il voto resta N.V. fino alla correzione."
                     : " Concorrono come 0/10 fino alla correzione."}
                 </p>
@@ -288,7 +290,9 @@ export default function GradeCalculationReport({
 
       {hasPendingSubjective && !breakdown.subjectivePart && (
         <p className="text-[10px] text-amber-300/90 bg-amber-500/10 border border-amber-500/20 rounded-lg px-2 py-1">
-          {breakdown.pendingSubjectiveCount} domanda/e aperta/e in attesa: non incluse nel voto di riserva, calcolato sulla sola parte oggettiva.
+          {breakdown.isEvaluationHeld
+            ? `${breakdown.pendingSubjectiveCount} domanda/e aperta/e con risposta scritta non ancora valutata/e: il voto resta N.V. fino alla correzione del docente.`
+            : `${breakdown.pendingSubjectiveCount} domanda/e aperta/e in attesa: non incluse nel voto di riserva, calcolato sulla sola parte oggettiva.`}
         </p>
       )}
 

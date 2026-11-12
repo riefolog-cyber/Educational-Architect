@@ -116,8 +116,12 @@ export interface ReflectionEvaluationItem {
 }
 
 export interface Evaluation {
-  suggestedGrade: string; // Final weighted grade (e.g., "7.5", "8")
-  evaluationMode?: 'ai' | 'deterministic'; // Whether grading came from AI or deterministic fallback
+  suggestedGrade: string; // Final weighted grade (e.g., "7.5", "8") or "N.V."
+  evaluationMode?: 'ai' | 'deterministic' | 'pending'; // AI, deterministic fallback, or suspended for manual review
+  /** True when the automatic evaluation was suspended to avoid a wrong grade. */
+  requiresManualReview?: boolean;
+  /** Human-readable reason shown to the student and to the teacher. */
+  manualReviewReason?: string;
   mainErrors?: string; // Summary of errors
   openEndedEvaluation?: string; // Review of open ended questions
   overallFeedback?: string; // Workbook overall feedback
@@ -125,6 +129,7 @@ export interface Evaluation {
   reflectionDetails?: ReflectionEvaluationItem[]; // Workbook reflection details
   fibScore?: number; // Calculated fill-in-blank score
   fibTotal?: number; // Total blanks
+  gradeBreakdown?: any; // Full mathematical breakdown, when available
 }
 
 export interface SavedSubmission {
