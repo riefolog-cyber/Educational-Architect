@@ -4,7 +4,15 @@ import { initializeApp } from "firebase/app";
 import { getFirestore, doc, getDoc } from "firebase/firestore";
 import { GoogleGenAI, Type } from "@google/genai";
 
-const apiKey = "AIzaSyAN9N6gr8uXMRwbCrofJ5hga7YNHm_KC9g";
+// La chiave Gemini va passata come variabile d'ambiente, MAI hardcoded:
+//   $env:GEMINI_API_KEY="..."; npx tsx scripts/test-real-evaluation.ts
+const apiKey = process.env.GEMINI_API_KEY || process.env.educationaarch || "";
+if (!apiKey) {
+  console.error(
+    "ERRORE: variabile GEMINI_API_KEY mancante. Impostala nell'ambiente prima di eseguire lo script (non salvarla nel codice)."
+  );
+  process.exit(1);
+}
 const aiClient = new GoogleGenAI({
   apiKey,
   httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }

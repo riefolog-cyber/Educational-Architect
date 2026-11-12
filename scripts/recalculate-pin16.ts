@@ -10,7 +10,15 @@ import {
   detectGibberish
 } from "../src/utils";
 
-const apiKey = "AIzaSyAN9N6gr8uXMRwbCrofJ5hga7YNHm_KC9g";
+// La chiave Gemini va passata come variabile d'ambiente, MAI hardcoded:
+//   $env:GEMINI_API_KEY="..."; npx tsx scripts/recalculate-pin16.ts
+const apiKey = process.env.GEMINI_API_KEY || process.env.educationaarch || "";
+if (!apiKey) {
+  console.error(
+    "ERRORE: variabile GEMINI_API_KEY mancante. Impostala nell'ambiente prima di eseguire lo script (non salvarla nel codice)."
+  );
+  process.exit(1);
+}
 const aiClient = new GoogleGenAI({
   apiKey,
   httpOptions: { headers: { 'User-Agent': 'aistudio-build' } }
