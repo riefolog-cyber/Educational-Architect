@@ -748,7 +748,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
           config: {
             systemInstruction,
             temperature: 0.1,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 4096,
             thinkingConfig: {
               thinkingLevel: "LOW"
             },
@@ -839,7 +839,9 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         config: {
           systemInstruction,
           temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
-          maxOutputTokens: 2048,
+          // Abbondante per evitare troncamenti: un JSON troncato, anche se
+          // riparato, può mancare di dettagli e bloccare la valutazione.
+          maxOutputTokens: 4096,
           thinkingConfig: {
             thinkingLevel: "LOW"
           },
@@ -996,7 +998,7 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
           config: {
             systemInstruction,
             temperature: 0.1,
-            maxOutputTokens: 2048,
+            maxOutputTokens: 4096,
             thinkingConfig: { thinkingLevel: "LOW" },
             responseMimeType: "application/json",
             responseSchema: {
@@ -1077,7 +1079,9 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         config: {
           systemInstruction,
           temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
-          maxOutputTokens: 2048,
+          // 2048 troncava la valutazione di piu riflessioni: il parser ripara il
+          // JSON ma i dettagli mancanti fanno sospendere il voto (N.V.).
+          maxOutputTokens: 4096,
           thinkingConfig: {
             thinkingLevel: "LOW"
           },
