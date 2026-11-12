@@ -74,7 +74,7 @@ export default function ClassroomLiveMonitor({
   const [loading, setLoading] = useState(true);
   const [snapshotError, setSnapshotError] = useState("");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked">("in_progress");
+  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked">("all");
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -186,13 +186,21 @@ export default function ClassroomLiveMonitor({
   const inProgressCount = resolvedStudents.filter(
     s => s.status === "in_progress" || s.status === "self_evaluating"
   ).length;
-  const submittedCount = resolvedStudents.filter(s => s.status === "submitted").length;
+  const submittedStudents = resolvedStudents.filter(s => s.status === "submitted");
+  const submittedCount = submittedStudents.length;
   const waitingCount = resolvedStudents.filter(s => s.status === "waiting").length;
   const lockedCount = resolvedStudents.filter(s => s.locked).length;
   const alertsCount = resolvedStudents.filter(
     s => isSendingSignal(s.lastHeartbeat) && (s.tabSwitches > 0 || s.pasteAttempts > 0)
   ).length;
   const connectedCount = inProgressCount + submittedCount + waitingCount;
+  const submittedNamesSummary = submittedStudents.length === 1
+    ? submittedStudents[0].studentName
+    : submittedStudents.length === 2
+    ? `${submittedStudents[0].studentName}, ${submittedStudents[1].studentName}`
+    : submittedStudents.length > 2
+    ? `${submittedStudents[0].studentName} + ${submittedStudents.length - 1} altri`
+    : "";
 
   const getRelativeTime = (isoString: string) => {
     const diffSec = secondsSince(isoString);
@@ -773,54 +781,63 @@ export default function ClassroomLiveMonitor({
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
         <div 
           onClick={() => setFilter("all")}
-          className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
-            filter === "all" ? "bg-indigo-950/40 border-indigo-500/40 ring-1 ring-indigo-500/30" : "bg-slate-900/40 border-white/10 hover:border-white/20"
+          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+            filter === "all" ? "bg-indigo-950/50 border-indigo-500/50 ring-2 ring-indigo-500/30 shadow-lg shadow-indigo-950/40" : "bg-slate-900/60 border-white/10 hover:border-indigo-500/30 hover:bg-slate-900/80"
           }`}
         >
-          <div className="flex items-center justify-between text-slate-400 mb-1">
-            <span className="text-[10px] uppercase font-bold tracking-wider">Connessi</span>
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] uppercase font-bold tracking-wider group-hover:text-indigo-300 transition-colors">Connessi</span>
             <Users className="w-4 h-4 text-indigo-400" />
           </div>
           <p className="text-2xl font-bold font-mono text-white">{connectedCount}</p>
-          <p className="text-[10px] text-slate-500 mt-0.5">Dispositivi in aula</p>
+          <p className="text-[10px] text-slate-400 mt-1">Dispositivi in aula</p>
         </div>
 
         <div 
-          onClick={() => setFilter("in_progress")}
-          className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
-            filter === "in_progress" ? "bg-amber-950/40 border-amber-500/40 ring-1 ring-amber-500/30" : "bg-slate-900/40 border-white/10 hover:border-white/20"
+          onClick={() => setFilter(filter === "in_progress" ? "all" : "in_progress")}
+          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+            filter === "in_progress" ? "bg-amber-950/50 border-amber-500/50 ring-2 ring-amber-500/30 shadow-lg shadow-amber-950/40" : "bg-slate-900/60 border-white/10 hover:border-amber-500/30 hover:bg-slate-900/80"
           }`}
         >
-          <div className="flex items-center justify-between text-slate-400 mb-1">
-            <span className="text-[10px] uppercase font-bold tracking-wider">In Prova</span>
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] uppercase font-bold tracking-wider group-hover:text-amber-300 transition-colors">In Prova</span>
             <Activity className="w-4 h-4 text-amber-400 animate-pulse" />
           </div>
           <p className="text-2xl font-bold font-mono text-amber-300">{inProgressCount}</p>
-          <p className="text-[10px] text-slate-500 mt-0.5">Stanno compilando</p>
+          <p className="text-[10px] text-slate-400 mt-1">Stanno compilando</p>
         </div>
 
         <div 
-          onClick={() => setFilter("submitted")}
-          className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
-            filter === "submitted" ? "bg-emerald-950/40 border-emerald-500/40 ring-1 ring-emerald-500/30" : "bg-slate-900/40 border-white/10 hover:border-white/20"
+          onClick={() => setFilter(filter === "submitted" ? "all" : "submitted")}
+          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+            filter === "submitted" ? "bg-emerald-950/50 border-emerald-500/50 ring-2 ring-emerald-500/30 shadow-lg shadow-emerald-950/40" : "bg-slate-900/60 border-white/10 hover:border-emerald-500/30 hover:bg-slate-900/80"
           }`}
         >
-          <div className="flex items-center justify-between text-slate-400 mb-1">
-            <span className="text-[10px] uppercase font-bold tracking-wider">Consegnati</span>
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] uppercase font-bold tracking-wider group-hover:text-emerald-300 transition-colors">Consegnati</span>
             <CheckCircle2 className="w-4 h-4 text-emerald-400" />
           </div>
-          <p className="text-2xl font-bold font-mono text-emerald-300">{submittedCount}</p>
-          <p className="text-[10px] text-slate-500 mt-0.5">Prove completate</p>
+          <div className="flex items-baseline gap-2">
+            <p className="text-2xl font-bold font-mono text-emerald-300">{submittedCount}</p>
+            {submittedCount > 0 && (
+              <span className="text-[11px] text-emerald-400/90 font-medium truncate max-w-[130px]" title={submittedNamesSummary}>
+                {submittedNamesSummary}
+              </span>
+            )}
+          </div>
+          <p className="text-[10px] text-slate-400 mt-1">
+            {submittedCount === 0 ? "Nessuna consegna" : submittedCount === 1 ? "1 prova completata" : `${submittedCount} prove completate`}
+          </p>
         </div>
 
         <div 
-          onClick={() => setFilter(lockedCount > 0 ? "locked" : "alerts")}
-          className={`p-3.5 rounded-2xl border transition-all cursor-pointer ${
-            filter === "locked" || filter === "alerts" ? "bg-red-950/50 border-red-500/50 ring-1 ring-red-500/40" : "bg-slate-900/40 border-white/10 hover:border-white/20"
+          onClick={() => setFilter(filter === "locked" || filter === "alerts" ? "all" : lockedCount > 0 ? "locked" : "alerts")}
+          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+            filter === "locked" || filter === "alerts" ? "bg-red-950/50 border-red-500/50 ring-2 ring-red-500/40 shadow-lg shadow-red-950/40" : "bg-slate-900/60 border-white/10 hover:border-red-500/30 hover:bg-slate-900/80"
           }`}
         >
-          <div className="flex items-center justify-between text-slate-400 mb-1">
-            <span className="text-[10px] uppercase font-bold tracking-wider">Allarmi & Blocchi</span>
+          <div className="flex items-center justify-between text-slate-400 mb-1.5">
+            <span className="text-[10px] uppercase font-bold tracking-wider group-hover:text-red-300 transition-colors">Allarmi & Blocchi</span>
             {lockedCount > 0 ? (
               <Lock className="w-4 h-4 text-red-400 animate-bounce" />
             ) : (
@@ -835,7 +852,7 @@ export default function ClassroomLiveMonitor({
               </span>
             )}
           </div>
-          <p className="text-[10px] text-slate-400 mt-0.5">
+          <p className="text-[10px] text-slate-400 mt-1">
             {lockedCount > 0 ? "Richiedono sblocco 1-click" : "Uscite / Copia-incolla"}
           </p>
         </div>
@@ -858,10 +875,10 @@ export default function ClassroomLiveMonitor({
           <span className="text-[10px] text-slate-500 uppercase font-bold mr-1">Filtra:</span>
           {lockedCount > 0 && (
             <button
-              onClick={() => setFilter("locked")}
-              className={`px-3 py-1.5 rounded-lg text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+              onClick={() => setFilter(filter === "locked" ? "all" : "locked")}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
                 filter === "locked"
-                  ? "bg-red-600 text-white shadow-md ring-1 ring-red-400"
+                  ? "bg-red-600 text-white shadow-md ring-2 ring-red-400"
                   : "bg-red-950/70 text-red-300 hover:text-white border border-red-500/50 animate-pulse"
               }`}
             >
@@ -869,20 +886,27 @@ export default function ClassroomLiveMonitor({
               <span>Bloccati ({lockedCount})</span>
             </button>
           )}
-          {(["in_progress", "all", "submitted", "alerts"] as const).map((mode) => (
+          {[
+            { id: "all", label: "Tutti in aula", count: connectedCount },
+            { id: "in_progress", label: "In prova", count: inProgressCount },
+            { id: "submitted", label: "Consegnati", count: submittedCount },
+            { id: "alerts", label: "Segnalazioni", count: alertsCount }
+          ].map(({ id, label, count }) => (
             <button
-              key={mode}
-              onClick={() => setFilter(mode)}
-              className={`px-2.5 py-1.5 rounded-lg text-xs font-semibold cursor-pointer transition-all ${
-                filter === mode
-                  ? "bg-indigo-600 text-white shadow-sm"
-                  : "bg-slate-900/80 text-slate-400 hover:text-white border border-white/5"
+              key={id}
+              onClick={() => setFilter(id as any)}
+              className={`px-3 py-1.5 rounded-xl text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
+                filter === id
+                  ? "bg-indigo-600 text-white shadow-md shadow-indigo-600/30 ring-1 ring-indigo-400 font-bold"
+                  : "bg-slate-900/80 text-slate-300 hover:text-white border border-white/5 hover:border-white/15"
               }`}
             >
-              {mode === "all" && "In aula"}
-              {mode === "in_progress" && "In corso"}
-              {mode === "submitted" && "Consegnati"}
-              {mode === "alerts" && "⚠️ Con segnalazioni"}
+              <span>{label}</span>
+              <span className={`text-[10px] font-mono px-1.5 py-0.2 rounded-md ${
+                filter === id ? "bg-white/20 text-white font-bold" : "bg-white/5 text-slate-400"
+              }`}>
+                {count}
+              </span>
             </button>
           ))}
         </div>
@@ -929,13 +953,15 @@ export default function ClassroomLiveMonitor({
               return (
                 <div
                   key={student.id}
-                  className={`p-4 transition-colors flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-xl mx-2 my-1.5 ${
+                  className={`p-4 transition-all flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl mx-2 my-2 border ${
                     student.locked
-                      ? "bg-red-950/45 border-2 border-red-500/60 ring-1 ring-red-500/40 hover:bg-red-950/55"
+                      ? "bg-red-950/50 border-red-500/70 ring-2 ring-red-500/40 shadow-lg shadow-red-950/50 hover:bg-red-950/60"
+                      : student.status === "submitted"
+                      ? "bg-emerald-950/25 border-emerald-500/40 shadow-sm shadow-emerald-950/30 hover:bg-emerald-950/35 hover:border-emerald-500/60"
                       : hasAlerts
-                      ? "bg-red-500/5 hover:bg-red-500/10"
-                      : "hover:bg-white/5"
-                  } ${isOffline && !student.locked ? "opacity-50" : ""}`}
+                      ? "bg-red-500/5 border-red-500/20 hover:bg-red-500/10"
+                      : "bg-slate-900/40 border-white/5 hover:bg-white/[0.04] hover:border-white/15"
+                  } ${isOffline && !student.locked ? "opacity-55" : ""}`}
                 >
                   {/* Student identity */}
                   <div className="min-w-[220px] max-w-md">
@@ -943,36 +969,37 @@ export default function ClassroomLiveMonitor({
                       <div
                         className={`w-3.5 h-3.5 rounded-full shrink-0 ${
                           student.status === "submitted"
-                            ? "bg-emerald-400"
+                            ? "bg-emerald-400 shadow-sm shadow-emerald-400/50"
                             : student.locked
                             ? "bg-red-500 animate-ping"
                             : isOffline
                             ? "bg-slate-600"
-                            : "bg-emerald-500 animate-pulse"
+                            : "bg-teal-400 animate-pulse"
                         }`}
-                        title={student.locked ? "Prova bloccata" : isOffline ? "Segnale perso: alunno non connesso" : "Connesso e attivo"}
+                        title={student.locked ? "Prova bloccata" : student.status === "submitted" ? "Prova consegnata con successo" : isOffline ? "Segnale perso: alunno non connesso" : "Connesso e attivo"}
                       />
                       <div>
                         <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
                           <span>{student.studentName}</span>
                           {student.status === "submitted" && (
-                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30">
+                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
+                              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
                               Consegnato ✓
                             </span>
                           )}
                           {student.status === "self_evaluating" && (
-                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30">
                               Autovalutazione
                             </span>
                           )}
                           {student.status === "waiting" && (
-                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-sky-500/20 text-sky-300 border border-sky-500/30">
                               In attesa di inizio
                             </span>
                           )}
                           {student.locked && (
                             <span
-                              className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
+                              className="text-[10px] font-bold px-2.5 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
                               title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
                             >
                               <Lock className="w-3 h-3 text-red-300" />
@@ -980,7 +1007,7 @@ export default function ClassroomLiveMonitor({
                             </span>
                           )}
                           {isOffline && (
-                            <span className="text-[10px] font-normal px-1.5 py-0.2 rounded bg-slate-500/20 text-slate-300 border border-slate-500/30">
+                            <span className="text-[10px] font-normal px-2 py-0.5 rounded-lg bg-slate-500/20 text-slate-300 border border-slate-500/30">
                               {student.locked ? "Riconnessione..." : "Non connesso"}
                             </span>
                           )}
@@ -1007,22 +1034,22 @@ export default function ClassroomLiveMonitor({
                   </div>
 
                   {/* Progress bar */}
-                  <div className="w-full sm:w-56 space-y-1">
+                  <div className="w-full sm:w-56 space-y-1.5">
                     <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <span>Avanzamento:</span>
+                      <span className="font-medium">Avanzamento:</span>
                       <span className="font-mono text-white font-bold">
                         {student.answeredCount}/{student.totalQuestions} ({percent}%)
                       </span>
                     </div>
-                    <div className="h-2 w-full bg-slate-950 rounded-full overflow-hidden border border-white/5">
+                    <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-white/10 p-0.5">
                       <div
                         className={`h-full rounded-full transition-all duration-500 ${
                           student.status === "submitted"
-                            ? "bg-emerald-500"
+                            ? "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-sm shadow-emerald-500/50"
                             : percent > 75
-                            ? "bg-teal-400"
+                            ? "bg-gradient-to-r from-teal-400 to-emerald-400"
                             : percent > 40
-                            ? "bg-indigo-500"
+                            ? "bg-gradient-to-r from-indigo-500 to-teal-400"
                             : "bg-indigo-600"
                         }`}
                         style={{ width: `${percent}%` }}
@@ -1058,7 +1085,12 @@ export default function ClassroomLiveMonitor({
                         )}
                       </button>
                     )}
-                    {hasAlerts ? (
+                    {student.status === "submitted" ? (
+                      <div className="px-2.5 py-1 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold flex items-center gap-1.5 shadow-xs">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                        <span>Consegna Registrata</span>
+                      </div>
+                    ) : hasAlerts ? (
                       <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
                         <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
                         <span>
@@ -1073,9 +1105,9 @@ export default function ClassroomLiveMonitor({
                         <span>Segnale perso</span>
                       </div>
                     ) : (
-                      <div className="px-2.5 py-1 rounded-xl bg-emerald-500/10 border border-emerald-500/20 text-emerald-400 text-[10px] font-medium flex items-center gap-1">
-                        <CheckCircle2 className="w-3 h-3" />
-                        <span>Regolare</span>
+                      <div className="px-2.5 py-1 rounded-xl bg-teal-500/10 border border-teal-500/20 text-teal-300 text-[10px] font-medium flex items-center gap-1.5">
+                        <Activity className="w-3 h-3 text-teal-400 animate-pulse" />
+                        <span>In prova regolare</span>
                       </div>
                     )}
 

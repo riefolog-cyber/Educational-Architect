@@ -7,14 +7,20 @@
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, monospace;
 }
 
+html {
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  text-rendering: optimizeLegibility;
+}
+
 body {
   font-family: var(--font-sans);
-  background-color: #0b0f19;
+  background-color: #080c16;
   background-image: 
-    radial-gradient(at 0% 0%, rgba(67, 56, 202, 0.4) 0px, transparent 50%), 
-    radial-gradient(at 50% 0%, rgba(30, 27, 75, 0.5) 0px, transparent 50%), 
-    radial-gradient(at 100% 0%, rgba(14, 165, 233, 0.45) 0px, transparent 50%), 
-    radial-gradient(at 50% 100%, rgba(112, 26, 117, 0.4) 0px, transparent 50%);
+    radial-gradient(at 10% 0%, rgba(67, 56, 202, 0.35) 0px, transparent 50%), 
+    radial-gradient(at 50% 0%, rgba(30, 27, 75, 0.45) 0px, transparent 55%), 
+    radial-gradient(at 90% 10%, rgba(14, 165, 233, 0.35) 0px, transparent 50%), 
+    radial-gradient(at 50% 100%, rgba(112, 26, 117, 0.3) 0px, transparent 50%);
   background-attachment: fixed;
   color: #f8fafc;
   min-height: 100vh;
@@ -22,8 +28,8 @@ body {
 
 /* Custom subtle animation overlays */
 @keyframes pulseGlow {
-  0%, 100% { opacity: 0.2; }
-  50% { opacity: 0.4; }
+  0%, 100% { opacity: 0.15; transform: scale(1); }
+  50% { opacity: 0.35; transform: scale(1.02); }
 }
 
 .glowing-mesh {
@@ -34,8 +40,24 @@ body {
   bottom: 0;
   z-index: -1;
   pointer-events: none;
-  background: radial-gradient(circle at 50% 30%, rgba(99, 102, 241, 0.05) 0%, transparent 70%);
-  animation: pulseGlow 10s ease-in-out infinite;
+  background: radial-gradient(circle at 50% 25%, rgba(99, 102, 241, 0.08) 0%, transparent 65%);
+  animation: pulseGlow 12s ease-in-out infinite;
+}
+
+/* Glassmorphism subtle surface elevations */
+.glass-surface {
+  background: rgba(15, 23, 42, 0.55);
+  backdrop-filter: blur(16px);
+  -webkit-backdrop-filter: blur(16px);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.glass-card {
+  background: rgba(15, 23, 42, 0.65);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  box-shadow: 0 10px 30px -10px rgba(0, 0, 0, 0.5);
 }
 
 /* Safe selections for dark inputs */
@@ -48,18 +70,19 @@ select option {
 .dsa-scale-115 { font-size: 115%; }
 .dsa-scale-130 { font-size: 130%; }
 
-/* Custom scrollbars */
+/* Custom refined scrollbars */
 ::-webkit-scrollbar {
   width: 6px;
+  height: 6px;
 }
 ::-webkit-scrollbar-track {
   background: transparent;
 }
 ::-webkit-scrollbar-thumb {
-  background: rgba(255, 255, 255, 0.15);
-  border-radius: 3px;
+  background: rgba(255, 255, 255, 0.12);
+  border-radius: 9999px;
 }
 ::-webkit-scrollbar-thumb:hover {
-  background: rgba(255, 255, 255, 0.3);
+  background: rgba(255, 255, 255, 0.25);
 }
 
