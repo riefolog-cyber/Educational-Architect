@@ -11,7 +11,8 @@
     "build": "vite build && esbuild server.ts --bundle --platform=node --format=cjs --packages=external --sourcemap --outfile=dist/server.cjs",
     "start": "node dist/server.cjs",
     "clean": "rm -rf dist",
-    "lint": "tsc --noEmit",
+    "lint": "tsc --noEmit && tsx scripts/check-secrets.ts",
+    "check:secrets": "tsx scripts/check-secrets.ts",
     "test:grades": "tsx scripts/grade-tests.ts",
     "audit:grades": "tsx scripts/audit-grades.ts"
   },
