@@ -577,28 +577,48 @@ function getRequestHash(body: any): string {
 /**
  * Messaggio leggibile per un errore dell'IA: il client a volte riceve il JSON
  * grezzo del SDK (es. "API key not valid") e mostrarlo così com'è confonde.
+ *
+ * Il testo può essere JSON puro oppure un errore SDK che *contiene* il JSON:
+ * in entrambi i casi si estrae il dettaglio e si riconducono i casi noti a una
+ * spiegazione azionabile (chiave revocata, quota, modello inesistente, rete).
  */
 function humanAiError(raw: string): string {
   const text = String(raw || "").trim();
   if (!text) return "Errore durante la generazione con l'IA.";
-  if (text.startsWith("{")) {
+
+  let detail = "";
+  const jsonStart = text.indexOf("{");
+  if (jsonStart >= 0) {
     try {
-      const parsed = JSON.parse(text);
-      const detail = parsed?.error?.message || parsed?.message;
-      if (typeof detail === "string" && detail.trim()) {
-        if (/api key not valid|invalid api key|api_key_invalid/i.test(detail)) {
-          return "La chiave API di Gemini non è valida: controlla la variabile d'ambiente del server.";
-        }
-        if (/quota|rate limit|resource exhausted|resource_exhausted/i.test(detail)) {
-          return "La quota dell'IA è momentaneamente esaurita: riprova tra qualche minuto.";
-        }
-        return detail;
-      }
+      const parsed = JSON.parse(text.slice(jsonStart));
+      detail = String(parsed?.error?.message || parsed?.message || "");
     } catch {
-      // non è JSON: si usa il testo originale
+      // JSON troncato o assente: si analizza il testo grezzo.
     }
   }
-  return text;
+  const haystack = `${detail} ${text}`;
+
+  if (
+    /reported as leaked|api key not valid|invalid api key|api_key_invalid|api_key_service_blocked|permission denied|unauthenticated/i.test(
+      haystack
+    )
+  ) {
+    return (
+      "La chiave API di Gemini non è valida o è stata revocata da Google " +
+      "(chiave segnalata come esposta). Va creata una nuova chiave e impostata " +
+      "come variabile d'ambiente del server."
+    );
+  }
+  if (/quota|rate limit|resource exhausted|resource_exhausted/i.test(haystack)) {
+    return "La quota dell'IA è momentaneamente esaurita: riprova tra qualche minuto.";
+  }
+  if (/model[^.]{0,40}not found|not found[^.]{0,40}model/i.test(haystack)) {
+    return "Il modello IA richiesto non è disponibile: controlla il nome del modello nella configurazione.";
+  }
+  if (/fetch failed|ENOTFOUND|ECONNRESET|ETIMEDOUT|network error/i.test(haystack)) {
+    return "Impossibile raggiungere il servizio IA: verifica la connessione del server e riprova.";
+  }
+  return detail || text;
 }
 
 /**
@@ -915,7 +935,8 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr) {
-      console.warn("[evaluate] Correzione IA fallita per quiz con aperte (nessun voto assegnato):", (aiErr as any)?.message || aiErr);
+      const aiCause = humanAiError(String((aiErr as any)?.message || aiErr));
+      console.warn("[evaluate] Correzione IA fallita per quiz con aperte (nessun voto assegnato):", aiCause);
       // Never publish a deterministic reserve grade here: the students wrote
       // open answers that nobody evaluated. The exam stays "N.V." and the
       // teacher is warned in the registry.
@@ -931,7 +952,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         answers: report.risposte,
         missing: audit.missing,
         punteggioMC: mcScore,
-        cause: "servizio IA non disponibile",
+        cause: `servizio IA non disponibile — ${aiCause}`,
       });
     }
 
@@ -1145,7 +1166,8 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       evaluation.gradeBreakdown = mixedBreakdown;
       return evaluation;
     } catch (aiErr: any) {
-      console.warn("[evaluate] Correzione IA fallita per workbook con riflessioni (nessun voto assegnato):", aiErr?.message || aiErr);
+      const aiCause = humanAiError(String(aiErr?.message || aiErr));
+      console.warn("[evaluate] Correzione IA fallita per workbook con riflessioni (nessun voto assegnato):", aiCause);
       // Same rule as the quiz: better an unevaluated exam than reflections
       // silently scored 0 because the AI output was missing.
       const audit = auditSubjectiveEvaluation({
@@ -1161,7 +1183,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         missing: audit.missing,
         punteggioFIB: fibScore,
         punteggioMC: Number(report.punteggioMC || 0),
-        cause: "servizio IA non disponibile",
+        cause: `servizio IA non disponibile — ${aiCause}`,
       });
     }
   }
@@ -2808,6 +2830,17 @@ async function startServer() {
   console.log("[Educational Architect] Startup environment diagnostics:");
   console.log(` - NODE_ENV: ${process.env.NODE_ENV}`);
   console.log(` - isProduction resolved to: ${isProduction}`);
+  // Key presence only (never the value): a revoked/missing Gemini key makes
+  // every AI correction fail, and without this line the only symptom is a
+  // generic error in the UI.
+  const startupKey = getApiKey() || "";
+  console.log(
+    ` - Gemini API key: ${
+      startupKey
+        ? `configured (ends with ...${startupKey.slice(-4)})`
+        : "MISSING (set GEMINI_API_KEY): AI corrections will fail"
+    }`
+  );
 
   // Guarantee that unhandled /api/* requests never return HTML
   app.all("/api/*", (req, res) => {
