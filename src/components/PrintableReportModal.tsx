@@ -1,6 +1,6 @@
-import React, { useRef } from "react";
+import React from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 
 interface PrintableReportModalProps {
@@ -32,31 +32,12 @@ export default function PrintableReportModal({
   examTitle,
   examImages
 }: PrintableReportModalProps) {
-  const printAreaRef = useRef<HTMLDivElement>(null);
-
   if (!isOpen || !submission) return null;
 
   // Parse nested evaluation details safely
-  let evaluationObj: any = null;
-  if (submission.Full_Evaluation) {
-    if (typeof submission.Full_Evaluation === "object") {
-      evaluationObj = submission.Full_Evaluation;
-    } else {
-      try {
-        evaluationObj = JSON.parse(submission.Full_Evaluation);
-      } catch {
-        evaluationObj = null;
-      }
-    }
-  }
-
-  const parseMaybe = (value: any) => {
-    if (!value) return null;
-    if (typeof value === "object") return value;
-    try { return JSON.parse(value); } catch { return null; }
-  };
-  const examObj = parseMaybe(submission.Domande_Esame);
-  const answersObj = parseMaybe(submission.Risposte_Studente);
+  const evaluationObj = safeParseJson(submission.Full_Evaluation);
+  const examObj = safeParseJson(submission.Domande_Esame);
+  const answersObj = safeParseJson(submission.Risposte_Studente);
   const isQuiz = String(submission.Tipo || "").toLowerCase() === "quiz";
   const pendingEvaluation =
     isEvaluationPending(evaluationObj) ||
@@ -124,10 +105,7 @@ export default function PrintableReportModal({
 
         {/* Printable Area - Designed for crisp A4 paper printing */}
         <div className="overflow-y-auto p-4 sm:p-8 bg-slate-950 text-left print:p-0 print:bg-white print:text-black">
-          <div 
-            ref={printAreaRef}
-            className="max-w-3xl mx-auto bg-white text-slate-900 p-6 sm:p-10 rounded-2xl shadow-xl print:shadow-none print:p-6 print:rounded-none print:max-w-none text-xs font-sans space-y-6"
-          >
+          <div className="max-w-3xl mx-auto bg-white text-slate-900 p-6 sm:p-10 rounded-2xl shadow-xl print:shadow-none print:p-6 print:rounded-none print:max-w-none text-xs font-sans space-y-6">
             {/* School Header */}
             <div className="border-b-2 border-slate-900 pb-4 text-center space-y-1">
               <p className="text-[10px] tracking-widest uppercase font-bold text-slate-600">

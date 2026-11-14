@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { 
   Users, 
   Activity, 
@@ -11,7 +11,6 @@ import {
   Wifi,
   Lock,
   Unlock,
-  KeyRound,
   AlertCircle,
   Check,
   Trash2,
@@ -87,6 +86,19 @@ export default function ClassroomLiveMonitor({
   const [confirmingPin, setConfirmingPin] = useState<string | null>(null);
   const [confirmingAll, setConfirmingAll] = useState(false);
 
+  const timersRef = useRef<number[]>([]);
+  const scheduleTimer = (fn: () => void, ms: number) => {
+    const id = window.setTimeout(fn, ms);
+    timersRef.current.push(id);
+  };
+
+  useEffect(() => {
+    return () => {
+      timersRef.current.forEach((id) => window.clearTimeout(id));
+      timersRef.current = [];
+    };
+  }, []);
+
   // Reset any pending confirmation when a termination actually starts.
   useEffect(() => {
     if (terminatingPin) setConfirmingPin(null);
@@ -160,11 +172,10 @@ export default function ClassroomLiveMonitor({
   }, [pin]);
 
   const secondsSince = (isoString: string) => {
-    try {
-      return Math.max(0, Math.floor((currentTime - new Date(isoString).getTime()) / 1000));
-    } catch {
-      return Number.MAX_SAFE_INTEGER;
-    }
+    const ts = Date.parse(isoString);
+    return Number.isFinite(ts)
+      ? Math.max(0, Math.floor((currentTime - ts) / 1000))
+      : Number.MAX_SAFE_INTEGER;
   };
 
   const isSendingSignal = (lastHeartbeatStr: string) => secondsSince(lastHeartbeatStr) < HEARTBEAT_STALE_SEC;
@@ -262,11 +273,11 @@ export default function ClassroomLiveMonitor({
       setStudents([]);
       setClearSuccess(true);
       setConfirmClear(false);
-      setTimeout(() => setClearSuccess(false), 3500);
+      scheduleTimer(() => setClearSuccess(false), 3500);
     } catch (err: any) {
       console.warn("Svuotamento aula non riuscito:", err);
       setClearError(err?.message || "Impossibile svuotare l'aula. Verifica i permessi o la connessione.");
-      setTimeout(() => setClearError(null), 5000);
+      scheduleTimer(() => setClearError(null), 5000);
     } finally {
       setClearing(false);
     }
@@ -285,7 +296,7 @@ export default function ClassroomLiveMonitor({
         unlockedAt: new Date().toISOString()
       });
       setUnlockSuccessId(studentId);
-      setTimeout(() => setUnlockSuccessId(null), 3500);
+      scheduleTimer(() => setUnlockSuccessId(null), 3500);
     } catch (err) {
       console.warn("Sblocco remoto non riuscito:", err);
     } finally {
@@ -314,7 +325,7 @@ export default function ClassroomLiveMonitor({
         )
       );
       setUnlockAllSuccess(true);
-      setTimeout(() => setUnlockAllSuccess(false), 3500);
+      scheduleTimer(() => setUnlockAllSuccess(false), 3500);
     } catch (err) {
       console.warn("Sblocco cumulativo aula non riuscito:", err);
     } finally {
@@ -630,7 +641,7 @@ export default function ClassroomLiveMonitor({
               onClick={() => {
                 if (!pin) {
                   setClearError("Seleziona prima una sessione d'aula dal riquadro sopra per svuotarla.");
-                  setTimeout(() => setClearError(null), 4000);
+                  scheduleTimer(() => setClearError(null), 4000);
                   return;
                 }
                 setConfirmClear(true);
@@ -1038,7 +1049,7 @@ export default function ClassroomLiveMonitor({
                     <div className="flex items-center justify-between text-[10px] text-slate-400">
                       <span className="font-medium">Avanzamento:</span>
                       <span className="font-mono text-white font-bold">
-                        {student.answeredCount}/{student.totalQuestions} ({percent}%)
+                        {Math.min(student.answeredCount, student.totalQuestions)}/{student.totalQuestions} ({percent}%)
                       </span>
                     </div>
                     <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-white/10 p-0.5">

@@ -31,25 +31,32 @@ import {
 
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
-// Code splitting: students load only the student bundle, teachers only the (much larger) dashboard bundle.
-const StudentView = lazy(() => import("./components/StudentView"));
-const TeacherDashboard = lazy(() => import("./components/TeacherDashboard"));
-import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
-
-// Helper to detect Apple mobile devices (iPhone/iPad), where Safari ITP
-// blocks third-party cookies inside the AI Studio iframe and Google shows
-// the "Non disponi dell'accesso a AI Studio" admin screen.
-function checkIsAppleMobile(): boolean {
-  if (typeof window === "undefined" || typeof navigator === "undefined") return false;
-  const ua = navigator.userAgent || navigator.vendor || (window as any).opera || "";
-  if (/iPhone|iPod|iPad/i.test(ua)) return true;
-  // iPadOS 13+ reports as Macintosh: detect via touch support
-  return (
-    /Macintosh/i.test(ua) &&
-    typeof document !== "undefined" &&
-    "ontouchend" in document
-  );
+// Helper to retry failed dynamic module imports (e.g. transient dev-proxy / chunk cache hiccups)
+function lazyWithRetry<T extends React.ComponentType<any>>(
+  factory: () => Promise<{ default: T }>,
+  retries = 3
+): React.LazyExoticComponent<T> {
+  return lazy(async () => {
+    let lastError: unknown;
+    for (let attempt = 0; attempt < retries; attempt++) {
+      try {
+        return await factory();
+      } catch (err) {
+        lastError = err;
+        if (attempt < retries - 1) {
+          await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+        }
+      }
+    }
+    throw lastError;
+  });
 }
+
+// Code splitting: students load only the student bundle, teachers only the (much larger) dashboard bundle.
+const StudentView = lazyWithRetry(() => import("./components/StudentView"));
+const TeacherDashboard = lazyWithRetry(() => import("./components/TeacherDashboard"));
+import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
+import { isAppleMobile } from "./utils";
 
 // Helper to detect if user opened the link inside an in-app browser (WebView like WhatsApp, Classroom, etc.)
 function checkIsInAppBrowser(): boolean {
@@ -70,6 +77,76 @@ function LoadingScreen() {
       <p className="text-sm font-medium">Caricamento…</p>
     </div>
   );
+}
+
+interface LazyBoundaryProps {
+  children: React.ReactNode;
+  onBack: () => void;
+}
+
+interface LazyBoundaryState {
+  hasError: boolean;
+  errorMessage: string;
+}
+
+class LazyModuleErrorBoundary extends React.Component<LazyBoundaryProps, LazyBoundaryState> {
+  declare readonly props: LazyBoundaryProps;
+  declare state: LazyBoundaryState;
+  declare setState: (
+    updater: Partial<LazyBoundaryState> | ((prev: LazyBoundaryState) => Partial<LazyBoundaryState>)
+  ) => void;
+
+  constructor(props: LazyBoundaryProps) {
+    super(props);
+    this.state = { hasError: false, errorMessage: "" };
+  }
+
+  static getDerivedStateFromError(error: Error): LazyBoundaryState {
+    return {
+      hasError: true,
+      errorMessage: error?.message || "Errore di caricamento del modulo.",
+    };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      return (
+        <div className="max-w-lg mx-auto my-12 bg-slate-900/80 border border-amber-500/30 rounded-3xl p-6 sm:p-8 text-center space-y-4">
+          <div className="w-12 h-12 mx-auto rounded-2xl bg-amber-500/10 border border-amber-500/20 flex items-center justify-center text-amber-400">
+            <AlertCircle className="w-6 h-6" />
+          </div>
+          <div className="space-y-1.5">
+            <h3 className="text-base font-bold text-white">
+              Caricamento modulo interrotto
+            </h3>
+            <p className="text-xs text-slate-400 leading-relaxed">
+              Si è verificato un problema temporaneo nel scaricare questa sezione. Ricarica la pagina per ripristinare i file aggiornati.
+            </p>
+          </div>
+          <div className="flex flex-wrap items-center justify-center gap-2.5 pt-2">
+            <button
+              type="button"
+              onClick={() => window.location.reload()}
+              className="px-4 py-2.5 bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold rounded-xl transition-colors cursor-pointer"
+            >
+              Ricarica Pagina
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                this.setState({ hasError: false, errorMessage: "" });
+                this.props.onBack();
+              }}
+              className="px-4 py-2.5 bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold rounded-xl transition-colors cursor-pointer"
+            >
+              Torna alla Home
+            </button>
+          </div>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
 }
 
 export default function App() {
@@ -99,7 +176,7 @@ export default function App() {
 
   useEffect(() => {
     setInAppBrowserDetected(checkIsInAppBrowser());
-    setAppleMobileDetected(checkIsAppleMobile());
+    setAppleMobileDetected(isAppleMobile());
 
     // Pre-fill student fields from previous session if present
     try {
@@ -165,16 +242,17 @@ export default function App() {
     }, 2200);
 
     // 1. Check if student previously logged in via Direct Student Access (sessionStorage or localStorage)
+    let hasSavedDirect = false;
     try {
       const savedDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
       if (savedDirect) {
         const parsed = JSON.parse(savedDirect);
         if (parsed?.email) {
+          hasSavedDirect = true;
           setUser(parsed);
           setRole("student");
           setAuthLoading(false);
           clearTimeout(safetyTimer);
-          return;
         }
       }
     } catch {
@@ -192,6 +270,10 @@ export default function App() {
     getRedirectResult(auth)
       .then((result) => {
         if (result?.user) {
+          try {
+            sessionStorage.removeItem("direct_student_user");
+            localStorage.removeItem("direct_student_user");
+          } catch {}
           setUser(result.user);
           checkUserRoleAndBootstrap(result.user);
         }
@@ -201,20 +283,27 @@ export default function App() {
         handleAuthErrorMessage(err);
       });
 
-    // 3. Main onAuthStateChanged listener
+    // 3. Main onAuthStateChanged listener (always registered so Google login works after direct student sign-out)
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       clearTimeout(safetyTimer);
-      setAuthLoading(true);
       if (currentUser) {
+        setAuthLoading(true);
+        try {
+          sessionStorage.removeItem("direct_student_user");
+          localStorage.removeItem("direct_student_user");
+        } catch {}
         setUser(currentUser);
         await checkUserRoleAndBootstrap(currentUser);
       } else {
-        // If not logged into Firebase, check if direct student was stored
+        // If not logged into Firebase, preserve direct student session if stored
         try {
           const currentDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
           if (currentDirect) {
-            setUser(JSON.parse(currentDirect));
-            setRole("student");
+            const parsedDirect = JSON.parse(currentDirect);
+            if (!hasSavedDirect && parsedDirect?.email) {
+              setUser(parsedDirect);
+              setRole("student");
+            }
           } else {
             setUser(null);
             setRole("student");
@@ -877,13 +966,15 @@ export default function App() {
                   transition={{ duration: 0.25, ease: "easeInOut" }}
                   className="w-full"
                 >
-                  <Suspense fallback={<LoadingScreen />}>
-                    <StudentView
-                      user={user}
-                      onLogout={handleSignOut}
-                      onBack={() => setActivePane("home")}
-                    />
-                  </Suspense>
+                  <LazyModuleErrorBoundary onBack={() => setActivePane("home")}>
+                    <Suspense fallback={<LoadingScreen />}>
+                      <StudentView
+                        user={user}
+                        onLogout={handleSignOut}
+                        onBack={() => setActivePane("home")}
+                      />
+                    </Suspense>
+                  </LazyModuleErrorBoundary>
                 </motion.div>
               )}
 
@@ -897,12 +988,14 @@ export default function App() {
                   transition={{ duration: 0.25, ease: "easeInOut" }}
                   className="w-full"
                 >
-                  <Suspense fallback={<LoadingScreen />}>
-                    <TeacherDashboard
-                      user={user}
-                      onBack={() => setActivePane("home")}
-                    />
-                  </Suspense>
+                  <LazyModuleErrorBoundary onBack={() => setActivePane("home")}>
+                    <Suspense fallback={<LoadingScreen />}>
+                      <TeacherDashboard
+                        user={user}
+                        onBack={() => setActivePane("home")}
+                      />
+                    </Suspense>
+                  </LazyModuleErrorBoundary>
                 </motion.div>
               )}
             </AnimatePresence>

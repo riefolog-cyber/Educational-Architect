@@ -38,6 +38,7 @@ interface ParsedRow {
   weight?: number;
   section?: string;
   criteria?: string;
+  markedOption?: number;
 }
 
 const DEFAULT_TITLE = "Attività importata da Google Moduli";
@@ -336,7 +337,7 @@ function rowsFromPaste(text: string, warnings: string[]): ParsedRow[] {
       return;
     }
     if (current.options.length > 0 && !current.answer) {
-      const marked = (current as ParsedRow & { markedOption?: number }).markedOption;
+      const marked = current.markedOption;
       if (marked !== undefined && marked >= 0) current.answer = String.fromCharCode(65 + marked);
     }
     rows.push(current);
@@ -367,7 +368,7 @@ function rowsFromPaste(text: string, warnings: string[]): ParsedRow[] {
 
     const correctMatch = CORRECT_RE.exec(line);
     if (correctMatch && current) {
-      (current as ParsedRow).answer = correctMatch[1].trim();
+      current.answer = correctMatch[1].trim();
       continue;
     }
 
@@ -394,7 +395,7 @@ function rowsFromPaste(text: string, warnings: string[]): ParsedRow[] {
       current.options.push(optionText);
       current.kind = "mc";
       if (marked) {
-        (current as ParsedRow & { markedOption?: number }).markedOption = current.options.length - 1;
+        current.markedOption = current.options.length - 1;
       }
       continue;
     }
@@ -405,7 +406,7 @@ function rowsFromPaste(text: string, warnings: string[]): ParsedRow[] {
       current.options.push(optionText);
       current.kind = "mc";
       if (marked) {
-        (current as ParsedRow & { markedOption?: number }).markedOption = current.options.length - 1;
+        current.markedOption = current.options.length - 1;
       }
       continue;
     }

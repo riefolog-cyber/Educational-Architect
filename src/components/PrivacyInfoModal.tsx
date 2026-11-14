@@ -16,10 +16,9 @@ interface PrivacyInfoModalProps {
 }
 
 export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
-  if (!isOpen) return null;
-
   return (
     <AnimatePresence>
+      {isOpen && (
       <div 
         id="privacy-modal-overlay" 
         className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/80 backdrop-blur-md overflow-y-auto"
@@ -247,6 +246,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
           </div>
         </motion.div>
       </div>
+      )}
     </AnimatePresence>
   );
 }

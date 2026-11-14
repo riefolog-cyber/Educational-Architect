@@ -11,6 +11,24 @@ export default defineConfig(() => {
         '@': path.resolve(__dirname, '.'),
       },
     },
+    optimizeDeps: {
+      // Pre-bundle deps used exclusively inside lazy TeacherDashboard/StudentView
+      // so dynamic import() never triggers mid-session Vite re-optimization (504).
+      include: [
+        'react',
+        'react-dom',
+        'react/jsx-runtime',
+        'react/jsx-dev-runtime',
+        'firebase/app',
+        'firebase/auth',
+        'firebase/firestore',
+        'firebase/database',
+        'lucide-react',
+        'motion/react',
+        'jspdf',
+        'jszip',
+      ],
+    },
     build: {
       rollupOptions: {
         output: {

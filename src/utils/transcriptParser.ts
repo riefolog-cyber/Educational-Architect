@@ -88,8 +88,6 @@ export function parseTranscriptFile(fileName: string, rawText: string): ParsedTr
       if (format === "vtt" && /^(cue-|align:|position:|line:|size:)/i.test(line)) continue;
 
       let cleaned = line.replace(HTML_TAG, " ");
-      // VTT voice spans: <v Speaker>text</v> -> text
-      cleaned = cleaned.replace(/<\/?[a-z][^>]*>/gi, " ");
       // Sound-effect cues like [Musica] or [Applausi]: short bracketed
       // segments are almost always non-spoken noise.
       cleaned = cleaned.replace(/\[[^\[\]]{1,30}\]/g, " ");

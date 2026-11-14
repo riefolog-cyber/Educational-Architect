@@ -2,8 +2,12 @@ import express from "express";
 import path from "path";
 import fs from "fs";
 import crypto from "crypto";
-import { GoogleGenAI, Type } from "@google/genai";
+import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
+import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
+import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
+import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
+import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
 dotenv.config();
 
@@ -135,6 +139,18 @@ async function generateWithRetry(options: any, maxRetries = 6) {
       console.warn(`[Gemini Try ${i+1}/${maxRetries} Failed on model '${currentOptions.model}']:`, err.message);
 
       const errStatus = err.status ?? err.statusCode ?? err.code;
+      const isThinkingUnsupported =
+        errStatus === 400 &&
+        !!currentOptions.config?.thinkingConfig &&
+        /thinking|thinking_level|thinking_config|budget/i.test(`${errStr} ${errStringified}`);
+
+      if (isThinkingUnsupported) {
+        currentOptions.config = { ...currentOptions.config };
+        delete currentOptions.config.thinkingConfig;
+        console.warn(`[Gemini Thinking] '${currentOptions.model}' rejected thinkingConfig (400), retrying without thinkingConfig.`);
+        continue;
+      }
+
       const isModelMissing = errStatus === 404 ||
         (/not[ -]?found/.test(errStr) && errStr.includes("model")) ||
         (/model[^.]{0,40}not (found|supported|available)/.test(errStr));
@@ -194,289 +210,8 @@ function extractResponseText(response: any): string {
   return "";
 }
 
-const repairJsonSyntaxServer = (input: string): string => {
-  let r = input
-    .replace(/[“”„«»]/g, '"')
-    .replace(/[‘’‚´]/g, "'")
-    .replace(/ /g, " ");
-
-  // Strip // and /* */ comments outside strings
-  let noComments = "";
-  {
-    let inStr = false;
-    let esc = false;
-    for (let i = 0; i < r.length; i++) {
-      const c = r[i];
-      const next = r[i + 1] || "";
-      if (inStr) {
-        noComments += c;
-        if (esc) esc = false;
-        else if (c === "\\") esc = true;
-        else if (c === '"') inStr = false;
-        continue;
-      }
-      if (c === '"') { inStr = true; noComments += c; continue; }
-      if (c === "/" && next === "/") {
-        while (i < r.length && r[i] !== "\n") i++;
-        if (i < r.length) noComments += "\n";
-        continue;
-      }
-      if (c === "/" && next === "*") {
-        i += 2;
-        while (i < r.length && !(r[i] === "*" && r[i + 1] === "/")) i++;
-        i++;
-        noComments += " ";
-        continue;
-      }
-      noComments += c;
-    }
-  }
-  r = noComments;
-
-  // Escape literal newlines/tabs inside strings
-  {
-    let out = "";
-    let inStr = false;
-    let esc = false;
-    for (let i = 0; i < r.length; i++) {
-      const c = r[i];
-      if (!inStr) {
-        if (c === '"') inStr = true;
-        out += c;
-        continue;
-      }
-      if (esc) { out += c; esc = false; continue; }
-      if (c === "\\") { out += c; esc = true; continue; }
-      if (c === '"') { inStr = false; out += c; continue; }
-      if (c === "\n") { out += "\\n"; continue; }
-      if (c === "\r") { out += "\\r"; continue; }
-      if (c === "\t") { out += "\\t"; continue; }
-      out += c;
-    }
-    r = out;
-  }
-
-  // Escape inner unescaped quotes: only a " followed by : , } ] ends the string
-  {
-    let out = "";
-    let inStr = false;
-    let esc = false;
-    for (let i = 0; i < r.length; i++) {
-      const c = r[i];
-      if (!inStr) {
-        out += c;
-        if (c === '"') inStr = true;
-        continue;
-      }
-      if (esc) { out += c; esc = false; continue; }
-      if (c === "\\") { out += c; esc = true; continue; }
-      if (c === '"') {
-        let j = i + 1;
-        while (j < r.length && /[ \t\r\n]/.test(r[j])) j++;
-        const next = r[j] || "";
-        if (next === ":" || next === "," || next === "}" || next === "]" || next === "") {
-          out += c;
-          inStr = false;
-        } else if (next === '"') {
-          const rest = r.slice(j, j + 220);
-          if (/^"[^"\n]{0,200}"\s*[:,}\]]/.test(rest)) {
-            out += c;
-            inStr = false;
-          } else {
-            out += '\\"';
-          }
-        } else {
-          out += '\\"';
-        }
-        continue;
-      }
-      out += c;
-    }
-    r = out;
-  }
-
-  // Missing commas between properties/items
-  r = r.replace(/([0-9\]\}"])\s+("[^"]*"\s*:)/g, "$1, $2");
-  r = r.replace(/([\}\]])\s+([\{\[])/g, "$1, $2");
-  // Trailing commas
-  r = r.replace(/,\s*([\]}])/g, "$1");
-  return r;
-};
-
-const parseJsonResponse = (text: string) => {
-  const fenceRegex = /```(?:json)?\s*([\s\S]*?)\s*```/gi;
-  const blocks: string[] = [];
-  let mm: RegExpExecArray | null;
-  while ((mm = fenceRegex.exec(text)) !== null) {
-    if (mm[1] && mm[1].trim()) blocks.push(mm[1].trim());
-  }
-  let cleanedText = (blocks.length > 0
-    ? blocks.sort((a, b) => b.length - a.length)[0]
-    : text).trim().replace(/^﻿/, "");
-  if (cleanedText.startsWith("```json")) {
-    cleanedText = cleanedText.replace(/^```json\s*/i, "").replace(/\s*```$/, "").trim();
-  } else if (cleanedText.startsWith("```")) {
-    cleanedText = cleanedText.replace(/^```\s*/, "").replace(/\s*```$/, "").trim();
-  }
-
-  // 1. Direct standard parse
-  try {
-    return JSON.parse(cleanedText);
-  } catch (initialErr: any) {
-    // 2. Remove trailing commas before } or ]
-    try {
-      const fixedCommas = cleanedText.replace(/,\s*([\]}])/g, "$1");
-      return JSON.parse(fixedCommas);
-    } catch {}
-
-    // 2b. Syntax repair: smart quotes, comments, inner quotes, missing commas
-    try {
-      const repairedSyntax = repairJsonSyntaxServer(cleanedText);
-      const parsed = JSON.parse(repairedSyntax);
-      console.warn("[JSON Parser] Successfully repaired JSON syntax (quotes/commas/comments)!");
-      return parsed;
-    } catch {}
-
-    // 3. Resilient repair for truncated JSON outputs (e.g. unterminated strings / cut-off tokens)
-    try {
-      let candidate = cleanedText;
-
-      // Check if we are inside an unclosed string
-      let inString = false;
-      let escaped = false;
-      for (let i = 0; i < candidate.length; i++) {
-        const char = candidate[i];
-        if (char === '\\' && !escaped) {
-          escaped = true;
-          continue;
-        }
-        if (char === '"' && !escaped) {
-          inString = !inString;
-        }
-        escaped = false;
-      }
-
-      // If cut off mid-string, close the string
-      if (inString) {
-        candidate += '"';
-      }
-
-      // Remove any dangling trailing commas or incomplete key/value fragments at the end
-      candidate = candidate.replace(/,\s*("[^"]*"\s*:\s*)?$/, "");
-
-      // Balance unmatched opening brackets and braces
-      const stack: string[] = [];
-      let inStr = false;
-      let esc = false;
-      for (let i = 0; i < candidate.length; i++) {
-        const char = candidate[i];
-        if (char === '\\' && !esc) {
-          esc = true;
-          continue;
-        }
-        if (char === '"' && !esc) {
-          inStr = !inStr;
-        }
-        if (!inStr) {
-          if (char === '{') stack.push('}');
-          else if (char === '[') stack.push(']');
-          else if (char === '}' || char === ']') {
-            if (stack.length > 0 && stack[stack.length - 1] === char) {
-              stack.pop();
-            }
-          }
-        }
-        esc = false;
-      }
-
-      while (stack.length > 0) {
-        candidate += stack.pop();
-      }
-
-      candidate = candidate.replace(/,\s*([\]}])/g, "$1");
-      const repaired = JSON.parse(candidate);
-      console.warn("[JSON Parser] Successfully repaired truncated JSON response from model!");
-      return repaired;
-    } catch (repairErr) {
-      // 3b. Combined syntax-repair + balance (e.g. inner quotes + truncated tail)
-      try {
-        const syntaxFixed = repairJsonSyntaxServer(cleanedText);
-        let candidate2 = syntaxFixed;
-        let inString2 = false;
-        let escaped2 = false;
-        for (let i = 0; i < candidate2.length; i++) {
-          const ch = candidate2[i];
-          if (ch === "\\" && !escaped2) { escaped2 = true; continue; }
-          if (ch === '"' && !escaped2) inString2 = !inString2;
-          escaped2 = false;
-        }
-        if (inString2) candidate2 += '"';
-        candidate2 = candidate2.replace(/,\s*("[^"]*"\s*:\s*)?$/, "");
-        const stack2: string[] = [];
-        let inS2 = false;
-        let e2 = false;
-        for (let i = 0; i < candidate2.length; i++) {
-          const ch = candidate2[i];
-          if (ch === "\\" && !e2) { e2 = true; continue; }
-          if (ch === '"' && !e2) inS2 = !inS2;
-          if (!inS2) {
-            if (ch === "{") stack2.push("}");
-            else if (ch === "[") stack2.push("]");
-            else if (ch === "}" || ch === "]") {
-              if (stack2.length > 0 && stack2[stack2.length - 1] === ch) stack2.pop();
-            }
-          }
-          e2 = false;
-        }
-        while (stack2.length > 0) candidate2 += stack2.pop();
-        candidate2 = candidate2.replace(/,\s*([\]}])/g, "$1");
-        const repaired2 = JSON.parse(candidate2);
-        console.warn("[JSON Parser] Successfully repaired JSON with combined syntax+truncation fix!");
-        return repaired2;
-      } catch {}
-
-      // 4. Fallback: Trim back to the last complete item delimiter `},` or `}` and close
-      try {
-        const lastObjectEnd = cleanedText.lastIndexOf("},");
-        if (lastObjectEnd !== -1) {
-          let pruned = cleanedText.substring(0, lastObjectEnd + 1);
-          const stack: string[] = [];
-          let inStr = false;
-          let esc = false;
-          for (let i = 0; i < pruned.length; i++) {
-            const char = pruned[i];
-            if (char === '\\' && !esc) { esc = true; continue; }
-            if (char === '"' && !esc) { inStr = !inStr; }
-            if (!inStr) {
-              if (char === '{') stack.push('}');
-              else if (char === '[') stack.push(']');
-              else if (char === '}' || char === ']') {
-                if (stack.length > 0 && stack[stack.length - 1] === char) stack.pop();
-              }
-            }
-            esc = false;
-          }
-          while (stack.length > 0) {
-            pruned += stack.pop();
-          }
-          pruned = pruned.replace(/,\s*([\]}])/g, "$1");
-          const repaired = JSON.parse(pruned);
-          console.warn("[JSON Parser] Successfully repaired JSON by pruning to last complete object!");
-          return repaired;
-        }
-      } catch {}
-
-      throw initialErr;
-    }
-  }
-};
-
 // Middleware for JSON parsing
 app.use(express.json({ limit: '10mb' }));
-
-import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
-import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
-import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
@@ -521,15 +256,19 @@ const MAX_RECOVERY_QUEUE = Math.max(20, Number(process.env.RECOVERY_MAX_QUEUE) |
  * anche il JSON dell'esame (con le immagini) e pesa centinaia di KB. Senza
  * questa pulizia, dopo qualche classe su un'istanza piccola si arriva all'OOM.
  */
+function releaseJobHash(jobId: string) {
+  for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
+    if (cachedJobId === jobId) reqToJobCache.delete(hashKey);
+  }
+}
+
 function purgeOldJobs(now = Date.now()) {
   if (jobStore.size === 0) return;
 
   const deleteJob = (id: string, job: EvaluationJob) => {
     jobStore.delete(id);
     job.reqBody = undefined;
-    for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-      if (cachedJobId === id) reqToJobCache.delete(hashKey);
-    }
+    releaseJobHash(id);
   };
 
   for (const [id, job] of jobStore) {
@@ -742,7 +481,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
 
       try {
         const response = await generateWithRetry({
-          model: "gemini-3.5-flash",
+          model: TASK_MODEL_PREFERENCE["evaluate"][0],
           models: TASK_MODEL_PREFERENCE["evaluate"],
           contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
           config: {
@@ -750,7 +489,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
             temperature: 0.1,
             maxOutputTokens: 4096,
             thinkingConfig: {
-              thinkingLevel: "LOW"
+              thinkingLevel: ThinkingLevel.LOW
             },
             responseMimeType: "application/json",
             responseSchema: {
@@ -767,7 +506,10 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         const responseText = extractResponseText(response);
         if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-        const evaluation = parseJsonResponse(responseText);
+        const evaluation = tolerantJsonParse(responseText);
+        if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) {
+          throw new Error("Struttura JSON di valutazione non valida.");
+        }
         evaluation.suggestedGrade = mathGrade;
         evaluation.openEndedDetails = [];
         evaluation.evaluationMode = "ai";
@@ -833,7 +575,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
 
     try {
       const response = await generateWithRetry({
-        model: "gemini-3.5-flash",
+        model: TASK_MODEL_PREFERENCE["evaluate"][0],
         models: TASK_MODEL_PREFERENCE["evaluate"],
         contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
         config: {
@@ -843,7 +585,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
           // riparato, può mancare di dettagli e bloccare la valutazione.
           maxOutputTokens: 4096,
           thinkingConfig: {
-            thinkingLevel: "LOW"
+            thinkingLevel: ThinkingLevel.LOW
           },
           responseMimeType: "application/json",
           responseSchema: {
@@ -872,18 +614,21 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       const responseText = extractResponseText(response);
       if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-      const evaluation = parseJsonResponse(responseText);
+      const evaluation = tolerantJsonParse(responseText);
+      if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) {
+        throw new Error("Struttura JSON di valutazione non valida.");
+      }
 
       // Deterministic zero enforcement: if an answer is blank, [VUOTO], pure punctuation (like "...."),
       // or detected gibberish, the score MUST be 0 and the feedback pedagogical.
       if (Array.isArray(evaluation.openEndedDetails)) {
         evaluation.openEndedDetails.forEach((det: any, idx: number) => {
-          const q = oeList.find((item: any) => item.id === det.questionId) || oeList[idx];
-          const qId = q?.id || det.questionId;
+          const q = oeList.find((item: any) => String(item.id) === String(det?.questionId)) || oeList[idx];
+          const qId = q?.id ?? det?.questionId;
           const rawAns = String(
-            report.risposte?.oe?.[qId] ||
-            report.risposte?.openEnded?.[qId] ||
-            report.risposte?.wbRq?.[qId] ||
+            report.risposte?.oe?.[qId] ??
+            report.risposte?.openEnded?.[qId] ??
+            report.risposte?.wbRq?.[qId] ??
             ""
           ).trim();
           if (detectGibberish(rawAns)) {
@@ -992,14 +737,14 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
 
       try {
         const response = await generateWithRetry({
-          model: "gemini-3.5-flash",
+          model: TASK_MODEL_PREFERENCE["evaluate"][0],
           models: TASK_MODEL_PREFERENCE["evaluate"],
           contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
           config: {
             systemInstruction,
             temperature: 0.1,
             maxOutputTokens: 4096,
-            thinkingConfig: { thinkingLevel: "LOW" },
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
             responseMimeType: "application/json",
             responseSchema: {
               type: Type.OBJECT,
@@ -1014,7 +759,10 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         const responseText = extractResponseText(response);
         if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-        const evaluation = parseJsonResponse(responseText);
+        const evaluation = tolerantJsonParse(responseText);
+        if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) {
+          throw new Error("Struttura JSON di valutazione non valida.");
+        }
         evaluation.evaluationMode = "ai";
         evaluation.suggestedGrade = mathBreakdown.finalGradeFormatted;
         evaluation.fibScore = fibScore;
@@ -1073,7 +821,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
 
     try {
       const response = await generateWithRetry({
-        model: "gemini-3.5-flash",
+        model: TASK_MODEL_PREFERENCE["evaluate"][0],
         models: TASK_MODEL_PREFERENCE["evaluate"],
         contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
         config: {
@@ -1083,7 +831,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
           // JSON ma i dettagli mancanti fanno sospendere il voto (N.V.).
           maxOutputTokens: 4096,
           thinkingConfig: {
-            thinkingLevel: "LOW"
+            thinkingLevel: ThinkingLevel.LOW
           },
           responseMimeType: "application/json",
           responseSchema: {
@@ -1111,16 +859,19 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       const responseText = extractResponseText(response);
       if (!responseText) throw new Error("Risposta vuota dall'IA.");
 
-      const evaluation = parseJsonResponse(responseText);
+      const evaluation = tolerantJsonParse(responseText);
+      if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) {
+        throw new Error("Struttura JSON di valutazione non valida.");
+      }
 
       // Deterministic zero enforcement for blank, pure punctuation or gibberish reflections
       if (Array.isArray(evaluation.reflectionDetails)) {
         evaluation.reflectionDetails.forEach((det: any, idx: number) => {
-          const r = rqList.find((item: any) => item.id === det.id) || rqList[idx];
-          const rId = r?.id || det.id;
+          const r = rqList.find((item: any) => String(item.id) === String(det?.id)) || rqList[idx];
+          const rId = r?.id ?? det?.id;
           const rawAns = String(
-            report.risposte?.wbRq?.[rId] ||
-            report.risposte?.oe?.[rId] ||
+            report.risposte?.wbRq?.[rId] ??
+            report.risposte?.oe?.[rId] ??
             ""
           ).trim();
           if (detectGibberish(rawAns)) {
@@ -1214,22 +965,12 @@ function processQueue() {
         currentJob.status = "completed";
         currentJob.result = result;
         // Release hash from active deduplication cache after 30 seconds
-        setTimeout(() => {
-          for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-            if (cachedJobId === currentJob.id) {
-              reqToJobCache.delete(hashKey);
-            }
-          }
-        }, 30000);
+        setTimeout(() => releaseJobHash(currentJob.id), 30000);
       } catch (err: any) {
         currentJob.status = "failed";
         currentJob.error = humanAiError(err?.message || "Errore durante la valutazione");
         // Release hash immediately on error to allow fast retry
-        for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-          if (cachedJobId === currentJob.id) {
-            reqToJobCache.delete(hashKey);
-          }
-        }
+        releaseJobHash(currentJob.id);
       } finally {
         activeWorkers--;
         // Il payload completo non serve più: tenerlo per ogni job concluso è il modo
@@ -1253,6 +994,9 @@ app.all("/api/evaluate/enqueue", (req, res) => {
     return res.status(405).json({ 
       error: "Method Not Allowed. Il browser ha momentaneamente perso la sessione a causa dei cookie nel blocco iframe. La connessione è stata ripristinata con successo. Clicca nuovamente su Consegna per procedere!" 
     });
+  }
+  if (!req.body || typeof req.body !== "object") {
+    return res.status(400).json({ error: "Richiesta di valutazione priva dei dati della consegna." });
   }
 
   // OPTIMIZATION 1: Request De-duplication Check
@@ -1382,14 +1126,14 @@ Il piano deve comprendere tassativamente queste 4 aree logiche:
 Usa un italiano impeccabile e un approccio profondamente pedagogico.`;
 
   const response = await generateWithRetry({
-    model: "gemini-3.5-flash",
+    model: TASK_MODEL_PREFERENCE["recovery-plan"][0],
     models: TASK_MODEL_PREFERENCE["recovery-plan"],
     contents: prompt,
     config: {
       temperature: 0.7,
       maxOutputTokens: 2500,
       thinkingConfig: {
-        thinkingLevel: "LOW"
+        thinkingLevel: ThinkingLevel.LOW
       }
     }
   });
@@ -1417,18 +1161,12 @@ function processRecoveryQueue() {
       try {
         currentJob.result = await runRecoveryCore(currentJob.reqBody);
         currentJob.status = "completed";
-        setTimeout(() => {
-          for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-            if (cachedJobId === currentJob.id) reqToJobCache.delete(hashKey);
-          }
-        }, 30000);
+        setTimeout(() => releaseJobHash(currentJob.id), 30000);
       } catch (err: any) {
         currentJob.status = "failed";
         currentJob.error = humanAiError(err?.message || "Errore durante la generazione del piano");
         console.warn("[Piano di recupero]", currentJob.error);
-        for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
-          if (cachedJobId === currentJob.id) reqToJobCache.delete(hashKey);
-        }
+        releaseJobHash(currentJob.id);
       } finally {
         activeRecoveryWorkers--;
         currentJob.reqBody = undefined;
@@ -1574,7 +1312,10 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente 
       throw new Error("Risposta vuota ricevuta da Gemini.");
     }
 
-    const data = parseJsonResponse(responseText);
+    const data = tolerantJsonParse(responseText);
+    if (!data || typeof data !== "object") {
+      throw new Error("Risposta JSON non valida ricevuta dal modello di intelligenza artificiale.");
+    }
     
     // Normalize and repair output object
     let parsedObj: any = null;
@@ -1582,35 +1323,27 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente 
       parsedObj = data.optimizedJson;
     } else if (typeof data.optimizedJson === "string") {
       try {
-        parsedObj = JSON.parse(data.optimizedJson);
-      } catch (pErr) {
+        parsedObj = tolerantJsonParse(data.optimizedJson);
+      } catch {
         // Leave raw string
       }
     }
 
-    // Normalization safeguard: If exam is Quiz (no sections) and has reflectionQuestions at root, migrate them into openEnded!
-    if (parsedObj && typeof parsedObj === "object" && !parsedObj.sections) {
-      if (Array.isArray(parsedObj.reflectionQuestions) && parsedObj.reflectionQuestions.length > 0) {
-        if (!Array.isArray(parsedObj.openEnded)) parsedObj.openEnded = [];
-        for (const rq of parsedObj.reflectionQuestions) {
-          if (!parsedObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-            parsedObj.openEnded.push({
-              id: rq.id || `q_ref_${parsedObj.openEnded.length + 1}`,
-              question: rq.question,
-              criteria: rq.criteria || rq.criteri
-            });
-          }
-        }
-        delete parsedObj.reflectionQuestions;
-      }
+    if (parsedObj) {
+      normalizeExamStructure(parsedObj);
     }
 
     const finalJson = parsedObj ? JSON.stringify(parsedObj, null, 2) : String(data.optimizedJson);
 
+    const safeReviewHtml = String(data.reviewHtml || "")
+      .replace(/<(script|iframe|object|embed|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+      .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+      .replace(/javascript\s*:/gi, "");
+
     return res.json({ 
       status: "success", 
       review: {
-        reviewHtml: data.reviewHtml,
+        reviewHtml: safeReviewHtml,
         suggestions: data.suggestions || [],
         proposedAdditions: data.proposedAdditions || [],
         optimizedJson: finalJson
@@ -1651,12 +1384,8 @@ app.all("/api/extend-exam-json", async (req, res) => {
   try {
     let baseExam: any = null;
     try {
-      baseExam = JSON.parse(examJson);
-    } catch {
-      try {
-        baseExam = parseJsonResponse(examJson);
-      } catch {}
-    }
+      baseExam = tolerantJsonParse(examJson);
+    } catch {}
     if (Array.isArray(baseExam)) {
       baseExam = { title: "Verifica", multipleChoice: baseExam, openEnded: [] };
     } else if (!baseExam || typeof baseExam !== "object") {
@@ -1786,7 +1515,10 @@ REGOLE TASSATIVE:
       throw new Error("Risposta vuota ricevuta da Gemini.");
     }
 
-    const data = parseJsonResponse(responseText);
+    const data = tolerantJsonParse(responseText);
+    if (!data || typeof data !== "object") {
+      throw new Error("Risposta JSON non valida ricevuta da Gemini.");
+    }
     const addedItems: Array<{ type: string; title: string; previewText: string }> = Array.isArray(data.addedItems) ? data.addedItems : [];
 
     // --- PROGRAMMATIC MERGE: Guarantee 100% preservation of all existing items and clean appending ---
@@ -1959,6 +1691,7 @@ REGOLE TASSATIVE:
       }
     }
 
+    normalizeExamStructure(baseExam);
     const finalJson = JSON.stringify(baseExam, null, 2);
 
     return res.json({
@@ -2114,52 +1847,29 @@ REGOLE ESSENZIALI:
       throw new Error("Risposta vuota ricevuta dal modello di intelligenza artificiale.");
     }
 
-    const generatedData = parseJsonResponse(responseText);
-    
-    // Auto-sanitize fillInTheBlank sentences to guarantee brackets are converted to underscores
-    if (isWorkbook && Array.isArray(generatedData.sections)) {
-      for (const sec of generatedData.sections) {
-        if (Array.isArray(sec.fillInTheBlank)) {
-          for (const fib of sec.fillInTheBlank) {
-            if (fib && typeof fib.sentence === "string") {
-              if (/\[([^\]]+)\]/.test(fib.sentence)) {
-                const match = fib.sentence.match(/\[([^\]]+)\]/);
-                if (match && (!fib.answer || !fib.answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
-                  fib.answer = match[1].trim();
-                }
-                fib.sentence = fib.sentence.replace(/\[([^\]]+)\]/g, "________");
-              } else if (fib.answer && typeof fib.answer === "string" && !/_{2,}|\.{3,}/.test(fib.sentence)) {
-                const ansEsc = fib.answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                if (ansEsc.length > 0) {
-                  const re = new RegExp(`\\b${ansEsc}\\b`, "i");
-                  if (re.test(fib.sentence)) {
-                    fib.sentence = fib.sentence.replace(re, "________");
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
+    const parsedRaw = tolerantJsonParse(responseText);
+    if (!parsedRaw || typeof parsedRaw !== "object") {
+      throw new Error("L'IA ha restituito una struttura non valida per la verifica.");
     }
+    const generatedData = normalizeExamStructure(parsedRaw);
 
-    // Format JSON string for teacher editor
-    const formattedJson = JSON.stringify({
+    const examObj = {
       title: generatedData.title || topic.substring(0, 40),
-      ...(isWorkbook ? { sections: generatedData.sections } : {
+      ...(isWorkbook ? { sections: generatedData.sections || [] } : {
         multipleChoice: generatedData.multipleChoice || [],
         openEnded: generatedData.openEnded || []
       })
-    }, null, 2);
+    };
+    const formattedJson = JSON.stringify(examObj, null, 2);
 
     return res.json({
       status: "success",
-      title: generatedData.title || topic.substring(0, 40),
+      title: examObj.title,
       examType: isWorkbook ? "workbook" : "quiz",
       recommendedDurationMinutes: generatedData.recommendedDurationMinutes || 45,
       summaryDescription: generatedData.summaryDescription || "",
       modelUsed,
-      examObj: JSON.parse(formattedJson),
+      examObj,
       formattedJson
     });
 
@@ -2170,18 +1880,6 @@ REGOLE ESSENZIALI:
       details: error.message 
     });
   }
-});
-
-// Global error handler for JSON parsing and other synchronous middleware errors
-app.use((err: any, _req: any, res: any, _next: any) => {
-  console.error('[EXPRESS ERROR]:', err);
-  if (err instanceof SyntaxError && 'body' in err) {
-    return res.status(400).json({ error: "Richiesta JSON non valida" });
-  }
-  if (err.type === 'entity.too.large') {
-    return res.status(413).json({ error: "Payload troppo grande" });
-  }
-  res.status(500).json({ error: "Errore interno del server", details: err.message });
 });
 
 // ---------------------------------------------------------------------------
@@ -2746,6 +2444,7 @@ app.get("/api/google/oauth/callback", async (req, res) => {
         redirect_uri: googleCallbackUri(base),
         grant_type: "authorization_code",
       }).toString(),
+      signal: AbortSignal.timeout(20000),
     });
     const tokenData = (await tokenResponse.json().catch(() => null)) as
       | { access_token?: string; error?: string; error_description?: string }
@@ -2760,6 +2459,7 @@ app.get("/api/google/oauth/callback", async (req, res) => {
 
     const formResponse = await fetch(GOOGLE_FORMS_API_URL + encodeURIComponent(state.formId), {
       headers: { Authorization: `Bearer ${tokenData.access_token}`, Accept: "application/json" },
+      signal: AbortSignal.timeout(20000),
     });
     const formData = (await formResponse.json().catch(() => null)) as any;
     if (!formResponse.ok) {
@@ -2886,6 +2586,18 @@ async function startServer() {
       res.status(404).json({ error: `Not Found. Unhandled POST to ${req.originalUrl}` });
     });
   }
+
+  // Global error handler for JSON parsing and synchronous middleware errors (must stay after all routes)
+  app.use((err: any, _req: any, res: any, _next: any) => {
+    console.error("[EXPRESS ERROR]:", err);
+    if (err instanceof SyntaxError && "body" in err) {
+      return res.status(400).json({ error: "Richiesta JSON non valida" });
+    }
+    if (err.type === "entity.too.large") {
+      return res.status(413).json({ error: "Payload troppo grande" });
+    }
+    res.status(500).json({ error: "Errore interno del server", details: err?.message || "Errore imprevisto" });
+  });
 
   app.listen(PORT, "0.0.0.0", () => {
     console.log(`[Educational Architect] Server listening at http://localhost:${PORT}`);

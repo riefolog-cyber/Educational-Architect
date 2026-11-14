@@ -969,25 +969,27 @@ export function isEvaluationPending(evaluation: any): boolean {
   );
 }
 
+/** Parses JSON strings safely, passing existing objects through and returning null on failure. */
+export function safeParseJson<T = any>(value: unknown): T | null {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "object") return value as T;
+  if (typeof value !== "string") return null;
+  try {
+    return JSON.parse(value) as T;
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Extracts and calculates the grade breakdown from a Firestore submission document.
  */
 export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
   const tipo: "Quiz" | "Workbook" = String(sub?.Tipo || "").toLowerCase() === "workbook" ? "Workbook" : "Quiz";
 
-  const safeParse = (data: any) => {
-    if (!data) return null;
-    if (typeof data === "object") return data;
-    try {
-      return JSON.parse(data);
-    } catch {
-      return null;
-    }
-  };
-
-  const evaluation = safeParse(sub?.Full_Evaluation);
-  const examData = safeParse(sub?.Domande_Esame);
-  const answers = safeParse(sub?.Risposte_Studente);
+  const evaluation = safeParseJson(sub?.Full_Evaluation);
+  const examData = safeParseJson(sub?.Domande_Esame);
+  const answers = safeParseJson(sub?.Risposte_Studente);
 
   // Detect legacy/AI documents where a written open answer has no score: those
   // must never be displayed as "0". Blanks are fine (a legitimate zero).
@@ -1049,20 +1051,11 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
  */
 export function getPendingSubjectiveCount(sub: any): number {
   try {
-    const parseMaybe = (data: any) => {
-      if (!data) return null;
-      if (typeof data === "object") return data;
-      try {
-        return JSON.parse(data);
-      } catch {
-        return null;
-      }
-    };
     const tipo: "Quiz" | "Workbook" =
       String(sub?.Tipo || "").toLowerCase() === "workbook" ? "Workbook" : "Quiz";
-    const examData = parseMaybe(sub?.Domande_Esame);
-    const answers = parseMaybe(sub?.Risposte_Studente);
-    const evaluation = parseMaybe(sub?.Full_Evaluation);
+    const examData = safeParseJson(sub?.Domande_Esame);
+    const answers = safeParseJson(sub?.Risposte_Studente);
+    const evaluation = safeParseJson(sub?.Full_Evaluation);
     const questions =
       tipo === "Workbook"
         ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
@@ -1191,7 +1184,7 @@ export function fibWeightedScore(
   for (const fib of fibList || []) {
     const w = itemWeight(fib);
     weightedTotal += w;
-    const target = fib?.answer || (typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : undefined);
+    const target = extractFibExpected(fib) || undefined;
     if (isCorrect(answersWbFib?.[fib?.id], target)) {
       correct++;
       weightedCorrect += w;
@@ -1427,30 +1420,6 @@ export async function requestAppFullScreen(): Promise<boolean> {
   if (docEl.webkitRequestFullscreen) return awaitFullscreenRequest(() => docEl.webkitRequestFullscreen());
   if (docEl.mozRequestFullScreen) return awaitFullscreenRequest(() => docEl.mozRequestFullScreen());
   if (docEl.msRequestFullscreen) return awaitFullscreenRequest(() => docEl.msRequestFullscreen());
-  return false;
-}
-
-// Exit full screen
-export async function exitAppFullScreen(): Promise<boolean> {
-  if (typeof document === "undefined") return false;
-  try {
-    const doc: any = document;
-    if (doc.exitFullscreen) {
-      await doc.exitFullscreen();
-      return true;
-    } else if (doc.webkitExitFullscreen) {
-      await doc.webkitExitFullscreen();
-      return true;
-    } else if (doc.mozCancelFullScreen) {
-      await doc.mozCancelFullScreen();
-      return true;
-    } else if (doc.msExitFullscreen) {
-      await doc.msExitFullscreen();
-      return true;
-    }
-  } catch (e) {
-    console.warn("Exit fullscreen error:", e);
-  }
   return false;
 }
 

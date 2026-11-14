@@ -419,7 +419,7 @@ export default function GoogleFormsImportModal({
                 </button>
               </div>
 
-              {!linked.scriptVersion && (
+              {linked.importedVia === "script" && !linked.scriptVersion && (
                 <p className="text-[10px] text-amber-200/90 bg-amber-500/5 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
                   Lo script non dichiara la sua versione: il deployment sta eseguendo una copia vecchia del codice.
                   In Apps Script fai <b className="text-amber-100">Distribuisci → Gestisci distribuzioni → ✏️ →
@@ -427,7 +427,7 @@ export default function GoogleFormsImportModal({
                 </p>
               )}
 
-              {!linked.questions.some((q) => q.image) && (
+              {linked.importedVia === "script" && !linked.questions.some((q) => q.image) && (
                 <p className="text-[10px] text-amber-200/90 bg-amber-500/10 border border-amber-500/25 rounded-xl p-2 leading-relaxed">
                   Nessuna immagine letta dal modulo. Se le figure sono messe <i>dentro</i> una domanda,
                   Apps Script non le vede: premi <b className="text-amber-100">Immagine</b> sulla domanda e allega il

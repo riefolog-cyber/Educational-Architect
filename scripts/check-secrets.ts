@@ -1,5 +1,6 @@
 import { execSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync } from "node:fs";
+import path from "node:path";
 
 /**
  * Guardrail contro lo stesso incidente della chiave Gemini revocata:
@@ -17,9 +18,37 @@ const ALLOWLIST = new Set([
   "firebase-applet-config.json",
 ]);
 
+const SKIP_DIRS = new Set(["node_modules", "dist", ".git", ".aistudio"]);
+
+function walkWorkspace(dir: string, baseDir = dir, acc: string[] = []): string[] {
+  for (const entry of readdirSync(dir)) {
+    if (SKIP_DIRS.has(entry) || entry === ".env" || entry.startsWith(".env.")) continue;
+    const full = path.join(dir, entry);
+    let st;
+    try {
+      st = statSync(full);
+    } catch {
+      continue;
+    }
+    if (st.isDirectory()) {
+      walkWorkspace(full, baseDir, acc);
+    } else if (st.isFile()) {
+      acc.push(path.relative(baseDir, full));
+    }
+  }
+  return acc;
+}
+
 function trackedFiles(): string[] {
-  const out = execSync("git ls-files -z", { encoding: "buffer" }).toString("utf8");
-  return out.split("\0").filter(Boolean);
+  if (existsSync(".git")) {
+    try {
+      const out = execSync("git ls-files -z", { encoding: "buffer" }).toString("utf8");
+      return out.split("\0").filter(Boolean);
+    } catch {
+      // Fallback to directory walk if git command fails
+    }
+  }
+  return walkWorkspace(process.cwd());
 }
 
 const offenders: Array<{ file: string; line: number; match: string }> = [];

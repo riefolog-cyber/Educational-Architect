@@ -26,7 +26,6 @@ import {
   Sparkles, 
   ArrowLeft,
   Lock,
-  Unlock,
   ChevronRight,
   Info,
   BookOpen,
@@ -67,8 +66,10 @@ import {
   buildSubjectiveReviewEntries,
   auditSubjectiveEvaluation,
   isEvaluationPending,
-  getPendingSubjectiveCount
+  getPendingSubjectiveCount,
+  safeParseJson
 } from "../utils";
+import { normalizeExamStructure } from "../utils/examStructureRepair";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   recoveryProgressLabel,
@@ -281,7 +282,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   const [isExamActive, setIsExamActive] = useState(false);
   const [infractionModalMsg, setInfractionModalMsg] = useState<string | null>(null);
-  const [submitWarningMsg, setSubmitWarningMsg] = useState<string | null>(null);
   const [missingQuestionsList, setMissingQuestionsList] = useState<MissingQuestionItem[]>([]);
   const [showMissingQuestionsModal, setShowMissingQuestionsModal] = useState(false);
   const isInteractingWithInAppDialogRef = useRef(false);
@@ -364,41 +364,82 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   // Live progress synchronization to Firestore for Teacher Dashboard
   const syncLiveProgress = useCallback(async (
-    status: "waiting" | "in_progress" | "self_evaluating" | "submitted" = "in_progress"
+    status: "waiting" | "in_progress" | "self_evaluating" | "submitted" = "in_progress",
+    override?: {
+      pin?: string;
+      runId?: string;
+      examType?: "quiz" | "workbook";
+      examData?: any;
+      answers?: Answers;
+    }
   ) => {
-    if (!dbFirestore || !sessionPin || !user?.email) return;
+    const targetPin = (override?.pin || sessionPin || "").trim().toUpperCase();
+    if (!dbFirestore || !targetPin || !user?.email) return;
+    const activeType = override?.examType || examType;
+    const activeData = override?.examData || examData;
+    const activeAns = override?.answers || answers;
+    const activeRunId = override?.runId ?? sessionRunId;
     try {
       const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
-      const answeredCount = examType === "quiz"
-        ? Object.keys(answers.mc).length + Object.keys(answers.oe).filter(k => (answers.oe[k] || "").trim().length > 0).length
-        : Object.keys(answers.wbFib).length + Object.keys(answers.wbRq).filter(k => (answers.wbRq[k] || "").trim().length > 0).length + Object.keys(answers.mc).length;
+      let answeredCount = 0;
+      let totalQuestions = 1;
 
-      const totalQuestions = examType === "quiz"
-        ? ((examData?.multipleChoice?.length || 0) + (examData?.openEnded?.length || 0))
-        : ((examData?.sections || []).flatMap((s: any) => [...(s.fillInTheBlank || []), ...(s.reflectionQuestions || []), ...(s.multipleChoice || [])]).length + (examData?.multipleChoice?.length || 0) || 1);
+      if (activeType === "quiz") {
+        const mcList = Array.isArray(activeData?.multipleChoice) ? activeData.multipleChoice : [];
+        const oeList = Array.isArray(activeData?.openEnded) ? activeData.openEnded : [];
+        const mcIds = new Set(mcList.map((q: any) => q?.id).filter(Boolean));
+        const oeIds = new Set(oeList.map((q: any) => q?.id).filter(Boolean));
+        const mcDone = mcIds.size > 0
+          ? mcList.filter((q: any) => activeAns.mc?.[q.id] !== undefined).length
+          : Object.keys(activeAns.mc || {}).length;
+        const oeDone = oeIds.size > 0
+          ? oeList.filter((q: any) => String(activeAns.oe?.[q.id] ?? "").trim().length > 0).length
+          : Object.keys(activeAns.oe || {}).filter((k) => String(activeAns.oe?.[k] ?? "").trim().length > 0).length;
+        totalQuestions = Math.max(1, mcList.length + oeList.length);
+        answeredCount = Math.min(totalQuestions, mcDone + oeDone);
+      } else {
+        const sections = Array.isArray(activeData?.sections) ? activeData.sections : [];
+        const fibList = sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []));
+        const rqList = sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []));
+        const mcList = [
+          ...(Array.isArray(activeData?.multipleChoice) ? activeData.multipleChoice : []),
+          ...sections.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
+        ];
+        const fibDone = fibList.length > 0
+          ? fibList.filter((f: any) => String(activeAns.wbFib?.[f.id] ?? "").trim().length > 0).length
+          : Object.keys(activeAns.wbFib || {}).filter((k) => String(activeAns.wbFib?.[k] ?? "").trim().length > 0).length;
+        const rqDone = rqList.length > 0
+          ? rqList.filter((r: any) => String(activeAns.wbRq?.[r.id] ?? activeAns.oe?.[r.id] ?? "").trim().length > 0).length
+          : Object.keys(activeAns.wbRq || {}).filter((k) => String(activeAns.wbRq?.[k] ?? "").trim().length > 0).length;
+        const mcDone = mcList.length > 0
+          ? mcList.filter((q: any) => activeAns.mc?.[q.id] !== undefined).length
+          : Object.keys(activeAns.mc || {}).length;
+        totalQuestions = Math.max(1, fibList.length + rqList.length + mcList.length);
+        answeredCount = Math.min(totalQuestions, fibDone + rqDone + mcDone);
+      }
 
-      const progressPercent = Math.min(100, Math.round((answeredCount / (totalQuestions || 1)) * 100));
+      const progressPercent = Math.min(100, Math.round((answeredCount / totalQuestions) * 100));
 
       // Stable join time: first value wins for the whole session (also across
       // a page reload within the same tab).
-      const joinedKey = `${sessionPin}|${user.email}`;
+      const joinedKey = `${targetPin}|${user.email}`;
       let joinedAt = joinedAtBySessionRef.current[joinedKey];
       if (!joinedAt) {
         try {
-          joinedAt = sessionStorage.getItem(`exam_joined_${sessionPin}_${safeKey}`) || "";
+          joinedAt = sessionStorage.getItem(`exam_joined_${targetPin}_${safeKey}`) || "";
         } catch {
           joinedAt = "";
         }
         if (!joinedAt) joinedAt = new Date().toISOString();
         joinedAtBySessionRef.current[joinedKey] = joinedAt;
         try {
-          sessionStorage.setItem(`exam_joined_${sessionPin}_${safeKey}`, joinedAt);
+          sessionStorage.setItem(`exam_joined_${targetPin}_${safeKey}`, joinedAt);
         } catch {
           // Storage disabled: the in-memory ref still keeps it stable.
         }
       }
 
-      const docRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey);
+      const docRef = doc(dbFirestore, "active_sessions", targetPin, "live_students", safeKey);
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
@@ -409,7 +450,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         pasteAttempts: behavior.pasteAttempts,
         lastHeartbeat: new Date().toISOString(),
         joinedAt,
-        sessionRunId,
+        sessionRunId: activeRunId,
         status
       }, { merge: true });
     } catch (err) {
@@ -531,7 +572,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             const k = localStorage.key(i);
             if (k && k.startsWith("exam_lock_")) keysToRemove.push(k);
           }
-          keysToRemove.forEach((k) => localStorage.removeItem(k));
+          keysToRemove.forEach((k) => {
+            try {
+              localStorage.removeItem(k);
+              sessionStorage.removeItem(k);
+            } catch {}
+          });
         } catch {}
       }
     } catch {
@@ -671,15 +717,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return `draft_${currPin}_${userEmailKey}`;
   };
 
-  const saveDraft = (currPin: string, currAnswers: Answers) => {
+  const saveDraft = (currPin: string, currAnswers: Answers, runId = sessionRunId) => {
     try {
-      localStorage.setItem(getDraftKey(currPin), JSON.stringify(currAnswers));
+      localStorage.setItem(
+        getDraftKey(currPin),
+        JSON.stringify({ sessionRunId: runId || "", answers: currAnswers })
+      );
     } catch (e) {
       console.warn("Impossibile salvare la bozza in localStorage:", e);
     }
   };
 
-  const loadDraft = (currPin: string): boolean => {
+  const loadDraft = (currPin: string, expectedRunId?: string): boolean => {
     try {
       // 1. Try student-specific isolated draft
       let draft = localStorage.getItem(getDraftKey(currPin));
@@ -689,7 +738,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       }
       if (draft) {
         const parsed = JSON.parse(draft);
-        setAnswers(parsed);
+        if (!parsed || typeof parsed !== "object") return false;
+        const draftRunId = typeof parsed.sessionRunId === "string" ? parsed.sessionRunId : "";
+        if (draftRunId && expectedRunId && draftRunId !== expectedRunId) {
+          clearDraft(currPin);
+          return false;
+        }
+        const rawAnswers = parsed.answers && typeof parsed.answers === "object" ? parsed.answers : parsed;
+        setAnswers({
+          mc: rawAnswers.mc && typeof rawAnswers.mc === "object" ? rawAnswers.mc : {},
+          oe: rawAnswers.oe && typeof rawAnswers.oe === "object" ? rawAnswers.oe : {},
+          wbFib: rawAnswers.wbFib && typeof rawAnswers.wbFib === "object" ? rawAnswers.wbFib : {},
+          wbRq: rawAnswers.wbRq && typeof rawAnswers.wbRq === "object" ? rawAnswers.wbRq : {},
+        });
         return true;
       }
     } catch (e) {
@@ -713,17 +774,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const sessionSnap = await getDoc(sessionDocRef);
       if (sessionSnap.exists()) {
         const sessionData = sessionSnap.data();
-        let examContent = sessionData.examData;
+        const parsedExam = safeParseJson(sessionData.data ?? sessionData.examData);
+        const examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
         if (examContent) {
           setExamData(examContent);
           setExamType(examContent.sections ? "workbook" : "quiz");
         }
+        const restoredRunId = sessionData.sessionId || sessionData.sessionRunId || "";
         setExpiryTime(sessionData.expiry || null);
         setBackendUrl(sessionData.backendUrl || null);
         setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
         setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
-        setSessionRunId(sessionData.sessionRunId || "");
-        loadDraft(savedPin);
+        setSessionRunId(restoredRunId);
+        loadDraft(savedPin, restoredRunId);
 
         // Check if teacher has already unlocked this student in Firestore
         if (user?.email) {
@@ -832,32 +895,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setGeneratingPlan(true);
     setRecoveryProgress(null);
     try {
-      let finalEvalObj = null;
-      try {
-        finalEvalObj = typeof submission.Full_Evaluation === "string" 
-          ? JSON.parse(submission.Full_Evaluation) 
-          : submission.Full_Evaluation;
-      } catch (e) {
-        finalEvalObj = submission.Full_Evaluation || {};
-      }
-
-      let parsedAnswers = null;
-      try {
-        parsedAnswers = typeof submission.Risposte_Studente === "string" 
-          ? JSON.parse(submission.Risposte_Studente) 
-          : submission.Risposte_Studente;
-      } catch (e) {
-        parsedAnswers = submission.Risposte_Studente || {};
-      }
-
-      let parsedExamData = null;
-      try {
-        parsedExamData = typeof submission.Domande_Esame === "string" 
-          ? JSON.parse(submission.Domande_Esame) 
-          : submission.Domande_Esame;
-      } catch (e) {
-        parsedExamData = submission.Domande_Esame || {};
-      }
+      const finalEvalObj = safeParseJson(submission.Full_Evaluation) || {};
+      const parsedAnswers = safeParseJson(submission.Risposte_Studente) || {};
+      const parsedExamData = safeParseJson(submission.Domande_Esame) || {};
 
       // Il piano passa da una coda dedicata sul server: con tutta la classe che
       // lo chiede insieme, le correzioni degli elaborati non perdono posti.
@@ -990,53 +1030,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setSessionPin(formattedPin);
           setSessionRunId(sessionData.sessionId || "");
 
-          let examContent = sessionData.data;
-          if (typeof examContent === "string") {
-            try { examContent = JSON.parse(examContent); } catch {}
-          }
-
-          // Normalization safeguard: If examContent is a Quiz (no sections) and has reflectionQuestions at the root,
-          // migrate them into openEnded so they are rendered and evaluated seamlessly for the student!
-          if (examContent && !examContent.sections && Array.isArray(examContent.reflectionQuestions) && examContent.reflectionQuestions.length > 0) {
-            const existingOE = Array.isArray(examContent.openEnded) ? [...examContent.openEnded] : [];
-            for (const rq of examContent.reflectionQuestions) {
-              if (!existingOE.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-                existingOE.push({
-                  id: rq.id || `q_ref_${existingOE.length + 1}`,
-                  question: rq.question,
-                  criteria: rq.criteria || rq.criteri
-                });
-              }
-            }
-            examContent = {
-              ...examContent,
-              openEnded: existingOE
-            };
-          }
-
-          // Reciprocal safeguard: If examContent is a Workbook (has sections) and has openEnded at root,
-          // migrate them into the last section's reflectionQuestions so they are rendered and evaluated!
-          if (examContent && Array.isArray(examContent.sections) && examContent.sections.length > 0 && Array.isArray(examContent.openEnded) && examContent.openEnded.length > 0) {
-            const sectionsCopy = [...examContent.sections];
-            const targetSec = { ...sectionsCopy[sectionsCopy.length - 1] };
-            const existingRQ = Array.isArray(targetSec.reflectionQuestions) ? [...targetSec.reflectionQuestions] : [];
-            for (const oe of examContent.openEnded) {
-              if (!existingRQ.some((rq: any) => rq.id === oe.id || rq.question === oe.question)) {
-                existingRQ.push({
-                  id: oe.id || `ref_${existingRQ.length + 1}`,
-                  question: oe.question,
-                  criteria: oe.criteria || oe.criteri,
-                  weight: oe.weight || 1
-                });
-              }
-            }
-            targetSec.reflectionQuestions = existingRQ;
-            sectionsCopy[sectionsCopy.length - 1] = targetSec;
-            examContent = {
-              ...examContent,
-              sections: sectionsCopy
-            };
-          }
+          const parsedExam = safeParseJson(sessionData.data);
+          let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
 
           // Anti-cheat: Randomize questions and options if enabled by teacher
           if (sessionData.randomizeQuestions && examContent?.multipleChoice) {
@@ -1075,7 +1070,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                sessionStorage.getItem("active_exam_lock");
             if (storedLock) {
               const parsedLock = JSON.parse(storedLock);
-              if (parsedLock?.locked) {
+              const lockPin = String(parsedLock?.pin || "").trim().toUpperCase();
+              if (parsedLock?.locked && (!lockPin || lockPin === formattedPin)) {
                 isLockedNow = true;
                 currentLockReason = String(parsedLock.reason || "Prova precedentemente bloccata per allontanamento");
               }
@@ -1100,20 +1096,21 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             } catch {}
           }
 
+          const currentRunId = String(sessionData.sessionId || sessionData.sessionRunId || "");
           if (isLockedNow) {
             lockedRef.current = true;
             setExamLocked(true);
             setLockReason(currentLockReason);
             persistExamLock(true, currentLockReason);
             setIsExamActive(true);
-            loadDraft(formattedPin);
+            loadDraft(formattedPin, currentRunId);
             setActiveScreen("exam-space");
           } else {
             lockedRef.current = false;
             setExamLocked(false);
             setLockReason("");
             persistExamLock(false);
-            loadDraft(formattedPin);
+            loadDraft(formattedPin, currentRunId);
             setActiveScreen("warning");
           }
         } else {
@@ -1640,7 +1637,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         fullscreenLockTimerRef.current = null;
       }
       if (wakeLockRef.current) {
-        wakeLockRef.current.release().then(() => { wakeLockRef.current = null; });
+        wakeLockRef.current.release()
+          .catch(() => {})
+          .finally(() => { wakeLockRef.current = null; });
       }
     };
   }, [isExamActive, severityPreset]);
@@ -1711,7 +1710,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setIsExamActive(false);
           
           // Force redirection to self-assessment when timer expires!
-          setAppAlert({ msg: "⏱️ Il tempo a disposizione impostato dal docente per questa sessione d'esame è scaduto!\n\nTutti i tuoi testi e le risposte fornite finora sono stati salvati come bozza. Verrai ora reindirizzato al pannello di autovalutazione metacognitiva per completare l'invio ufficiale.", onOk: () => setActiveScreen("self-assessment") });
+          setAppAlert({
+            msg: "⏱️ Il tempo a disposizione impostato dal docente per questa sessione d'esame è scaduto!\n\nTutti i tuoi testi e le risposte fornite finora sono stati salvati come bozza. Verrai ora reindirizzato al pannello di autovalutazione metacognitiva per completare l'invio ufficiale.",
+            onOk: () => {
+              setActiveScreen("self-assessment");
+              syncLiveProgressRef.current("self_evaluating");
+            }
+          });
           return;
         }
 
@@ -2200,7 +2205,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           const docRef = await addDoc(collection(dbFirestore, "valutazioni"), submissionData);
           setActiveSubmissionId(docRef.id);
           setSavingStatus("✓ Tutti i voti e le note di integrità sono salvati nel database del docente!");
-          syncLiveProgress("submitted");
+          void syncLiveProgress("submitted", {
+            pin: rescue.sessionPin,
+            runId: rescue.sessionRunId,
+            examType: rescue.examType,
+            examData: rescue.examData,
+            answers: rescue.answers,
+          });
         } catch (dbErr: any) {
           console.error("Errore salvataggio firestore:", dbErr);
           setSavingStatus("⚠️ Connessione al database di classe non riuscita.");
@@ -2278,14 +2289,15 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       fullscreenLockTimerRef.current = null;
     }
 
-    // Finalize any ongoing leave or fullscreen exit durations at submit time
+    // Finalize any ongoing leave or fullscreen exit durations at submit time (without mutating React state)
+    const updatedInfractionsLog = behavior.infractionsLog.map((inf) => ({ ...inf }));
     if (fullscreenExitTimeRef.current) {
       const dur = Math.max(1, Math.round((Date.now() - fullscreenExitTimeRef.current) / 1000));
       fullscreenExitTimeRef.current = null;
-      for (let i = behavior.infractionsLog.length - 1; i >= 0; i--) {
-        if (behavior.infractionsLog[i].type === "uscita_schermo_intero" && behavior.infractionsLog[i].durationSeconds === undefined) {
-          behavior.infractionsLog[i].durationSeconds = dur;
-          behavior.infractionsLog[i].details = `Uscita dalla modalità a schermo intero (${dur}s fuori schermo intero/pagina fino alla consegna)`;
+      for (let i = updatedInfractionsLog.length - 1; i >= 0; i--) {
+        if (updatedInfractionsLog[i].type === "uscita_schermo_intero" && updatedInfractionsLog[i].durationSeconds === undefined) {
+          updatedInfractionsLog[i].durationSeconds = dur;
+          updatedInfractionsLog[i].details = `Uscita dalla modalità a schermo intero (${dur}s fuori schermo intero/pagina fino alla consegna)`;
           break;
         }
       }
@@ -2293,14 +2305,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     if (leaveTimeRef.current) {
       const dur = Math.max(1, Math.round((Date.now() - leaveTimeRef.current) / 1000));
       leaveTimeRef.current = null;
-      for (let i = behavior.infractionsLog.length - 1; i >= 0; i--) {
-        if (behavior.infractionsLog[i].type === "abbandono_pagina" && behavior.infractionsLog[i].durationSeconds === undefined) {
-          behavior.infractionsLog[i].durationSeconds = dur;
-          behavior.infractionsLog[i].details = (behavior.infractionsLog[i].details || "") + ` (${dur}s fuori app fino alla consegna)`;
+      for (let i = updatedInfractionsLog.length - 1; i >= 0; i--) {
+        if (updatedInfractionsLog[i].type === "abbandono_pagina" && updatedInfractionsLog[i].durationSeconds === undefined) {
+          updatedInfractionsLog[i].durationSeconds = dur;
+          updatedInfractionsLog[i].details = (updatedInfractionsLog[i].details || "") + ` (${dur}s fuori app fino alla consegna)`;
           break;
         }
       }
     }
+    const finalBehavior = { ...behavior, infractionsLog: updatedInfractionsLog };
+    setBehavior(finalBehavior);
 
     // Evaluation scores math pre-calculation (count + didactic weights)
     const allExamMC: any[] = [];
@@ -2340,7 +2354,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
 
     // Creating sanitized payload filtering out gibberish or empty values
-    const sanitizedAnswers = JSON.parse(JSON.stringify(answers));
+    const sanitizedAnswers = {
+      ...answers,
+      mc: { ...answers.mc },
+      oe: { ...answers.oe },
+      wbFib: { ...answers.wbFib },
+      wbRq: { ...answers.wbRq },
+    };
     if (examType === "quiz" && examData?.openEnded) {
       examData.openEnded.forEach((q: any) => {
         const text = answers.oe[q.id] || "";
@@ -2362,8 +2382,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     let examPayload = examData;
 
     if (examType === "quiz") {
-      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: incoraggiante e attento ai contenuti, senza rigidità burocratica. Devi correggere le domande aperte di un quiz.
-      Dati dell'alunno: ${user?.displayName || "Studente"} (Email: ${user?.email || "scuola"}).
+      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: incoraggiante e attento ai contenuti, senza rigidità burocratica. Devi correggere le domande aperte di un quiz (valutazione rigorosamente anonima).
 
       Valuta SOLO le risposte alle DOMANDE APERTE dello studente. La sufficienza consiste in 6/10.
       Atteggiamento pedagogico: Dai priorità a ciò che lo studente SA, non a ciò che manca. Ricerca sempre il nucleo valido della risposta anche quando è formulato in modo impreciso, e valorizzalo esplicitamente nel feedback. Sottolinea i punti da migliorare come occasioni di crescita, non come errori da penalizzare. Tono costruttivo, chiaro e motivante, mai derisorio né punitivo.
@@ -2385,8 +2404,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
       IMPORTANTE: Fornisci per ogni domanda un feedback estremamente SINTETICO E CONCISO (massimo 2-3 frasi) in italiano impeccabile. Inizia sempre riconoscendo un punto di forza della risposta, poi suggerisci un miglioramento concreto. Rivolgiti direttamente allo studente (ad es. "Hai colto bene il punto...", "Per approfondire potresti...").`;
     } else {
-      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: empatico, incoraggiante, ma rigoroso sulla qualità dell'impegno. Devi correggere un quaderno/workbook di riflessona critica.
-      Dati dello studente: ${user?.displayName || "Studente"}.
+      evaluationPrompt = `Sei un docente di scuola secondaria di secondo grado: empatico, incoraggiante, ma rigoroso sulla qualità dell'impegno. Devi correggere un quaderno/workbook di riflessione critica (valutazione rigorosamente anonima).
       
       Valuta le riflessioni assegnando punteggi da 0 a 10 per ciascuna. L'obiettivo è stimolare lo spirito critico.
       Atteggiamento pedagogico: Fai da guida incoraggiante. Valorizza sempre chi si mette in gioco e segnala le riflessioni sbrigative come occasione di crescita, non come colpa. Non penalizzare mai la forma o la lunghezza: una risposta breve ma ragionata vale più di una lunga ma generica.
@@ -2476,7 +2494,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         backendUrl,
         teacherEmail,
         answers,
-        behavior,
+        behavior: finalBehavior,
         studentSelfGrade,
         calculatedMCScore,
         calculatedFIBScore,
@@ -2495,26 +2513,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   const handleRestart = () => {
+    persistExamLock(false);
     try {
-      if (sessionPin) {
-        sessionStorage.removeItem(`exam_lock_${sessionPin}`);
-        localStorage.removeItem(`exam_lock_${sessionPin}`);
-      }
-      sessionStorage.removeItem("active_exam_lock");
-      localStorage.removeItem("active_exam_lock");
       sessionStorage.removeItem("active_student_session");
       localStorage.removeItem("active_student_session");
-      const keysToRemove: string[] = [];
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith("exam_lock_")) keysToRemove.push(k);
-      }
-      keysToRemove.forEach((k) => {
-        try {
-          localStorage.removeItem(k);
-          sessionStorage.removeItem(k);
-        } catch {}
-      });
     } catch {}
     lockedRef.current = false;
     setExamLocked(false);
@@ -2678,32 +2680,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               <div className="text-left space-y-4">
                 {selectedPastSub ? (
                   (() => {
-                    let parsedEval: any = null;
-                    try {
-                      parsedEval = typeof selectedPastSub.Full_Evaluation === "string"
-                        ? JSON.parse(selectedPastSub.Full_Evaluation)
-                        : selectedPastSub.Full_Evaluation;
-                    } catch (e) {
-                      parsedEval = selectedPastSub.Full_Evaluation || {};
-                    }
-
-                    let parsedAnswers: any = null;
-                    try {
-                      parsedAnswers = typeof selectedPastSub.Risposte_Studente === "string"
-                        ? JSON.parse(selectedPastSub.Risposte_Studente)
-                        : selectedPastSub.Risposte_Studente;
-                    } catch (e) {
-                      parsedAnswers = selectedPastSub.Risposte_Studente || {};
-                    }
-
-                    let parsedExamData: any = null;
-                    try {
-                      parsedExamData = typeof selectedPastSub.Domande_Esame === "string"
-                        ? JSON.parse(selectedPastSub.Domande_Esame)
-                        : selectedPastSub.Domande_Esame;
-                    } catch (e) {
-                      parsedExamData = selectedPastSub.Domande_Esame || {};
-                    }
+                    const parsedEval = safeParseJson(selectedPastSub.Full_Evaluation) || {};
+                    const parsedAnswers = safeParseJson(selectedPastSub.Risposte_Studente) || {};
+                    const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
 
                     const pastIsPending =
                       isEvaluationPending(parsedEval) ||

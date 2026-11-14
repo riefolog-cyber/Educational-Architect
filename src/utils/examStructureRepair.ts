@@ -149,12 +149,6 @@ function quoteUnquotedKeys(text: string): string {
   let out = "";
   let inStr = false;
   let esc = false;
-  let token = "";
-  const flushToken = () => {
-    // token holds consecutive word chars outside strings; handled inline below
-    out += token;
-    token = "";
-  };
   for (let i = 0; i < text.length; i++) {
     const c = text[i];
     if (inStr) {
@@ -165,7 +159,6 @@ function quoteUnquotedKeys(text: string): string {
       continue;
     }
     if (c === '"') {
-      flushToken();
       inStr = true;
       out += c;
       continue;
@@ -183,7 +176,7 @@ function quoteUnquotedKeys(text: string): string {
           continue;
         }
         if (text[j] === "'") { found = true; break; }
-        if (text[j] === "\n" && text.slice(j, j + 1) === "\n" && inner.length > 300) break;
+        if (text[j] === "\n" && inner.length > 300) break;
         inner += text[j];
         j++;
         if (j - i > 5000) break;
@@ -220,7 +213,6 @@ function quoteUnquotedKeys(text: string): string {
     }
     out += c;
   }
-  flushToken();
   return out;
 }
 
@@ -432,7 +424,11 @@ export function tolerantJsonParse(rawText: string): any {
     } catch (e) { errors.push(e); }
   }
 
-  // 5. Repair + balance (truncated output: unclosed string/brackets)
+  // 5. Balance truncated output (first directly on cleaned syntax, then with full repair)
+  try {
+    return tryParse(balanceBrackets(cleaned));
+  } catch (e) { errors.push(e); }
+
   try {
     return tryParse(balanceBrackets(repairJsonSyntax(cleaned)));
   } catch (e) { errors.push(e); }
@@ -441,8 +437,11 @@ export function tolerantJsonParse(rawText: string): any {
   try {
     const lastObjectEnd = cleaned.lastIndexOf("},");
     if (lastObjectEnd !== -1) {
-      const pruned = balanceBrackets(repairJsonSyntax(cleaned.substring(0, lastObjectEnd + 1)));
-      return tryParse(pruned);
+      const prefix = cleaned.substring(0, lastObjectEnd + 1);
+      try {
+        return tryParse(balanceBrackets(prefix));
+      } catch {}
+      return tryParse(balanceBrackets(repairJsonSyntax(prefix)));
     }
   } catch (e) { errors.push(e); }
 
@@ -451,6 +450,103 @@ export function tolerantJsonParse(rawText: string): any {
   // Preserve original position info for callers that parse it
   (enriched as any).cause = initialErr;
   throw enriched;
+}
+
+/**
+ * Sanitizes a single fill-in-the-blank item in place:
+ * converts "[answer]" or embedded answer words into "________" while preserving
+ * the omitted solution in `fib.answer`. Supports multi-alternative answers separated by |, ; or /.
+ * Returns true if the item was modified.
+ */
+export function sanitizeFibQuestion(fib: any): boolean {
+  if (!fib || typeof fib !== "object" || typeof fib.sentence !== "string") return false;
+  let changed = false;
+
+  if (/\[([^\]]+)\]/.test(fib.sentence)) {
+    const match = fib.sentence.match(/\[([^\]]+)\]/);
+    if (match && (!fib.answer || !String(fib.answer).trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
+      fib.answer = match[1].trim();
+    }
+    fib.sentence = fib.sentence.replace(/\[([^\]]+)\]/g, "________");
+    changed = true;
+  } else if (fib.answer && typeof fib.answer === "string" && !/_{2,}|\.{3,}/.test(fib.sentence)) {
+    const candidates = fib.answer
+      .split(/[|;\/,]/)
+      .map((s: string) => s.trim())
+      .filter(Boolean)
+      .sort((a: string, b: string) => b.length - a.length);
+
+    for (const candidate of candidates) {
+      const ansEsc = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      if (!ansEsc) continue;
+      const re = new RegExp(`\\b${ansEsc}\\b`, "i");
+      if (re.test(fib.sentence)) {
+        fib.sentence = fib.sentence.replace(re, "________");
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  return changed;
+}
+
+/**
+ * Normalizes Quiz/Workbook structural edge cases in place and returns the exam object:
+ * - Quiz (no sections) with root `reflectionQuestions` migrates them into `openEnded`
+ * - Workbook (sections) with root `openEnded` migrates them into last section's `reflectionQuestions`
+ * - Workbook fill-in-the-blank items have `[word]` converted cleanly to `________`
+ * Preserves `weight` (when custom) and `criteria`.
+ */
+export function normalizeExamStructure<T = any>(examObj: T): T {
+  if (!examObj || typeof examObj !== "object" || Array.isArray(examObj)) return examObj;
+  const obj = examObj as any;
+
+  if (Array.isArray(obj.sections)) {
+    for (const sec of obj.sections) {
+      if (sec && Array.isArray(sec.fillInTheBlank)) {
+        for (const fib of sec.fillInTheBlank) {
+          sanitizeFibQuestion(fib);
+        }
+      }
+    }
+
+    if (obj.sections.length > 0 && Array.isArray(obj.openEnded) && obj.openEnded.length > 0) {
+      const lastSec = obj.sections[obj.sections.length - 1];
+      if (lastSec) {
+        if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
+        for (const oe of obj.openEnded) {
+          if (!oe) continue;
+          if (!lastSec.reflectionQuestions.some((rq: any) => (oe.id && rq.id === oe.id) || (oe.question && rq.question === oe.question))) {
+            const w = Number(oe.weight ?? oe.peso);
+            lastSec.reflectionQuestions.push({
+              id: oe.id || `ref_${lastSec.reflectionQuestions.length + 1}`,
+              question: oe.question,
+              ...(oe.criteria || oe.criteri ? { criteria: oe.criteria || oe.criteri } : {}),
+              ...(!isNaN(w) && w > 0 && w !== 1 ? { weight: w } : {}),
+            });
+          }
+        }
+      }
+    }
+  } else if (Array.isArray(obj.reflectionQuestions) && obj.reflectionQuestions.length > 0) {
+    if (!Array.isArray(obj.openEnded)) obj.openEnded = [];
+    for (const rq of obj.reflectionQuestions) {
+      if (!rq) continue;
+      if (!obj.openEnded.some((oe: any) => (rq.id && oe.id === rq.id) || (rq.question && oe.question === rq.question))) {
+        const w = Number(rq.weight ?? rq.peso);
+        obj.openEnded.push({
+          id: rq.id || `q_ref_${obj.openEnded.length + 1}`,
+          question: rq.question,
+          ...(rq.criteria || rq.criteri ? { criteria: rq.criteria || rq.criteri } : {}),
+          ...(!isNaN(w) && w > 0 && w !== 1 ? { weight: w } : {}),
+        });
+      }
+    }
+    delete obj.reflectionQuestions;
+  }
+
+  return examObj;
 }
 
 /**
@@ -582,29 +678,14 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       const rawFib = sec.fillInTheBlank || sec.completamento || sec.cloze || sec.frasi || [];
       const correctedFib = Array.isArray(rawFib)
         ? rawFib.map((item: any, fIdx: number) => {
-            let sentence = String(item.sentence || item.frase || item.testo || item.prompt || "");
-            let answer = String(item.answer || item.risposta || item.soluzione || "");
-            if (/\[([^\]]+)\]/.test(sentence)) {
-              const match = sentence.match(/\[([^\]]+)\]/);
-              if (match && (!answer || !answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
-                answer = match[1].trim();
-              }
-              sentence = sentence.replace(/\[([^\]]+)\]/g, "________");
-            } else if (answer && !/_{2,}|\.{3,}/.test(sentence)) {
-              const ansEsc = answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-              if (ansEsc.length > 0) {
-                const re = new RegExp(`\\b${ansEsc}\\b`, "i");
-                if (re.test(sentence)) {
-                  sentence = sentence.replace(re, "________");
-                }
-              }
-            }
-            return {
+            const fibObj = {
               id: item.id || `fib_${sIdx + 1}_${fIdx + 1}`,
-              sentence,
-              answer,
+              sentence: String(item.sentence || item.frase || item.testo || item.prompt || ""),
+              answer: String(item.answer || item.risposta || item.soluzione || ""),
               ...preservedDidacticFields(item),
             };
+            sanitizeFibQuestion(fibObj);
+            return fibObj;
           })
         : [];
 

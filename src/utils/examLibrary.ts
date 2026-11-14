@@ -1,13 +1,14 @@
 /**
- * Exam library with Cloud Firestore persistence (collection 'exam_library')
- * and automatic synchronization with active_sessions and local browser cache.
+ * Personal exam library with real-time cross-device Cloud Firestore persistence
+ * (collection 'exam_library') and offline local browser cache.
  *
- * Guarantees that any exam saved or extended with AI (+ questions) is permanently
- * preserved, never overwritten by older cloud sessions, and instantly loadable.
+ * Scoped to the teacher's email + configured school aliases so exams saved on
+ * one device (PC, tablet, phone) appear immediately on every other device.
  */
 
-import { dbFirestore } from "../firebase";
-import { collection, getDocs, doc, getDoc, setDoc, deleteDoc } from "firebase/firestore";
+import { dbFirestore, handleFirestoreError, OperationType } from "../firebase";
+import { collection, getDocs, doc, getDoc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
+import { sanitizeFibQuestion } from "./examStructureRepair";
 
 export type LibraryExamType = "Quiz" | "Workbook";
 
@@ -18,11 +19,13 @@ export interface ExamLibraryItem {
   examType: LibraryExamType;
   /** Full exam JSON (same schema as the teacher editor). */
   examJson: string;
-  /** Where it came from: "Generatore IA", "Editor + IA", "Trascrizione video", "Editor", ... */
+  /** Origin label: "Generatore IA", "Editor", "Editor + IA", "Google Moduli", "Backup importato". */
   source: string;
   questionCount: number;
   createdAt: string;
   updatedAt: string;
+  /** True when confirmed written/read from Cloud Firestore; false if awaiting upload. */
+  syncedToCloud?: boolean;
 }
 
 export interface NewLibraryExam {
@@ -34,42 +37,123 @@ export interface NewLibraryExam {
   questionCount: number;
 }
 
-const keyFor = (teacherEmail: string) =>
-  `exam_library_${(teacherEmail || "anon").toLowerCase().trim()}`;
+export interface SaveLibraryResult {
+  id: string;
+  syncedToCloud: boolean;
+  cloudError?: string;
+}
 
-const DELETED_SESSIONS_KEY = "exam_library_deleted_sessions";
-const DELETED_TITLES_KEY = "exam_library_deleted_titles";
+export interface DeleteLibraryResult {
+  deletedFromCloud: boolean;
+  cloudError?: string;
+}
 
-function getDeletedSessionIds(): Set<string> {
+/** Alias groups belonging to the same physical teacher across personal/school logins. */
+const TEACHER_ALIAS_GROUPS: string[][] = [
+  ["riefolog@gmail.com", "riefolo.giovanni@ferrarisfermiclass.it"],
+];
+
+function normalizeEmail(email: unknown): string {
+  return String(email || "").toLowerCase().trim();
+}
+
+export function getTeacherAliasEmails(teacherEmail: string): string[] {
+  const norm = normalizeEmail(teacherEmail) || "anon";
+  for (const group of TEACHER_ALIAS_GROUPS) {
+    if (group.includes(norm)) {
+      return [...group];
+    }
+  }
+  return [norm];
+}
+
+function isPrimaryTeacherGroup(normEmail: string): boolean {
+  return TEACHER_ALIAS_GROUPS.some((group) => group.includes(normEmail));
+}
+
+/**
+ * Checks if two teacher emails belong to the same teacher (exact match, case-insensitive,
+ * or same school/personal alias group). Also recovers legacy unattributed cloud docs for
+ * primary teacher / sandbox accounts.
+ */
+export function belongsToTeacherEmail(docEmail: unknown, currentEmail: string): boolean {
+  const normCurrent = normalizeEmail(currentEmail) || "anon";
+  const normDoc = normalizeEmail(docEmail);
+  const scope = getTeacherAliasEmails(normCurrent);
+
+  if (normDoc && scope.includes(normDoc)) return true;
+
+  // Legacy cloud docs saved without email, as "anon", or in sandbox mode
+  // belong to the teacher alias group / sandbox user so nothing already in Cloud is lost.
+  const isLegacyUnowned =
+    !normDoc ||
+    normDoc === "anon" ||
+    normDoc === "docente" ||
+    normDoc === "docente_sandbox@scuola.it";
+
+  if (isLegacyUnowned && (isPrimaryTeacherGroup(normCurrent) || normCurrent === "docente_sandbox@scuola.it" || normCurrent === "anon")) {
+    return true;
+  }
+
+  return false;
+}
+
+function canonicalScopeKey(teacherEmail: string): string {
+  const aliases = getTeacherAliasEmails(teacherEmail);
+  return aliases[0] || "anon";
+}
+
+const keyFor = (emailKey: string) =>
+  `exam_library_${(emailKey || "anon").toLowerCase().trim()}`;
+
+const deletedKeyFor = (teacherEmail: string) =>
+  `exam_library_deleted_${canonicalScopeKey(teacherEmail)}`;
+
+function readDeletedIds(teacherEmail: string): Set<string> {
   try {
-    const raw = localStorage.getItem(DELETED_SESSIONS_KEY);
+    const raw = localStorage.getItem(deletedKeyFor(teacherEmail));
     if (!raw) return new Set();
-    const arr = JSON.parse(raw);
-    return new Set(Array.isArray(arr) ? arr : []);
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? new Set(parsed.map(String)) : new Set();
   } catch {
     return new Set();
   }
 }
 
-function getDeletedTitles(): Set<string> {
+function writeDeletedIds(teacherEmail: string, ids: Set<string>): void {
   try {
-    const raw = localStorage.getItem(DELETED_TITLES_KEY);
-    if (!raw) return new Set();
-    const arr = JSON.parse(raw);
-    return new Set(Array.isArray(arr) ? arr.map((t: any) => String(t).toLowerCase().trim()) : []);
-  } catch {
-    return new Set();
-  }
-}
-
-function addDeletedTitle(title: string): void {
-  try {
-    const clean = cleanExamTitle(title);
-    if (!clean) return;
-    const titles = getDeletedTitles();
-    titles.add(clean);
-    localStorage.setItem(DELETED_TITLES_KEY, JSON.stringify([...titles]));
+    if (ids.size === 0) {
+      localStorage.removeItem(deletedKeyFor(teacherEmail));
+    } else {
+      localStorage.setItem(deletedKeyFor(teacherEmail), JSON.stringify(Array.from(ids)));
+    }
   } catch {}
+}
+
+function addDeletedId(teacherEmail: string, id: string): void {
+  const set = readDeletedIds(teacherEmail);
+  set.add(id);
+  writeDeletedIds(teacherEmail, set);
+}
+
+function removeDeletedId(teacherEmail: string, id: string): void {
+  const set = readDeletedIds(teacherEmail);
+  if (set.delete(id)) {
+    writeDeletedIds(teacherEmail, set);
+  }
+}
+
+function isPermissionDeniedError(err: any): boolean {
+  const code = String(err?.code || "").toLowerCase();
+  const msg = String(err?.message || "").toLowerCase();
+  return code.includes("permission-denied") || msg.includes("missing or insufficient permissions");
+}
+
+function normalizeLibrarySource(rawSource: unknown): string {
+  const s = String(rawSource || "Editor").trim();
+  if (!s || s === "Cloud Firestore") return "Salvata nel Cloud";
+  if (s.startsWith("Sessione Cloud")) return "Salvata nel Cloud";
+  return s;
 }
 
 /**
@@ -83,29 +167,9 @@ export function sanitizeWorkbookExamJson(rawJson: string): string {
     let changed = false;
     if (obj && Array.isArray(obj.sections)) {
       for (const sec of obj.sections) {
-        if (Array.isArray(sec.fillInTheBlank)) {
+        if (Array.isArray(sec?.fillInTheBlank)) {
           for (const fib of sec.fillInTheBlank) {
-            if (fib && typeof fib.sentence === "string") {
-              // 1. Bracketed term e.g. "[autodeterminazione]" or "[...]"
-              if (/\[([^\]]+)\]/.test(fib.sentence)) {
-                const match = fib.sentence.match(/\[([^\]]+)\]/);
-                if (match && (!fib.answer || !fib.answer.trim()) && match[1] !== "..." && !match[1].startsWith("_")) {
-                  fib.answer = match[1].trim();
-                }
-                fib.sentence = fib.sentence.replace(/\[([^\]]+)\]/g, "________");
-                changed = true;
-              } else if (fib.answer && typeof fib.answer === "string" && !/_{2,}|\.{3,}/.test(fib.sentence)) {
-                // Sentence has no blank, but contains the answer word directly
-                const ansEsc = fib.answer.trim().replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-                if (ansEsc.length > 0) {
-                  const re = new RegExp(`\\b${ansEsc}\\b`, "i");
-                  if (re.test(fib.sentence)) {
-                    fib.sentence = fib.sentence.replace(re, "________");
-                    changed = true;
-                  }
-                }
-              }
-            }
+            if (sanitizeFibQuestion(fib)) changed = true;
           }
         }
       }
@@ -149,7 +213,6 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
     }
   }
 
-  // Also include any questions attached at root level
   const mc = Array.isArray(examObj.multipleChoice) ? examObj.multipleChoice.length : 0;
   const oe = Array.isArray(examObj.openEnded) ? examObj.openEnded.length : 0;
   const rq = Array.isArray(examObj.reflectionQuestions) ? examObj.reflectionQuestions.length : 0;
@@ -167,64 +230,53 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
   };
 }
 
+function getLocalStorageBuckets(teacherEmail: string): string[] {
+  const norm = normalizeEmail(teacherEmail) || "anon";
+  const buckets = new Set<string>(getTeacherAliasEmails(norm));
+  if (isPrimaryTeacherGroup(norm) || norm === "docente_sandbox@scuola.it" || norm === "anon") {
+    buckets.add("docente_sandbox@scuola.it");
+    buckets.add("anon");
+  }
+  return Array.from(buckets);
+}
+
 function readLocalAll(teacherEmail: string): ExamLibraryItem[] {
-  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const normEmail = normalizeEmail(teacherEmail) || "anon";
+  const deletedIds = readDeletedIds(normEmail);
   const items: ExamLibraryItem[] = [];
   const seenIds = new Set<string>();
 
-  // 1. Primary email bucket
-  try {
-    const raw = localStorage.getItem(keyFor(normEmail));
-    if (raw) {
+  for (const bucket of getLocalStorageBuckets(normEmail)) {
+    try {
+      const raw = localStorage.getItem(keyFor(bucket));
+      if (!raw) continue;
       const parsed = JSON.parse(raw);
-      if (Array.isArray(parsed)) {
-        for (const item of parsed) {
-          if (item && item.id && !seenIds.has(item.id)) {
-            seenIds.add(item.id);
-            const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
-            items.push({ ...item, examJson: cleanedJson });
-          }
-        }
-      }
-    }
-  } catch {}
+      if (!Array.isArray(parsed)) continue;
 
-  // 2. Scan all other localStorage exam_library_* keys
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith("exam_library_") && k !== keyFor(normEmail) && k !== DELETED_SESSIONS_KEY) {
-        try {
-          const rawOther = localStorage.getItem(k);
-          if (rawOther) {
-            const parsedOther = JSON.parse(rawOther);
-            if (Array.isArray(parsedOther)) {
-              for (const it of parsedOther) {
-                if (it && it.id && !seenIds.has(it.id)) {
-                  seenIds.add(it.id);
-                  const cleanedJson = it.examJson ? sanitizeWorkbookExamJson(it.examJson) : it.examJson;
-                  items.push({ ...it, examJson: cleanedJson });
-                }
-              }
-            }
-          }
-        } catch {}
+      for (const item of parsed) {
+        if (!item || !item.id || seenIds.has(item.id) || deletedIds.has(item.id)) continue;
+        if (item.teacherEmail && !belongsToTeacherEmail(item.teacherEmail, normEmail)) continue;
+        seenIds.add(item.id);
+        const cleanedJson = item.examJson ? sanitizeWorkbookExamJson(item.examJson) : item.examJson;
+        items.push({
+          ...item,
+          source: normalizeLibrarySource(item.source),
+          examJson: cleanedJson,
+        });
       }
-    }
-  } catch {}
+    } catch {}
+  }
 
   return items;
 }
 
 function writeLocalAll(teacherEmail: string, items: ExamLibraryItem[]): void {
   try {
-    const normEmail = (teacherEmail || "anon").toLowerCase().trim();
-    localStorage.setItem(keyFor(normEmail), JSON.stringify(items));
-    // Also sync to fallback key so guest/sandbox sessions see the exact same updated exams
-    if (normEmail !== "docente_sandbox@scuola.it") {
-      try {
-        localStorage.setItem(keyFor("docente_sandbox@scuola.it"), JSON.stringify(items));
-      } catch {}
+    const scopeKey = canonicalScopeKey(teacherEmail);
+    localStorage.setItem(keyFor(scopeKey), JSON.stringify(items));
+    const norm = normalizeEmail(teacherEmail);
+    if (norm && norm !== scopeKey) {
+      localStorage.setItem(keyFor(norm), JSON.stringify(items));
     }
   } catch (e: any) {
     if (e?.name === "QuotaExceededError") {
@@ -233,228 +285,34 @@ function writeLocalAll(teacherEmail: string, items: ExamLibraryItem[]): void {
   }
 }
 
-/**
- * Synchronizes sessions from Firestore active_sessions collection.
- * Converts active or past session exams into library items.
- */
-export async function syncActiveSessionsToLibrary(teacherEmail?: string): Promise<ExamLibraryItem[]> {
-  const syncedItems: ExamLibraryItem[] = [];
-  if (!dbFirestore) return syncedItems;
+function firestoreDocToItem(id: string, data: any, fallbackEmail: string): ExamLibraryItem | null {
+  if (!data || typeof data.examJson !== "string" || !data.examJson.trim()) return null;
 
-  try {
-    const snap = await getDocs(collection(dbFirestore, "active_sessions"));
-    const deleted = getDeletedSessionIds();
-    const deletedTitles = getDeletedTitles();
-
-    snap.forEach((d) => {
-      const pinId = d.id;
-      const itemId = `session_${pinId}`;
-      if (deleted.has(itemId) || deleted.has(pinId)) return;
-
-      const data = d.data();
-      const examObj = data?.data || data?.examData;
-      if (!examObj || typeof examObj !== "object") return;
-
-      const { type, count } = countLibraryQuestions(examObj);
-      let title = data.title || examObj.title || `Verifica PIN ${pinId}`;
-      if (deletedTitles.has(cleanExamTitle(title))) return;
-      if (pinId === "12" && (title === "sicurezza" || title === "sicurezza 3ao 3bo")) {
-        title = "sicurezza 3ao 3bo (PIN 12)";
-      }
-
-      // STABLE TIMESTAMP: Never use new Date().toISOString() as fallback!
-      // Using 'now' would sort older cloud sessions above newly saved exams.
-      const stableCreatedAt = data.createdAt || "2026-01-01T00:00:00.000Z";
-      const stableUpdatedAt = data.updatedAt || data.createdAt || "2026-01-01T00:00:00.000Z";
-
-      syncedItems.push({
-        id: itemId,
-        teacherEmail: data.teacherEmail || data.createdBy || teacherEmail || "docente",
-        title,
-        examType: type,
-        examJson: JSON.stringify(examObj, null, 2),
-        source: `Sessione Cloud (PIN ${pinId})`,
-        questionCount: count,
-        createdAt: stableCreatedAt,
-        updatedAt: stableUpdatedAt,
-      });
-    });
-  } catch (err) {
-    console.warn("[examLibrary] Sincronizzazione active_sessions non riuscita (continua da cache locale):", err);
-  }
-
-  return syncedItems;
-}
-
-/**
- * Fetches an exam directly from any session PIN in Firestore.
- */
-export async function fetchExamFromSessionPin(pin: string): Promise<ExamLibraryItem | null> {
-  if (!dbFirestore || !pin.trim()) return null;
-  const cleanPin = pin.trim().toUpperCase();
-
-  try {
-    const snap = await getDoc(doc(dbFirestore, "active_sessions", cleanPin));
-    if (!snap.exists()) return null;
-
-    const data = snap.data();
-    const examObj = data?.data || data?.examData;
-    if (!examObj || typeof examObj !== "object") return null;
-
-    const { type, count } = countLibraryQuestions(examObj);
-    let title = data.title || examObj.title || `Verifica PIN ${cleanPin}`;
-    if (cleanPin === "12" && (title === "sicurezza" || title === "sicurezza 3ao 3bo")) {
-      title = "sicurezza 3ao 3bo (PIN 12)";
-    }
-
-    const stableCreatedAt = data.createdAt || "2026-01-01T00:00:00.000Z";
-    const stableUpdatedAt = data.updatedAt || data.createdAt || "2026-01-01T00:00:00.000Z";
-
-    const item: ExamLibraryItem = {
-      id: `session_${cleanPin}`,
-      teacherEmail: data.teacherEmail || data.createdBy || "docente",
-      title,
-      examType: type,
-      examJson: JSON.stringify(examObj, null, 2),
-      source: `Sessione Cloud (PIN ${cleanPin})`,
-      questionCount: count,
-      createdAt: stableCreatedAt,
-      updatedAt: stableUpdatedAt,
-    };
-
-    return item;
-  } catch (err) {
-    console.error("[examLibrary] Errore recupero sessione PIN:", err);
-    return null;
-  }
-}
-
-/**
- * Lists all exams in the library, combining Cloud Firestore `exam_library`,
- * local storage cache, and Firestore `active_sessions`.
- *
- * Guarantees that updated exams with added questions take precedence over
- * older versions, and deduplicates identical exams by title.
- */
-export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
-  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
-  const deleted = getDeletedSessionIds();
-  const deletedTitles = getDeletedTitles();
-
-  // Map keyed by ID or cleanTitle to avoid duplicate/conflicting entries
-  const itemsMap = new Map<string, ExamLibraryItem>();
-
-  // 1. Load local cache
-  const localItems = readLocalAll(normEmail).filter(
-    (it) =>
-      !deleted.has(it.id) &&
-      !deleted.has(it.id.replace("session_", "")) &&
-      !deletedTitles.has(cleanExamTitle(it.title))
-  );
-  for (const it of localItems) {
-    itemsMap.set(it.id, it);
-  }
-
-  // 2. Fetch authoritative cloud library from Firestore collection 'exam_library'
-  if (dbFirestore) {
+  let questionCount = Number(data.questionCount) || 0;
+  if (!questionCount) {
     try {
-      const snap = await getDocs(collection(dbFirestore, "exam_library"));
-      snap.forEach((d) => {
-        const id = d.id;
-        if (deleted.has(id) || deleted.has(id.replace("session_", ""))) return;
-        const data = d.data() as any;
-        if (!data || !data.examJson) return;
-        if (deletedTitles.has(cleanExamTitle(data.title || ""))) return;
-
-        let questionCount = Number(data.questionCount) || 0;
-        if (!questionCount) {
-          try {
-            const parsed = JSON.parse(data.examJson);
-            questionCount = countLibraryQuestions(parsed).count;
-          } catch {}
-        }
-
-        const cloudItem: ExamLibraryItem = {
-          id,
-          teacherEmail: data.teacherEmail || normEmail,
-          title: data.title || "Verifica salvata",
-          examType: data.examType === "Workbook" ? "Workbook" : "Quiz",
-          examJson: data.examJson,
-          source: data.source || "Cloud Firestore",
-          questionCount,
-          createdAt: data.createdAt || new Date().toISOString(),
-          updatedAt: data.updatedAt || data.createdAt || new Date().toISOString(),
-        };
-
-        const existing = itemsMap.get(id);
-        if (!existing) {
-          itemsMap.set(id, cloudItem);
-        } else {
-          // Keep the version with more questions, or if equal, the newer timestamp
-          if (
-            cloudItem.questionCount > existing.questionCount ||
-            (cloudItem.questionCount === existing.questionCount &&
-              String(cloudItem.updatedAt).localeCompare(String(existing.updatedAt)) > 0)
-          ) {
-            itemsMap.set(id, cloudItem);
-          }
-        }
-      });
-    } catch (cloudErr) {
-      console.warn("[examLibrary] Lettura Firestore exam_library fallita (continua con cache):", cloudErr);
-    }
+      const parsed = JSON.parse(data.examJson);
+      questionCount = countLibraryQuestions(parsed).count;
+    } catch {}
   }
 
-  // 3. Sync active sessions from Firestore (e.g. PIN 12, PIN 13)
-  try {
-    const cloudSessions = await syncActiveSessionsToLibrary(normEmail);
-    for (const cs of cloudSessions) {
-      if (deleted.has(cs.id) || deleted.has(cs.id.replace("session_", ""))) continue;
-      if (deletedTitles.has(cleanExamTitle(cs.title))) continue;
+  return {
+    id,
+    teacherEmail: normalizeEmail(data.teacherEmail) || normalizeEmail(fallbackEmail) || "anon",
+    title: String(data.title || "Verifica salvata"),
+    examType: data.examType === "Workbook" ? "Workbook" : "Quiz",
+    examJson: sanitizeWorkbookExamJson(data.examJson),
+    source: normalizeLibrarySource(data.source),
+    questionCount,
+    createdAt: data.createdAt || data.updatedAt || new Date().toISOString(),
+    updatedAt: data.updatedAt || data.createdAt || new Date().toISOString(),
+    syncedToCloud: true,
+  };
+}
 
-      const csCleanTitle = cleanExamTitle(cs.title);
-      const csPin = cs.id.replace("session_", "").trim().toLowerCase();
-
-      // Check if this session is already represented in itemsMap (by ID, PIN, or cleanTitle)
-      let matchKey: string | null = null;
-      for (const [key, item] of itemsMap.entries()) {
-        if (key === cs.id) {
-          matchKey = key;
-          break;
-        }
-        const itemPin = item.id.startsWith("session_") ? item.id.replace("session_", "").trim().toLowerCase() : "";
-        if (csPin && itemPin && csPin === itemPin) {
-          matchKey = key;
-          break;
-        }
-        const itemCleanTitle = cleanExamTitle(item.title);
-        if (itemCleanTitle && csCleanTitle && itemCleanTitle === csCleanTitle) {
-          matchKey = key;
-          break;
-        }
-      }
-
-      if (!matchKey) {
-        itemsMap.set(cs.id, cs);
-      } else {
-        const existing = itemsMap.get(matchKey)!;
-        // Only update if cloud session has STRICTLY MORE questions than the existing library entry.
-        // Never downgrade an updated 16-question library entry with a 14-question session.
-        if (cs.questionCount > existing.questionCount) {
-          existing.examJson = cs.examJson;
-          existing.questionCount = cs.questionCount;
-          existing.updatedAt = cs.updatedAt;
-        }
-      }
-    }
-  } catch (syncErr) {
-    console.warn("[examLibrary] Avviso sync active_sessions:", syncErr);
-  }
-
-  // 4. Title-level deduplication: if multiple entries share the exact same clean title,
-  // keep the one with the highest questionCount and newest updatedAt.
+function deduplicateAndSort(items: ExamLibraryItem[]): ExamLibraryItem[] {
   const titleMap = new Map<string, ExamLibraryItem>();
-  for (const item of itemsMap.values()) {
+  for (const item of items) {
     const cleanT = cleanExamTitle(item.title);
     if (!cleanT) {
       titleMap.set(item.id, item);
@@ -464,43 +322,211 @@ export async function listLibraryExams(teacherEmail: string): Promise<ExamLibrar
     const prev = titleMap.get(cleanT);
     if (!prev) {
       titleMap.set(cleanT, item);
-    } else {
-      if (
-        item.questionCount > prev.questionCount ||
-        (item.questionCount === prev.questionCount &&
-          String(item.updatedAt).localeCompare(String(prev.updatedAt)) > 0)
-      ) {
-        titleMap.set(cleanT, item);
-      }
+      continue;
+    }
+
+    const timeCmp = String(item.updatedAt || "").localeCompare(String(prev.updatedAt || ""));
+    if (
+      timeCmp > 0 ||
+      (timeCmp === 0 && item.syncedToCloud && !prev.syncedToCloud) ||
+      (timeCmp === 0 && item.questionCount > prev.questionCount)
+    ) {
+      titleMap.set(cleanT, item);
     }
   }
 
   const finalItems = Array.from(titleMap.values());
   finalItems.sort((a, b) => String(b.updatedAt || "").localeCompare(String(a.updatedAt || "")));
+  return finalItems;
+}
 
-  // Write merged state back to local cache
+function buildFirestorePayload(item: ExamLibraryItem) {
+  return {
+    id: String(item.id),
+    teacherEmail: normalizeEmail(item.teacherEmail) || "anon",
+    title: String(item.title || "Verifica salvata"),
+    examType: item.examType === "Workbook" ? "Workbook" : "Quiz",
+    examJson: String(item.examJson || ""),
+    source: normalizeLibrarySource(item.source),
+    questionCount: Number.isFinite(Number(item.questionCount)) ? Number(item.questionCount) : 0,
+    createdAt: String(item.createdAt || new Date().toISOString()),
+    updatedAt: String(item.updatedAt || new Date().toISOString()),
+  };
+}
+
+/**
+ * Lists all saved exams owned by `teacherEmail` (including school/personal aliases and
+ * legacy cloud-saved docs) from Cloud Firestore 'exam_library' + local cache.
+ * Automatically flushes pending offline deletions and pushes local-only saves up to Cloud
+ * so every device sees the exact same library.
+ */
+export async function listLibraryExams(teacherEmail: string): Promise<ExamLibraryItem[]> {
+  const normEmail = normalizeEmail(teacherEmail) || "anon";
+  const localItems = readLocalAll(normEmail);
+  const deletedIds = readDeletedIds(normEmail);
+  const itemsMap = new Map<string, ExamLibraryItem>();
+
+  for (const it of localItems) {
+    itemsMap.set(it.id, it);
+  }
+
+  if (dbFirestore) {
+    // Flush any pending offline deletions first so deleted items stay deleted across devices
+    if (deletedIds.size > 0) {
+      for (const delId of Array.from(deletedIds)) {
+        try {
+          await deleteDoc(doc(dbFirestore, "exam_library", delId));
+          deletedIds.delete(delId);
+        } catch (err) {
+          if (isPermissionDeniedError(err)) {
+            handleFirestoreError(err, OperationType.DELETE, `exam_library/${delId}`);
+          }
+        }
+      }
+      writeDeletedIds(normEmail, deletedIds);
+    }
+
+    try {
+      const snap = await getDocs(collection(dbFirestore, "exam_library"));
+      const cloudIds = new Set<string>();
+      const cloudCleanTitles = new Set<string>();
+
+      snap.forEach((d) => {
+        const id = d.id;
+        if (deletedIds.has(id)) return;
+        const data = d.data() as any;
+        if (!data || !belongsToTeacherEmail(data.teacherEmail, normEmail)) return;
+
+        const cloudItem = firestoreDocToItem(id, data, normEmail);
+        if (!cloudItem) return;
+
+        cloudIds.add(id);
+        const ct = cleanExamTitle(cloudItem.title);
+        if (ct) cloudCleanTitles.add(ct);
+
+        const existing = itemsMap.get(id);
+        if (!existing) {
+          itemsMap.set(id, cloudItem);
+        } else {
+          const cmp = String(cloudItem.updatedAt).localeCompare(String(existing.updatedAt));
+          if (cmp > 0 || (cmp === 0 && (!existing.syncedToCloud || cloudItem.questionCount >= existing.questionCount))) {
+            itemsMap.set(id, cloudItem);
+          } else if (existing.syncedToCloud === false && cmp < 0) {
+            // Keep newer unsynced local copy so the push loop below updates Cloud
+          } else {
+            itemsMap.set(id, { ...existing, syncedToCloud: true });
+          }
+        }
+      });
+
+      // Auto-sync any local-only or pending items up to Cloud Firestore so other devices find them
+      for (const localIt of localItems) {
+        if (deletedIds.has(localIt.id)) continue;
+        const localCleanTitle = cleanExamTitle(localIt.title);
+        const alreadyInCloudById = cloudIds.has(localIt.id);
+        const alreadyInCloudByTitle = localCleanTitle && cloudCleanTitles.has(localCleanTitle);
+        const needsPush =
+          localIt.syncedToCloud === false || (!alreadyInCloudById && !alreadyInCloudByTitle);
+
+        if (needsPush && localIt.examJson) {
+          try {
+            const toUpload: ExamLibraryItem = {
+              ...localIt,
+              teacherEmail: normalizeEmail(localIt.teacherEmail) || normEmail,
+              syncedToCloud: true,
+            };
+            await setDoc(doc(dbFirestore, "exam_library", localIt.id), buildFirestorePayload(toUpload), { merge: true });
+            itemsMap.set(localIt.id, toUpload);
+            cloudIds.add(localIt.id);
+            if (localCleanTitle) cloudCleanTitles.add(localCleanTitle);
+          } catch (pushErr) {
+            if (isPermissionDeniedError(pushErr)) {
+              handleFirestoreError(pushErr, OperationType.WRITE, `exam_library/${localIt.id}`);
+            }
+            console.warn("[examLibrary] Sync automatico verso Cloud rimandato:", pushErr);
+          }
+        }
+      }
+    } catch (cloudErr: any) {
+      if (isPermissionDeniedError(cloudErr)) {
+        handleFirestoreError(cloudErr, OperationType.LIST, "exam_library");
+      }
+      console.warn("[examLibrary] Lettura Firestore exam_library fallita (uso cache locale):", cloudErr);
+    }
+  }
+
+  const finalItems = deduplicateAndSort(Array.from(itemsMap.values()));
   writeLocalAll(normEmail, finalItems);
-
   return finalItems;
 }
 
 /**
+ * Real-time subscription to Cloud Firestore 'exam_library' so changes made on any device
+ * appear automatically without manual page reload.
+ */
+export function subscribeLibraryExams(
+  teacherEmail: string,
+  onItems: (items: ExamLibraryItem[]) => void,
+  onError?: (err: unknown) => void
+): () => void {
+  if (!dbFirestore) return () => {};
+  const normEmail = normalizeEmail(teacherEmail) || "anon";
+
+  return onSnapshot(
+    collection(dbFirestore, "exam_library"),
+    (snap) => {
+      const deletedIds = readDeletedIds(normEmail);
+      const localPending = readLocalAll(normEmail).filter((it) => it.syncedToCloud === false && !deletedIds.has(it.id));
+      const itemsMap = new Map<string, ExamLibraryItem>();
+
+      for (const p of localPending) {
+        itemsMap.set(p.id, p);
+      }
+
+      snap.forEach((d) => {
+        if (deletedIds.has(d.id)) return;
+        const data = d.data() as any;
+        if (!data || !belongsToTeacherEmail(data.teacherEmail, normEmail)) return;
+        const cloudItem = firestoreDocToItem(d.id, data, normEmail);
+        if (!cloudItem) return;
+
+        const existing = itemsMap.get(d.id);
+        if (!existing || String(cloudItem.updatedAt).localeCompare(String(existing.updatedAt)) >= 0) {
+          itemsMap.set(d.id, cloudItem);
+        }
+      });
+
+      const finalItems = deduplicateAndSort(Array.from(itemsMap.values()));
+      writeLocalAll(normEmail, finalItems);
+      onItems(finalItems);
+    },
+    (err) => {
+      if (isPermissionDeniedError(err)) {
+        try {
+          handleFirestoreError(err, OperationType.LIST, "exam_library");
+        } catch (wrapped) {
+          onError?.(wrapped);
+          return;
+        }
+      }
+      onError?.(err);
+    }
+  );
+}
+
+/**
  * Saves or updates an exam in both Cloud Firestore ('exam_library' collection)
- * and the local browser cache.
- *
- * Guarantees 100% preservation of all questions (including newly added questions).
+ * and local browser cache, returning whether Cloud synchronization succeeded.
  */
 export async function saveLibraryExam(
   item: NewLibraryExam,
   targetId?: string
-): Promise<string> {
+): Promise<SaveLibraryResult> {
   const now = new Date().toISOString();
-  const normEmail = (item.teacherEmail || "anon").toLowerCase().trim();
+  const normEmail = normalizeEmail(item.teacherEmail) || "anon";
   const items = readLocalAll(normEmail);
-
   const cleanTitle = cleanExamTitle(item.title);
 
-  // Find if an item with the same targetId or same clean title already exists
   let existingIndex = -1;
   if (targetId) {
     existingIndex = items.findIndex((it) => it.id === targetId);
@@ -514,134 +540,123 @@ export async function saveLibraryExam(
     finalId = `lib_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
   }
 
+  const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
+  const normalizedSource = normalizeLibrarySource(item.source);
+
   const fullItem: ExamLibraryItem = {
     ...item,
     id: finalId,
     teacherEmail: normEmail,
+    examJson: sanitizedJson,
+    source: normalizedSource,
     createdAt: existingIndex >= 0 ? items[existingIndex].createdAt || now : now,
     updatedAt: now,
+    syncedToCloud: false,
   };
 
-  // 1. Update local storage cache
+  removeDeletedId(normEmail, finalId);
+
+  let syncedToCloud = false;
+  let cloudError: string | undefined;
+
+  if (dbFirestore) {
+    try {
+      await setDoc(
+        doc(dbFirestore, "exam_library", finalId),
+        buildFirestorePayload(fullItem),
+        { merge: true }
+      );
+      syncedToCloud = true;
+      fullItem.syncedToCloud = true;
+    } catch (cloudErr: any) {
+      if (isPermissionDeniedError(cloudErr)) {
+        handleFirestoreError(cloudErr, OperationType.WRITE, `exam_library/${finalId}`);
+      }
+      cloudError = cloudErr?.message || "connessione Cloud non disponibile";
+      console.warn("[examLibrary] Salvataggio Firestore non riuscito:", cloudErr);
+    }
+  } else {
+    cloudError = "database Cloud non configurato";
+  }
+
   if (existingIndex >= 0) {
     items[existingIndex] = fullItem;
   } else {
     items.unshift(fullItem);
   }
 
-  // Deduplicate entries with same clean title or ID
-  const deduplicated = items.filter((it, idx) => {
+  // Clean up duplicate-titled local entries (and remove stale duplicate Cloud doc if merged into a new ID)
+  const duplicateIdsToClean: string[] = [];
+  const deduplicated = items.filter((it) => {
     if (it.id === finalId) return true;
     const otherClean = cleanExamTitle(it.title);
-    if (cleanTitle && otherClean === cleanTitle) return false;
+    if (cleanTitle && otherClean === cleanTitle) {
+      duplicateIdsToClean.push(it.id);
+      return false;
+    }
     return true;
   });
   writeLocalAll(normEmail, deduplicated);
 
-  // 2. Persist to Cloud Firestore collection 'exam_library'
-  if (dbFirestore) {
-    try {
-      await setDoc(doc(dbFirestore, "exam_library", finalId), {
-        id: finalId,
-        teacherEmail: fullItem.teacherEmail,
-        title: fullItem.title,
-        examType: fullItem.examType,
-        examJson: fullItem.examJson,
-        source: fullItem.source,
-        questionCount: fullItem.questionCount,
-        createdAt: fullItem.createdAt,
-        updatedAt: fullItem.updatedAt,
-      }, { merge: true });
-    } catch (cloudErr) {
-      console.warn("[examLibrary] Salvataggio Firestore non riuscito (prosegue con cache locale):", cloudErr);
+  if (dbFirestore && syncedToCloud && duplicateIdsToClean.length > 0) {
+    for (const dupId of duplicateIdsToClean) {
+      try {
+        await deleteDoc(doc(dbFirestore, "exam_library", dupId));
+      } catch {}
     }
   }
 
-  return finalId;
+  return { id: finalId, syncedToCloud, cloudError };
 }
 
 /**
- * Permanently deletes an exam from both Cloud Firestore and local storage.
+ * Permanently deletes a saved exam from the teacher's local cache and Cloud Firestore.
  */
-export async function deleteLibraryExam(teacherEmail: string, id: string, title?: string): Promise<void> {
-  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+export async function deleteLibraryExam(
+  teacherEmail: string,
+  id: string,
+  _title?: string
+): Promise<DeleteLibraryResult> {
+  const normEmail = normalizeEmail(teacherEmail) || "anon";
+  addDeletedId(normEmail, id);
 
-  // Resolve the exam title (for title-based resurrection protection) from local storage if not provided
-  let resolvedTitle = title;
-  if (!resolvedTitle) {
+  for (const bucket of getLocalStorageBuckets(normEmail)) {
     try {
-      for (let i = 0; i < localStorage.length; i++) {
-        const k = localStorage.key(i);
-        if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY && k !== DELETED_TITLES_KEY) {
-          try {
-            const raw = localStorage.getItem(k);
-            if (raw) {
-              const parsed = JSON.parse(raw);
-              if (Array.isArray(parsed)) {
-                const found = parsed.find((it: any) => it && it.id === id);
-                if (found && found.title) {
-                  resolvedTitle = found.title;
-                  break;
-                }
-              }
-            }
-          } catch {}
-        }
+      const raw = localStorage.getItem(keyFor(bucket));
+      if (!raw) continue;
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed)) {
+        localStorage.setItem(
+          keyFor(bucket),
+          JSON.stringify(parsed.filter((it: any) => it?.id !== id))
+        );
       }
     } catch {}
   }
 
-  // 1. Track deleted IDs so cloud auto-sync and readAll never resurrect intentionally deleted items
-  try {
-    const deleted = getDeletedSessionIds();
-    deleted.add(id);
-    if (id.startsWith("session_")) {
-      deleted.add(id.replace("session_", ""));
-    }
-    localStorage.setItem(DELETED_SESSIONS_KEY, JSON.stringify([...deleted]));
-  } catch {}
-
-  // 1b. Track deleted title so any session/cloud exam with the same title cannot resurrect it
-  if (resolvedTitle) {
-    addDeletedTitle(resolvedTitle);
-  }
-
-  // 2. Remove from all local storage library keys
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY) {
-        try {
-          const raw = localStorage.getItem(k);
-          if (raw) {
-            const parsed = JSON.parse(raw);
-            if (Array.isArray(parsed)) {
-              const filtered = parsed.filter((it: any) => it.id !== id);
-              localStorage.setItem(k, JSON.stringify(filtered));
-            }
-          }
-        } catch {}
-      }
-    }
-  } catch {}
-
-  // 3. Delete from Cloud Firestore 'exam_library'
   if (dbFirestore) {
     try {
       await deleteDoc(doc(dbFirestore, "exam_library", id));
-      if (id.startsWith("session_")) {
-        const pin = id.replace("session_", "");
-        await deleteDoc(doc(dbFirestore, "exam_library", pin)).catch(() => {});
+      removeDeletedId(normEmail, id);
+      return { deletedFromCloud: true };
+    } catch (cloudErr: any) {
+      if (isPermissionDeniedError(cloudErr)) {
+        handleFirestoreError(cloudErr, OperationType.DELETE, `exam_library/${id}`);
       }
-    } catch (cloudErr) {
-      console.warn("[examLibrary] Eliminazione da Firestore non riuscita:", cloudErr);
+      console.warn("[examLibrary] Eliminazione da Firestore rimandata:", cloudErr);
+      return {
+        deletedFromCloud: false,
+        cloudError: cloudErr?.message || "connessione Cloud non disponibile",
+      };
     }
   }
+
+  return { deletedFromCloud: false, cloudError: "database Cloud non configurato" };
 }
 
 /**
- * Renames an exam in both Cloud Firestore ('exam_library' collection and active_sessions if applicable)
- * and the local browser cache, updating its title both in metadata and within examJson.
+ * Renames a saved exam in both the teacher's local cache and Cloud Firestore ('exam_library'),
+ * updating its title both in metadata and within examJson.
  */
 export async function renameLibraryExam(
   teacherEmail: string,
@@ -653,53 +668,34 @@ export async function renameLibraryExam(
     throw new Error("Il titolo della verifica non può essere vuoto.");
   }
 
-  const normEmail = (teacherEmail || "anon").toLowerCase().trim();
+  const normEmail = normalizeEmail(teacherEmail) || "anon";
   const now = new Date().toISOString();
   let updatedItem: ExamLibraryItem | null = null;
 
-  // 1. Update matching item across all local storage buckets
-  try {
-    for (let i = 0; i < localStorage.length; i++) {
-      const k = localStorage.key(i);
-      if (k && k.startsWith("exam_library_") && k !== DELETED_SESSIONS_KEY) {
+  const arr = readLocalAll(normEmail);
+  let changed = false;
+  for (const it of arr) {
+    if (it && it.id === id) {
+      it.title = cleanTitle;
+      it.updatedAt = now;
+      it.syncedToCloud = false;
+      if (it.examJson) {
         try {
-          const raw = localStorage.getItem(k);
-          if (raw) {
-            const arr = JSON.parse(raw);
-            if (Array.isArray(arr)) {
-              let changed = false;
-              for (const it of arr) {
-                if (it && (it.id === id || (id.startsWith("session_") && it.id === id.replace("session_", "")))) {
-                  it.title = cleanTitle;
-                  it.updatedAt = now;
-                  if (it.examJson) {
-                    try {
-                      const parsed = JSON.parse(it.examJson);
-                      if (parsed && typeof parsed === "object") {
-                        parsed.title = cleanTitle;
-                        it.examJson = JSON.stringify(parsed, null, 2);
-                      }
-                    } catch {}
-                  }
-                  changed = true;
-                  if (!updatedItem) {
-                    updatedItem = { ...it };
-                  }
-                }
-              }
-              if (changed) {
-                localStorage.setItem(k, JSON.stringify(arr));
-              }
-            }
+          const parsed = JSON.parse(it.examJson);
+          if (parsed && typeof parsed === "object") {
+            parsed.title = cleanTitle;
+            it.examJson = JSON.stringify(parsed, null, 2);
           }
         } catch {}
       }
+      changed = true;
+      updatedItem = { ...it };
     }
-  } catch (err) {
-    console.warn("[examLibrary] Errore aggiornamento localStorage per rinomina:", err);
+  }
+  if (changed) {
+    writeLocalAll(normEmail, arr);
   }
 
-  // 2. Update Cloud Firestore collection 'exam_library'
   if (dbFirestore) {
     try {
       const docRef = doc(dbFirestore, "exam_library", id);
@@ -726,47 +722,21 @@ export async function renameLibraryExam(
           },
           { merge: true }
         );
+        if (updatedItem) {
+          updatedItem.syncedToCloud = true;
+        }
       } else if (updatedItem) {
-        await setDoc(
-          docRef,
-          {
-            id: updatedItem.id,
-            teacherEmail: updatedItem.teacherEmail || normEmail,
-            title: cleanTitle,
-            examType: updatedItem.examType,
-            examJson: updatedItem.examJson,
-            source: updatedItem.source,
-            questionCount: updatedItem.questionCount,
-            createdAt: updatedItem.createdAt || now,
-            updatedAt: now,
-          },
-          { merge: true }
-        );
+        await setDoc(docRef, buildFirestorePayload(updatedItem), { merge: true });
+        updatedItem.syncedToCloud = true;
       }
 
-      // 3. If item is tied to an active session PIN, synchronize active_sessions too
-      const pin = id.startsWith("session_") ? id.replace("session_", "").trim().toUpperCase() : "";
-      if (pin) {
-        const sessRef = doc(dbFirestore, "active_sessions", pin);
-        const sSnap = await getDoc(sessRef);
-        if (sSnap.exists()) {
-          const sData = sSnap.data();
-          let sObj = sData.data || sData.examData;
-          if (sObj && typeof sObj === "object") {
-            sObj = { ...sObj, title: cleanTitle };
-          }
-          await setDoc(
-            sessRef,
-            {
-              title: cleanTitle,
-              data: sObj || { title: cleanTitle },
-              updatedAt: now,
-            },
-            { merge: true }
-          );
-        }
+      if (changed && updatedItem?.syncedToCloud) {
+        writeLocalAll(normEmail, arr.map((it) => (it.id === id ? { ...it, syncedToCloud: true } : it)));
       }
     } catch (cloudErr) {
+      if (isPermissionDeniedError(cloudErr)) {
+        handleFirestoreError(cloudErr, OperationType.WRITE, `exam_library/${id}`);
+      }
       console.warn("[examLibrary] Aggiornamento Firestore fallito per rinomina:", cloudErr);
     }
   }
@@ -792,13 +762,14 @@ export function formatLibraryDate(iso: string): string {
 
 /** Safe filename from an exam title. */
 export function libraryFilename(title: string, ext = "json"): string {
-  const base = (title || "verifica")
-    .normalize("NFD")
-    .replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-zA-Z0-9-_]+/g, "_")
-    .replace(/_+/g, "_")
-    .replace(/^_|_$/g, "")
-    .slice(0, 60) || "verifica";
+  const base =
+    (title || "verifica")
+      .normalize("NFD")
+      .replace(/[\u0300-\u036f]/g, "")
+      .replace(/[^a-zA-Z0-9-_]+/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "")
+      .slice(0, 60) || "verifica";
   return `${base}.${ext}`;
 }
 
@@ -826,7 +797,7 @@ export function buildLibraryBackup(items: ExamLibraryItem[]): string {
       kind: "exam-library-backup",
       version: 1,
       exportedAt: new Date().toISOString(),
-      items: items.map(({ id, ...rest }) => rest),
+      items: items.map(({ id, syncedToCloud, ...rest }) => rest),
     },
     null,
     2

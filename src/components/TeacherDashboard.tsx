@@ -56,19 +56,22 @@ import {
 
 import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { SavedSubmission } from "../types";
-import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, buildSubjectiveReviewEntries, getPendingSubjectiveCount, auditSubjectiveEvaluation, isEvaluationPending } from "../utils";
+import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, buildSubjectiveReviewEntries, getPendingSubjectiveCount, auditSubjectiveEvaluation, isEvaluationPending, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
   tolerantJsonParse,
+  normalizeExamStructure,
   ExamCorrectionResult
 } from "../utils/examStructureRepair";
 import {
   listLibraryExams,
+  subscribeLibraryExams,
   saveLibraryExam,
   deleteLibraryExam,
   renameLibraryExam,
+  belongsToTeacherEmail,
   countLibraryQuestions,
   formatLibraryDate,
   libraryFilename,
@@ -76,7 +79,6 @@ import {
   buildLibraryBackup,
   parseLibraryBackup,
   sanitizeWorkbookExamJson,
-  fetchExamFromSessionPin,
   ExamLibraryItem
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
@@ -139,8 +141,8 @@ function parseInfractionClock(t: any): number | null {
 // Structured-part accuracy (MC or FIB, weight-aware) for borderline detection
 function submissionStructuredAccuracy(sub: SavedSubmission): number | null {
   try {
-    const domande = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
-    const ans = typeof sub.Risposte_Studente === "string" ? JSON.parse(sub.Risposte_Studente) : sub.Risposte_Studente;
+    const domande = safeParseJson(sub.Domande_Esame);
+    const ans = safeParseJson(sub.Risposte_Studente);
     if (sub.Tipo === "Quiz") {
       const mcList = domande?.multipleChoice || [];
       if (mcList.length === 0) return null;
@@ -173,14 +175,9 @@ export function isBorderlineSubmission(sub: SavedSubmission): boolean {
  * would defeat the safety gate and let a wrong grade reach the registry/CSV.
  */
 export function displaySubmissionGrade(sub: any): string {
-  try {
-    let ev = sub?.Full_Evaluation;
-    if (typeof ev === "string") ev = JSON.parse(ev);
-    if (isEvaluationPending(ev)) return "N.V.";
-    if (getPendingSubjectiveCount(sub) > 0) return "N.V.";
-  } catch {
-    // Malformed document: fall through to the stored value below.
-  }
+  const ev = safeParseJson(sub?.Full_Evaluation);
+  if (isEvaluationPending(ev)) return "N.V.";
+  if (getPendingSubjectiveCount(sub) > 0) return "N.V.";
   return sub?.Voto_Suggerito || "N/A";
 }
 
@@ -276,8 +273,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
-  // Anti-cheat strictness for this session (read by StudentView at PIN check)
-  const [severityPreset, setSeverityPreset] = useState<string>("normale");
   const [expiryTime, setExpiryTime] = useState(() => {
     const d = new Date();
     d.setHours(d.getHours() + 2);
@@ -297,8 +292,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [librarySaving, setLibrarySaving] = useState(false);
   const [libraryMsg, setLibraryMsg] = useState<string | null>(null);
   const [loadedLibraryItemId, setLoadedLibraryItemId] = useState<string | null>(null);
-  const [recoverPinInput, setRecoverPinInput] = useState("");
-  const [isRecoveringPin, setIsRecoveringPin] = useState(false);
+  const [librarySearch, setLibrarySearch] = useState("");
+  const [libraryTypeFilter, setLibraryTypeFilter] = useState<"all" | "Quiz" | "Workbook">("all");
   const libraryImportRef = useRef<HTMLInputElement | null>(null);
   const [renamingLibraryId, setRenamingLibraryId] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
@@ -352,6 +347,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
   const [copiedExamPin, setCopiedExamPin] = useState<string | null>(null);
   const [showAccessHelpModal, setShowAccessHelpModal] = useState<boolean>(false);
+  const [appAlert, setAppAlert] = useState<{ msg: string } | null>(null);
 
   const [selectedSub, setSelectedSub] = useState<SavedSubmission | null>(null);
   // Manual teacher grade retouch (audit trail via Voto_Originale_IA)
@@ -362,6 +358,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [confirmDeleteLibraryId, setConfirmDeleteLibraryId] = useState<string | null>(null);
   const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
+  const notifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+    };
+  }, []);
+  const showNotify = (type: "success" | "error", message: string, durationMs = 4500) => {
+    if (notifyTimerRef.current) clearTimeout(notifyTimerRef.current);
+    setDeleteNotify({ type, message });
+    notifyTimerRef.current = setTimeout(() => {
+      notifyTimerRef.current = null;
+      setDeleteNotify(null);
+    }, durationMs);
+  };
   const [blindGradingMode, setBlindGradingMode] = useState(false);
 
   // New features state
@@ -391,12 +401,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
   };
 
+  const copyPinTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (copyPinTimerRef.current) clearTimeout(copyPinTimerRef.current);
+    };
+  }, []);
+
   const handleCopyPin = (pinValue: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!pinValue || pinValue === "—") return;
     navigator.clipboard.writeText(pinValue);
     setCopiedExamPin(pinValue);
-    setTimeout(() => {
+    if (copyPinTimerRef.current) clearTimeout(copyPinTimerRef.current);
+    copyPinTimerRef.current = setTimeout(() => {
+      copyPinTimerRef.current = null;
       setCopiedExamPin(prev => prev === pinValue ? null : prev);
     }, 2000);
   };
@@ -443,17 +462,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     handleLoadSubmissions();
   }, []);
 
-  // Load the live sessions owned by this teacher so the monitor can target the right PIN
+  // Load the live sessions owned by this teacher (across aliases) so the monitor can target the right PIN
   const handleLoadActiveSessions = async () => {
     if (!dbFirestore || !user?.email) return;
     setLoadingSessions(true);
     try {
-      const qSnap = await getDocs(
-        query(collection(dbFirestore, "active_sessions"), where("teacherEmail", "==", user.email))
-      );
+      const qSnap = await getDocs(collection(dbFirestore, "active_sessions"));
       const list: LiveSessionSummary[] = [];
       qSnap.forEach((docSnap) => {
         const d = docSnap.data();
+        if (!belongsToTeacherEmail(d.teacherEmail, user.email)) return;
         list.push({
           pin: docSnap.id,
           title: d.title || "Esame attivato",
@@ -488,6 +506,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [terminatingPin, setTerminatingPin] = useState<string | null>(null);
   const [terminatingAll, setTerminatingAll] = useState(false);
 
+  const purgeLiveStudents = async (cleanPin: string) => {
+    if (!dbFirestore || !cleanPin) return;
+    try {
+      const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
+      const snap = await getDocs(liveColRef);
+      if (snap.empty) return;
+      const docs = snap.docs;
+      const chunkSize = 400;
+      for (let i = 0; i < docs.length; i += chunkSize) {
+        const chunk = docs.slice(i, i + chunkSize);
+        const batch = writeBatch(dbFirestore);
+        chunk.forEach((d) => batch.delete(d.ref));
+        await batch.commit();
+      }
+    } catch (purgeErr) {
+      console.warn("Pulizia alunni live non riuscita (continuo):", purgeErr);
+    }
+  };
+
   // Terminates (ends) and cancels a single active classroom session:
   // removes its live students, deletes the active_session document and the
   // RTDB backup, then refreshes the teacher's session list.
@@ -498,22 +535,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setTerminatingPin(cleanPin);
     try {
       // 1. Purge live students
-      try {
-        const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
-        const snap = await getDocs(liveColRef);
-        if (!snap.empty) {
-          const docs = snap.docs;
-          const chunkSize = 400;
-          for (let i = 0; i < docs.length; i += chunkSize) {
-            const chunk = docs.slice(i, i + chunkSize);
-            const batch = writeBatch(dbFirestore);
-            chunk.forEach((d) => batch.delete(d.ref));
-            await batch.commit();
-          }
-        }
-      } catch (purgeErr) {
-        console.warn("Pulizia alunni live non riuscita (continuo):", purgeErr);
-      }
+      await purgeLiveStudents(cleanPin);
 
       // 2. Delete the active_session document
       await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
@@ -535,7 +557,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
     } catch (err: any) {
       console.error("Terminazione sessione fallita:", err);
-      alert(`❌ Impossibile terminare la sessione ${cleanPin}: ${err?.message || "errore sconosciuto"}`);
+      setAppAlert({ msg: `❌ Impossibile terminare la sessione ${cleanPin}: ${err?.message || "errore sconosciuto"}` });
     } finally {
       setTerminatingPin(null);
       await handleLoadActiveSessions();
@@ -551,22 +573,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     try {
       for (const s of live) {
         const cleanPin = s.pin.trim().toUpperCase();
-        try {
-          const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
-          const snap = await getDocs(liveColRef);
-          if (!snap.empty) {
-            const docs = snap.docs;
-            const chunkSize = 400;
-            for (let i = 0; i < docs.length; i += chunkSize) {
-              const chunk = docs.slice(i, i + chunkSize);
-              const batch = writeBatch(dbFirestore);
-              chunk.forEach((d) => batch.delete(d.ref));
-              await batch.commit();
-            }
-          }
-        } catch (purgeErr) {
-          console.warn("Pulizia alunni live non riuscita (continuo):", purgeErr);
-        }
+        await purgeLiveStudents(cleanPin);
         try {
           await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
         } catch (delErr) {
@@ -585,7 +592,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setPin("");
     } catch (err: any) {
       console.error("Terminazione massiva fallita:", err);
-      alert(`❌ Errore durante la terminazione delle sessioni: ${err?.message || "errore sconosciuto"}`);
+      setAppAlert({ msg: `❌ Errore durante la terminazione delle sessioni: ${err?.message || "errore sconosciuto"}` });
     } finally {
       setTerminatingAll(false);
       await handleLoadActiveSessions();
@@ -619,20 +626,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return null;
       }
 
-      // Normalization safeguard: if it's a Quiz and has reflectionQuestions at root, migrate them into openEnded
-      if (!isWorkbook && Array.isArray(data.reflectionQuestions) && data.reflectionQuestions.length > 0) {
-        if (!data.openEnded) data.openEnded = [];
-        for (const rq of data.reflectionQuestions) {
-          if (!data.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-            data.openEnded.push({
-              id: rq.id || `q_ref_${data.openEnded.length + 1}`,
-              question: rq.question,
-              criteria: rq.criteria || rq.criteri
-            });
-          }
-        }
-        delete data.reflectionQuestions;
-      }
+      normalizeExamStructure(data);
 
       if (isWorkbook) {
         if (!data.title) {
@@ -704,13 +698,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       return true;
     } else {
       if (interactive) {
-        alert(`⚠️ Correzione automatica non riuscita: ${result.summaryNotice}`);
+        setAppAlert({ msg: `⚠️ Correzione automatica non riuscita: ${result.summaryNotice}` });
       }
       return false;
     }
   };
 
-  // ---- Exam library (browser localStorage): save / load / delete reusable exams ----
+  // ---- Exam library (Cloud Firestore + local cache): save / load / sync across all devices ----
   const loadLibrary = async () => {
     const emailToUse = user?.email || "docente_sandbox@scuola.it";
     setLibraryLoading(true);
@@ -719,32 +713,45 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setLibrary(items);
     } catch (e: any) {
       console.warn("Libreria verifiche non caricata:", e);
+      setLibraryMsg(`⚠️ Sincronizzazione Cloud parziale: ${e?.message || "riprova tra poco"}.`);
     } finally {
       setLibraryLoading(false);
     }
   };
 
   useEffect(() => {
+    const emailToUse = user?.email || "docente_sandbox@scuola.it";
     loadLibrary();
+    const unsubscribe = subscribeLibraryExams(
+      emailToUse,
+      (items) => setLibrary(items),
+      (err: any) => console.warn("Aggiornamento live libreria:", err)
+    );
+    return () => unsubscribe();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [user?.email]);
 
-  const handleSaveToLibrary = async (source: string, jsonOverride?: string, titleOverride?: string) => {
+  const handleSaveToLibrary = async (
+    source: string,
+    jsonOverride?: string,
+    titleOverride?: string,
+    options?: { asNew?: boolean }
+  ) => {
     const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const raw = (jsonOverride ?? jsonText).trim();
     if (!raw) {
-      alert("⚠️ Niente da salvare: l'editor è vuoto.");
+      setAppAlert({ msg: "⚠️ Niente da salvare: l'editor è vuoto." });
       return;
     }
     let parsed: any = null;
     try {
       parsed = tolerantJsonParse(raw);
     } catch (e: any) {
-      alert(`⚠️ JSON non valido, impossibile salvare in libreria: ${e.message}`);
+      setAppAlert({ msg: `⚠️ JSON non valido, impossibile salvare in libreria: ${e.message}` });
       return;
     }
     if (!parsed || typeof parsed !== "object") {
-      alert("⚠️ Il contenuto non è un esame valido.");
+      setAppAlert({ msg: "⚠️ Il contenuto non è un esame valido." });
       return;
     }
 
@@ -756,55 +763,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setLibrarySaving(true);
     setLibraryMsg(null);
     try {
-      // Ensure title is present on the parsed object
       if (!parsed.title && title) {
         parsed.title = title;
       }
 
-      // Normalization safeguard: If Workbook (sections) and root openEnded exists,
-      // integrate openEnded into reflectionQuestions of the last section so they are preserved and evaluated
-      if (Array.isArray(parsed.sections) && parsed.sections.length > 0 && Array.isArray(parsed.openEnded) && parsed.openEnded.length > 0) {
-        const lastSec = parsed.sections[parsed.sections.length - 1];
-        if (lastSec) {
-          if (!Array.isArray(lastSec.reflectionQuestions)) lastSec.reflectionQuestions = [];
-          for (const oe of parsed.openEnded) {
-            if (!lastSec.reflectionQuestions.some((rq: any) => rq.id === oe.id || rq.question === oe.question)) {
-              lastSec.reflectionQuestions.push({
-                id: oe.id || `ref_${lastSec.reflectionQuestions.length + 1}`,
-                question: oe.question,
-                criteria: oe.criteria || oe.criteri,
-                weight: oe.weight || 1
-              });
-            }
-          }
-        }
-      }
-
-      // Normalization safeguard: If Quiz (no sections) and reflectionQuestions exists at root,
-      // migrate them into openEnded
-      if (!parsed.sections && Array.isArray(parsed.reflectionQuestions) && parsed.reflectionQuestions.length > 0) {
-        if (!Array.isArray(parsed.openEnded)) parsed.openEnded = [];
-        for (const rq of parsed.reflectionQuestions) {
-          if (!parsed.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-            parsed.openEnded.push({
-              id: rq.id || `q_ref_${parsed.openEnded.length + 1}`,
-              question: rq.question,
-              criteria: rq.criteria || rq.criteri,
-              weight: rq.weight || 1
-            });
-          }
-        }
-        delete parsed.reflectionQuestions;
-      }
+      normalizeExamStructure(parsed);
 
       const { type, count } = countLibraryQuestions(parsed);
-      // PRESERVE ALL ORIGINAL & NEW QUESTIONS: serialize the entire parsed object!
       const formatted = JSON.stringify(parsed, null, 2);
 
-      // Keep editor in sync with formatted and validated JSON
       setJsonText(formatted);
 
-      const savedId = await saveLibraryExam(
+      const reuseTargetId = !options?.asNew && !jsonOverride ? loadedLibraryItemId || undefined : undefined;
+      const saveResult = await saveLibraryExam(
         {
           teacherEmail: effectiveEmail,
           title,
@@ -813,38 +784,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           source,
           questionCount: count,
         },
-        loadedLibraryItemId || undefined
+        reuseTargetId
       );
 
-      setLoadedLibraryItemId(savedId);
-
-      // Keep cloud active session in sync if a PIN is assigned and exists in Firestore
-      const targetPin = (pin.trim() || (loadedLibraryItemId?.startsWith("session_") ? loadedLibraryItemId.replace("session_", "").trim() : "")).toUpperCase();
-      if (dbFirestore && targetPin) {
-        try {
-          const sessionRef = doc(dbFirestore, "active_sessions", targetPin);
-          const snap = await getDoc(sessionRef);
-          if (snap.exists()) {
-            const sessData = snap.data();
-            const teacherEmail = user?.email || effectiveEmail;
-            if (!sessData.teacherEmail || sessData.teacherEmail === teacherEmail || !user?.uid || sessData.teacherId === user?.uid) {
-              await setDoc(sessionRef, {
-                ...sessData,
-                data: parsed,
-                title: parsed.title || title,
-                updatedAt: new Date().toISOString()
-              }, { merge: true });
-            }
-          }
-        } catch (cloudErr) {
-          console.warn("Sincronizzazione sessione cloud non riuscita (non bloccante):", cloudErr);
-        }
-      }
-
+      setLoadedLibraryItemId(saveResult.id);
       await loadLibrary();
-      setLibraryMsg(`✅ "${title}" salvata in libreria con ${count} quesiti completi (tutte le aggiunte salvate).`);
+      if (saveResult.syncedToCloud) {
+        setLibraryMsg(`✓ "${title}" salvata nel Cloud (${count} quesiti): la ritrovi su tutti i tuoi dispositivi.`);
+      } else {
+        setLibraryMsg(
+          `⚠️ "${title}" salvata su questo dispositivo, ma non ancora nel Cloud (${saveResult.cloudError || "rete assente"}). Verrà sincronizzata appena possibile.`
+        );
+      }
     } catch (e: any) {
-      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "spazio locale esaurito"}.`);
+      setLibraryMsg(`❌ Salvataggio non riuscito: ${e.message || "errore imprevisto"}.`);
     } finally {
       setLibrarySaving(false);
     }
@@ -855,53 +808,29 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
     setJsonText(sanitizedJson);
     if (item.title) {
-      // Clean title from "(PIN ...)" suffix if present
       const cleanTitle = item.title.replace(/\s*\(PIN\s*[^)]+\)$/i, "").trim();
       setMateria(cleanTitle || item.title);
     }
-    if (item.id.startsWith("session_")) {
-      const pinFromId = item.id.replace("session_", "").trim();
-      if (pinFromId) setPin(pinFromId);
-    }
     validateExamJSON(sanitizedJson);
-    setLibraryMsg(`📥 "${item.title}" (${item.questionCount} quesiti) caricata nell'editor: pronta per modifiche o avvio sessione.`);
-  };
-
-  const handleFetchExamByPin = async (customPin?: string) => {
-    const targetPin = (customPin || recoverPinInput).trim();
-    if (!targetPin) {
-      alert("⚠️ Digita il codice PIN della sessione che desideri recuperare (es. 12).");
-      return;
-    }
-    setIsRecoveringPin(true);
-    setLibraryMsg(null);
-    try {
-      const item = await fetchExamFromSessionPin(targetPin);
-      if (!item) {
-        setLibraryMsg(`⚠️ Nessuna verifica attiva trovata su Cloud per il PIN "${targetPin}".`);
-        return;
-      }
-      handleLoadLibraryItem(item);
-      setPin(targetPin);
-      await loadLibrary();
-      setLibraryMsg(`✨ Recuperata con successo "${item.title}" dal PIN ${targetPin} e caricata nell'editor!`);
-    } catch (e: any) {
-      setLibraryMsg(`❌ Errore recupero PIN: ${e.message}`);
-    } finally {
-      setIsRecoveringPin(false);
-    }
+    setLibraryMsg(`"${item.title}" (${item.questionCount} quesiti) caricata nell'editor: imposta un PIN e la scadenza per avviarla.`);
   };
 
   const handleDeleteLibraryItem = async (item: ExamLibraryItem) => {
-    const teacherEmail = user?.email || "anon";
-    // Optimistic UI removal so the list updates immediately without delay
+    const teacherEmail = user?.email || "docente_sandbox@scuola.it";
+    if (loadedLibraryItemId === item.id) {
+      setLoadedLibraryItemId(null);
+    }
     setLibrary(prev => prev.filter(it => it.id !== item.id));
     try {
-      await deleteLibraryExam(teacherEmail, item.id, item.title);
+      const delRes = await deleteLibraryExam(teacherEmail, item.id, item.title);
       await loadLibrary();
-      setLibraryMsg(`🗑️ "${item.title}" eliminata definitivamente dalla libreria.`);
+      if (delRes.deletedFromCloud) {
+        setLibraryMsg(`"${item.title}" eliminata definitivamente da tutti i dispositivi.`);
+      } else {
+        setLibraryMsg(`"${item.title}" rimossa in locale (rimozione Cloud in sospeso: ${delRes.cloudError || "rete assente"}).`);
+      }
     } catch (e: any) {
-      setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore locale"}.`);
+      setLibraryMsg(`❌ Eliminazione non riuscita: ${e.message || "errore imprevisto"}.`);
       await loadLibrary();
     }
   };
@@ -919,7 +848,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleSaveRename = async (item: ExamLibraryItem) => {
     const trimmedTitle = renamingTitle.trim();
     if (!trimmedTitle) {
-      alert("⚠️ Il titolo della verifica non può essere vuoto.");
+      setAppAlert({ msg: "⚠️ Il titolo della verifica non può essere vuoto." });
       return;
     }
     if (trimmedTitle === item.title) {
@@ -954,7 +883,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
 
       await loadLibrary();
-      setLibraryMsg(`✏️ Verifica rinominata in "${trimmedTitle}".`);
+      setLibraryMsg(`✏️ Verifica rinominata in "${trimmedTitle}" nel Cloud.`);
       setRenamingLibraryId(null);
     } catch (e: any) {
       setLibraryMsg(`❌ Rinomina non riuscita: ${e.message || "errore imprevisto"}.`);
@@ -990,17 +919,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleImportLibraryBackup = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     e.target.value = "";
-    if (!file || !user?.email) return;
+    if (!file) return;
+    const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const reader = new FileReader();
     reader.onload = async (event) => {
       try {
         const raw = String(event.target?.result || "");
-        const incoming = parseLibraryBackup(raw, user.email);
+        const incoming = parseLibraryBackup(raw, effectiveEmail);
+        let syncedCount = 0;
         for (const entry of incoming) {
-          await saveLibraryExam(entry);
+          const res = await saveLibraryExam(entry);
+          if (res.syncedToCloud) syncedCount++;
         }
         await loadLibrary();
-        setLibraryMsg(`📥 Importate ${incoming.length} verifiche dal backup "${file.name}".`);
+        setLibraryMsg(
+          `📥 Importate ${incoming.length} verifiche dal backup "${file.name}" (${syncedCount}/${incoming.length} sincronizzate nel Cloud).`
+        );
       } catch (err: any) {
         setLibraryMsg(`❌ Import non riuscito: ${err.message || "file non valido"}.`);
       }
@@ -1053,11 +987,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const targetPin = pin.trim().toUpperCase();
     
     if (!targetPin) {
-      alert("⚠️ Digita un PIN identificativo per attivare la sessione.");
+      setAppAlert({ msg: "⚠️ Digita un PIN identificativo per attivare la sessione." });
       return;
     }
     if (!expiryTime) {
-      alert("⚠️ Scegli un'ora di scadenza valida per la sessione.");
+      setAppAlert({ msg: "⚠️ Scegli un'ora di scadenza valida per la sessione." });
       return;
     }
 
@@ -1072,24 +1006,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
 
     if (!examObj) {
-      alert("⚠️ Correggi la sintassi JSON o applica la correzione automatica della struttura prima dell'attivazione.");
+      setAppAlert({ msg: "⚠️ Correggi la sintassi JSON o applica la correzione automatica della struttura prima dell'attivazione." });
       return;
     }
 
-    // Normalization safeguard before Firestore activation:
-    if (!examObj.sections && Array.isArray(examObj.reflectionQuestions) && examObj.reflectionQuestions.length > 0) {
-      if (!Array.isArray(examObj.openEnded)) examObj.openEnded = [];
-      for (const rq of examObj.reflectionQuestions) {
-        if (!examObj.openEnded.some((oe: any) => oe.id === rq.id || oe.question === rq.question)) {
-          examObj.openEnded.push({
-            id: rq.id || `q_ref_${examObj.openEnded.length + 1}`,
-            question: rq.question,
-            criteria: rq.criteria || rq.criteri
-          });
-        }
-      }
-      delete examObj.reflectionQuestions;
-    }
+    normalizeExamStructure(examObj);
     
     if (materia.trim()) {
       examObj.title = materia.trim();
@@ -1126,7 +1047,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       teacherEmail: user?.email || "docente_sandbox@scuola.it",
       backendUrl: "AI_STUDIO_GENAI_INTEGRATA",
       randomizeQuestions,
-      severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
+      severityPreset: "normale",
       unlockCode,
       active: true,
       createdAt: new Date().toISOString()
@@ -1142,10 +1063,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           const hasNotExpired = existingSession.expiry ? (new Date(existingSession.expiry).getTime() > Date.now()) : true;
           const isSessionTrulyActive = existingSession.active && hasNotExpired;
 
-          if (isSessionTrulyActive && existingSession.teacherEmail && existingSession.teacherEmail !== user?.email) {
-            alert(
-              `🚨 CONFLITTO DI PIN BLOCCATO!\n\nIl PIN "${targetPin}" è attualmente attivo ed è gestito da un altro docente (${existingSession.teacherEmail}).\n\nPer evitare collisioni d'esame in aula, la sovrascrittura automatica è stata inibita dal sistema. Scegli o digita un codice PIN diverso per attivare questa sessione.`
-            );
+          if (isSessionTrulyActive && existingSession.teacherEmail && !belongsToTeacherEmail(existingSession.teacherEmail, user?.email || "")) {
+            setAppAlert({
+              msg: `🚨 CONFLITTO DI PIN BLOCCATO!\n\nIl PIN "${targetPin}" è attualmente attivo ed è gestito da un altro docente (${existingSession.teacherEmail}).\n\nPer evitare collisioni d'esame in aula, la sovrascrittura automatica è stata inibita dal sistema. Scegli o digita un codice PIN diverso per attivare questa sessione.`
+            });
             setPinStatus(`❌ Errore: Il PIN ${targetPin} è occupato da un altro docente. Prova con un altro PIN.`);
             return;
           }
@@ -1153,16 +1074,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         // Purge leftovers from any previous run of this same PIN so two different
         // classes sharing a PIN code can never be mixed inside the live monitor.
-        try {
-          const staleSnap = await getDocs(collection(dbFirestore, "active_sessions", targetPin, "live_students"));
-          if (!staleSnap.empty) {
-            const purgeBatch = writeBatch(dbFirestore);
-            staleSnap.forEach((s) => purgeBatch.delete(s.ref));
-            await purgeBatch.commit();
-          }
-        } catch (purgeErr) {
-          console.warn("Pulizia lista alunni pre-sessione non riuscita (non bloccante):", purgeErr);
-        }
+        await purgeLiveStudents(targetPin);
 
         // Active Session with Full Details saved to Firestore
         const firestorePayload = {
@@ -1173,7 +1085,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           teacherId: user?.uid || "mock_teacher",
           data: examObj,
           randomizeQuestions,
-          severityPreset: ["tollerante", "normale", "rigido"].includes(severityPreset) ? severityPreset : "normale",
+          severityPreset: "normale",
           unlockCode,
           active: true,
           createdAt: new Date().toISOString(),
@@ -1204,12 +1116,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           hour: "2-digit",
           minute: "2-digit"
         });
-        alert(`Sessione attivata correttamente!\nPIN: ${targetPin}\nScadenza fissata alle: ${friendlyScadenza}`);
+        setAppAlert({ msg: `Sessione attivata correttamente!\nPIN: ${targetPin}\nScadenza fissata alle: ${friendlyScadenza}` });
 
       } catch (err: any) {
         console.error("Firestore activation failed:", err);
         setPinStatus(`❌ Errore d'attivazione: ${err.message}`);
-        alert(`❌ Errore durante l'attivazione della sessione: ${err.message}`);
+        setAppAlert({ msg: `❌ Errore durante l'attivazione della sessione: ${err.message}` });
       }
     } else {
       setPinStatus("⚠️ Modalità Sandbox: Database scolastico non connesso. Usa i codici STORIA42 o SCIENZA101 nello Studente.");
@@ -1249,7 +1161,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
     } catch (err: any) {
       console.error("Analysis error:", err);
-      alert(`❌ Errore durante l'analisi dell'esame: ${err.message}`);
+      setAppAlert({ msg: `❌ Errore durante l'analisi dell'esame: ${err.message}` });
     } finally {
       setIsAnalyzing(false);
     }
@@ -1304,11 +1216,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleExtendExam = async (customInstructionOverride?: string, additionType?: string) => {
     const promptToSend = (customInstructionOverride || extendPrompt).trim();
     if (!promptToSend) {
-      alert("⚠️ Scrivi cosa desideri aggiungere all'esame oppure seleziona uno dei suggerimenti rapidi.");
+      setAppAlert({ msg: "⚠️ Scrivi cosa desideri aggiungere all'esame oppure seleziona uno dei suggerimenti rapidi." });
       return;
     }
     if (!jsonText.trim()) {
-      alert("⚠️ Carica o incolla prima la struttura JSON dell'esame.");
+      setAppAlert({ msg: "⚠️ Carica o incolla prima la struttura JSON dell'esame." });
       return;
     }
 
@@ -1356,7 +1268,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
     } catch (err: any) {
       console.error("Extend error:", err);
-      alert(`❌ Errore durante l'aggiunta di contenuti: ${err.message}`);
+      setAppAlert({ msg: `❌ Errore durante l'aggiunta di contenuti: ${err.message}` });
     } finally {
       setIsExtending(false);
     }
@@ -1382,26 +1294,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         setSubmissions(prev => prev.filter(sub => sub.id !== id));
         if (selectedSub?.id === id) setSelectedSub(null);
         setConfirmDeleteId(null);
-        setDeleteNotify({ type: "success", message: "✅ Valutazione eliminata con successo!" });
-        setTimeout(() => setDeleteNotify(null), 4000);
+        showNotify("success", "✅ Valutazione eliminata con successo!", 4000);
       } catch (e: any) {
         console.error("Errore eliminazione:", e);
         setConfirmDeleteId(null);
-        setDeleteNotify({ type: "error", message: `❌ Errore d'eliminazione: ${e.message}. Verifica i permessi.` });
-        setTimeout(() => setDeleteNotify(null), 6000);
+        showNotify("error", `❌ Errore d'eliminazione: ${e.message}. Verifica i permessi.`, 6000);
         handleFirestoreError(e, OperationType.DELETE, `valutazioni/${id}`);
       }
     } else {
-      setDeleteNotify({ type: "error", message: "⚠️ Database scolastico non disponibile." });
-      setTimeout(() => setDeleteNotify(null), 4000);
+      showNotify("error", "⚠️ Database scolastico non disponibile.", 4000);
     }
   };
 
   // Delete an entire exam group (all submissions belonging to this exam/session)
   const handleDeleteExamGroup = async (exam: ExamSummary) => {
     if (!dbFirestore) {
-      setDeleteNotify({ type: "error", message: "⚠️ Database scolastico non disponibile." });
-      setTimeout(() => setDeleteNotify(null), 4000);
+      showNotify("error", "⚠️ Database scolastico non disponibile.", 4000);
       return;
     }
 
@@ -1425,19 +1333,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         setSelectedSub(null);
       }
       setConfirmDeleteExamKey(null);
-      setDeleteNotify({ 
-        type: "success", 
-        message: `✅ Gruppo prova "${exam.title}" eliminato con successo (${idsToDelete.length} ${idsToDelete.length === 1 ? "elaborato rimosso" : "elaborati rimossi"})!` 
-      });
-      setTimeout(() => setDeleteNotify(null), 5000);
+      showNotify(
+        "success",
+        `✅ Gruppo prova "${exam.title}" eliminato con successo (${idsToDelete.length} ${idsToDelete.length === 1 ? "elaborato rimosso" : "elaborati rimossi"})!`,
+        5000
+      );
     } catch (e: any) {
       console.error("Errore durante l'eliminazione del gruppo prova:", e);
       setConfirmDeleteExamKey(null);
-      setDeleteNotify({ 
-        type: "error", 
-        message: `❌ Errore durante l'eliminazione della prova: ${e.message}. Verifica i permessi del database.` 
-      });
-      setTimeout(() => setDeleteNotify(null), 6000);
+      showNotify(
+        "error",
+        `❌ Errore durante l'eliminazione della prova: ${e.message}. Verifica i permessi del database.`,
+        6000
+      );
       handleFirestoreError(e, OperationType.DELETE, `valutazioni/${exam.key}`);
     } finally {
       setIsDeletingExamGroup(null);
@@ -1455,25 +1363,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Recalculates and repairs a submission if evaluation had discrepancies or hallucinated questions
   const handleRecalculateGrade = async (sub: SavedSubmission) => {
     if (!dbFirestore) {
-      alert("⚠️ Database scolastico non disponibile.");
+      setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
       return;
     }
 
     setRecalculatingId(sub.id);
     try {
-      let domandeObj: any = null;
-      let ansObj: any = {};
-      let evalObj: any = {};
-
-      try {
-        domandeObj = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
-      } catch {}
-      try {
-        ansObj = typeof sub.Risposte_Studente === "string" ? JSON.parse(sub.Risposte_Studente) : sub.Risposte_Studente;
-      } catch {}
-      try {
-        evalObj = typeof sub.Full_Evaluation === "string" ? JSON.parse(sub.Full_Evaluation) : sub.Full_Evaluation;
-      } catch {}
+      const domandeObj = safeParseJson(sub.Domande_Esame);
+      const ansObj = safeParseJson(sub.Risposte_Studente) || {};
+      let evalObj = safeParseJson(sub.Full_Evaluation) || {};
 
       let newGrade = sub.Voto_Suggerito;
       let newErrors = sub.Errori_Principali;
@@ -1490,13 +1388,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         mcList.forEach((q: any, idx: number) => {
           const chosen = ansObj.mc?.[q.id];
-          if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
+          const hasChosen = chosen !== undefined && chosen !== null && chosen !== "";
+          if (hasChosen && Number(chosen) === Number(q.correctIndex)) {
             correctCount++;
           } else {
             wrongQuestions.push({
               number: idx + 1,
               question: q.question,
-              studentChoice: (chosen !== undefined && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
+              studentChoice: (hasChosen && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
               correctChoice: q.options?.[q.correctIndex] || ""
             });
           }
@@ -1539,8 +1438,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           // Real AI re-evaluation: never apply a fixed "dignity floor".
           // Blank or gibberish answers are marked "[VUOTO]" so the AI scores
           // them 0; every written answer is graded on its actual content.
-          const sanitizedAnswers = JSON.parse(JSON.stringify(ansObj || {}));
-          sanitizedAnswers.oe = sanitizedAnswers.oe || {};
+          const sanitizedAnswers = { ...(ansObj || {}), oe: { ...(ansObj?.oe || {}) } };
           oeList.forEach((q: any) => {
             const text = String(ansObj.oe?.[q?.id] ?? ansObj.openEnded?.[q?.id] ?? "");
             if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
@@ -1626,7 +1524,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         if (wbMcList.length > 0) {
           wbMcList.forEach((q: any) => {
             const chosen = ansObj.mc?.[q.id];
-            if (chosen !== undefined && Number(chosen) === Number(q.correctIndex)) {
+            if (chosen !== undefined && chosen !== null && chosen !== "" && Number(chosen) === Number(q.correctIndex)) {
               correctMc++;
             }
           });
@@ -1658,8 +1556,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           newFeedback = evalObj.overallFeedback;
         } else {
           // Real AI re-evaluation of the reflections (same rule as the Quiz).
-          const sanitizedAnswers = JSON.parse(JSON.stringify(ansObj || {}));
-          sanitizedAnswers.wbRq = sanitizedAnswers.wbRq || {};
+          const sanitizedAnswers = { ...(ansObj || {}), wbRq: { ...(ansObj?.wbRq || {}) } };
           rqList.forEach((r: any) => {
             const text = String(ansObj.wbRq?.[r?.id] ?? ansObj.oe?.[r?.id] ?? "");
             if (detectGibberish(text)) sanitizedAnswers.wbRq[r.id] = "[VUOTO]";
@@ -1751,14 +1648,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         setSelectedSub(updatedSub);
       }
 
-      setDeleteNotify({
-        type: "success",
-        message: `✅ Voto e valutazione aggiornati con successo nel database scolastico! Nuovo voto: ${newGrade}`
-      });
-      setTimeout(() => setDeleteNotify(null), 5000);
+      showNotify(
+        "success",
+        `✅ Voto e valutazione aggiornati con successo nel database scolastico! Nuovo voto: ${newGrade}`,
+        5000
+      );
     } catch (err: any) {
       console.error("Errore ricalcolo valutazione:", err);
-      alert(`Errore durante il ricalcolo: ${err.message}`);
+      setAppAlert({ msg: `Errore durante il ricalcolo: ${err.message}` });
     } finally {
       setRecalculatingId(null);
     }
@@ -1768,12 +1665,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // The first retouch preserves the original AI grade for audit trail.
   const handleManualGrade = async (sub: SavedSubmission) => {
     if (!dbFirestore) {
-      alert("⚠️ Database scolastico non disponibile.");
+      setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
       return;
     }
     const num = parseSubmissionNumericGrade(gradeEditValue);
     if (isNaN(num) || num < 1 || num > 10.5) {
-      alert("⚠️ Inserisci un voto valido (es. 6, 6+, 7½, 8).");
+      setAppAlert({ msg: "⚠️ Inserisci un voto valido (es. 6, 6+, 7½, 8)." });
       return;
     }
     try {
@@ -1786,13 +1683,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setSelectedSub(updated);
       setGradeEditOpen(false);
       setGradeEditValue("");
-      setDeleteNotify({
-        type: "success",
-        message: `✅ Voto ritoccato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
-      });
-      setTimeout(() => setDeleteNotify(null), 5000);
+      showNotify(
+        "success",
+        `✅ Voto ritoccato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
+        5000
+      );
     } catch (err: any) {
-      alert(`Errore salvataggio voto: ${err.message}`);
+      setAppAlert({ msg: `Errore salvataggio voto: ${err.message}` });
     }
   };
 
@@ -1822,8 +1719,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       .replace(/[❌✖️✖🔴🚨🛑]/g, "[NO] ")
       .replace(/[⏱️⏰⏳]/g, "[TEMPO] ")
       .replace(/[⚠️💡⭐🌟📌🎯🔍🎓📘📖✏️📝⚙️🧪🩺💼🧠🧬]/g, "* ")
-      .replace(/[➢➔➤➔➜🛈ℹ️]/g, "-> ")
-      .replace(/[•●▪▪]/g, "- ")
+      .replace(/[➢➔➤➜→⇒🛈ℹ️]/g, "-> ")
+      .replace(/≥/g, ">=")
+      .replace(/≤/g, "<=")
+      .replace(/[•●▪]/g, "- ")
       .replace(/[\u201C\u201D]/g, '"') // Smart quotes
       .replace(/[\u2018\u2019]/g, "'"); // Smart single quotes
     
@@ -2005,37 +1904,50 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
     const breakdown = extractBreakdownFromSubmission(sub);
     if (breakdown) {
-      checkPageBreak(28);
+      doc.setFont("Courier", "bold");
+      doc.setFontSize(8.5);
+      const summaryLines: string[] = doc.splitTextToSize(sanitizePdfText(breakdown.formulaSummary || ""), 172);
+      doc.setFont("Helvetica", "normal");
+      doc.setFontSize(7.5);
+      const explRaw = sanitizePdfText(breakdown.explanationLines[0] || "");
+      const explLines: string[] = explRaw ? doc.splitTextToSize(explRaw, 172).slice(0, 2) : [];
+
+      const boxHeight = 12 + summaryLines.length * 4.5 + (explLines.length > 0 ? explLines.length * 4 + 2 : 0);
+      checkPageBreak(boxHeight + 4);
       doc.setFillColor(248, 250, 252);
       doc.setDrawColor(203, 213, 225);
-      doc.roundedRect(15, currentY, 180, 25, 2.5, 2.5, "FD");
+      doc.roundedRect(15, currentY, 180, boxHeight, 2.5, 2.5, "FD");
 
       doc.setFont("Helvetica", "bold");
       doc.setFontSize(9);
       doc.setTextColor(30, 41, 59);
-      doc.text(`Composizione del Voto: ${breakdown.formulaTitle}`, 19, currentY + 6);
+      doc.text(`Composizione del Voto: ${sanitizePdfText(breakdown.formulaTitle || "")}`, 19, currentY + 6);
 
+      let boxY = currentY + 12;
       doc.setFont("Courier", "bold");
       doc.setFontSize(8.5);
       doc.setTextColor(67, 56, 202);
-      doc.text(breakdown.formulaSummary, 19, currentY + 13);
+      for (const sLine of summaryLines) {
+        doc.text(sLine, 19, boxY);
+        boxY += 4.5;
+      }
 
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(7.5);
-      doc.setTextColor(71, 85, 105);
-      const explText = breakdown.explanationLines[0] || "";
-      doc.text(explText.length > 105 ? explText.slice(0, 105) + "..." : explText, 19, currentY + 19);
+      if (explLines.length > 0) {
+        boxY += 1.5;
+        doc.setFont("Helvetica", "normal");
+        doc.setFontSize(7.5);
+        doc.setTextColor(71, 85, 105);
+        for (const eLine of explLines) {
+          doc.text(eLine, 19, boxY);
+          boxY += 4;
+        }
+      }
 
-      currentY += 29;
+      currentY += boxHeight + 4;
     }
 
     // Parser per i dati IA completi
-    let evalObj: any = null;
-    try {
-      evalObj = typeof sub.Full_Evaluation === "string" 
-        ? JSON.parse(sub.Full_Evaluation) 
-        : sub.Full_Evaluation;
-    } catch {}
+    const evalObj = safeParseJson(sub.Full_Evaluation);
 
     // 4. GIUDIZIO DIDATTICO COMPLESSIVO
     const generalFeedback = sub.Feedback_Generale || evalObj?.overallFeedback || evalObj?.openEndedEvaluation;
@@ -2086,21 +1998,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     doc.text("Dettaglio Risposte & Analisi Metacognitiva", 15, currentY);
     currentY += 6;
 
-    let ansObj: any = {};
-    try {
-      ansObj = typeof sub.Risposte_Studente === "string" 
-        ? JSON.parse(sub.Risposte_Studente) 
-        : sub.Risposte_Studente;
-    } catch {}
-
-    let domandeObj: any = null;
-    if (sub.Domande_Esame) {
-      try {
-        domandeObj = typeof sub.Domande_Esame === "string"
-          ? JSON.parse(sub.Domande_Esame)
-          : sub.Domande_Esame;
-      } catch {}
-    }
+    const ansObj = safeParseJson(sub.Risposte_Studente) || {};
+    const domandeObj = safeParseJson(sub.Domande_Esame);
 
     if (sub.Tipo === "Quiz") {
       const mcqList = domandeObj?.multipleChoice || [];
@@ -2118,9 +2017,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
         mcqList.forEach((q: any, idx: number) => {
           const selectedOptIdx = ansObj.mc?.[q.id];
-          const selectedOptText = selectedOptIdx !== undefined ? q.options[selectedOptIdx] : "Risposta non data o mancante";
-          const correctOptText = q.options[q.correctIndex];
-          const isCorrect = selectedOptIdx === q.correctIndex;
+          const opts = Array.isArray(q.options) ? q.options : [];
+          const hasSelection = selectedOptIdx !== undefined && selectedOptIdx !== null && selectedOptIdx !== "";
+          const parsedIdx = hasSelection ? Number(selectedOptIdx) : -1;
+          const selectedOptText =
+            hasSelection && Number.isInteger(parsedIdx) && opts[parsedIdx] !== undefined
+              ? String(opts[parsedIdx])
+              : "Risposta non data o mancante";
+          const correctOptText = opts[q.correctIndex] !== undefined ? String(opts[q.correctIndex]) : "N/D";
+          const isCorrect = hasSelection && Number.isInteger(parsedIdx) && parsedIdx === Number(q.correctIndex);
           
           checkPageBreak(18);
           writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
@@ -2329,14 +2234,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       doc.save(`esito_ea_${formattedName}_pin_${sub.Pin || "esame"}.pdf`);
     } catch (pdfErr) {
       console.error("PDF generation error:", pdfErr);
-      alert("❌ Errore durante l'assemblaggio del PDF. Riprovare.");
+      setAppAlert({ msg: "❌ Errore durante l'assemblaggio del PDF. Riprovare." });
     }
   };
 
   // Cumulative ZIP export: bundles multiple PDF evaluations into a single compressed .zip file
   const handleExportZip = async (subsToExport: SavedSubmission[], zipBaseName = "verifiche_classe") => {
     if (!subsToExport || subsToExport.length === 0) {
-      alert("Nessuna verifica presente da esportare in ZIP.");
+      setAppAlert({ msg: "Nessuna verifica presente da esportare in ZIP." });
       return;
     }
     setIsExportingZip(true);
@@ -2389,16 +2294,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-      URL.revokeObjectURL(url);
+      setTimeout(() => URL.revokeObjectURL(url), 100);
 
-      setDeleteNotify({
-        type: "success",
-        message: `✅ Archivio ZIP generato con successo! Scaricati ${subsToExport.length} report PDF per il registro elettronico.`
-      });
-      setTimeout(() => setDeleteNotify(null), 5000);
+      showNotify(
+        "success",
+        `✅ Archivio ZIP generato con successo! Scaricati ${subsToExport.length} report PDF per il registro elettronico.`,
+        5000
+      );
     } catch (err: any) {
       console.error("Errore generazione archivio ZIP:", err);
-      alert(`❌ Errore durante la creazione dello ZIP: ${err?.message || err}`);
+      setAppAlert({ msg: `❌ Errore durante la creazione dello ZIP: ${err?.message || err}` });
     } finally {
       setIsExportingZip(false);
       setZipProgress(null);
@@ -2439,13 +2344,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // Helper to extract clean exam title from a submission
   const getSubmissionExamTitle = (sub: SavedSubmission): string => {
-    if (sub.Domande_Esame) {
-      try {
-        const parsed = typeof sub.Domande_Esame === "string" ? JSON.parse(sub.Domande_Esame) : sub.Domande_Esame;
-        if (parsed && typeof parsed.title === "string" && parsed.title.trim()) {
-          return parsed.title.trim();
-        }
-      } catch {}
+    const parsed = safeParseJson(sub.Domande_Esame);
+    if (parsed && typeof parsed.title === "string" && parsed.title.trim()) {
+      return parsed.title.trim();
     }
     if (sub.Pin) {
       return `Prova con PIN: ${sub.Pin}`;
@@ -2453,17 +2354,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     return sub.Tipo === "Quiz" ? "Quiz Didattico Senza PIN" : "Workbook Didattico Senza PIN";
   };
 
-  // Export single exam roster directly to CSV for class gradebook
-  const handleExportSingleExamCSV = (exam: ExamSummary) => {
+  const downloadCsvFile = (filename: string, headers: string[], rows: Array<Array<unknown>>) => {
     const escapeCSVString = (val: any) => {
       if (val === undefined || val === null) return "";
-      let str = String(val).replace(/"/g, '""');
-      if (str.includes(",") || str.includes("\n") || str.includes('\r') || str.includes('"')) {
+      const str = String(val).replace(/"/g, '""');
+      if (str.includes(",") || str.includes("\n") || str.includes("\r") || str.includes('"')) {
         return `"${str}"`;
       }
       return str;
     };
 
+    const csvContent =
+      "\uFEFF" +
+      [headers.map(escapeCSVString).join(","), ...rows.map((r) => r.map(escapeCSVString).join(","))].join("\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement("a");
+    link.href = url;
+    link.setAttribute("download", filename);
+    document.body.appendChild(link);
+    link.click();
+    document.body.removeChild(link);
+    setTimeout(() => URL.revokeObjectURL(url), 100);
+  };
+
+  // Export single exam roster directly to CSV for class gradebook
+  const handleExportSingleExamCSV = (exam: ExamSummary) => {
     const headers = [
       "Nome Studente",
       "Email",
@@ -2480,53 +2396,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     ];
 
     const rows = exam.submissions.map(sub => [
-      escapeCSVString(sub.Nome || "Anonimo"),
-      escapeCSVString(sub.Email || ""),
-      escapeCSVString(sub.Pin || exam.pin),
-      escapeCSVString(exam.title),
-      escapeCSVString(sub.Tipo || ""),
-      escapeCSVString(displaySubmissionGrade(sub)),
-      escapeCSVString(sub.Autovalutazione || ""),
-      escapeCSVString(sub.AntiCopia_TabSwitch || 0),
-      escapeCSVString(sub.AntiCopia_IncollaBloccato || 0),
-      escapeCSVString(sub.Errori_Principali || ""),
-      escapeCSVString(sub.Feedback_Generale || ""),
-      escapeCSVString(sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "")
+      sub.Nome || "Anonimo",
+      sub.Email || "",
+      sub.Pin || exam.pin,
+      exam.title,
+      sub.Tipo || "",
+      displaySubmissionGrade(sub),
+      sub.Autovalutazione || "",
+      sub.AntiCopia_TabSwitch || 0,
+      sub.AntiCopia_IncollaBloccato || 0,
+      sub.Errori_Principali || "",
+      sub.Feedback_Generale || "",
+      sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : ""
     ]);
 
-    const BOM = "\uFEFF";
-    const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
     const cleanTitle = (exam.pin !== "—" ? `pin_${exam.pin}` : exam.title).toLowerCase().replace(/[^a-z0-9]/g, "_");
-    link.setAttribute("download", `tabellone_voti_${cleanTitle}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 100);
+    downloadCsvFile(`tabellone_voti_${cleanTitle}.csv`, headers, rows);
   };
 
   // Export current list to CSV for Excel / Google Sheets
   const handleExportCSV = () => {
-    // Helper to sanitize cell values correctly
-    const escapeCSVString = (val: any) => {
-      if (val === undefined || val === null) return "";
-      let str = String(val).replace(/"/g, '""'); // Double quotes for escaping
-      if (str.includes(",") || str.includes("\n") || str.includes('\r') || str.includes('"')) {
-        return `"${str}"`;
-      }
-      return str;
-    };
-
-    const BOM = "\uFEFF";
-    const dateFormatted = new Date().toISOString().split('T')[0];
+    const dateFormatted = new Date().toISOString().split("T")[0];
 
     // Branch A: Aggregated Students Export
     if (submissionViewMode === "by_student") {
       if (filteredStudentSummaries.length === 0) {
-        alert("⚠️ Nessun dato studente da esportare con i filtri attuali.");
+        setAppAlert({ msg: "⚠️ Nessun dato studente da esportare con i filtri attuali." });
         return;
       }
       const headers = [
@@ -2543,38 +2438,27 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         "Tentativi Incolla Bloccati Totali"
       ];
       const rows = filteredStudentSummaries.map(stu => [
-        escapeCSVString(stu.name),
-        escapeCSVString(stu.email),
-        escapeCSVString(stu.totalTests),
-        escapeCSVString(stu.quizCount),
-        escapeCSVString(stu.workbookCount),
-        escapeCSVString(stu.averageGradeFormatted),
-        escapeCSVString(
-          stu.latestSubmission ? displaySubmissionGrade(stu.latestSubmission) : ""
-        ),
-        escapeCSVString(stu.latestDate ? new Date(stu.latestDate).toLocaleString("it-IT") : ""),
-        escapeCSVString(stu.uniquePins.join("; ")),
-        escapeCSVString(stu.totalTabSwitches),
-        escapeCSVString(stu.totalPasteAttempts)
+        stu.name,
+        stu.email,
+        stu.totalTests,
+        stu.quizCount,
+        stu.workbookCount,
+        stu.averageGradeFormatted,
+        stu.latestSubmission ? displaySubmissionGrade(stu.latestSubmission) : "",
+        stu.latestDate ? new Date(stu.latestDate).toLocaleString("it-IT") : "",
+        stu.uniquePins.join("; "),
+        stu.totalTabSwitches,
+        stu.totalPasteAttempts
       ]);
 
-      const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `elenco_studenti_prove_fatte_${dateFormatted}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      setTimeout(() => URL.revokeObjectURL(url), 100);
+      downloadCsvFile(`elenco_studenti_prove_fatte_${dateFormatted}.csv`, headers, rows);
       return;
     }
 
     // Branch B: Aggregated Exams Export
     if (submissionViewMode === "by_exam") {
       if (filteredExamSummaries.length === 0) {
-        alert("⚠️ Nessuna prova da esportare con i filtri attuali.");
+        setAppAlert({ msg: "⚠️ Nessuna prova da esportare con i filtri attuali." });
         return;
       }
       const headers = [
@@ -2593,41 +2477,31 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         "Data Ultima Consegna"
       ];
       const rows = filteredExamSummaries.map(ex => [
-        escapeCSVString(ex.pin),
-        escapeCSVString(ex.title),
-        escapeCSVString(ex.tipo),
-        escapeCSVString(ex.totalStudents),
-        escapeCSVString(ex.averageGradeFormatted),
-        escapeCSVString(ex.highestGrade),
-        escapeCSVString(ex.lowestGrade),
-        escapeCSVString(ex.passedCount),
-        escapeCSVString(ex.failedCount),
-        escapeCSVString(`${ex.passRate}%`),
-        escapeCSVString(ex.totalViolations),
-        escapeCSVString(ex.firstDate ? new Date(ex.firstDate).toLocaleString("it-IT") : ""),
-        escapeCSVString(ex.latestDate ? new Date(ex.latestDate).toLocaleString("it-IT") : "")
+        ex.pin,
+        ex.title,
+        ex.tipo,
+        ex.totalStudents,
+        ex.averageGradeFormatted,
+        ex.highestGrade,
+        ex.lowestGrade,
+        ex.passedCount,
+        ex.failedCount,
+        `${ex.passRate}%`,
+        ex.totalViolations,
+        ex.firstDate ? new Date(ex.firstDate).toLocaleString("it-IT") : "",
+        ex.latestDate ? new Date(ex.latestDate).toLocaleString("it-IT") : ""
       ]);
 
-      const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement("a");
-      link.href = url;
-      link.setAttribute("download", `riepilogo_prove_esami_${dateFormatted}.csv`);
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      setTimeout(() => URL.revokeObjectURL(url), 100);
+      downloadCsvFile(`riepilogo_prove_esami_${dateFormatted}.csv`, headers, rows);
       return;
     }
 
     // Branch C: Chronological Submissions Export
     if (filteredSubmissions.length === 0) {
-      alert("⚠️ Nessun dato da esportare con i filtri attuali.");
+      setAppAlert({ msg: "⚠️ Nessun dato da esportare con i filtri attuali." });
       return;
     }
 
-    // Define CSV Headers in Italian for standard school reporting
     const headers = [
       "Nome Studente",
       "Email",
@@ -2642,55 +2516,84 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       "Feedback Generale"
     ];
 
-    // Build Rows
     const rows = filteredSubmissions.map(sub => [
-      escapeCSVString(sub.Nome || "Anonimo"),
-      escapeCSVString(sub.Email || ""),
-      escapeCSVString(sub.Tipo || ""),
-      escapeCSVString(sub.Pin || ""),
-      escapeCSVString(sub.Timestamp || ""),
-      escapeCSVString(displaySubmissionGrade(sub)),
-      escapeCSVString(sub.Autovalutazione || ""),
-      escapeCSVString(sub.AntiCopia_TabSwitch || 0),
-      escapeCSVString(sub.AntiCopia_IncollaBloccato || 0),
-      escapeCSVString(sub.Errori_Principali || ""),
-      escapeCSVString(sub.Feedback_Generale || "")
+      sub.Nome || "Anonimo",
+      sub.Email || "",
+      sub.Tipo || "",
+      sub.Pin || "",
+      sub.Timestamp || "",
+      displaySubmissionGrade(sub),
+      sub.Autovalutazione || "",
+      sub.AntiCopia_TabSwitch || 0,
+      sub.AntiCopia_IncollaBloccato || 0,
+      sub.Errori_Principali || "",
+      sub.Feedback_Generale || ""
     ]);
 
-    const csvContent = BOM + [headers.join(","), ...rows.map(e => e.join(","))].join("\n");
-    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
-    const url = URL.createObjectURL(blob);
-    const link = document.createElement("a");
-    link.href = url;
-    link.setAttribute("download", `registro_voti_alunni_${dateFormatted}.csv`);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 100);
+    downloadCsvFile(`registro_voti_alunni_${dateFormatted}.csv`, headers, rows);
   };
+
+  // Precompute parsed submission metadata once per submissions update instead of re-parsing JSON on every render row
+  const submissionMetaMap = React.useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        displayGrade: string;
+        numericGrade: number;
+        pendingOpen: number;
+        hasDiscrepancy: boolean;
+        totalViolations: number;
+      }
+    >();
+    submissions.forEach((sub) => {
+      const pendingOpen = getPendingSubjectiveCount(sub);
+      const ev = safeParseJson(sub?.Full_Evaluation);
+      const isPending = isEvaluationPending(ev) || pendingOpen > 0;
+      const displayGrade = isPending ? "N.V." : (sub?.Voto_Suggerito || "N/A");
+      const rawNum = isPending ? -1 : parseSubmissionNumericGrade(sub.Voto_Suggerito);
+      const numericGrade = Number.isNaN(rawNum) ? -1 : rawNum;
+      const hasDiscrepancy = hasGradeDiscrepancy(sub);
+      const totalViolations =
+        (sub.AntiCopia_TabSwitch || 0) +
+        (sub.AntiCopia_IncollaBloccato || 0) +
+        (sub.AntiCopia_SchermoDiviso || 0);
+      map.set(sub.id, {
+        displayGrade,
+        numericGrade,
+        pendingOpen,
+        hasDiscrepancy,
+        totalViolations,
+      });
+    });
+    return map;
+  }, [submissions]);
 
   // Submissions filtered list logic (chronological) with multi-sorting
   const filteredSubmissions = React.useMemo(() => {
-    let result = submissions.filter(sub => {
-      const matchesSearch = 
-        (sub.Nome || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (sub.Email || "").toLowerCase().includes(searchQuery.toLowerCase()) ||
-        (sub.Pin || "").toLowerCase().includes(searchQuery.toLowerCase());
-      
+    const q = searchQuery.toLowerCase();
+    const result = submissions.filter(sub => {
+      const matchesSearch =
+        !q ||
+        (sub.Nome || "").toLowerCase().includes(q) ||
+        (sub.Email || "").toLowerCase().includes(q) ||
+        (sub.Pin || "").toLowerCase().includes(q);
+
       if (filterType === "All") return matchesSearch;
       return matchesSearch && sub.Tipo === filterType;
     });
 
     result.sort((a, b) => {
       if (chronologicalSortBy === "grade_desc") {
-        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+        const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
         if (gradeB !== gradeA) return gradeB - gradeA;
         return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
       }
       if (chronologicalSortBy === "grade_asc") {
-        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        const rawA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+        const rawB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+        const gradeA = rawA < 0 ? 99 : rawA;
+        const gradeB = rawB < 0 ? 99 : rawB;
         if (gradeA !== gradeB) return gradeA - gradeB;
         return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
       }
@@ -2698,15 +2601,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return (a.Nome || "").localeCompare(b.Nome || "");
       }
       if (chronologicalSortBy === "violations_desc") {
-        const vA = (a.AntiCopia_TabSwitch || 0) + (a.AntiCopia_IncollaBloccato || 0);
-        const vB = (b.AntiCopia_TabSwitch || 0) + (b.AntiCopia_IncollaBloccato || 0);
+        const vA = submissionMetaMap.get(a.id)?.totalViolations ?? 0;
+        const vB = submissionMetaMap.get(b.id)?.totalViolations ?? 0;
         if (vB !== vA) return vB - vA;
       }
       return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
     });
 
     return result;
-  }, [submissions, searchQuery, filterType, chronologicalSortBy]);
+  }, [submissions, submissionMetaMap, searchQuery, filterType, chronologicalSortBy]);
 
   // Aggregated submissions grouped by student
   const studentSummaries: StudentSummary[] = React.useMemo(() => {
@@ -2749,14 +2652,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         totalTabSwitches += s.AntiCopia_TabSwitch || 0;
         totalPasteAttempts += s.AntiCopia_IncollaBloccato || 0;
 
-        if (s.Voto_Suggerito) {
-          // Single source of truth: same parser used for sorting (handles
-          // "7,5 (8-)", "6½", "10 (Eccellente)", bare "7+" notations)
-          const num = parseSubmissionNumericGrade(s.Voto_Suggerito);
-          if (!isNaN(num) && num >= 1 && num <= 10.5) {
-            numericGradesSum += num;
-            numericGradesCount++;
-          }
+        const num = submissionMetaMap.get(s.id)?.numericGrade ?? -1;
+        if (num >= 1 && num <= 10.5) {
+          numericGradesSum += num;
+          numericGradesCount++;
         }
       });
 
@@ -2770,8 +2669,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           (a, b) => new Date(a.Timestamp).getTime() - new Date(b.Timestamp).getTime()
         );
         const valid = chrono
-          .map((s) => parseSubmissionNumericGrade(s.Voto_Suggerito))
-          .filter((n) => !isNaN(n) && n >= 1 && n <= 10.5);
+          .map((s) => submissionMetaMap.get(s.id)?.numericGrade ?? -1)
+          .filter((n) => n >= 1 && n <= 10.5);
         if (valid.length >= 2) {
           const delta = Math.round((valid[valid.length - 1] - valid[0]) * 10) / 10;
           trend = {
@@ -2801,7 +2700,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return list;
-  }, [submissions]);
+  }, [submissions, submissionMetaMap]);
 
   // Filtered and sorted students list
   const filteredStudentSummaries = React.useMemo(() => {
@@ -2877,10 +2776,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const latestSub = chronologicallySorted[0];
       const oldestSub = chronologicallySorted[chronologicallySorted.length - 1];
 
-      // Sort submissions by AI grade descending (highest to lowest) by default
+      // Sort submissions by validated numeric grade descending (N.V. at bottom)
       examSubs.sort((a, b) => {
-        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+        const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+        const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
         if (gradeB !== gradeA) return gradeB - gradeA;
         return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
       });
@@ -2919,24 +2818,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       let totalViolations = 0;
 
       examSubs.forEach(s => {
-        totalViolations += (s.AntiCopia_TabSwitch || 0) + (s.AntiCopia_IncollaBloccato || 0);
+        const meta = submissionMetaMap.get(s.id);
+        totalViolations += meta?.totalViolations ?? ((s.AntiCopia_TabSwitch || 0) + (s.AntiCopia_IncollaBloccato || 0) + (s.AntiCopia_SchermoDiviso || 0));
 
-        if (s.Voto_Suggerito) {
-          const num = parseSubmissionNumericGrade(s.Voto_Suggerito);
-          if (!isNaN(num) && num >= 1 && num <= 10.5) {
-            numericGradesSum += num;
-            numericGradesCount++;
-            if (num >= 6) passedCount++;
-            else failedCount++;
+        const num = meta?.numericGrade ?? -1;
+        if (num >= 1 && num <= 10.5) {
+          numericGradesSum += num;
+          numericGradesCount++;
+          if (num >= 6) passedCount++;
+          else failedCount++;
 
-            if (num > highestNumeric) {
-              highestNumeric = num;
-              highestGradeStr = String(s.Voto_Suggerito);
-            }
-            if (num < lowestNumeric) {
-              lowestNumeric = num;
-              lowestGradeStr = String(s.Voto_Suggerito);
-            }
+          if (num > highestNumeric) {
+            highestNumeric = num;
+            highestGradeStr = String(s.Voto_Suggerito);
+          }
+          if (num < lowestNumeric) {
+            lowestNumeric = num;
+            lowestGradeStr = String(s.Voto_Suggerito);
           }
         }
       });
@@ -2966,7 +2864,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return list;
-  }, [submissions]);
+  }, [submissions, submissionMetaMap]);
 
   // Filtered and sorted exams list
   const filteredExamSummaries = React.useMemo(() => {
@@ -2999,8 +2897,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return a.pin.localeCompare(b.pin, undefined, { numeric: true });
       }
       if (examSortBy === "highest_avg") {
-        const avgA = a.averageGradeNumber || 0;
-        const avgB = b.averageGradeNumber || 0;
+        const avgA = a.averageGradeNumber ?? -1;
+        const avgB = b.averageGradeNumber ?? -1;
         if (avgB !== avgA) return avgB - avgA;
         return b.totalStudents - a.totalStudents;
       }
@@ -3687,14 +3585,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 )}
               </div>
 
-              {/* Exam library: saved exams reusable across classes/sessions */}
-              <div className="p-3.5 bg-amber-950/30 border border-amber-500/25 rounded-2xl space-y-2.5">
-                <div className="flex items-center justify-between gap-2">
-                  <span className="text-[10px] font-bold uppercase tracking-wider text-amber-300 flex items-center gap-1.5">
-                    <BookOpen className="w-3.5 h-3.5 text-amber-400" />
-                    <span>Libreria verifiche salvate ({library.length})</span>
-                  </span>
-                  <div className="flex items-center gap-1">
+              {/* Personal Exam Library: synced in Cloud Firestore across all devices */}
+              <div className="bg-slate-900/50 border border-white/10 rounded-2xl p-4 space-y-3">
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="min-w-0">
+                    <h3 className="text-xs font-bold text-white flex items-center gap-2">
+                      <BookOpen className="w-3.5 h-3.5 text-teal-400 shrink-0" />
+                      <span>Libreria verifiche salvate</span>
+                      <span className="text-slate-400 font-mono tabular-nums font-normal">
+                        {library.length}
+                      </span>
+                    </h3>
+                    <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">
+                      Sincronizzata nel Cloud · Salva una prova qui e la ritrovi su qualsiasi dispositivo.
+                    </p>
+                  </div>
+
+                  <div className="flex items-center gap-1.5 flex-wrap shrink-0">
                     <input
                       ref={libraryImportRef}
                       type="file"
@@ -3702,12 +3609,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       onChange={handleImportLibraryBackup}
                       className="hidden"
                     />
+                    {jsonText.trim() && (
+                      <button
+                        type="button"
+                        onClick={() => handleSaveToLibrary("Editor")}
+                        disabled={librarySaving}
+                        title="Salva la verifica presente nell'editor dentro la tua libreria"
+                        className="px-2.5 py-1.5 text-[11px] font-semibold text-emerald-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap shrink-0"
+                      >
+                        <PlusCircle className="w-3.5 h-3.5" />
+                        <span>{librarySaving ? "Salvataggio..." : "Salva attuale"}</span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={handleExportLibraryBackup}
                       disabled={libraryLoading || library.length === 0}
-                      title="Esporta tutta la libreria in un file di backup"
-                      className="px-2 py-1 text-[10px] font-bold text-amber-300 hover:text-amber-200 bg-amber-500/10 hover:bg-amber-500/20 border border-amber-500/30 rounded-lg cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1"
+                      title="Esporta tutte le tue verifiche salvate in un file di backup"
+                      className="px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg cursor-pointer transition-colors disabled:opacity-40 flex items-center gap-1 whitespace-nowrap shrink-0"
                     >
                       <Download className="w-3 h-3" />
                       <span>Backup</span>
@@ -3716,8 +3635,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       type="button"
                       onClick={() => libraryImportRef.current?.click()}
                       disabled={libraryLoading}
-                      title="Ripristina un backup esportato da un altro PC"
-                      className="px-2 py-1 text-[10px] font-bold text-teal-300 hover:text-teal-200 bg-teal-500/10 hover:bg-teal-500/20 border border-teal-500/30 rounded-lg cursor-pointer transition-colors disabled:opacity-50"
+                      title="Importa verifiche da un file di backup"
+                      className="px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg cursor-pointer transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
                     >
                       <span>Ripristina</span>
                     </button>
@@ -3725,213 +3644,277 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       type="button"
                       onClick={loadLibrary}
                       disabled={libraryLoading}
-                      title="Ricarica libreria"
-                      className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50"
+                      title="Aggiorna elenco verifiche salvate"
+                      className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50 shrink-0"
                     >
                       <RefreshCw className={`w-3.5 h-3.5 ${libraryLoading ? "animate-spin" : ""}`} />
                     </button>
                   </div>
                 </div>
-                <p className="text-[10px] text-slate-400 leading-normal">
-                  Riusa una verifica già creata (anche da trascrizione SRT o sessione PIN) per altre classi: caricala con un click, cambia PIN o scadenza, e avvia.
-                </p>
 
-                {/* Direct PIN Session Retrieval Bar */}
-                <div className="flex items-center gap-1.5 p-1.5 bg-black/40 border border-amber-500/25 rounded-xl shadow-inner">
-                  <div className="relative flex-1">
-                    <input
-                      type="text"
-                      placeholder="Recupera da PIN Cloud (es. 12)..."
-                      value={recoverPinInput}
-                      onChange={(e) => setRecoverPinInput(e.target.value)}
-                      onKeyDown={(e) => {
-                        if (e.key === "Enter") {
-                          e.preventDefault();
-                          handleFetchExamByPin();
-                        }
-                      }}
-                      className="w-full px-2.5 py-1 text-xs bg-slate-950 border border-white/10 focus:border-amber-400 rounded-lg text-amber-200 placeholder:text-slate-500 outline-none font-mono font-bold uppercase"
-                    />
+                {/* Search & Type Segmented Filter */}
+                {library.length > 0 && (
+                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+                    <div className="relative flex-1">
+                      <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+                      <input
+                        type="text"
+                        placeholder="Cerca verifica per titolo..."
+                        value={librarySearch}
+                        onChange={(e) => setLibrarySearch(e.target.value)}
+                        className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-950/80 border border-white/10 focus:border-teal-400 rounded-lg text-white placeholder:text-slate-500 outline-none transition-colors"
+                      />
+                      {librarySearch && (
+                        <button
+                          type="button"
+                          onClick={() => setLibrarySearch("")}
+                          aria-label="Pulisci ricerca"
+                          className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
+                    <div className="flex items-center p-0.5 bg-slate-950/80 border border-white/10 rounded-lg text-[11px] shrink-0">
+                      {(["all", "Quiz", "Workbook"] as const).map((t) => (
+                        <button
+                          key={t}
+                          type="button"
+                          onClick={() => setLibraryTypeFilter(t)}
+                          className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
+                            libraryTypeFilter === t
+                              ? "bg-teal-500/20 text-teal-300"
+                              : "text-slate-400 hover:text-slate-200"
+                          }`}
+                        >
+                          {t === "all" ? "Tutte" : t}
+                        </button>
+                      ))}
+                    </div>
                   </div>
-                  <button
-                    type="button"
-                    onClick={() => handleFetchExamByPin()}
-                    disabled={isRecoveringPin || !recoverPinInput.trim()}
-                    className="px-2.5 py-1 bg-amber-500/20 hover:bg-amber-500/35 text-amber-300 border border-amber-500/40 text-[11px] font-bold rounded-lg transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-not-allowed shrink-0 flex items-center gap-1"
-                  >
-                    {isRecoveringPin ? (
-                      <RefreshCw className="w-3 h-3 animate-spin" />
-                    ) : (
-                      <Search className="w-3 h-3" />
-                    )}
-                    <span>Recupera PIN</span>
-                  </button>
-                </div>
+                )}
 
                 {libraryMsg && (
-                  <p className="text-[11px] text-amber-100/90 bg-black/30 border border-amber-500/20 rounded-xl p-2 leading-relaxed">
-                    {libraryMsg}
-                  </p>
+                  <div className="flex items-center justify-between gap-2 text-[11px] text-teal-200 bg-teal-950/40 border border-teal-500/25 rounded-lg px-3 py-2 leading-snug">
+                    <span>{libraryMsg}</span>
+                    <button
+                      type="button"
+                      onClick={() => setLibraryMsg(null)}
+                      aria-label="Chiudi avviso libreria"
+                      className="text-teal-300/70 hover:text-white cursor-pointer shrink-0"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
                 )}
+
                 {libraryLoading ? (
-                  <p className="text-[11px] text-slate-400">Caricamento libreria e sincronizzazione sessioni cloud...</p>
+                  <div className="space-y-2 py-1">
+                    <div className="h-12 bg-white/5 rounded-lg animate-pulse" />
+                    <div className="h-12 bg-white/5 rounded-lg animate-pulse" />
+                  </div>
                 ) : library.length === 0 ? (
-                  <p className="text-[11px] text-slate-500 italic">
-                    Ancora vuota: genera una verifica con l'IA, digita un PIN in "Recupera PIN" o premi "Salva in libreria" nell'editor.
-                  </p>
-                ) : (
-                  <div className="space-y-1.5 max-h-56 overflow-y-auto pr-0.5">
-                    {library.map((item) => (
-                      <div
-                        key={item.id}
-                        className="p-2.5 bg-slate-950/60 border border-white/10 rounded-xl space-y-1.5"
-                      >
-                        <div className="flex items-start justify-between gap-2">
-                          <div className="min-w-0 flex-1">
+                  <div className="py-5 px-3 text-center border border-dashed border-white/10 rounded-xl space-y-1.5">
+                    <p className="text-xs font-medium text-slate-300">
+                      Nessuna verifica salvata al momento
+                    </p>
+                    <p className="text-[11px] text-slate-500 max-w-sm mx-auto leading-relaxed">
+                      Genera una prova con l&apos;IA, importala da Google Moduli oppure incolla un JSON nell&apos;editor e premi &ldquo;Salva attuale&rdquo;.
+                    </p>
+                  </div>
+                ) : (() => {
+                  const q = librarySearch.trim().toLowerCase();
+                  const filteredLibrary = library.filter((it) => {
+                    if (libraryTypeFilter !== "all" && it.examType !== libraryTypeFilter) return false;
+                    if (!q) return true;
+                    return (
+                      it.title.toLowerCase().includes(q) ||
+                      (it.source || "").toLowerCase().includes(q)
+                    );
+                  });
+
+                  if (filteredLibrary.length === 0) {
+                    return (
+                      <div className="py-4 px-3 text-center border border-white/10 rounded-xl space-y-2">
+                        <p className="text-xs text-slate-400">
+                          Nessuna verifica corrisponde ai filtri attuali.
+                        </p>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setLibrarySearch("");
+                            setLibraryTypeFilter("all");
+                          }}
+                          className="text-[11px] font-medium text-teal-300 hover:text-teal-200 underline cursor-pointer"
+                        >
+                          Mostra tutte le verifiche
+                        </button>
+                      </div>
+                    );
+                  }
+
+                  return (
+                    <div className="divide-y divide-white/10 max-h-64 overflow-y-auto border border-white/10 rounded-xl bg-slate-950/60">
+                      {filteredLibrary.map((item) => {
+                        const isLoaded = loadedLibraryItemId === item.id;
+                        return (
+                          <div
+                            key={item.id}
+                            className={`px-3 py-2.5 transition-colors hover:bg-white/[0.03] ${
+                              isLoaded ? "bg-teal-500/[0.06]" : ""
+                            }`}
+                          >
                             {renamingLibraryId === item.id ? (
                               <form
                                 onSubmit={(e) => {
                                   e.preventDefault();
                                   handleSaveRename(item);
                                 }}
-                                className="space-y-1 my-0.5"
+                                className="flex items-center gap-1.5"
                               >
-                                <div className="flex items-center gap-1.5">
-                                  <input
-                                    type="text"
-                                    value={renamingTitle}
-                                    onChange={(e) => setRenamingTitle(e.target.value)}
-                                    onKeyDown={(e) => {
-                                      if (e.key === "Escape") {
-                                        e.preventDefault();
-                                        handleCancelRename();
-                                      }
-                                    }}
-                                    autoFocus
-                                    placeholder="Nuovo titolo della prova..."
-                                    className="flex-1 min-w-0 px-2 py-1 text-xs bg-slate-900 border border-teal-400 focus:border-teal-300 rounded-lg text-white font-medium outline-none shadow-inner"
-                                  />
-                                  <button
-                                    type="submit"
-                                    disabled={isSavingRename || !renamingTitle.trim()}
-                                    title="Salva nuovo nome (Invio)"
-                                    className="px-2 py-1 bg-teal-500 hover:bg-teal-400 text-teal-950 font-bold text-[10px] rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 shrink-0 shadow-sm"
-                                  >
-                                    {isSavingRename ? (
-                                      <RefreshCw className="w-3 h-3 animate-spin" />
-                                    ) : (
-                                      <Check className="w-3 h-3" />
+                                <input
+                                  type="text"
+                                  value={renamingTitle}
+                                  onChange={(e) => setRenamingTitle(e.target.value)}
+                                  onKeyDown={(e) => {
+                                    if (e.key === "Escape") {
+                                      e.preventDefault();
+                                      handleCancelRename();
+                                    }
+                                  }}
+                                  autoFocus
+                                  placeholder="Nuovo titolo della verifica..."
+                                  className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-slate-900 border border-teal-400 focus:border-teal-300 rounded-lg text-white font-medium outline-none"
+                                />
+                                <button
+                                  type="submit"
+                                  disabled={isSavingRename || !renamingTitle.trim()}
+                                  className="px-2.5 py-1.5 bg-teal-500 hover:bg-teal-400 text-teal-950 font-bold text-[11px] rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 whitespace-nowrap shrink-0"
+                                >
+                                  {isSavingRename ? (
+                                    <RefreshCw className="w-3 h-3 animate-spin" />
+                                  ) : (
+                                    <Check className="w-3 h-3" />
+                                  )}
+                                  <span>Salva</span>
+                                </button>
+                                <button
+                                  type="button"
+                                  onClick={handleCancelRename}
+                                  disabled={isSavingRename}
+                                  title="Annulla"
+                                  className="p-1.5 text-slate-400 hover:text-white hover:bg-white/10 rounded-lg transition-colors cursor-pointer shrink-0"
+                                >
+                                  <X className="w-3.5 h-3.5" />
+                                </button>
+                              </form>
+                            ) : (
+                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                                <div className="min-w-0 flex-1">
+                                  <div className="flex items-center gap-2 min-w-0">
+                                    <p
+                                      className="text-xs font-semibold text-white truncate"
+                                      title={item.title}
+                                    >
+                                      {item.title}
+                                    </p>
+                                    {isLoaded && (
+                                      <span className="text-[10px] font-medium text-teal-400 whitespace-nowrap shrink-0">
+                                        · In editor
+                                      </span>
                                     )}
-                                    <span>Salva</span>
+                                  </div>
+                                  <p className="text-[11px] text-slate-400 tabular-nums mt-0.5 truncate">
+                                    <span className={item.examType === "Workbook" ? "text-teal-300 font-medium" : "text-indigo-300 font-medium"}>
+                                      {item.examType}
+                                    </span>
+                                    <span aria-hidden="true"> · </span>
+                                    <span>{item.questionCount} quesiti</span>
+                                    {formatLibraryDate(item.updatedAt) && (
+                                      <>
+                                        <span aria-hidden="true"> · </span>
+                                        <span>{formatLibraryDate(item.updatedAt)}</span>
+                                      </>
+                                    )}
+                                    {item.source && (
+                                      <>
+                                        <span aria-hidden="true"> · </span>
+                                        <span>{item.source}</span>
+                                      </>
+                                    )}
+                                    {item.syncedToCloud === false && (
+                                      <>
+                                        <span aria-hidden="true"> · </span>
+                                        <span className="text-amber-300">Solo locale (sync in sospeso)</span>
+                                      </>
+                                    )}
+                                  </p>
+                                </div>
+
+                                <div className="flex items-center gap-1 shrink-0">
+                                  <button
+                                    type="button"
+                                    onClick={() => handleLoadLibraryItem(item)}
+                                    className="px-2.5 py-1 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 border border-teal-500/30 font-semibold text-[11px] rounded-lg flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
+                                  >
+                                    <Check className="w-3 h-3" />
+                                    <span>Carica</span>
                                   </button>
                                   <button
                                     type="button"
-                                    onClick={handleCancelRename}
-                                    disabled={isSavingRename}
-                                    title="Annulla modifica (Esc)"
-                                    className="p-1 text-slate-400 hover:text-white hover:bg-white/10 rounded-lg transition-colors cursor-pointer shrink-0"
+                                    onClick={() => handleStartRename(item)}
+                                    title={`Rinomina "${item.title}"`}
+                                    className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-white/5 rounded-lg cursor-pointer transition-colors shrink-0"
                                   >
-                                    <X className="w-3.5 h-3.5" />
+                                    <Pencil className="w-3.5 h-3.5" />
                                   </button>
+                                  <button
+                                    type="button"
+                                    onClick={() => handleExportLibraryItem(item)}
+                                    title={`Scarica "${item.title}" (.json)`}
+                                    className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-white/5 rounded-lg cursor-pointer transition-colors shrink-0"
+                                  >
+                                    <Download className="w-3.5 h-3.5" />
+                                  </button>
+                                  {confirmDeleteLibraryId === item.id ? (
+                                    <div className="flex items-center gap-1">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          handleDeleteLibraryItem(item);
+                                          setConfirmDeleteLibraryId(null);
+                                        }}
+                                        className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[10px] rounded-lg cursor-pointer transition-colors whitespace-nowrap"
+                                      >
+                                        Elimina
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => setConfirmDeleteLibraryId(null)}
+                                        className="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] rounded-lg cursor-pointer transition-colors"
+                                      >
+                                        Annulla
+                                      </button>
+                                    </div>
+                                  ) : (
+                                    <button
+                                      type="button"
+                                      onClick={() => setConfirmDeleteLibraryId(item.id)}
+                                      title={`Elimina "${item.title}"`}
+                                      className="p-1.5 text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors shrink-0"
+                                    >
+                                      <Trash2 className="w-3.5 h-3.5" />
+                                    </button>
+                                  )}
                                 </div>
-                              </form>
-                            ) : (
-                              <div className="flex items-center gap-1.5 flex-wrap">
-                                <p className="text-xs font-bold text-white truncate max-w-[200px]" title={item.title}>
-                                  {item.title}
-                                </p>
-                                <button
-                                  type="button"
-                                  onClick={() => handleStartRename(item)}
-                                  title={`Rinomina "${item.title}"`}
-                                  className="p-0.5 text-slate-400 hover:text-teal-300 hover:bg-teal-500/10 rounded cursor-pointer transition-colors"
-                                >
-                                  <Pencil className="w-3 h-3" />
-                                </button>
-                                {item.source?.includes("Cloud") && (
-                                  <span className="px-1.5 py-0.2 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                                    ☁️ Cloud
-                                  </span>
-                                )}
                               </div>
                             )}
-                            <p className="text-[10px] text-slate-400 font-mono mt-0.5">
-                              {item.examType} • {item.questionCount} quesiti • {formatLibraryDate(item.updatedAt)}
-                            </p>
-                            {item.source && (
-                              <p className="text-[10px] text-slate-500 italic">Origine: {item.source}</p>
-                            )}
                           </div>
-                          <span className={`text-[9px] font-bold uppercase px-1.5 py-0.5 rounded border shrink-0 ${
-                            item.examType === "Workbook"
-                              ? "bg-teal-500/15 text-teal-300 border-teal-500/30"
-                              : "bg-indigo-500/15 text-indigo-300 border-indigo-500/30"
-                          }`}>
-                            {item.examType === "Workbook" ? "Workbook" : "Quiz"}
-                          </span>
-                        </div>
-                        <div className="flex items-center gap-1.5">
-                          <button
-                            type="button"
-                            onClick={() => handleLoadLibraryItem(item)}
-                            className="flex-1 py-1.5 px-2 bg-emerald-600/20 hover:bg-emerald-600/30 text-emerald-300 border border-emerald-500/30 font-bold text-[11px] rounded-lg flex items-center justify-center gap-1 cursor-pointer transition-colors"
-                          >
-                            <Check className="w-3.5 h-3.5" />
-                            <span>Carica</span>
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleStartRename(item)}
-                            title={`Rinomina "${item.title}"`}
-                            className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg cursor-pointer transition-colors"
-                          >
-                            <Pencil className="w-3.5 h-3.5" />
-                          </button>
-                          <button
-                            type="button"
-                            onClick={() => handleExportLibraryItem(item)}
-                            title={`Esporta "${item.title}" su file`}
-                            className="p-1.5 text-slate-500 hover:text-teal-300 hover:bg-teal-500/10 rounded-lg cursor-pointer transition-colors"
-                          >
-                            <Download className="w-3.5 h-3.5" />
-                          </button>
-                          {confirmDeleteLibraryId === item.id ? (
-                            <div className="flex items-center gap-1 animate-fadeIn">
-                              <button
-                                type="button"
-                                onClick={() => {
-                                  handleDeleteLibraryItem(item);
-                                  setConfirmDeleteLibraryId(null);
-                                }}
-                                title="Conferma eliminazione definitiva"
-                                className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white font-bold text-[10px] rounded cursor-pointer transition-colors shadow-sm"
-                              >
-                                Elimina?
-                              </button>
-                              <button
-                                type="button"
-                                onClick={() => setConfirmDeleteLibraryId(null)}
-                                title="Annulla"
-                                className="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] rounded cursor-pointer transition-colors"
-                              >
-                                ✕
-                              </button>
-                            </div>
-                          ) : (
-                            <button
-                              type="button"
-                              onClick={() => setConfirmDeleteLibraryId(item.id)}
-                              title={`Elimina "${item.title}" dalla libreria`}
-                              className="p-1.5 text-slate-500 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
-                            >
-                              <Trash2 className="w-3.5 h-3.5" />
-                            </button>
-                          )}
-                        </div>
-                      </div>
-                    ))}
-                  </div>
-                )}
+                        );
+                      })}
+                    </div>
+                  );
+                })()}
               </div>
 
               <button
@@ -4536,13 +4519,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   <div className="grid grid-cols-1 gap-2">
                                     {[...stu.submissions]
                                       .sort((a, b) => {
-                                        const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-                                        const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                        const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                        const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
                                         if (gradeB !== gradeA) return gradeB - gradeA;
                                         return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                       })
                                       .map((sub, idx) => {
-                                      const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
+                                      const meta = submissionMetaMap.get(sub.id);
+                                      const totalViolations = meta?.totalViolations ?? ((sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0));
+                                      const subGradeLabel = meta?.displayGrade ?? displaySubmissionGrade(sub);
                                       return (
                                         <div 
                                           key={sub.id}
@@ -4572,8 +4557,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                           <div className="flex items-center gap-3 w-full sm:w-auto justify-between sm:justify-end">
                                             <div className="text-left sm:text-right">
                                               <span className="text-[10px] text-slate-400 block">Voto</span>
-                                              <span className={`font-extrabold font-mono text-xs ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
-                                                {displaySubmissionGrade(sub)}
+                                              <span className={`font-extrabold font-mono text-xs ${subGradeLabel === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                                {subGradeLabel}
                                               </span>
                                             </div>
 
@@ -4965,14 +4950,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         {[...exam.submissions]
                                           .sort((a, b) => {
                                             if (examRosterSort === "grade_desc") {
-                                              const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-                                              const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                              const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                              const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
                                               if (gradeB !== gradeA) return gradeB - gradeA;
                                               return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                             }
                                             if (examRosterSort === "grade_asc") {
-                                              const gradeA = parseSubmissionNumericGrade(a.Voto_Suggerito);
-                                              const gradeB = parseSubmissionNumericGrade(b.Voto_Suggerito);
+                                              const rawA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                              const rawB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+                                              const gradeA = rawA < 0 ? 99 : rawA;
+                                              const gradeB = rawB < 0 ? 99 : rawB;
                                               if (gradeA !== gradeB) return gradeA - gradeB;
                                               return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                             }
@@ -4982,7 +4969,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                             return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                           })
                                           .map((sub, sIdx) => {
-                                            const violations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
+                                            const meta = submissionMetaMap.get(sub.id);
+                                            const violations = meta?.totalViolations ?? ((sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0));
+                                            const subGradeLabel = meta?.displayGrade ?? displaySubmissionGrade(sub);
                                             return (
                                               <tr key={sub.id} className="hover:bg-white/5 transition-colors">
                                                 <td className="p-2 text-center font-mono font-bold text-xs">
@@ -5007,8 +4996,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                                   </div>
                                                 )}
                                               </td>
-                                              <td className={`p-2 text-center font-extrabold font-mono text-xs sm:text-sm ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
-                                                {displaySubmissionGrade(sub)}
+                                              <td className={`p-2 text-center font-extrabold font-mono text-xs sm:text-sm ${subGradeLabel === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                                {subGradeLabel}
                                               </td>
                                               <td className="p-2 text-center text-indigo-300 font-mono text-xs">
                                                 {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
@@ -5188,8 +5177,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                             </tr>
                           ) : (
                             filteredSubmissions.map((sub, sIdx) => {
-                              const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
-                              const pendingOpen = getPendingSubjectiveCount(sub);
+                              const meta = submissionMetaMap.get(sub.id);
+                              const totalViolations = meta?.totalViolations ?? ((sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0));
+                              const pendingOpen = meta?.pendingOpen ?? 0;
+                              const subGradeLabel = meta?.displayGrade ?? displaySubmissionGrade(sub);
+                              const subHasDiscrepancy = meta?.hasDiscrepancy ?? false;
                               return (
                                 <tr key={sub.id} className="hover:bg-white/5 transition-colors group">
                                   <td className="p-2 sm:p-3 text-center font-mono font-bold text-xs">
@@ -5239,9 +5231,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                     <span className="hidden sm:inline"> {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}</span>
                                   </p>
                                 </td>
-                                <td className={`p-2 sm:p-3 text-center font-display font-extrabold text-xs sm:text-sm ${displaySubmissionGrade(sub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
-                                  {displaySubmissionGrade(sub)}
-                                  {hasGradeDiscrepancy(sub) && (
+                                <td className={`p-2 sm:p-3 text-center font-display font-extrabold text-xs sm:text-sm ${subGradeLabel === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                  {subGradeLabel}
+                                  {subHasDiscrepancy && (
                                     <button
                                       onClick={(e) => {
                                         e.stopPropagation();
@@ -5397,10 +5389,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             <div className="p-6 overflow-y-auto space-y-6 text-slate-100 text-xs leading-relaxed text-left">
               {/* Evaluation suspended banner: never grade a written answer as 0 */}
               {(() => {
-                let ev: any = selectedSub.Full_Evaluation;
-                if (typeof ev === "string") {
-                  try { ev = JSON.parse(ev); } catch { ev = null; }
-                }
+                const ev = safeParseJson(selectedSub.Full_Evaluation);
                 if (!isEvaluationPending(ev)) return null;
                 return (
                   <div className="p-4 bg-rose-500/10 border-2 border-rose-500/40 rounded-xl space-y-2 animate-fadeIn">
@@ -5605,13 +5594,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
               {/* AI Details parsing */}
               {(() => {
-                let evalObj: any = null;
-                try {
-                  evalObj = typeof selectedSub.Full_Evaluation === "string" 
-                    ? JSON.parse(selectedSub.Full_Evaluation) 
-                    : selectedSub.Full_Evaluation;
-                } catch {}
-
+                const evalObj = safeParseJson(selectedSub.Full_Evaluation);
                 if (!evalObj) return null;
 
                 return (
@@ -5652,21 +5635,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     <div className="space-y-3 pt-2">
                       <p className="font-bold uppercase tracking-wider text-[10px] text-slate-400">Dettaglio Risposte & Correzioni Singole:</p>
                       {(() => {
-                        let ansObj: any = {};
-                        try {
-                          ansObj = typeof selectedSub.Risposte_Studente === "string" 
-                            ? JSON.parse(selectedSub.Risposte_Studente) 
-                            : selectedSub.Risposte_Studente;
-                        } catch {}
-
-                        let domandeObj: any = null;
-                        if (selectedSub.Domande_Esame) {
-                          try {
-                            domandeObj = typeof selectedSub.Domande_Esame === "string"
-                              ? JSON.parse(selectedSub.Domande_Esame)
-                              : selectedSub.Domande_Esame;
-                          } catch {}
-                        }
+                        const ansObj = safeParseJson(selectedSub.Risposte_Studente) || {};
+                        const domandeObj = safeParseJson(selectedSub.Domande_Esame);
 
                         if (selectedSub.Tipo === "Quiz") {
                           const mcqList = domandeObj?.multipleChoice || [];
@@ -5877,11 +5847,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         isOpen={showAiModal}
         onClose={() => setShowAiModal(false)}
         onApplyExam={(generatedJson, newTitle) => {
+          setLoadedLibraryItemId(null);
           setJsonText(generatedJson);
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
-          // Keep a history copy so it can be reused for other classes
-          handleSaveToLibrary("Generatore IA", generatedJson, newTitle);
+          handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { asNew: true });
         }}
       />
 
@@ -5891,10 +5861,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         onClose={() => setShowFormsModal(false)}
         defaultTitle={materia.trim() || undefined}
         onApplyExam={(importedJson, importedTitle) => {
+          setLoadedLibraryItemId(null);
           setJsonText(importedJson);
           if (importedTitle) setMateria(importedTitle);
           validateExamJSON(importedJson);
-          handleSaveToLibrary("Google Moduli", importedJson, importedTitle);
+          handleSaveToLibrary("Google Moduli", importedJson, importedTitle, { asNew: true });
         }}
       />
 
@@ -5907,16 +5878,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }}
         submission={printableSub}
         examTitle={materia || printableSub?.Tipo}
-        examImages={(() => {
-          try {
-            const d = typeof printableSub?.Domande_Esame === "string"
-              ? JSON.parse(printableSub.Domande_Esame)
-              : printableSub?.Domande_Esame;
-            return d?.images;
-          } catch {
-            return undefined;
-          }
-        })()}
+        examImages={safeParseJson(printableSub?.Domande_Esame)?.images}
       />
 
       {/* Educational Access & Concurrency Help Modal */}
@@ -6048,6 +6010,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 style={{ width: `${(zipProgress.current / zipProgress.total) * 100}%` }}
               />
             </div>
+          </div>
+        </div>
+      )}
+
+      {appAlert && (
+        <div className="fixed inset-0 bg-slate-950/80 z-[9999] flex flex-col justify-center items-center p-6 text-center leading-relaxed backdrop-blur-sm">
+          <div className="bg-slate-900 border border-white/10 rounded-2xl p-6 max-w-md w-full shadow-2xl">
+            <p className="text-sm text-slate-100 mb-6 whitespace-pre-line text-left">
+              {appAlert.msg}
+            </p>
+            <button
+              type="button"
+              onClick={() => setAppAlert(null)}
+              className="px-8 py-2.5 bg-white text-slate-950 font-bold hover:bg-slate-100 rounded-xl transition-colors shadow-lg cursor-pointer active:scale-95"
+            >
+              OK
+            </button>
           </div>
         </div>
       )}
