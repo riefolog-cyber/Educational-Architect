@@ -835,3 +835,155 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
     } as NewLibraryExam;
   });
 }
+
+// ---- Cross-teacher Exam Sharing via Short Code (Firestore 'shared_exams') ----
+
+function generateShareCode(): string {
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // unambiguous characters
+  let code = "";
+  for (let i = 0; i < 8; i++) {
+    code += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return code;
+}
+
+export interface SharedExamSummary {
+  shareCode: string;
+  title: string;
+  examType: LibraryExamType;
+  questionCount: number;
+  createdAt: string;
+}
+
+export async function publishSharedExam(
+  item: ExamLibraryItem & { sharedCode?: string },
+  teacherEmail: string
+): Promise<string> {
+  if (!dbFirestore) {
+    throw new Error("Database Cloud non disponibile: impossibile generare il codice di condivisione.");
+  }
+  const existingCode = String((item as any).sharedCode || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  const cleanCode = existingCode.length >= 6 ? existingCode : generateShareCode();
+  const normEmail = normalizeEmail(teacherEmail) || normalizeEmail(item.teacherEmail) || "anon";
+  const nowIso = new Date().toISOString();
+  try {
+    await setDoc(doc(dbFirestore, "shared_exams", cleanCode), {
+      shareCode: cleanCode,
+      teacherEmail: normEmail,
+      title: String(item.title || "Verifica condivisa"),
+      examType: item.examType === "Workbook" ? "Workbook" : "Quiz",
+      examJson: sanitizeWorkbookExamJson(item.examJson),
+      questionCount: Number(item.questionCount) || 0,
+      createdAt: nowIso,
+    });
+    // Persist sharedCode on the library item when possible so future clicks reuse it
+    try {
+      await setDoc(
+        doc(dbFirestore, "exam_library", item.id),
+        { sharedCode: cleanCode, updatedAt: nowIso },
+        { merge: true }
+      );
+    } catch {}
+    return cleanCode;
+  } catch (err) {
+    if (isPermissionDeniedError(err)) {
+      handleFirestoreError(err, OperationType.WRITE, `shared_exams/${cleanCode}`);
+    }
+    throw err;
+  }
+}
+
+export async function listMySharedExams(teacherEmail: string): Promise<SharedExamSummary[]> {
+  if (!dbFirestore || !teacherEmail) return [];
+  const normEmail = normalizeEmail(teacherEmail);
+  try {
+    const { query: fsQuery, where: fsWhere } = await import("firebase/firestore");
+    const q = fsQuery(collection(dbFirestore, "shared_exams"), fsWhere("teacherEmail", "==", normEmail));
+    const snap = await getDocs(q);
+    return snap.docs
+      .map((d) => {
+        const data = d.data() as any;
+        return {
+          shareCode: String(data.shareCode || d.id),
+          title: String(data.title || "Verifica condivisa"),
+          examType: data.examType === "Workbook" ? "Workbook" : "Quiz",
+          questionCount: Number(data.questionCount) || 0,
+          createdAt: String(data.createdAt || ""),
+        } as SharedExamSummary;
+      })
+      .sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
+  } catch {
+    return [];
+  }
+}
+
+export async function revokeSharedExam(shareCode: string): Promise<void> {
+  if (!dbFirestore) return;
+  const cleanCode = String(shareCode || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  if (!cleanCode) return;
+  try {
+    await deleteDoc(doc(dbFirestore, "shared_exams", cleanCode));
+  } catch (err) {
+    if (isPermissionDeniedError(err)) {
+      handleFirestoreError(err, OperationType.DELETE, `shared_exams/${cleanCode}`);
+    }
+    throw err;
+  }
+}
+
+export async function importSharedExamByCode(
+  rawCode: string,
+  teacherEmail: string
+): Promise<{ title: string; questionCount: number; saveResult: SaveLibraryResult }> {
+  if (!dbFirestore) {
+    throw new Error("Database Cloud non disponibile: impossibile recuperare la verifica condivisa.");
+  }
+  const cleanCode = String(rawCode || "")
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]/g, "");
+  if (cleanCode.length < 6) {
+    throw new Error("Inserisci un codice di condivisione valido (almeno 6 caratteri).");
+  }
+
+  let snap;
+  try {
+    snap = await getDoc(doc(dbFirestore, "shared_exams", cleanCode));
+  } catch (err) {
+    if (isPermissionDeniedError(err)) {
+      handleFirestoreError(err, OperationType.GET, `shared_exams/${cleanCode}`);
+    }
+    throw err;
+  }
+
+  if (!snap.exists()) {
+    throw new Error(`Nessuna verifica trovata con il codice "${cleanCode}". Controlla che il collega lo abbia copiato correttamente.`);
+  }
+
+  const data = snap.data() as any;
+  if (!data?.examJson) {
+    throw new Error("La verifica condivisa non contiene dati validi.");
+  }
+
+  const parsed = JSON.parse(data.examJson);
+  const { type, count } = countLibraryQuestions(parsed);
+  const title = String(data.title || parsed?.title || `Verifica condivisa (${cleanCode})`);
+  const saveResult = await saveLibraryExam({
+    teacherEmail,
+    title,
+    examType: data.examType === "Workbook" || type === "Workbook" ? "Workbook" : "Quiz",
+    examJson: data.examJson,
+    source: `Condivisa da collega (${cleanCode})`,
+    questionCount: Number(data.questionCount) || count,
+  });
+
+  return { title, questionCount: Number(data.questionCount) || count, saveResult };
+}
+
+

@@ -15,7 +15,10 @@ import {
   getPendingSubjectiveCount,
   auditSubjectiveEvaluation,
   isEvaluationPending,
+  sanitizeAiHtml,
 } from "../src/utils";
+import { computeExamItemAnalysis } from "../src/utils/examAnalytics";
+import { stripExamAnswers, restoreExamAnswers } from "../src/utils/examSecurity";
 
 let passed = 0;
 let failed = 0;
@@ -649,6 +652,168 @@ test("isEvaluationPending: riconosce il blocco e non declassa le valutazioni AI"
   assert.equal(isEvaluationPending({ requiresManualReview: true }), true);
   assert.equal(isEvaluationPending({ evaluationMode: "ai" }), false);
   assert.equal(isEvaluationPending(null), false);
+});
+
+// ---------- Per-question Item Analysis ----------
+
+test("computeExamItemAnalysis: rileva distrattori errati, media aperte e argomenti deboli", () => {
+  const examData = {
+    multipleChoice: [
+      { id: "mc1", question: "Capitale d'Italia", options: ["Roma", "Milano", "Napoli"], correctIndex: 0 },
+      { id: "mc2", question: "Anno Costituzione", options: ["1946", "1948", "1950"], correctIndex: 1 },
+    ],
+    openEnded: [
+      { id: "oe1", question: "Spiega l'art. 3" },
+    ],
+  };
+  const baseDomande = JSON.stringify(examData);
+  const subs: any[] = [
+    {
+      id: "s1",
+      Tipo: "Quiz",
+      Domande_Esame: baseDomande,
+      Risposte_Studente: JSON.stringify({ mc: { mc1: 0, mc2: 0 }, oe: { oe1: "Uguaglianza" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 4 }] }),
+    },
+    {
+      id: "s2",
+      Tipo: "Quiz",
+      Domande_Esame: baseDomande,
+      Risposte_Studente: JSON.stringify({ mc: { mc1: 0, mc2: 0 }, oe: { oe1: "Diritti" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 5 }] }),
+    },
+    {
+      id: "s3",
+      Tipo: "Quiz",
+      Domande_Esame: baseDomande,
+      Risposte_Studente: JSON.stringify({ mc: { mc1: 0, mc2: 1 }, oe: { oe1: "" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 4.5 }] }),
+    },
+  ];
+  const analysis = computeExamItemAnalysis(subs);
+  assert.equal(analysis.totalSubmissions, 3);
+  assert.equal(analysis.mcStats.length, 2);
+  assert.equal(analysis.mcStats[0].accuracyPercent, 100);
+  assert.equal(analysis.mcStats[0].needsReview, false);
+  assert.equal(analysis.mcStats[1].accuracyPercent, 33);
+  assert.equal(analysis.mcStats[1].needsReview, true);
+  assert.equal(analysis.mcStats[1].topWrongOption?.text, "1946");
+  assert.equal(analysis.mcStats[1].topWrongOption?.count, 2);
+  assert.equal(analysis.subjectiveStats.length, 1);
+  near(analysis.subjectiveStats[0].averageScore!, 4.5);
+  assert.equal(analysis.subjectiveStats[0].needsReview, true);
+  assert.equal(analysis.weakTopicsCount, 2);
+});
+
+test("computeExamItemAnalysis: gestisce workbook FIB e riflessioni", () => {
+  const wbData = {
+    sections: [
+      {
+        fillInTheBlank: [{ id: "f1", sentence: "La ___ tutela i diritti", answer: "Costituzione" }],
+        reflectionQuestions: [{ id: "r1", question: "Riflessione" }],
+      },
+    ],
+  };
+  const subs: any[] = [
+    {
+      id: "w1",
+      Tipo: "Workbook",
+      Domande_Esame: JSON.stringify(wbData),
+      Risposte_Studente: JSON.stringify({ wbFib: { f1: "legge" }, wbRq: { r1: "Bene" } }),
+      Full_Evaluation: JSON.stringify({ reflectionDetails: [{ id: "r1", score: 8 }] }),
+    },
+    {
+      id: "w2",
+      Tipo: "Workbook",
+      Domande_Esame: JSON.stringify(wbData),
+      Risposte_Studente: JSON.stringify({ wbFib: { f1: "Costituzione" }, wbRq: { r1: "Ottimo" } }),
+      Full_Evaluation: JSON.stringify({ reflectionDetails: [{ id: "r1", score: 9 }] }),
+    },
+  ];
+  const analysis = computeExamItemAnalysis(subs);
+  assert.equal(analysis.fibStats.length, 1);
+  assert.equal(analysis.fibStats[0].accuracyPercent, 50);
+  assert.equal(analysis.fibStats[0].needsReview, false);
+  assert.equal(analysis.fibStats[0].topWrongAnswer?.text, "legge");
+  near(analysis.subjectiveStats[0].averageScore!, 8.5);
+  assert.equal(analysis.weakTopicsCount, 0);
+});
+
+// ---------- Exam Security & HTML Sanitization ----------
+
+test("stripExamAnswers & restoreExamAnswers: rimuove chiavi, maschera [parola] e rimappa opzioni mescolate", () => {
+  const originalExam = {
+    title: "Verifica Storia",
+    multipleChoice: [
+      {
+        id: "mc1",
+        question: "Capitale d'Italia?",
+        options: ["Milano", "Roma", "Napoli"],
+        correctIndex: 1,
+        explanation: "Roma è capitale dal 1871",
+      },
+    ],
+    sections: [
+      {
+        title: "Sezione 1",
+        multipleChoice: [
+          {
+            id: "wbmc1",
+            question: "Anno Costituzione?",
+            options: ["1946", "1948", "1950"],
+            correctIndex: 1,
+            explanation: "Entrata in vigore 1 gennaio 1948",
+          },
+        ],
+        fillInTheBlank: [
+          { id: "f1", sentence: "La [Costituzione] tutela i diritti.", answer: "Costituzione" },
+          { id: "f2", sentence: "L'Italia è una [Repubblica] democratica." },
+        ],
+      },
+    ],
+  };
+
+  const { sanitizedExam, answerKey } = stripExamAnswers(originalExam);
+
+  // Student-facing payload must contain zero solutions
+  assert.equal(sanitizedExam.multipleChoice[0].correctIndex, undefined);
+  assert.equal(sanitizedExam.multipleChoice[0].explanation, undefined);
+  assert.equal(sanitizedExam.sections[0].multipleChoice[0].correctIndex, undefined);
+  assert.equal(sanitizedExam.sections[0].multipleChoice[0].explanation, undefined);
+  assert.equal(sanitizedExam.sections[0].fillInTheBlank[0].answer, undefined);
+  assert.equal(sanitizedExam.sections[0].fillInTheBlank[0].sentence, "La ___ tutela i diritti.");
+  assert.equal(sanitizedExam.sections[0].fillInTheBlank[1].answer, undefined);
+  assert.equal(sanitizedExam.sections[0].fillInTheBlank[1].sentence, "L'Italia è una ___ democratica.");
+
+  // Extracted key stores all answers
+  assert.equal(answerKey.mc.mc1, 1);
+  assert.equal(answerKey.mc.wbmc1, 1);
+  assert.equal(answerKey.fib.f1, "Costituzione");
+  assert.equal(answerKey.fib.f2, "Repubblica");
+
+  // Simulate per-student option shuffling: [2, 0, 1] -> original idx 1 ("Roma") is now at shuffled idx 2
+  const studentExam = JSON.parse(JSON.stringify(sanitizedExam));
+  studentExam.multipleChoice[0].options = ["Napoli", "Milano", "Roma"];
+  const mcOptionOrder = { mc1: [2, 0, 1], wbmc1: [1, 2, 0] };
+
+  const restored = restoreExamAnswers(studentExam, answerKey, mcOptionOrder);
+  assert.equal(restored.multipleChoice[0].correctIndex, 2);
+  assert.equal(restored.multipleChoice[0].explanation, "Roma è capitale dal 1871");
+  assert.equal(restored.sections[0].multipleChoice[0].correctIndex, 0);
+  assert.equal(restored.sections[0].fillInTheBlank[0].answer, "Costituzione");
+  assert.equal(restored.sections[0].fillInTheBlank[1].answer, "Repubblica");
+});
+
+test("sanitizeAiHtml: blocca script/handler/javascript: ma preserva HTML didattico", () => {
+  const dirty = `<h3>Analisi</h3><p onclick="alert(1)">Testo <strong>sicuro</strong></p><script>evil()</script><a href="javascript:steal()">link</a><iframe src="https://x.test"></iframe>`;
+  const clean = sanitizeAiHtml(dirty);
+  assert.ok(!clean.includes("<script"));
+  assert.ok(!clean.includes("evil()"));
+  assert.ok(!clean.includes("onclick"));
+  assert.ok(!clean.includes("javascript:"));
+  assert.ok(!clean.includes("<iframe"));
+  assert.ok(clean.includes("<h3>Analisi</h3>"));
+  assert.ok(clean.includes("<strong>sicuro</strong>"));
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

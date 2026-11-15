@@ -1,32 +1,119 @@
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
+    // --- Authentication & Role Helpers ---
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isPrimaryTeacher() {
+      return isSignedIn() && (
+        request.auth.token.email.lower() == 'riefolog@gmail.com' ||
+        request.auth.token.email.lower() == 'riefolo.giovanni@ferrarisfermiclass.it'
+      );
+    }
+
+    function isTeacher() {
+      return isPrimaryTeacher() || (
+        isSignedIn() && (
+          exists(/databases/$(database)/documents/docenti/$(request.auth.token.email)) ||
+          exists(/databases/$(database)/documents/docenti/$(request.auth.token.email.lower())) ||
+          exists(/databases/$(database)/documents/docenti/$(request.auth.uid))
+        )
+      );
+    }
+
+    // --- Validation Helpers ---
+    function isValidExamLibraryItem(data) {
+      return data is map &&
+        data.keys().hasAll(['id', 'title', 'examJson']) &&
+        data.id is string && data.id.size() > 0 && data.id.size() <= 120 &&
+        data.title is string && data.title.size() > 0 && data.title.size() <= 300 &&
+        data.examJson is string && data.examJson.size() > 2 && data.examJson.size() <= 900000;
+    }
+
+    function isValidSharedExam(data) {
+      return data is map &&
+        data.keys().hasAll(['shareCode', 'teacherEmail', 'title', 'examType', 'examJson']) &&
+        data.shareCode is string && data.shareCode.size() >= 6 && data.shareCode.size() <= 16 &&
+        data.teacherEmail is string && data.teacherEmail.size() > 0 && data.teacherEmail.size() <= 200 &&
+        data.title is string && data.title.size() > 0 && data.title.size() <= 300 &&
+        data.examType in ['Quiz', 'Workbook'] &&
+        data.examJson is string && data.examJson.size() > 2 && data.examJson.size() <= 900000;
+    }
+
+    function isValidSubmissionCreate(data) {
+      return data is map &&
+        data.keys().hasAll(['Timestamp', 'Tipo', 'Email', 'Voto_Suggerito']) &&
+        data.Timestamp is string && data.Timestamp.size() > 0 && data.Timestamp.size() <= 64 &&
+        data.Tipo in ['Quiz', 'Workbook'] &&
+        data.Email is string && data.Email.size() > 0 && data.Email.size() <= 200 &&
+        data.Voto_Suggerito is string && data.Voto_Suggerito.size() <= 40 &&
+        (!('Piano_Recupero' in data) || (data.Piano_Recupero is string && data.Piano_Recupero.size() <= 40000));
+    }
+
+    function isStudentRecoveryPlanUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly(['Piano_Recupero']) &&
+        request.resource.data.Piano_Recupero is string &&
+        request.resource.data.Piano_Recupero.size() <= 40000;
+    }
+
+    function isValidLiveStudentWrite(data) {
+      return data is map &&
+        (!('studentEmail' in data) || (data.studentEmail is string && data.studentEmail.size() > 0 && data.studentEmail.size() <= 200)) &&
+        (!('draftAnswersJson' in data) || (data.draftAnswersJson is string && data.draftAnswersJson.size() <= 220000)) &&
+        (!('draftUpdatedAt' in data) || (data.draftUpdatedAt is string && data.draftUpdatedAt.size() <= 64)) &&
+        (!('answeredCount' in data) || data.answeredCount is int) &&
+        (!('totalQuestions' in data) || data.totalQuestions is int);
+    }
+
     // Global Safety Net
     match /{document=**} {
       allow read, write: if false;
     }
 
-    // Collection for authorized teachers
+    // Collection for authorized teachers (only primary super-admins can grant/revoke teacher roles)
     match /docenti/{docId} {
-      allow read, write: if request.auth != null;
+      allow read: if isSignedIn();
+      allow write: if isPrimaryTeacher();
     }
 
     // Library of teacher-saved exams, reusable across classes/sessions
     match /exam_library/{docId} {
-      allow read, write: if true;
+      allow read: if isTeacher();
+      allow create, update: if isTeacher() && isValidExamLibraryItem(request.resource.data);
+      allow delete: if isTeacher();
+    }
+
+    // Cross-teacher exam sharing templates via short code
+    match /shared_exams/{shareCode} {
+      allow get: if isTeacher();
+      allow list: if isTeacher() && resource.data.teacherEmail == request.auth.token.email;
+      allow create, update: if isTeacher() && isValidSharedExam(request.resource.data);
+      allow delete: if isPrimaryTeacher() || (isTeacher() && resource.data.teacherEmail == request.auth.token.email);
     }
 
     // Collection for exam submissions and evaluations
+    // Note: Students read own history and create submissions via Direct Student Access (without Firebase Auth).
+    // Students can only update 'Piano_Recupero'; grades, answers, and deletes require an authenticated teacher.
     match /valutazioni/{valId} {
-      allow read, create, update: if true;
-      allow delete: if request.auth != null;
+      allow read: if true;
+      allow create: if isValidSubmissionCreate(request.resource.data);
+      allow update: if isTeacher() || isStudentRecoveryPlanUpdate();
+      allow delete: if isTeacher();
     }
 
-    // Collection for keeping track of active exam sessions and live classroom progress
+    // Active exam sessions and live classroom progress
+    // Students can look up a single session by PIN ('get') and update their live progress/cloud draft.
+    // Listing all active PINs or modifying/deleting sessions requires an authenticated teacher.
     match /active_sessions/{sessionId} {
-      allow read, write: if true;
-      match /{allChildren=**} {
-        allow read, write: if true;
+      allow get: if true;
+      allow list, create, update, delete: if isTeacher();
+
+      match /live_students/{studentId} {
+        allow get: if true;
+        allow list: if isTeacher();
+        allow write: if isTeacher() || isValidLiveStudentWrite(request.resource.data);
       }
     }
   }

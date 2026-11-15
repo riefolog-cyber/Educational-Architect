@@ -81,5 +81,17 @@ export function handleFirestoreError(error: unknown, operationType: OperationTyp
   throw new Error(JSON.stringify(errInfo));
 }
 
+export async function getAuthHeaders(): Promise<Record<string, string>> {
+  try {
+    const currentUser = auth?.currentUser;
+    if (!currentUser) return {};
+    const token = await currentUser.getIdToken();
+    return token ? { Authorization: `Bearer ${token}` } : {};
+  } catch (err) {
+    console.warn("Impossibile ottenere token auth Firebase:", err);
+    return {};
+  }
+}
+
 export { app, auth, db, dbFirestore, googleProvider };
 export { firebaseConfig };

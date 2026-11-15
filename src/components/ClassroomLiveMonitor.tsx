@@ -15,11 +15,13 @@ import {
   Check,
   Trash2,
   X,
-  StopCircle
+  StopCircle,
+  MessageSquare,
+  Send
 } from "lucide-react";
 import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
-import type { LiveSessionSummary } from "./TeacherDashboard";
+import type { LiveSessionSummary } from "../types";
 
 export interface LiveStudentData {
   id: string;
@@ -27,6 +29,8 @@ export interface LiveStudentData {
   studentEmail: string;
   answeredCount: number;
   totalQuestions: number;
+  mcDoneCount?: number;
+  openDoneCount?: number;
   currentProgressPercent: number;
   tabSwitches: number;
   pasteAttempts: number;
@@ -37,6 +41,8 @@ export interface LiveStudentData {
   locked?: boolean;
   lockReason?: string;
   lockedAt?: string;
+  teacherNotice?: string;
+  teacherNoticeAt?: string;
 }
 
 interface ClassroomLiveMonitorProps {
@@ -85,6 +91,11 @@ export default function ClassroomLiveMonitor({
   const [unlockAllSuccess, setUnlockAllSuccess] = useState(false);
   const [confirmingPin, setConfirmingPin] = useState<string | null>(null);
   const [confirmingAll, setConfirmingAll] = useState(false);
+  const [noticeTargetId, setNoticeTargetId] = useState<string | null>(null);
+  const [noticeText, setNoticeText] = useState("");
+  const [sendingNotice, setSendingNotice] = useState(false);
+  const [noticeSentId, setNoticeSentId] = useState<string | null>(null);
+  const progressChangedAtRef = useRef<Record<string, { answered: number; changedAt: number }>>({});
 
   const timersRef = useRef<number[]>([]);
   const scheduleTimer = (fn: () => void, ms: number) => {
@@ -126,14 +137,22 @@ export default function ClassroomLiveMonitor({
       liveColRef,
       (snapshot) => {
         const list: LiveStudentData[] = [];
+        const now = Date.now();
         snapshot.forEach((docSnap) => {
           const data = docSnap.data();
+          const ansCount = Number(data.answeredCount) || 0;
+          const prevTrack = progressChangedAtRef.current[docSnap.id];
+          if (!prevTrack || prevTrack.answered !== ansCount) {
+            progressChangedAtRef.current[docSnap.id] = { answered: ansCount, changedAt: now };
+          }
           list.push({
             id: docSnap.id,
             studentName: data.studentName || "Studente",
             studentEmail: data.studentEmail || "",
-            answeredCount: Number(data.answeredCount) || 0,
+            answeredCount: ansCount,
             totalQuestions: Number(data.totalQuestions) || 1,
+            mcDoneCount: typeof data.mcDoneCount === "number" ? data.mcDoneCount : undefined,
+            openDoneCount: typeof data.openDoneCount === "number" ? data.openDoneCount : undefined,
             currentProgressPercent: Number(data.currentProgressPercent) || 0,
             tabSwitches: Number(data.tabSwitches) || 0,
             pasteAttempts: Number(data.pasteAttempts) || 0,
@@ -142,7 +161,9 @@ export default function ClassroomLiveMonitor({
             joinedAt: data.joinedAt,
             locked: !!data.locked,
             lockReason: data.lockReason || "",
-            lockedAt: data.lockedAt || ""
+            lockedAt: data.lockedAt || "",
+            teacherNotice: typeof data.teacherNotice === "string" ? data.teacherNotice : undefined,
+            teacherNoticeAt: typeof data.teacherNoticeAt === "string" ? data.teacherNoticeAt : undefined,
           });
         });
 
@@ -344,6 +365,26 @@ export default function ClassroomLiveMonitor({
       console.warn("Rimozione studente non riuscita:", err);
     } finally {
       setRemovingId(null);
+    }
+  };
+
+  const handleSendNotice = async (studentId: string) => {
+    const clean = noticeText.trim();
+    if (!dbFirestore || !pin || !clean || sendingNotice) return;
+    setSendingNotice(true);
+    try {
+      await updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId), {
+        teacherNotice: clean,
+        teacherNoticeAt: new Date().toISOString(),
+      });
+      setNoticeTargetId(null);
+      setNoticeText("");
+      setNoticeSentId(studentId);
+      scheduleTimer(() => setNoticeSentId((prev) => (prev === studentId ? null : prev)), 3500);
+    } catch (err) {
+      console.warn("Invio avviso studente non riuscito:", err);
+    } finally {
+      setSendingNotice(false);
     }
   };
 
@@ -960,186 +1001,282 @@ export default function ClassroomLiveMonitor({
               const isOffline = student.status === "offline";
               const hasAlerts = !isOffline && (student.tabSwitches > 0 || student.pasteAttempts > 0);
               const percent = Math.min(100, Math.max(0, student.currentProgressPercent || 0));
+              const track = progressChangedAtRef.current[student.id];
+              const stagnantMs = track ? currentTime - track.changedAt : 0;
+              const isStuck =
+                !isOffline &&
+                !student.locked &&
+                student.status !== "submitted" &&
+                student.answeredCount < student.totalQuestions &&
+                stagnantMs >= 3 * 60 * 1000;
+              const hasBreakdown =
+                typeof student.mcDoneCount === "number" || typeof student.openDoneCount === "number";
 
               return (
                 <div
                   key={student.id}
-                  className={`p-4 transition-all flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 rounded-2xl mx-2 my-2 border ${
+                  className={`p-4 transition-all flex flex-col gap-3 rounded-2xl mx-2 my-2 border ${
                     student.locked
                       ? "bg-red-950/50 border-red-500/70 ring-2 ring-red-500/40 shadow-lg shadow-red-950/50 hover:bg-red-950/60"
                       : student.status === "submitted"
                       ? "bg-emerald-950/25 border-emerald-500/40 shadow-sm shadow-emerald-950/30 hover:bg-emerald-950/35 hover:border-emerald-500/60"
                       : hasAlerts
                       ? "bg-red-500/5 border-red-500/20 hover:bg-red-500/10"
+                      : isStuck
+                      ? "bg-amber-950/25 border-amber-500/35 hover:bg-amber-950/35"
                       : "bg-slate-900/40 border-white/5 hover:bg-white/[0.04] hover:border-white/15"
                   } ${isOffline && !student.locked ? "opacity-55" : ""}`}
                 >
-                  {/* Student identity */}
-                  <div className="min-w-[220px] max-w-md">
-                    <div className="flex items-center gap-3">
-                      <div
-                        className={`w-3.5 h-3.5 rounded-full shrink-0 ${
-                          student.status === "submitted"
-                            ? "bg-emerald-400 shadow-sm shadow-emerald-400/50"
-                            : student.locked
-                            ? "bg-red-500 animate-ping"
-                            : isOffline
-                            ? "bg-slate-600"
-                            : "bg-teal-400 animate-pulse"
-                        }`}
-                        title={student.locked ? "Prova bloccata" : student.status === "submitted" ? "Prova consegnata con successo" : isOffline ? "Segnale perso: alunno non connesso" : "Connesso e attivo"}
-                      />
-                      <div>
-                        <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
-                          <span>{student.studentName}</span>
-                          {student.status === "submitted" && (
-                            <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
-                              <CheckCircle2 className="w-3 h-3 text-emerald-400" />
-                              Consegnato ✓
-                            </span>
-                          )}
-                          {student.status === "self_evaluating" && (
-                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30">
-                              Autovalutazione
-                            </span>
-                          )}
-                          {student.status === "waiting" && (
-                            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-sky-500/20 text-sky-300 border border-sky-500/30">
-                              In attesa di inizio
-                            </span>
-                          )}
-                          {student.locked && (
-                            <span
-                              className="text-[10px] font-bold px-2.5 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
-                              title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
-                            >
-                              <Lock className="w-3 h-3 text-red-300" />
-                              PROVA BLOCCATA
-                            </span>
-                          )}
-                          {isOffline && (
-                            <span className="text-[10px] font-normal px-2 py-0.5 rounded-lg bg-slate-500/20 text-slate-300 border border-slate-500/30">
-                              {student.locked ? "Riconnessione..." : "Non connesso"}
-                            </span>
-                          )}
-                        </h4>
-                        <p className="text-[10px] text-slate-400 font-mono mt-0.5">{student.studentEmail}</p>
-                      </div>
-                    </div>
-
-                    {/* Prominent lock details banner if student is locked */}
-                    {student.locked && (
-                      <div className="mt-2.5 p-2 rounded-xl bg-red-950/80 border border-red-500/40 text-[11px] text-red-100 flex items-start gap-2">
-                        <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                  <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 w-full">
+                    {/* Student identity */}
+                    <div className="min-w-[220px] max-w-md">
+                      <div className="flex items-center gap-3">
+                        <div
+                          className={`w-3.5 h-3.5 rounded-full shrink-0 ${
+                            student.status === "submitted"
+                              ? "bg-emerald-400 shadow-sm shadow-emerald-400/50"
+                              : student.locked
+                              ? "bg-red-500 animate-ping"
+                              : isOffline
+                              ? "bg-slate-600"
+                              : isStuck
+                              ? "bg-amber-400 animate-pulse"
+                              : "bg-teal-400 animate-pulse"
+                          }`}
+                          title={student.locked ? "Prova bloccata" : student.status === "submitted" ? "Prova consegnata con successo" : isOffline ? "Segnale perso: alunno non connesso" : isStuck ? "Nessun avanzamento negli ultimi 3 minuti" : "Connesso e attivo"}
+                        />
                         <div>
-                          <span className="font-bold text-red-300">Motivo del blocco: </span>
-                          <span className="text-red-100">{student.lockReason || "Perdita di focus dalla finestra o uscita schermo intero"}</span>
-                          {student.lockedAt && (
-                            <span className="text-[10px] text-red-300/80 font-mono ml-2">
-                              (bloccato da {getRelativeTime(student.lockedAt)})
-                            </span>
-                          )}
+                          <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
+                            <span>{student.studentName}</span>
+                            {student.status === "submitted" && (
+                              <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
+                                <CheckCircle2 className="w-3 h-3 text-emerald-400" />
+                                Consegnato ✓
+                              </span>
+                            )}
+                            {student.status === "self_evaluating" && (
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-amber-500/20 text-amber-300 border border-amber-500/30">
+                                Autovalutazione
+                              </span>
+                            )}
+                            {student.status === "waiting" && (
+                              <span className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-sky-500/20 text-sky-300 border border-sky-500/30">
+                                In attesa di inizio
+                              </span>
+                            )}
+                            {isStuck && (
+                              <span
+                                className="text-[10px] font-semibold px-2 py-0.5 rounded-lg bg-amber-500/20 text-amber-200 border border-amber-500/40"
+                                title="Lo studente è fermo sullo stesso numero di risposte da oltre 3 minuti"
+                              >
+                                Fermo &gt;3m
+                              </span>
+                            )}
+                            {student.locked && (
+                              <span
+                                className="text-[10px] font-bold px-2.5 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
+                                title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
+                              >
+                                <Lock className="w-3 h-3 text-red-300" />
+                                PROVA BLOCCATA
+                              </span>
+                            )}
+                            {isOffline && (
+                              <span className="text-[10px] font-normal px-2 py-0.5 rounded-lg bg-slate-500/20 text-slate-300 border border-slate-500/30">
+                                {student.locked ? "Riconnessione..." : "Non connesso"}
+                              </span>
+                            )}
+                          </h4>
+                          <p className="text-[10px] text-slate-400 font-mono mt-0.5">{student.studentEmail}</p>
                         </div>
                       </div>
-                    )}
-                  </div>
 
-                  {/* Progress bar */}
-                  <div className="w-full sm:w-56 space-y-1.5">
-                    <div className="flex items-center justify-between text-[10px] text-slate-400">
-                      <span className="font-medium">Avanzamento:</span>
-                      <span className="font-mono text-white font-bold">
-                        {Math.min(student.answeredCount, student.totalQuestions)}/{student.totalQuestions} ({percent}%)
-                      </span>
+                      {/* Prominent lock details banner if student is locked */}
+                      {student.locked && (
+                        <div className="mt-2.5 p-2 rounded-xl bg-red-950/80 border border-red-500/40 text-[11px] text-red-100 flex items-start gap-2">
+                          <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
+                          <div>
+                            <span className="font-bold text-red-300">Motivo del blocco: </span>
+                            <span className="text-red-100">{student.lockReason || "Perdita di focus dalla finestra o uscita schermo intero"}</span>
+                            {student.lockedAt && (
+                              <span className="text-[10px] text-red-300/80 font-mono ml-2">
+                                (bloccato da {getRelativeTime(student.lockedAt)})
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      )}
                     </div>
-                    <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-white/10 p-0.5">
-                      <div
-                        className={`h-full rounded-full transition-all duration-500 ${
-                          student.status === "submitted"
-                            ? "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-sm shadow-emerald-500/50"
-                            : percent > 75
-                            ? "bg-gradient-to-r from-teal-400 to-emerald-400"
-                            : percent > 40
-                            ? "bg-gradient-to-r from-indigo-500 to-teal-400"
-                            : "bg-indigo-600"
-                        }`}
-                        style={{ width: `${percent}%` }}
-                      />
-                    </div>
-                  </div>
 
-                  {/* Anti-cheat report & Actions */}
-                  <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap justify-between sm:justify-end w-full sm:w-auto">
-                    {student.locked && (
-                      <button
-                        type="button"
-                        onClick={() => handleRemoteUnlock(student.id)}
-                        disabled={unlockingId === student.id}
-                        className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
-                        title={`Sblocca la prova di ${student.studentName} con 1 click`}
-                      >
-                        {unlockSuccessId === student.id ? (
-                          <>
-                            <Check className="w-4 h-4 text-emerald-950" />
-                            <span>Sbloccato ✓</span>
-                          </>
-                        ) : unlockingId === student.id ? (
-                          <>
-                            <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                            <span>Sblocco...</span>
-                          </>
-                        ) : (
-                          <>
-                            <Unlock className="w-3.5 h-3.5" />
-                            <span>Sblocca Alunno</span>
-                          </>
-                        )}
-                      </button>
-                    )}
-                    {student.status === "submitted" ? (
-                      <div className="px-2.5 py-1 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold flex items-center gap-1.5 shadow-xs">
-                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
-                        <span>Consegna Registrata</span>
-                      </div>
-                    ) : hasAlerts ? (
-                      <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
-                        <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                        <span>
-                          {student.tabSwitches > 0 && `${student.tabSwitches} uscite`}
-                          {student.tabSwitches > 0 && student.pasteAttempts > 0 && ", "}
-                          {student.pasteAttempts > 0 && `${student.pasteAttempts} incolla bloccati`}
+                    {/* Progress bar */}
+                    <div className="w-full sm:w-56 space-y-1">
+                      <div className="flex items-center justify-between text-[10px] text-slate-400">
+                        <span className="font-medium">Avanzamento:</span>
+                        <span className="font-mono text-white font-bold">
+                          {Math.min(student.answeredCount, student.totalQuestions)}/{student.totalQuestions} ({percent}%)
                         </span>
                       </div>
-                    ) : isOffline ? (
-                      <div className="px-2.5 py-1 rounded-xl bg-slate-500/10 border border-slate-500/20 text-slate-400 text-[10px] font-medium flex items-center gap-1">
-                        <Clock className="w-3 h-3" />
-                        <span>Segnale perso</span>
+                      <div className="h-2.5 w-full bg-slate-950 rounded-full overflow-hidden border border-white/10 p-0.5">
+                        <div
+                          className={`h-full rounded-full transition-all duration-500 ${
+                            student.status === "submitted"
+                              ? "bg-gradient-to-r from-emerald-500 to-teal-400 shadow-sm shadow-emerald-500/50"
+                              : percent > 75
+                              ? "bg-gradient-to-r from-teal-400 to-emerald-400"
+                              : percent > 40
+                              ? "bg-gradient-to-r from-indigo-500 to-teal-400"
+                              : "bg-indigo-600"
+                          }`}
+                          style={{ width: `${percent}%` }}
+                        />
                       </div>
-                    ) : (
-                      <div className="px-2.5 py-1 rounded-xl bg-teal-500/10 border border-teal-500/20 text-teal-300 text-[10px] font-medium flex items-center gap-1.5">
-                        <Activity className="w-3 h-3 text-teal-400 animate-pulse" />
-                        <span>In prova regolare</span>
-                      </div>
-                    )}
+                      {hasBreakdown && (
+                        <div className="flex items-center justify-between text-[10px] font-mono text-slate-400">
+                          <span>Chiuse: <b className="text-slate-200">{student.mcDoneCount ?? 0}</b></span>
+                          <span>Aperte: <b className="text-slate-200">{student.openDoneCount ?? 0}</b></span>
+                        </div>
+                      )}
+                    </div>
 
-                    {/* Relative heartbeat */}
-                    <span className="text-[10px] text-slate-500 font-mono w-16 text-right shrink-0">
-                      {getRelativeTime(student.lastHeartbeat)}
-                    </span>
+                    {/* Anti-cheat report & Actions */}
+                    <div className="flex items-center gap-2 flex-wrap sm:flex-nowrap justify-between sm:justify-end w-full sm:w-auto">
+                      {student.locked && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemoteUnlock(student.id)}
+                          disabled={unlockingId === student.id}
+                          className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
+                          title={`Sblocca la prova di ${student.studentName} con 1 click`}
+                        >
+                          {unlockSuccessId === student.id ? (
+                            <>
+                              <Check className="w-4 h-4 text-emerald-950" />
+                              <span>Sbloccato ✓</span>
+                            </>
+                          ) : unlockingId === student.id ? (
+                            <>
+                              <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                              <span>Sblocco...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Unlock className="w-3.5 h-3.5" />
+                              <span>Sblocca Alunno</span>
+                            </>
+                          )}
+                        </button>
+                      )}
+                      {student.status === "submitted" ? (
+                        <div className="px-2.5 py-1 rounded-xl bg-emerald-500/20 border border-emerald-500/40 text-emerald-300 text-[11px] font-semibold flex items-center gap-1.5 shadow-xs">
+                          <CheckCircle2 className="w-3.5 h-3.5 text-emerald-400 shrink-0" />
+                          <span>Consegna Registrata</span>
+                        </div>
+                      ) : hasAlerts ? (
+                        <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
+                          <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                          <span>
+                            {student.tabSwitches > 0 && `${student.tabSwitches} uscite`}
+                            {student.tabSwitches > 0 && student.pasteAttempts > 0 && ", "}
+                            {student.pasteAttempts > 0 && `${student.pasteAttempts} incolla bloccati`}
+                          </span>
+                        </div>
+                      ) : isOffline ? (
+                        <div className="px-2.5 py-1 rounded-xl bg-slate-500/10 border border-slate-500/20 text-slate-400 text-[10px] font-medium flex items-center gap-1">
+                          <Clock className="w-3 h-3" />
+                          <span>Segnale perso</span>
+                        </div>
+                      ) : (
+                        <div className="px-2.5 py-1 rounded-xl bg-teal-500/10 border border-teal-500/20 text-teal-300 text-[10px] font-medium flex items-center gap-1.5">
+                          <Activity className="w-3 h-3 text-teal-400 animate-pulse" />
+                          <span>In prova regolare</span>
+                        </div>
+                      )}
 
-                    {/* Remove single student button (for offline, finished or ghost entries) */}
-                    {(isOffline || student.status === "submitted") && (
-                      <button
-                        type="button"
-                        onClick={() => handleRemoveStudent(student.id)}
-                        disabled={removingId === student.id}
-                        title={`Rimuovi ${student.studentName} da questo monitor d'aula`}
-                        className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-40"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    )}
+                      {student.status !== "submitted" && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            if (noticeTargetId === student.id) {
+                              setNoticeTargetId(null);
+                              setNoticeText("");
+                            } else {
+                              setNoticeTargetId(student.id);
+                              setNoticeText(student.teacherNotice || "");
+                            }
+                          }}
+                          title={`Invia un messaggio mirato a ${student.studentName}`}
+                          className={`px-2 py-1 rounded-lg text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-colors shrink-0 ${
+                            noticeSentId === student.id
+                              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                              : noticeTargetId === student.id
+                              ? "bg-indigo-500/25 text-indigo-200 border border-indigo-400/40"
+                              : "bg-white/5 hover:bg-indigo-500/15 text-slate-300 hover:text-indigo-200 border border-white/10"
+                          }`}
+                        >
+                          {noticeSentId === student.id ? <Check className="w-3 h-3" /> : <MessageSquare className="w-3 h-3" />}
+                          <span>{noticeSentId === student.id ? "Inviato" : "Avviso"}</span>
+                        </button>
+                      )}
+
+                      {/* Relative heartbeat */}
+                      <span className="text-[10px] text-slate-500 font-mono w-16 text-right shrink-0">
+                        {getRelativeTime(student.lastHeartbeat)}
+                      </span>
+
+                      {/* Remove single student button (for offline, finished or ghost entries) */}
+                      {(isOffline || student.status === "submitted") && (
+                        <button
+                          type="button"
+                          onClick={() => handleRemoveStudent(student.id)}
+                          disabled={removingId === student.id}
+                          title={`Rimuovi ${student.studentName} da questo monitor d'aula`}
+                          className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-40"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                        </button>
+                      )}
+                    </div>
                   </div>
+
+                  {noticeTargetId === student.id && (
+                    <form
+                      onSubmit={(e) => {
+                        e.preventDefault();
+                        handleSendNotice(student.id);
+                      }}
+                      className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-2 border-t border-white/10"
+                    >
+                      <input
+                        type="text"
+                        value={noticeText}
+                        onChange={(e) => setNoticeText(e.target.value)}
+                        placeholder={`Scrivi un avviso rapido a ${student.studentName} (es. 'Mancano 5 minuti, procedi alla consegna')...`}
+                        maxLength={240}
+                        autoFocus
+                        className="flex-1 px-3 py-1.5 text-xs bg-slate-950 border border-indigo-400/40 focus:border-indigo-400 rounded-lg text-white outline-none"
+                      />
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="submit"
+                          disabled={sendingNotice || !noticeText.trim()}
+                          className="px-3 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                        >
+                          <Send className="w-3 h-3" />
+                          <span>{sendingNotice ? "Invio..." : "Invia"}</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setNoticeTargetId(null);
+                            setNoticeText("");
+                          }}
+                          className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 cursor-pointer"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </form>
+                  )}
                 </div>
               );
             })}

@@ -160,3 +160,117 @@ export interface SavedSubmission {
   Session_Id?: string;   // Unique run id of the live session (separates classes reusing the same PIN)
   Session_Titolo?: string;
 }
+
+export interface LiveSessionSummary {
+  pin: string;
+  title: string;
+  expiry: string | null;
+  createdAt: string | null;
+  sessionId: string;
+  active: boolean;
+  teacherEmail: string;
+  /** 6-digit code the teacher gives to a student whose exam was locked. */
+  unlockCode?: string;
+}
+
+export interface ExamSummary {
+  key: string;
+  pin: string;
+  title: string;
+  tipo: 'Quiz' | 'Workbook' | 'Misto';
+  submissions: SavedSubmission[];
+  totalStudents: number;
+  latestDate: string;
+  firstDate: string;
+  averageGradeNumber: number | null;
+  averageGradeFormatted: string;
+  highestGrade: string;
+  lowestGrade: string;
+  passedCount: number;
+  failedCount: number;
+  passRate: number;
+  totalViolations: number;
+}
+
+export interface StudentSummary {
+  key: string;
+  name: string;
+  email: string;
+  submissions: SavedSubmission[];
+  totalTests: number;
+  quizCount: number;
+  workbookCount: number;
+  latestDate: string;
+  latestSubmission: SavedSubmission;
+  averageGradeNumber: number | null;
+  averageGradeFormatted: string;
+  trend: { dir: 'up' | 'down' | 'same'; delta: number } | null;
+  uniquePins: string[];
+  totalTabSwitches: number;
+  totalPasteAttempts: number;
+}
+
+export interface SharedExamRecord {
+  shareCode: string;
+  teacherEmail: string;
+  title: string;
+  examType: 'Quiz' | 'Workbook';
+  examJson: string;
+  questionCount: number;
+  createdAt: string;
+}
+
+export interface McItemStat {
+  id: string;
+  index: number;
+  question: string;
+  totalResponses: number;
+  correctCount: number;
+  errorCount: number;
+  blankCount: number;
+  accuracyPercent: number;
+  topWrongOption?: { text: string; count: number };
+  needsReview: boolean;
+}
+
+export interface FibItemStat {
+  id: string;
+  index: number;
+  sentence: string;
+  expectedAnswer: string;
+  totalResponses: number;
+  correctCount: number;
+  accuracyPercent: number;
+  topWrongAnswer?: { text: string; count: number };
+  needsReview: boolean;
+}
+
+export interface SubjectiveItemStat {
+  id: string;
+  index: number;
+  kind: 'open_ended' | 'reflection';
+  question: string;
+  evaluatedCount: number;
+  pendingCount: number;
+  blankCount: number;
+  averageScore: number | null;
+  needsReview: boolean;
+}
+
+export interface ExamItemAnalysis {
+  totalSubmissions: number;
+  mcStats: McItemStat[];
+  fibStats: FibItemStat[];
+  subjectiveStats: SubjectiveItemStat[];
+  weakTopicsCount: number;
+}
+
+export interface AiModalPrefill {
+  topic: string;
+  examType: "quiz" | "workbook";
+  difficulty?: "base" | "intermedio" | "avanzato";
+  numQuestions?: number;
+  label?: string;
+}
+
+

@@ -38,7 +38,9 @@ import {
   GraduationCap,
   Wifi,
   AlertCircle,
-  ArrowRight
+  ArrowRight,
+  Volume2,
+  Square
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
@@ -259,6 +261,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [sessionRunId, setSessionRunId] = useState("");
   const [examType, setExamType] = useState<"quiz" | "workbook">("quiz");
   const [examData, setExamData] = useState<any>(null);
+  const [encryptedAnswerKey, setEncryptedAnswerKey] = useState<string>("");
+  const mcOptionOrderRef = useRef<Record<string, number[]>>({});
   const [expiryTime, setExpiryTime] = useState<string | null>(null);
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [teacherEmail, setTeacherEmail] = useState<string>("sconosciuto");
@@ -325,20 +329,105 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Printable Report state
   const [showPrintModal, setShowPrintModal] = useState(false);
 
+  // BES / DSA Text-to-Speech + Teacher Live Notice + Timer Warnings
+  const [speakingId, setSpeakingId] = useState<string | null>(null);
+  const [teacherNoticeBanner, setTeacherNoticeBanner] = useState<{ text: string; at: string } | null>(null);
+  const lastTeacherNoticeAtRef = useRef<string | null>(null);
+  const warn5MinShownRef = useRef(false);
+  const warn1MinShownRef = useRef(false);
+
+  const canUseSpeech = typeof window !== "undefined" && "speechSynthesis" in window;
+  const stopSpeech = useCallback(() => {
+    try {
+      if (typeof window !== "undefined" && "speechSynthesis" in window) {
+        window.speechSynthesis.cancel();
+      }
+    } catch {}
+    setSpeakingId(null);
+  }, []);
+
+  const speakText = useCallback((text: string, id: string) => {
+    if (typeof window === "undefined" || !("speechSynthesis" in window)) return;
+    const cleanText = String(text || "").trim();
+    if (!cleanText) return;
+    try {
+      window.speechSynthesis.cancel();
+      if (speakingId === id) {
+        setSpeakingId(null);
+        return;
+      }
+      const utter = new SpeechSynthesisUtterance(cleanText);
+      utter.lang = "it-IT";
+      utter.rate = 0.95;
+      utter.onend = () => setSpeakingId((curr) => (curr === id ? null : curr));
+      utter.onerror = () => setSpeakingId((curr) => (curr === id ? null : curr));
+      setSpeakingId(id);
+      window.speechSynthesis.speak(utter);
+    } catch {
+      setSpeakingId(null);
+    }
+  }, [speakingId]);
+
+  useEffect(() => {
+    if (activeScreen !== "exam-space") {
+      stopSpeech();
+    }
+  }, [activeScreen, stopSpeech]);
+
+  useEffect(() => {
+    return () => {
+      try {
+        if (typeof window !== "undefined" && "speechSynthesis" in window) {
+          window.speechSynthesis.cancel();
+        }
+      } catch {}
+    };
+  }, []);
+
+  const renderSpeakButton = (text: string, id: string) => {
+    if (!canUseSpeech || !text.trim()) return null;
+    const isSpeaking = speakingId === id;
+    return (
+      <button
+        type="button"
+        onClick={() => speakText(text, id)}
+        className={`ml-2 inline-flex items-center gap-1 px-2 py-0.5 rounded-lg border text-[11px] font-semibold transition-all cursor-pointer align-middle ${
+          isSpeaking
+            ? "bg-amber-500/20 border-amber-400/50 text-amber-200"
+            : "bg-slate-800/80 border-white/10 text-slate-300 hover:text-white hover:border-teal-400/40"
+        }`}
+        title={isSpeaking ? "Ferma lettura vocale" : "Ascolta domanda con sintesi vocale (BES/DSA)"}
+      >
+        {isSpeaking ? <Square className="w-3 h-3 fill-current" /> : <Volume2 className="w-3 h-3" />}
+        <span>{isSpeaking ? "Stop" : "Ascolta"}</span>
+      </button>
+    );
+  };
+
   // BES / DSA wrapper classes actually applied to the exam workspace
   const accessibilityClasses = [
     fontSize === "large" ? "dsa-scale-115" : "",
     fontSize === "xlarge" ? "dsa-scale-130" : ""
   ].filter(Boolean).join(" ");
 
-  // Reading ruler cursor tracker
+  // Reading ruler cursor tracker (RAF-throttled so 120Hz+ mouse moves don't saturate React renders)
   useEffect(() => {
     if (!readingRuler) return;
+    let rafId: number | null = null;
+    let latestY = 0;
     const handleMouseMove = (e: MouseEvent) => {
-      setMouseY(e.clientY);
+      latestY = e.clientY;
+      if (rafId !== null) return;
+      rafId = window.requestAnimationFrame(() => {
+        rafId = null;
+        setMouseY(latestY);
+      });
     };
-    window.addEventListener("mousemove", handleMouseMove);
-    return () => window.removeEventListener("mousemove", handleMouseMove);
+    window.addEventListener("mousemove", handleMouseMove, { passive: true });
+    return () => {
+      window.removeEventListener("mousemove", handleMouseMove);
+      if (rafId !== null) window.cancelAnimationFrame(rafId);
+    };
   }, [readingRuler]);
 
   // Network connection integrity listener for school Wi-Fi
@@ -383,10 +472,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
       let answeredCount = 0;
       let totalQuestions = 1;
+      let mcDoneCount = 0;
+      let openDoneCount = 0;
 
       if (activeType === "quiz") {
         const mcList = Array.isArray(activeData?.multipleChoice) ? activeData.multipleChoice : [];
         const oeList = Array.isArray(activeData?.openEnded) ? activeData.openEnded : [];
+        const rqList = Array.isArray(activeData?.reflectionQuestions) ? activeData.reflectionQuestions : [];
         const mcIds = new Set(mcList.map((q: any) => q?.id).filter(Boolean));
         const oeIds = new Set(oeList.map((q: any) => q?.id).filter(Boolean));
         const mcDone = mcIds.size > 0
@@ -395,8 +487,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         const oeDone = oeIds.size > 0
           ? oeList.filter((q: any) => String(activeAns.oe?.[q.id] ?? "").trim().length > 0).length
           : Object.keys(activeAns.oe || {}).filter((k) => String(activeAns.oe?.[k] ?? "").trim().length > 0).length;
-        totalQuestions = Math.max(1, mcList.length + oeList.length);
-        answeredCount = Math.min(totalQuestions, mcDone + oeDone);
+        const rqDone = rqList.filter((q: any) => String(activeAns.oe?.[q.id] ?? activeAns.wbRq?.[q.id] ?? "").trim().length > 0).length;
+        mcDoneCount = mcDone;
+        openDoneCount = oeDone + rqDone;
+        totalQuestions = Math.max(1, mcList.length + oeList.length + rqList.length);
+        answeredCount = Math.min(totalQuestions, mcDoneCount + openDoneCount);
       } else {
         const sections = Array.isArray(activeData?.sections) ? activeData.sections : [];
         const fibList = sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []));
@@ -414,8 +509,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         const mcDone = mcList.length > 0
           ? mcList.filter((q: any) => activeAns.mc?.[q.id] !== undefined).length
           : Object.keys(activeAns.mc || {}).length;
+        mcDoneCount = mcDone + fibDone;
+        openDoneCount = rqDone;
         totalQuestions = Math.max(1, fibList.length + rqList.length + mcList.length);
-        answeredCount = Math.min(totalQuestions, fibDone + rqDone + mcDone);
+        answeredCount = Math.min(totalQuestions, mcDoneCount + openDoneCount);
       }
 
       const progressPercent = Math.min(100, Math.round((answeredCount / totalQuestions) * 100));
@@ -439,19 +536,40 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         }
       }
 
+      let draftFields: Record<string, string> = {};
+      if (status === "in_progress" || status === "self_evaluating") {
+        try {
+          const serializedDraft = JSON.stringify(activeAns);
+          if (serializedDraft.length <= 180000) {
+            draftFields = {
+              draftAnswersJson: serializedDraft,
+              draftUpdatedAt: new Date().toISOString(),
+            };
+          }
+        } catch {}
+      } else if (status === "submitted") {
+        draftFields = {
+          draftAnswersJson: "",
+          draftUpdatedAt: new Date().toISOString(),
+        };
+      }
+
       const docRef = doc(dbFirestore, "active_sessions", targetPin, "live_students", safeKey);
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
         answeredCount,
         totalQuestions,
+        mcDoneCount,
+        openDoneCount,
         currentProgressPercent: progressPercent,
         tabSwitches: behavior.tabSwitches,
         pasteAttempts: behavior.pasteAttempts,
         lastHeartbeat: new Date().toISOString(),
         joinedAt,
         sessionRunId: activeRunId,
-        status
+        status,
+        ...draftFields,
       }, { merge: true });
     } catch (err) {
       console.warn("Live progress sync skipped:", err);
@@ -481,6 +599,23 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }, 15000);
     return () => clearInterval(interval);
   }, [isExamActive, sessionPin, user?.email]);
+
+  // Debounced cloud draft sync while the student writes/selects answers during the exam
+  useEffect(() => {
+    if (!isExamActive || !sessionPin || !user?.email) return;
+    if (activeScreen !== "exam-space" && activeScreen !== "self-assessment") return;
+    const hasAnyAnswer =
+      Object.keys(answers.mc || {}).length > 0 ||
+      Object.values(answers.oe || {}).some((v) => String(v || "").trim().length > 0) ||
+      Object.values(answers.wbFib || {}).some((v) => String(v || "").trim().length > 0) ||
+      Object.values(answers.wbRq || {}).some((v) => String(v || "").trim().length > 0);
+    if (!hasAnyAnswer) return;
+    const syncStatus = activeScreen === "self-assessment" ? "self_evaluating" : "in_progress";
+    const timer = setTimeout(() => {
+      syncLiveProgressRef.current(syncStatus);
+    }, 3000);
+    return () => clearTimeout(timer);
+  }, [answers, isExamActive, sessionPin, user?.email, activeScreen]);
 
   // Ref for tracking focus/visibility lifecycle
   const wakeLockRef = useRef<any>(null);
@@ -672,6 +807,25 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       (snap) => {
         if (!snap.exists()) return;
         const data = snap.data();
+
+        // Live message from teacher in ClassroomLiveMonitor
+        const noticeAt = data?.teacherNoticeAt ? String(data.teacherNoticeAt) : "";
+        const noticeText = data?.teacherNotice ? String(data.teacherNotice).trim() : "";
+        if (noticeAt && noticeText) {
+          if (lastTeacherNoticeAtRef.current === null) {
+            lastTeacherNoticeAtRef.current = noticeAt;
+            const parsedNoticeTs = Date.parse(noticeAt);
+            if (!isNaN(parsedNoticeTs) && Date.now() - parsedNoticeTs < 2 * 60 * 1000) {
+              setTeacherNoticeBanner({ text: noticeText, at: noticeAt });
+              setInfractionToastMsg(`📩 Avviso del docente: ${noticeText}`);
+            }
+          } else if (noticeAt !== lastTeacherNoticeAtRef.current) {
+            lastTeacherNoticeAtRef.current = noticeAt;
+            setTeacherNoticeBanner({ text: noticeText, at: noticeAt });
+            setInfractionToastMsg(`📩 Avviso del docente: ${noticeText}`);
+          }
+        }
+
         const remoteId = data?.remoteUnlockId;
         const currentId = remoteId ? String(remoteId) : "";
         const isDocLocked = data?.locked === true;
@@ -707,6 +861,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     );
     return () => unsubscribe();
   }, [sessionPin, user?.email]);
+  const latestAnswersRef = useRef(answers);
+  const latestPinRef = useRef(sessionPin);
+  useEffect(() => {
+    latestAnswersRef.current = answers;
+  }, [answers]);
+  useEffect(() => {
+    latestPinRef.current = sessionPin;
+  }, [sessionPin]);
   const timerIntervalRef = useRef<NodeJS.Timeout | null>(null);
   const elapsedRef = useRef<number>(0);
   const startTimeRef = useRef<number>(0);
@@ -721,10 +883,34 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     try {
       localStorage.setItem(
         getDraftKey(currPin),
-        JSON.stringify({ sessionRunId: runId || "", answers: currAnswers })
+        JSON.stringify({ sessionRunId: runId || "", updatedAt: Date.now(), answers: currAnswers })
       );
     } catch (e) {
       console.warn("Impossibile salvare la bozza in localStorage:", e);
+    }
+  };
+
+  const getLocalDraftUpdatedAt = (currPin: string, expectedRunId?: string): { found: boolean; updatedAt: number } => {
+    try {
+      const raw = localStorage.getItem(getDraftKey(currPin)) || localStorage.getItem(`draft_${currPin}`);
+      if (!raw) return { found: false, updatedAt: 0 };
+      const parsed = JSON.parse(raw);
+      if (!parsed || typeof parsed !== "object") return { found: false, updatedAt: 0 };
+      const draftRunId = typeof parsed.sessionRunId === "string" ? parsed.sessionRunId : "";
+      if (draftRunId && expectedRunId && draftRunId !== expectedRunId) {
+        return { found: false, updatedAt: 0 };
+      }
+      const rawAns = parsed.answers && typeof parsed.answers === "object" ? parsed.answers : parsed;
+      const hasAny =
+        Object.keys(rawAns.mc || {}).length > 0 ||
+        Object.values(rawAns.oe || {}).some((v: any) => String(v || "").trim().length > 0) ||
+        Object.values(rawAns.wbFib || {}).some((v: any) => String(v || "").trim().length > 0) ||
+        Object.values(rawAns.wbRq || {}).some((v: any) => String(v || "").trim().length > 0);
+      if (!hasAny) return { found: false, updatedAt: 0 };
+      const ts = Number(parsed.updatedAt);
+      return { found: true, updatedAt: Number.isFinite(ts) && ts > 0 ? ts : 1 };
+    } catch {
+      return { found: false, updatedAt: 0 };
     }
   };
 
@@ -759,11 +945,126 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return false;
   };
 
+  const restoreDraftWithCloudFallback = (currPin: string, expectedRunId: string, cloudStudentData: any) => {
+    const localLoaded = loadDraft(currPin, expectedRunId);
+    const localMeta = localLoaded ? getLocalDraftUpdatedAt(currPin, expectedRunId) : { found: false, updatedAt: 0 };
+    if (!cloudStudentData || typeof cloudStudentData.draftAnswersJson !== "string" || !cloudStudentData.draftAnswersJson.trim()) {
+      return;
+    }
+    const cloudRunId = String(cloudStudentData.sessionRunId || "");
+    if (cloudRunId && expectedRunId && cloudRunId !== expectedRunId) {
+      return;
+    }
+    const cloudUpdatedAt = cloudStudentData.draftUpdatedAt ? Date.parse(String(cloudStudentData.draftUpdatedAt)) : 0;
+    const cloudIsNewer =
+      !localMeta.found ||
+      (Number.isFinite(cloudUpdatedAt) && cloudUpdatedAt > localMeta.updatedAt);
+    if (!cloudIsNewer) return;
+
+    try {
+      const parsed = JSON.parse(cloudStudentData.draftAnswersJson);
+      if (!parsed || typeof parsed !== "object") return;
+      const normalized: Answers = {
+        mc: parsed.mc && typeof parsed.mc === "object" ? parsed.mc : {},
+        oe: parsed.oe && typeof parsed.oe === "object" ? parsed.oe : {},
+        wbFib: parsed.wbFib && typeof parsed.wbFib === "object" ? parsed.wbFib : {},
+        wbRq: parsed.wbRq && typeof parsed.wbRq === "object" ? parsed.wbRq : {},
+      };
+      const cloudHasAnswers =
+        Object.keys(normalized.mc).length > 0 ||
+        Object.values(normalized.oe).some((v) => String(v || "").trim().length > 0) ||
+        Object.values(normalized.wbFib).some((v) => String(v || "").trim().length > 0) ||
+        Object.values(normalized.wbRq).some((v) => String(v || "").trim().length > 0);
+      if (!cloudHasAnswers) return;
+
+      setAnswers(normalized);
+      saveDraft(currPin, normalized, expectedRunId);
+      setInfractionToastMsg("☁️ Bozza risposte recuperata automaticamente dal Cloud!");
+    } catch (e) {
+      console.warn("Errore parsing bozza cloud:", e);
+    }
+  };
+
   const clearDraft = (currPin: string) => {
     try {
       localStorage.removeItem(getDraftKey(currPin));
       localStorage.removeItem(`draft_${currPin}`);
     } catch {}
+  };
+
+  const getMcOrderStorageKey = (currPin: string, runIdVal: string) =>
+    `ea_mc_order_${currPin.trim().toUpperCase()}_${runIdVal || "default"}`;
+
+  const applyClientMcRandomization = (
+    rawExamContent: any,
+    shouldRandomize: boolean,
+    currPin: string,
+    runIdVal: string
+  ) => {
+    if (!rawExamContent) return rawExamContent;
+    let savedOrder: Record<string, number[]> | null = null;
+    try {
+      const rawSaved = localStorage.getItem(getMcOrderStorageKey(currPin, runIdVal));
+      if (rawSaved) savedOrder = JSON.parse(rawSaved);
+    } catch {}
+
+    const nextOrder: Record<string, number[]> = {};
+    const processMcList = (list: any[], allowShuffle: boolean) => {
+      const mappedList = list.map((q: any) => {
+        if (!q || !Array.isArray(q.options) || q.options.length < 2) return q;
+        const qId = String(q.id || "");
+        const existingOrder = qId && savedOrder && Array.isArray(savedOrder[qId]) && savedOrder[qId].length === q.options.length
+          ? savedOrder[qId]
+          : null;
+
+        let chosenOrder: number[];
+        if (existingOrder) {
+          chosenOrder = existingOrder;
+        } else if (allowShuffle) {
+          const indexed = q.options.map((_: string, idx: number) => idx);
+          chosenOrder = [...indexed].sort(() => Math.random() - 0.5);
+        } else {
+          return q;
+        }
+
+        if (qId) {
+          nextOrder[qId] = chosenOrder;
+        }
+        const reorderedOptions = chosenOrder.map((origIdx) => q.options[origIdx]);
+        const hasCorrectIdx = q.correctIndex !== undefined && q.correctIndex !== null;
+        const newCorrectIndex = hasCorrectIdx
+          ? chosenOrder.findIndex((origIdx) => Number(origIdx) === Number(q.correctIndex))
+          : -1;
+        return {
+          ...q,
+          options: reorderedOptions,
+          ...(hasCorrectIdx ? { correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex } : {}),
+        };
+      });
+      return allowShuffle && !savedOrder ? [...mappedList].sort(() => Math.random() - 0.5) : mappedList;
+    };
+
+    const result = { ...rawExamContent };
+    if (Array.isArray(result.multipleChoice) && (shouldRandomize || savedOrder)) {
+      result.multipleChoice = processMcList(result.multipleChoice, shouldRandomize);
+    }
+    if (Array.isArray(result.sections) && (shouldRandomize || savedOrder)) {
+      result.sections = result.sections.map((sec: any) => {
+        if (!sec || !Array.isArray(sec.multipleChoice)) return sec;
+        return {
+          ...sec,
+          multipleChoice: processMcList(sec.multipleChoice, shouldRandomize),
+        };
+      });
+    }
+
+    mcOptionOrderRef.current = nextOrder;
+    if (Object.keys(nextOrder).length > 0) {
+      try {
+        localStorage.setItem(getMcOrderStorageKey(currPin, runIdVal), JSON.stringify(nextOrder));
+      } catch {}
+    }
+    return result;
   };
 
   // Automatic recovery of locked exam session across page reloads / app restarts
@@ -774,31 +1075,34 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const sessionSnap = await getDoc(sessionDocRef);
       if (sessionSnap.exists()) {
         const sessionData = sessionSnap.data();
+        const restoredRunId = sessionData.sessionId || sessionData.sessionRunId || "";
         const parsedExam = safeParseJson(sessionData.data ?? sessionData.examData);
-        const examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
+        let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
         if (examContent) {
+          examContent = applyClientMcRandomization(examContent, !!sessionData.randomizeQuestions, savedPin, restoredRunId);
           setExamData(examContent);
           setExamType(examContent.sections ? "workbook" : "quiz");
         }
-        const restoredRunId = sessionData.sessionId || sessionData.sessionRunId || "";
+        setEncryptedAnswerKey(String(sessionData.encryptedAnswerKey || ""));
         setExpiryTime(sessionData.expiry || null);
         setBackendUrl(sessionData.backendUrl || null);
         setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
         setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
         setSessionRunId(restoredRunId);
-        loadDraft(savedPin, restoredRunId);
 
-        // Check if teacher has already unlocked this student in Firestore
+        let cloudStudentData: any = null;
+        // Check if teacher has already unlocked this student in Firestore + fetch cloud draft
         if (user?.email) {
           const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
           const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", savedPin, "live_students", safeKey));
           if (studentSnap.exists()) {
-            const sData = studentSnap.data();
-            if (sData?.locked === false && sData?.lockState === "unlocked") {
-              releaseExamLockRef.current("remote");
-              return;
-            }
+            cloudStudentData = studentSnap.data();
           }
+        }
+        restoreDraftWithCloudFallback(savedPin, restoredRunId, cloudStudentData);
+        if (cloudStudentData?.locked === false && cloudStudentData?.lockState === "unlocked") {
+          releaseExamLockRef.current("remote");
+          return;
         }
       }
     } catch (e) {
@@ -1027,34 +1331,27 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             console.warn("Verifica consegne precedente non riuscita, prosigo:", dupErr);
           }
 
+          const currentRunIdForInit = String(sessionData.sessionId || sessionData.sessionRunId || "");
           setSessionPin(formattedPin);
-          setSessionRunId(sessionData.sessionId || "");
+          setSessionRunId(currentRunIdForInit);
+          setEncryptedAnswerKey(String(sessionData.encryptedAnswerKey || ""));
 
           const parsedExam = safeParseJson(sessionData.data);
           let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
 
-          // Anti-cheat: Randomize questions and options if enabled by teacher
-          if (sessionData.randomizeQuestions && examContent?.multipleChoice) {
-            const shuffledMC = examContent.multipleChoice.map((q: any) => {
-              if (!q.options || q.options.length < 2) return q;
-              const mapped = q.options.map((opt: string, idx: number) => ({ opt, idx }));
-              const shuffled = [...mapped].sort(() => Math.random() - 0.5);
-              const newCorrectIndex = shuffled.findIndex(item => item.idx === q.correctIndex);
-              return {
-                ...q,
-                options: shuffled.map(item => item.opt),
-                correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex
-              };
-            }).sort(() => Math.random() - 0.5);
-
-            examContent = {
-              ...examContent,
-              multipleChoice: shuffledMC
-            };
+          // Anti-cheat: Randomize questions and options if enabled by teacher (recording mcOptionOrder for server grading)
+          mcOptionOrderRef.current = {};
+          if (examContent) {
+            examContent = applyClientMcRandomization(
+              examContent,
+              !!sessionData.randomizeQuestions,
+              formattedPin,
+              currentRunIdForInit
+            );
           }
 
           setExamData(examContent);
-          setExamType(examContent.sections ? "workbook" : "quiz");
+          setExamType(examContent?.sections ? "workbook" : "quiz");
           setExpiryTime(sessionData.expiry || null);
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
@@ -1080,12 +1377,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             // Ignore unreadable lock markers.
           }
 
+          let cloudStudentData: any = null;
           if (dbFirestore && user?.email) {
             try {
               const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
               const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", safeKey));
               if (studentSnap.exists()) {
                 const sData = studentSnap.data();
+                cloudStudentData = sData;
                 if (sData?.locked === true && sData?.lockState === "locked") {
                   isLockedNow = true;
                   currentLockReason = String(sData?.lockReason || currentLockReason || "Prova bloccata dal docente o dal sistema di integrità");
@@ -1103,14 +1402,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             setLockReason(currentLockReason);
             persistExamLock(true, currentLockReason);
             setIsExamActive(true);
-            loadDraft(formattedPin, currentRunId);
+            restoreDraftWithCloudFallback(formattedPin, currentRunId, cloudStudentData);
             setActiveScreen("exam-space");
           } else {
             lockedRef.current = false;
             setExamLocked(false);
             setLockReason("");
             persistExamLock(false);
-            loadDraft(formattedPin, currentRunId);
+            restoreDraftWithCloudFallback(formattedPin, currentRunId, cloudStudentData);
             setActiveScreen("warning");
           }
         } else {
@@ -1671,9 +1970,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   useEffect(() => {
     if (!isExamActive) {
       if (timerIntervalRef.current) clearInterval(timerIntervalRef.current);
+      warn5MinShownRef.current = false;
+      warn1MinShownRef.current = false;
       return;
     }
 
+    warn5MinShownRef.current = false;
+    warn1MinShownRef.current = false;
     startTimeRef.current = Date.now();
     
     timerIntervalRef.current = setInterval(() => {
@@ -1708,19 +2011,34 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setRemainingTimeText("⏱️ Tempo Scaduto!");
           setTimerUrgent(true);
           setIsExamActive(false);
+
+          // Persist local & cloud draft immediately before alerting student
+          saveDraft(latestPinRef.current, latestAnswersRef.current);
+          void syncLiveProgressRef.current("self_evaluating", {
+            pin: latestPinRef.current,
+            answers: latestAnswersRef.current,
+          });
           
           // Force redirection to self-assessment when timer expires!
           setAppAlert({
             msg: "⏱️ Il tempo a disposizione impostato dal docente per questa sessione d'esame è scaduto!\n\nTutti i tuoi testi e le risposte fornite finora sono stati salvati come bozza. Verrai ora reindirizzato al pannello di autovalutazione metacognitiva per completare l'invio ufficiale.",
             onOk: () => {
               setActiveScreen("self-assessment");
-              syncLiveProgressRef.current("self_evaluating");
+              void syncLiveProgressRef.current("self_evaluating");
             }
           });
           return;
         }
 
         const totalSeconds = Math.floor(diff / 1000);
+        if (totalSeconds <= 300 && totalSeconds > 60 && !warn5MinShownRef.current) {
+          warn5MinShownRef.current = true;
+          setInfractionToastMsg("⏳ Attenzione: mancano 5 minuti al termine della sessione.");
+        } else if (totalSeconds <= 60 && totalSeconds > 0 && !warn1MinShownRef.current) {
+          warn1MinShownRef.current = true;
+          setInfractionToastMsg("⚠️ Ultimo minuto rimasto! Controlla le risposte prima dello scadere del tempo.");
+        }
+
         const hours = Math.floor(totalSeconds / 3600);
         const min = Math.floor((totalSeconds % 3600) / 60);
         const sec = totalSeconds % 60;
@@ -1969,18 +2287,29 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     return missing;
   };
 
+  const dialogGraceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => {
+    return () => {
+      if (dialogGraceTimerRef.current) clearTimeout(dialogGraceTimerRef.current);
+    };
+  }, []);
+
+  const scheduleDialogInteractionEnd = (delayMs: number) => {
+    if (dialogGraceTimerRef.current) clearTimeout(dialogGraceTimerRef.current);
+    dialogGraceTimerRef.current = setTimeout(() => {
+      dialogGraceTimerRef.current = null;
+      isInteractingWithInAppDialogRef.current = false;
+    }, delayMs);
+  };
+
   const handleCloseMissingModal = () => {
     setShowMissingQuestionsModal(false);
-    setTimeout(() => {
-      isInteractingWithInAppDialogRef.current = false;
-    }, 2000);
+    scheduleDialogInteractionEnd(2000);
   };
 
   const handleJumpToMissingQuestion = (anchorId: string) => {
     setShowMissingQuestionsModal(false);
-    setTimeout(() => {
-      isInteractingWithInAppDialogRef.current = false;
-    }, 2500);
+    scheduleDialogInteractionEnd(2500);
     setTimeout(() => {
       const el = document.getElementById(anchorId);
       if (el) {
@@ -2098,14 +2427,36 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         } else if (statusData.status === "processing") {
           setSavingStatus("L'Intelligenza Artificiale sta completando la correzione della tua prova ora...");
         } else if (statusData.status === "completed") {
-          finalEval = statusData.evaluation;
+          const rawEval: any = statusData.evaluation || {};
+          const resolvedDomande = rawEval.resolvedDomande || rescue.examData;
+          if (resolvedDomande) {
+            rescue.examData = resolvedDomande;
+            setExamData(resolvedDomande);
+          }
+          if (typeof rawEval.calculatedMCScore === "number") {
+            rescue.calculatedMCScore = rawEval.calculatedMCScore;
+          }
+          if (typeof rawEval.calculatedFIBScore === "number") {
+            rescue.calculatedFIBScore = rawEval.calculatedFIBScore;
+          }
+          if (typeof rawEval.totalFIB === "number") {
+            rescue.totalFIB = rawEval.totalFIB;
+          }
+          const {
+            resolvedDomande: _omitDomande,
+            calculatedMCScore: _omitMc,
+            calculatedFIBScore: _omitFib,
+            totalFIB: _omitTotalFib,
+            ...cleanEval
+          } = rawEval;
+          finalEval = cleanEval as Evaluation;
           break;
         } else if (statusData.status === "failed") {
           throw new Error(statusData.error || "La valutazione ha riportato un fallimento interno al server.");
         }
       }
 
-      // Appending precalculated scores
+      // Appending authoritative scores
       if (rescue.examType === "quiz") {
         finalEval.fibScore = undefined;
       } else {
@@ -2152,6 +2503,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       try {
         localStorage.removeItem("active_student_session");
         sessionStorage.removeItem("active_student_session");
+        if (rescue.sessionPin) {
+          localStorage.removeItem(getMcOrderStorageKey(rescue.sessionPin, rescue.sessionRunId || ""));
+        }
       } catch {}
       setActiveScreen("results");
       setSavingStatus("");
@@ -2202,8 +2556,29 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             submissionData.Feedback_Generale = cleanVal(finalEval.overallFeedback);
           }
 
-          const docRef = await addDoc(collection(dbFirestore, "valutazioni"), submissionData);
-          setActiveSubmissionId(docRef.id);
+          const safeKey = (user?.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+          const cleanRunId = String(rescue.sessionRunId || "").replace(/[^a-zA-Z0-9_-]/g, "_");
+          let savedDocId = "";
+          if (cleanRunId) {
+            const deterministicId = `sub_${cleanRunId}_${safeKey}`;
+            const deterministicRef = doc(dbFirestore, "valutazioni", deterministicId);
+            try {
+              await setDoc(deterministicRef, submissionData);
+              savedDocId = deterministicId;
+            } catch (detErr: any) {
+              const existingSnap = await getDoc(deterministicRef).catch(() => null);
+              if (existingSnap?.exists()) {
+                savedDocId = deterministicId;
+              } else {
+                throw detErr;
+              }
+            }
+          } else {
+            const docRef = await addDoc(collection(dbFirestore, "valutazioni"), submissionData);
+            savedDocId = docRef.id;
+          }
+
+          setActiveSubmissionId(savedDocId);
           setSavingStatus("✓ Tutti i voti e le note di integrità sono salvati nel database del docente!");
           void syncLiveProgress("submitted", {
             pin: rescue.sessionPin,
@@ -2256,6 +2631,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setSessionRunId(data.sessionRunId || "");
           setExamType(data.examType || "quiz");
           setExamData(data.examData || null);
+          setEncryptedAnswerKey(data.encryptedAnswerKey || "");
+          mcOptionOrderRef.current = data.mcOptionOrder || {};
           setExpiryTime(data.expiryTime || null);
           setBackendUrl(data.backendUrl || null);
           setTeacherEmail(data.teacherEmail || "");
@@ -2423,6 +2800,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       studentEmail: user?.email || "",
       studentName: user?.displayName || "Studente",
       sessionPin: sessionPin || "",
+      encryptedAnswerKey: encryptedAnswerKey || "",
+      mcOptionOrder: mcOptionOrderRef.current || {},
       report: {
         domande: examPayload,
         risposte: sanitizedAnswers,
@@ -2490,6 +2869,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         examTitle: examData?.title || "",
         examType,
         examData,
+        encryptedAnswerKey: encryptedAnswerKey || "",
+        mcOptionOrder: mcOptionOrderRef.current || {},
         expiryTime,
         backendUrl,
         teacherEmail,
@@ -2513,6 +2894,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   const handleRestart = () => {
+    stopSpeech();
     persistExamLock(false);
     try {
       sessionStorage.removeItem("active_student_session");
@@ -2521,11 +2903,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     lockedRef.current = false;
     setExamLocked(false);
     setLockReason("");
+    setTeacherNoticeBanner(null);
+    lastTeacherNoticeAtRef.current = null;
+    warn5MinShownRef.current = false;
+    warn1MinShownRef.current = false;
     setActiveScreen("enter-pin");
     setPin("");
     setSessionPin("");
     setSessionRunId("");
     setExamData(null);
+    setEncryptedAnswerKey("");
+    mcOptionOrderRef.current = {};
     setAnswers({ mc: {}, oe: {}, wbFib: {}, wbRq: {} });
     setBehavior({ tabSwitches: 0, pasteAttempts: 0, rightClicks: 0, infractionsLog: [] });
     setStudentSelfGrade("");
@@ -3323,6 +3711,30 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               ? "bg-[#ffffff] text-[#0f172a] border-slate-300"
               : "bg-slate-900/40 backdrop-blur-xl border-white/10 text-white"
           }`}>
+            {/* Dismissible live teacher notice banner */}
+            {teacherNoticeBanner && (
+              <div className="mb-4 p-4 rounded-2xl bg-indigo-950/90 border border-indigo-400/50 text-indigo-100 flex items-start justify-between gap-3 shadow-lg animate-fadeIn">
+                <div className="flex items-start gap-2.5 text-left">
+                  <Info className="w-5 h-5 text-indigo-300 shrink-0 mt-0.5" />
+                  <div>
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-indigo-300">
+                      Avviso del Docente
+                    </p>
+                    <p className="text-sm text-white leading-relaxed mt-0.5">
+                      {teacherNoticeBanner.text}
+                    </p>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={() => setTeacherNoticeBanner(null)}
+                  className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 text-xs font-semibold shrink-0 cursor-pointer"
+                >
+                  Chiudi
+                </button>
+              </div>
+            )}
+
             {/* Accessibility and Inclusive Tools Bar (BES / DSA) */}
             <div className={`mb-6 p-3 rounded-2xl border transition-all ${
               contrastTheme === "sepia"
@@ -3472,6 +3884,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
+                              {renderSpeakButton(
+                                `${q.question}. ${(q.options || []).map((o: string, i: number) => `Opzione ${i + 1}: ${o}`).join(". ")}`,
+                                `quiz_mc_${q.id || qIdx}`
+                              )}
                               <QuestionMeta q={q} />
                             </p>
                             <QuestionFigure src={examData?.images?.[q.id]} />
@@ -3522,6 +3938,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {((examData?.multipleChoice || []).length) + qIdx + 1}.
                               </span>
                               {q.question}
+                              {renderSpeakButton(String(q.question || ""), `quiz_oe_${q.id || qIdx}`)}
                               <QuestionMeta q={q} />
                             </p>
                             <QuestionFigure src={examData?.images?.[q.id]} />
@@ -3564,6 +3981,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {((examData?.multipleChoice || []).length) + ((examData?.openEnded || []).length) + qIdx + 1}.
                               </span>
                               {q.question}
+                              {renderSpeakButton(String(q.question || ""), `quiz_rq_${q.id || qIdx}`)}
                               <QuestionMeta q={q} tone="teal" />
                             </p>
                             <div className="space-y-1.5">
@@ -3608,6 +4026,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             <p className="font-medium text-slate-200 text-sm">
                               <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
+                              {renderSpeakButton(
+                                `${q.question}. ${(q.options || []).map((o: string, i: number) => `Opzione ${i + 1}: ${o}`).join(". ")}`,
+                                `wb_root_mc_${q.id || qIdx}`
+                              )}
                               <QuestionMeta q={q} tone="teal" />
                             </p>
                             <QuestionFigure src={examData?.images?.[q.id]} />
@@ -3693,6 +4115,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                   className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm select-text"
                                 />
                                 <span>{after}</span>
+                                {renderSpeakButton(
+                                  `${before} spazio da completare ${after}`,
+                                  `wb_sec_${sIdx}_fib_${fib.id || fIdx}`
+                                )}
                                 <QuestionMeta q={fib} tone="teal" />
                               </div>
                             );
@@ -3716,6 +4142,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 <p className="font-medium text-slate-200 text-sm">
                                   <span className="text-teal-400 font-bold mr-2">{qIdx + 1}.</span>
                                   {q.question}
+                                  {renderSpeakButton(
+                                    `${q.question}. ${(q.options || []).map((o: string, i: number) => `Opzione ${i + 1}: ${o}`).join(". ")}`,
+                                    `wb_sec_${sIdx}_mc_${q.id || qIdx}`
+                                  )}
                                   <QuestionMeta q={q} tone="teal" />
                                 </p>
                                 <QuestionFigure src={examData?.images?.[q.id]} />
@@ -3763,6 +4193,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               <div key={rq.id} id={`wb_sec_${sIdx}_rq_${rq.id || rIdx}`} className="space-y-2 transition-all rounded-xl p-2 -m-2">
                                 <p className="text-xs font-semibold text-slate-300">
                                   {rIdx + 1}. {rq.question}
+                                  {renderSpeakButton(String(rq.question || ""), `wb_sec_${sIdx}_rq_${rq.id || rIdx}`)}
                                   <QuestionMeta q={rq} tone="teal" />
                                 </p>
                                 <textarea

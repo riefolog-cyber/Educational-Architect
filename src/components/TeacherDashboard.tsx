@@ -41,7 +41,6 @@ import {
   ChevronUp,
   Award,
   BarChart2,
-  BookOpen,
   HelpCircle,
   Layers,
   ListOrdered,
@@ -50,14 +49,14 @@ import {
   PlusCircle,
   Undo2,
   FileUp,
-  Archive,
-  Pencil
+  Archive
 } from "lucide-react";
 
-import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
-import { SavedSubmission } from "../types";
-import { formatMarkdown, formatItalianScholasticGrade, isFibAnswerCorrect, getFibSentenceParts, mcWeightedScore, fibWeightedScore, extractBreakdownFromSubmission, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, buildSubjectiveReviewEntries, getPendingSubjectiveCount, auditSubjectiveEvaluation, isEvaluationPending, safeParseJson } from "../utils";
-import GradeCalculationReport from "./GradeCalculationReport";
+import { db, dbFirestore, handleFirestoreError, OperationType, getAuthHeaders } from "../firebase";
+import { SavedSubmission, LiveSessionSummary, ExamSummary, StudentSummary, AiModalPrefill } from "../types";
+export type { LiveSessionSummary, ExamSummary };
+import { exportSubmissionPdf, exportSubmissionsZip } from "../utils/pdfExport";
+import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml } from "../utils";
 import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
@@ -73,49 +72,25 @@ import {
   renameLibraryExam,
   belongsToTeacherEmail,
   countLibraryQuestions,
-  formatLibraryDate,
-  libraryFilename,
   downloadTextFile,
   buildLibraryBackup,
   parseLibraryBackup,
   sanitizeWorkbookExamJson,
-  ExamLibraryItem
+  publishSharedExam,
+  importSharedExamByCode,
+  listMySharedExams,
+  revokeSharedExam,
+  libraryFilename,
+  ExamLibraryItem,
+  SharedExamSummary
 } from "../utils/examLibrary";
 import AiExamGeneratorModal from "./AiExamGeneratorModal";
 import GoogleFormsImportModal from "./GoogleFormsImportModal";
 import ClassroomLiveMonitor from "./ClassroomLiveMonitor";
 import PrintableReportModal from "./PrintableReportModal";
-
-export interface LiveSessionSummary {
-  pin: string;
-  title: string;
-  expiry: string | null;
-  createdAt: string | null;
-  sessionId: string;
-  active: boolean;
-  teacherEmail: string;
-  /** 6-digit code the teacher gives to a student whose exam was locked. */
-  unlockCode?: string;
-}
-
-export interface ExamSummary {
-  key: string;
-  pin: string;
-  title: string;
-  tipo: "Quiz" | "Workbook" | "Misto";
-  submissions: SavedSubmission[];
-  totalStudents: number;
-  latestDate: string;
-  firstDate: string;
-  averageGradeNumber: number | null;
-  averageGradeFormatted: string;
-  highestGrade: string;
-  lowestGrade: string;
-  passedCount: number;
-  failedCount: number;
-  passRate: number;
-  totalViolations: number;
-}
+import ExamLibraryPanel from "./ExamLibraryPanel";
+import ExamItemAnalysisPanel from "./ExamItemAnalysisPanel";
+import SubmissionDetailModal from "./SubmissionDetailModal";
 
 interface TeacherDashboardProps {
   user: any;
@@ -215,9 +190,10 @@ export function clusterInfractionsHint(log: any[]): string | null {
  * and returns the evaluation object produced by the server.
  */
 async function requestAiReevaluation(payload: any): Promise<any> {
+  const authHeaders = await getAuthHeaders();
   const enqueueResp = await fetch("/api/evaluate/enqueue", {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: { "Content-Type": "application/json", ...authHeaders },
     body: JSON.stringify(payload)
   });
 
@@ -269,16 +245,29 @@ async function requestAiReevaluation(payload: any): Promise<any> {
   throw new Error("Tempo di attesa per la correzione IA scaduto. Riprova tra qualche minuto.");
 }
 
+const getCurrentTimeHHMM = () => {
+  const d = new Date();
+  return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
+};
+
 export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps) {
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
-  const [expiryTime, setExpiryTime] = useState(() => {
-    const d = new Date();
-    d.setHours(d.getHours() + 2);
-    return `${String(d.getHours()).padStart(2, "0")}:${String(d.getMinutes()).padStart(2, "0")}`;
-  });
+  const [expiryTime, setExpiryTime] = useState(getCurrentTimeHHMM);
+  const [isExpiryCustom, setIsExpiryCustom] = useState(false);
   const timeInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (isExpiryCustom) return;
+    const syncNow = () => {
+      const next = getCurrentTimeHHMM();
+      setExpiryTime((prev) => (prev === next ? prev : next));
+    };
+    syncNow();
+    const timer = setInterval(syncNow, 15000);
+    return () => clearInterval(timer);
+  }, [isExpiryCustom]);
   const [jsonText, setJsonText] = useState("");
   const [validationError, setValidationError] = useState<string | null>(null);
   const [validationOk, setValidationOk] = useState(false);
@@ -298,6 +287,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [renamingLibraryId, setRenamingLibraryId] = useState<string | null>(null);
   const [renamingTitle, setRenamingTitle] = useState("");
   const [isSavingRename, setIsSavingRename] = useState(false);
+  const [sharedExams, setSharedExams] = useState<SharedExamSummary[]>([]);
+  const [generatingVariantId, setGeneratingVariantId] = useState<string | null>(null);
 
   // AI analysis of criteria state
   const [isAnalyzing, setIsAnalyzing] = useState(false);
@@ -350,12 +341,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [appAlert, setAppAlert] = useState<{ msg: string } | null>(null);
 
   const [selectedSub, setSelectedSub] = useState<SavedSubmission | null>(null);
-  // Manual teacher grade retouch (audit trail via Voto_Originale_IA)
-  const [gradeEditOpen, setGradeEditOpen] = useState(false);
-  const [gradeEditValue, setGradeEditValue] = useState("");
+  const [speedGraderScopeIds, setSpeedGraderScopeIds] = useState<string[] | null>(null);
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
   const [confirmDeleteExamKey, setConfirmDeleteExamKey] = useState<string | null>(null);
-  const [confirmDeleteLibraryId, setConfirmDeleteLibraryId] = useState<string | null>(null);
   const [isDeletingExamGroup, setIsDeletingExamGroup] = useState<string | null>(null);
   const [deleteNotify, setDeleteNotify] = useState<{ type: "success" | "error"; message: string } | null>(null);
   const notifyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -377,6 +365,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
+  const [aiModalPrefill, setAiModalPrefill] = useState<AiModalPrefill | null>(null);
   const [showFormsModal, setShowFormsModal] = useState<boolean>(false);
   const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
@@ -411,7 +400,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleCopyPin = (pinValue: string, e: React.MouseEvent) => {
     e.stopPropagation();
     if (!pinValue || pinValue === "—") return;
-    navigator.clipboard.writeText(pinValue);
+    const fallbackCopy = () => {
+      try {
+        const area = document.createElement("textarea");
+        area.value = pinValue;
+        area.style.position = "fixed";
+        area.style.opacity = "0";
+        document.body.appendChild(area);
+        area.select();
+        document.execCommand("copy");
+        document.body.removeChild(area);
+      } catch {}
+    };
+    if (navigator.clipboard?.writeText) {
+      navigator.clipboard.writeText(pinValue).catch(fallbackCopy);
+    } else {
+      fallbackCopy();
+    }
     setCopiedExamPin(pinValue);
     if (copyPinTimerRef.current) clearTimeout(copyPinTimerRef.current);
     copyPinTimerRef.current = setTimeout(() => {
@@ -427,7 +432,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     if (!dbFirestore) return;
     setLoadingSubmissions(true);
     try {
-      const isSuperAdmin = user?.email === "riefolo.giovanni@ferrarisfermiclass.it" || user?.email === "riefolog@gmail.com";
+      const isSuperAdmin = belongsToTeacherEmail(user?.email, "riefolog@gmail.com");
       let qSnap;
       if (isSuperAdmin) {
         qSnap = await getDocs(collection(dbFirestore, "valutazioni"));
@@ -705,11 +710,20 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   // ---- Exam library (Cloud Firestore + local cache): save / load / sync across all devices ----
+  const loadSharedExams = async () => {
+    const emailToUse = user?.email || "";
+    if (!emailToUse) return;
+    try {
+      const shares = await listMySharedExams(emailToUse);
+      setSharedExams(shares);
+    } catch {}
+  };
+
   const loadLibrary = async () => {
     const emailToUse = user?.email || "docente_sandbox@scuola.it";
     setLibraryLoading(true);
     try {
-      const items = await listLibraryExams(emailToUse);
+      const [items] = await Promise.all([listLibraryExams(emailToUse), loadSharedExams()]);
       setLibrary(items);
     } catch (e: any) {
       console.warn("Libreria verifiche non caricata:", e);
@@ -943,6 +957,70 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     reader.readAsText(file);
   };
 
+  const handleShareLibraryItem = async (item: ExamLibraryItem): Promise<string> => {
+    const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
+    try {
+      const code = await publishSharedExam(item, effectiveEmail);
+      await Promise.all([loadLibrary(), loadSharedExams()]);
+      setLibraryMsg(`🔗 Codice condivisione generato per "${item.title}": ${code} (copiato negli appunti). Invialo a un collega per fargliela importare.`);
+      return code;
+    } catch (err: any) {
+      setLibraryMsg(`❌ Condivisione non riuscita: ${err?.message || "errore Cloud"}`);
+      throw err;
+    }
+  };
+
+  const handleRevokeShare = async (shareCode: string): Promise<void> => {
+    try {
+      await revokeSharedExam(shareCode);
+      setSharedExams((prev) => prev.filter((s) => s.shareCode !== shareCode));
+      setLibrary((prev) => prev.map((it) => (it.sharedCode === shareCode ? { ...it, sharedCode: undefined } : it)));
+      setLibraryMsg(`🔒 Codice condiviso "${shareCode}" revocato: non è più utilizzabile per nuove importazioni.`);
+    } catch (err: any) {
+      setLibraryMsg(`❌ Revoca non riuscita: ${err?.message || "errore Cloud"}`);
+      throw err;
+    }
+  };
+
+  const handleGenerateVariant = async (item: ExamLibraryItem): Promise<void> => {
+    if (generatingVariantId) return;
+    setGeneratingVariantId(item.id);
+    setLibraryMsg(null);
+    try {
+      const authHeaders = await getAuthHeaders();
+      const resp = await fetch("/api/generate-variant", {
+        method: "POST",
+        headers: { "Content-Type": "application/json", ...authHeaders },
+        body: JSON.stringify({ examJson: item.examJson, title: item.title }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data?.error || !data?.formattedJson) {
+        throw new Error(data?.details || data?.error || "Errore nella generazione della variante Fila B.");
+      }
+      setLoadedLibraryItemId(null);
+      setJsonText(data.formattedJson);
+      if (data.title) setMateria(data.title);
+      validateExamJSON(data.formattedJson);
+      await handleSaveToLibrary("Variante Fila B", data.formattedJson, data.title, { asNew: true });
+    } catch (err: any) {
+      setLibraryMsg(`❌ Generazione Fila B non riuscita: ${err?.message || "riprova tra poco."}`);
+    } finally {
+      setGeneratingVariantId(null);
+    }
+  };
+
+  const handleImportSharedExamCode = async (code: string): Promise<void> => {
+    const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
+    try {
+      const res = await importSharedExamByCode(code, effectiveEmail);
+      await loadLibrary();
+      setLibraryMsg(`✅ Verifica condivisa "${res.title}" (${res.questionCount} quesiti) importata nella tua libreria!`);
+    } catch (err: any) {
+      setLibraryMsg(`❌ ${err?.message || "Impossibile importare il codice condiviso."}`);
+      throw err;
+    }
+  };
+
   // Upload file helper
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -1016,42 +1094,39 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       examObj.title = materia.trim();
     }
 
-    // Set precise expiry timestamp: Today + selected Hour/Minute (or +2 hours fallback)
+    // Set precise expiry timestamp: Today + selected Hour/Minute
     const expiryDate = new Date();
+    const nowMs = Date.now();
     if (expiryTime && expiryTime.includes(":")) {
       const [h, m] = expiryTime.split(":");
       const parsedH = parseInt(h, 10);
       const parsedM = parseInt(m, 10);
       if (!isNaN(parsedH) && !isNaN(parsedM)) {
         expiryDate.setHours(parsedH, parsedM, 0, 0);
-        // Smart adjustment: If the selected hour has already passed today, assume tomorrow
-        if (expiryDate.getTime() < Date.now()) {
+        // Prevent activating an untouched "current time" default (which would either
+        // expire immediately for students or wrap 24h into tomorrow by 1 second).
+        if (!isExpiryCustom || (expiryDate.getTime() <= nowMs && nowMs - expiryDate.getTime() < 2 * 60 * 1000)) {
+          setAppAlert({
+            msg: "⚠️ L'ora di scadenza coincide con l'ora attuale. Scegli un orario di fine prova futuro oppure usa una scorciatoia (+30m, +1 Ora, +2 Ore) prima di attivare la sessione."
+          });
+          return;
+        }
+        // Smart adjustment: if the teacher explicitly picked an earlier hour today (e.g. tomorrow morning), schedule tomorrow
+        if (expiryDate.getTime() < nowMs) {
           expiryDate.setDate(expiryDate.getDate() + 1);
         }
       } else {
-        expiryDate.setHours(expiryDate.getHours() + 2);
+        setAppAlert({ msg: "⚠️ Scegli un'ora di scadenza valida per la sessione." });
+        return;
       }
     } else {
-      // Default to 2 hours if no time was specified
-      expiryDate.setHours(expiryDate.getHours() + 2);
+      setAppAlert({ msg: "⚠️ Scegli un'ora di scadenza valida per la sessione." });
+      return;
     }
 
     // 6-digit unlock code: a student whose exam got locked after leaving the
     // page must enter it (or be unlocked from the live monitor) to resume.
     const unlockCode = String(Math.floor(100000 + Math.random() * 900000));
-
-    const sessionPayload = {
-      data: examObj,
-      expiry: expiryDate.toISOString(),
-      teacherId: user?.uid || "mock_teacher",
-      teacherEmail: user?.email || "docente_sandbox@scuola.it",
-      backendUrl: "AI_STUDIO_GENAI_INTEGRATA",
-      randomizeQuestions,
-      severityPreset: "normale",
-      unlockCode,
-      active: true,
-      createdAt: new Date().toISOString()
-    };
 
     if (dbFirestore) {
       try {
@@ -1072,18 +1147,47 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
 
+        // Strip solution keys on the server so students never receive correctIndex/answer in browser memory
+        const authHeaders = await getAuthHeaders();
+        const prepResp = await fetch("/api/session/prepare", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({ examData: examObj }),
+        });
+        const prepData = await prepResp.json().catch(() => ({}));
+        if (!prepResp.ok || !prepData?.sanitizedExam || !prepData?.encryptedAnswerKey) {
+          throw new Error(prepData?.error || "Impossibile proteggere le chiavi di risposta sul server.");
+        }
+        const sanitizedExam = prepData.sanitizedExam;
+        const encryptedAnswerKey = prepData.encryptedAnswerKey;
+
+        const sessionPayload = {
+          data: sanitizedExam,
+          encryptedAnswerKey,
+          expiry: expiryDate.toISOString(),
+          teacherId: user?.uid || "mock_teacher",
+          teacherEmail: user?.email || "docente_sandbox@scuola.it",
+          backendUrl: "AI_STUDIO_GENAI_INTEGRATA",
+          randomizeQuestions,
+          severityPreset: "normale",
+          unlockCode,
+          active: true,
+          createdAt: new Date().toISOString()
+        };
+
         // Purge leftovers from any previous run of this same PIN so two different
         // classes sharing a PIN code can never be mixed inside the live monitor.
         await purgeLiveStudents(targetPin);
 
-        // Active Session with Full Details saved to Firestore
+        // Active Session with sanitized student payload + encrypted key vault saved to Firestore
         const firestorePayload = {
           pin: targetPin,
           title: examObj.title || "Esame attivato",
           expiry: expiryDate.toISOString(),
           teacherEmail: user?.email || "docente_sandbox@scuola.it",
           teacherId: user?.uid || "mock_teacher",
-          data: examObj,
+          data: sanitizedExam,
+          encryptedAnswerKey,
           randomizeQuestions,
           severityPreset: "normale",
           unlockCode,
@@ -1104,7 +1208,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
 
-        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata! Gli studenti bloccati possono essere sbloccati direttamente con 1 click dal Monitor d'Aula.`);
+        setPinStatus(`✅ Sessione Live per il PIN ${targetPin} attivata (chiavi protette lato server)! Gli studenti bloccati possono essere sbloccati con 1 click dal Monitor d'Aula.`);
         setDashboardTab("live_monitor");
         setPin(targetPin);
         setMonitorPin(targetPin);
@@ -1141,9 +1245,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         console.warn("Warmup fallito (ignorato):", warmupErr);
       }
 
+      const authHeaders = await getAuthHeaders();
       const response = await fetch("/api/analyze-exam", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({ 
           examJson: jsonText,
           customInstruction: aiCustomInstruction.trim() || undefined
@@ -1232,9 +1337,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         reason: "Prima dell'aggiunta di contenuti con IA"
       });
 
+      const authHeaders = await getAuthHeaders();
       const res = await fetch("/api/extend-exam-json", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: { "Content-Type": "application/json", ...authHeaders },
         body: JSON.stringify({
           examJson: jsonText,
           instruction: promptToSend,
@@ -1663,12 +1769,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // Manual teacher retouch of the suggested grade (borderline cases).
   // The first retouch preserves the original AI grade for audit trail.
-  const handleManualGrade = async (sub: SavedSubmission) => {
+  const handleManualGrade = async (sub: SavedSubmission, newGradeValue: string) => {
     if (!dbFirestore) {
       setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
       return;
     }
-    const num = parseSubmissionNumericGrade(gradeEditValue);
+    const num = parseSubmissionNumericGrade(newGradeValue);
     if (isNaN(num) || num < 1 || num > 10.5) {
       setAppAlert({ msg: "⚠️ Inserisci un voto valido (es. 6, 6+, 7½, 8)." });
       return;
@@ -1681,8 +1787,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const updated = { ...sub, ...payload };
       setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
       setSelectedSub(updated);
-      setGradeEditOpen(false);
-      setGradeEditValue("");
       showNotify(
         "success",
         `✅ Voto ritoccato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
@@ -1693,545 +1797,121 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Helper to sanitize any UTF-8 / Emoji symbols that standard Helvetica can't render
-  const sanitizePdfText = (text: string): string => {
-    if (!text) return "";
-    
-    let temp = text
-      .replace(/<[^>]+>/g, '') 
-      .replace(/&ldquo;/g, '"')
-      .replace(/&rdquo;/g, '"')
-      .replace(/&mdash;/g, '-')
-      .replace(/&ndash;/g, '-')
-      .replace(/&amp;/g, '&')
-      .replace(/&eacute;/g, 'e')
-      .replace(/&agrave;/g, 'a')
-      .replace(/&egrave;/g, 'e')
-      .replace(/&igrave;/g, 'i')
-      .replace(/&ograve;/g, 'o')
-      .replace(/&ugrave;/g, 'u')
-      .replace(/\*\*/g, '') 
-      .replace(/\*/g, '');
+  // Manual teacher retouch of a single open-ended or reflection question score & feedback
+  const handleRetouchSubjectiveItem = async (
+    sub: SavedSubmission,
+    kind: "open_ended" | "reflection",
+    questionId: string,
+    newScore: number,
+    newFeedback: string
+  ) => {
+    if (!dbFirestore) {
+      setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
+      return;
+    }
+    try {
+      const domandeObj = safeParseJson(sub.Domande_Esame) || {};
+      const ansObj = safeParseJson(sub.Risposte_Studente) || {};
+      const evalObj = { ...(safeParseJson(sub.Full_Evaluation) || {}) };
 
-    // Replace common icons and emojis with safe text representations
-    temp = temp
-      .replace(/[✅✔️✔]/g, "[SI] ")
-      .replace(/[❌✖️✖🔴🚨🛑]/g, "[NO] ")
-      .replace(/[⏱️⏰⏳]/g, "[TEMPO] ")
-      .replace(/[⚠️💡⭐🌟📌🎯🔍🎓📘📖✏️📝⚙️🧪🩺💼🧠🧬]/g, "* ")
-      .replace(/[➢➔➤➜→⇒🛈ℹ️]/g, "-> ")
-      .replace(/≥/g, ">=")
-      .replace(/≤/g, "<=")
-      .replace(/[•●▪]/g, "- ")
-      .replace(/[\u201C\u201D]/g, '"') // Smart quotes
-      .replace(/[\u2018\u2019]/g, "'"); // Smart single quotes
-    
-    // Filter out code points above 255 to completely prevent weird character rendering artifacts
-    // standard Italian accented letters à è é ì ò ù are within 0-255 range (ISO-8859-1)
-    let result = "";
-    for (let i = 0; i < temp.length; i++) {
-      const charCode = temp.charCodeAt(i);
-      if (charCode <= 255) {
-        result += temp.charAt(i);
+      if (kind === "open_ended") {
+        const list = Array.isArray(evalObj.openEndedDetails) ? [...evalObj.openEndedDetails] : [];
+        const idx = list.findIndex((d: any) => String(d?.questionId) === String(questionId));
+        const nextEntry = {
+          questionId,
+          score: newScore,
+          feedback: newFeedback || (idx >= 0 ? list[idx]?.feedback : "Valutazione inserita dal docente."),
+          teacherEdited: true,
+        };
+        if (idx >= 0) list[idx] = { ...list[idx], ...nextEntry };
+        else list.push(nextEntry);
+        evalObj.openEndedDetails = list;
       } else {
-        if (charCode >= 0x2000 && charCode <= 0x206F) {
-          result += "-";
-        } else {
-          result += " ";
-        }
-      }
-    }
-    return result.trim() ? result : " ";
-  };
-
-  // Reusable function to assemble the full pedagogical report jsPDF document
-  const createSubmissionPdfDoc = (sub: SavedSubmission, jsPDFConstructor: any) => {
-    const doc = new jsPDFConstructor();
-    let currentY = 20;
-    const pageHeight = 275;
-
-    const checkPageBreak = (neededHeight: number) => {
-      if (currentY + neededHeight > pageHeight) {
-        doc.addPage();
-        currentY = 20;
-        doc.setFont("Helvetica", "normal");
-        doc.setFontSize(8);
-        doc.setTextColor(150, 150, 150);
-        doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(sub.Nome || "")}`, 15, 12);
-        doc.line(15, 14, 195, 14);
-        doc.setDrawColor(230, 230, 230);
-        currentY = 22;
-      }
-    };
-
-    const writeText = (text: string, fontSize: number = 10, isBold: boolean = false, color: [number, number, number] = [30, 41, 59], xPos: number = 15) => {
-      if (!text) return;
-      doc.setFont("Helvetica", isBold ? "bold" : "normal");
-      doc.setFontSize(fontSize);
-      doc.setTextColor(color[0], color[1], color[2]);
-      
-      const cleanStr = sanitizePdfText(text);
-      const lines: string[] = doc.splitTextToSize(cleanStr, 195 - xPos);
-      for (const line of lines) {
-        checkPageBreak(5);
-        doc.text(line, xPos, currentY);
-        currentY += 5;
-      }
-    };
-
-    const writeParagraphs = (rawText: string, fontSize: number = 10, color: [number, number, number] = [51, 65, 85], xPos: number = 15) => {
-      if (!rawText) return;
-      const blocks = rawText.split(/\n+/);
-      for (const block of blocks) {
-        if (!block.trim()) continue;
-        
-        const isListItem = block.trim().startsWith('-') || block.trim().startsWith('*') || /^\d+\./.test(block.trim());
-        if (isListItem) {
-          doc.setFont("Helvetica", "normal");
-          doc.setFontSize(fontSize);
-          doc.setTextColor(color[0], color[1], color[2]);
-          
-          const cleanBlock = sanitizePdfText(block.replace(/^[\s-*•\d+.]\s*/, ''));
-          const lines: string[] = doc.splitTextToSize("-  " + cleanBlock, 195 - (xPos + 4));
-          for (let j = 0; j < lines.length; j++) {
-            checkPageBreak(5);
-            const indentX = j === 0 ? xPos : xPos + 4;
-            doc.text(lines[j], indentX, currentY);
-            currentY += 5;
-          }
-          currentY += 1.5; 
-        } else {
-          writeText(block, fontSize, false, color, xPos);
-          currentY += 2; 
-        }
-      }
-    };
-
-    // 1. PAGE HEADER
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(16);
-    doc.setTextColor(13, 148, 136); // Teal
-    doc.text("EDUCATIONAL ARCHITECT", 15, currentY);
-    currentY += 6;
-
-    doc.setFont("Helvetica", "normal");
-    doc.setFontSize(9);
-    doc.setTextColor(100, 116, 139);
-    doc.text("Report di Valutazione Cognitiva e Metacognitiva Autonoma", 15, currentY);
-    currentY += 8;
-
-    doc.setDrawColor(226, 232, 240);
-    doc.line(15, currentY, 195, currentY);
-    currentY += 10;
-
-    // 2. DETTAGLIO STUDENTE CARD
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(11);
-    doc.setTextColor(15, 23, 42); // Deep slate
-    doc.text("Anagrafica & Informazioni Prova", 15, currentY);
-    currentY += 6;
-
-    // Draw box for student details
-    doc.setFillColor(248, 250, 252);
-    doc.rect(15, currentY, 180, 24, "F");
-    
-    doc.setFontSize(9);
-    doc.setFont("Helvetica", "normal");
-    doc.setTextColor(71, 85, 105);
-    
-    // Column 1
-    doc.text(`Studente: ${sanitizePdfText(sub.Nome || "Anonimo")}`, 18, currentY + 6);
-    doc.text(`Email: ${sanitizePdfText(sub.Email || "N/D")}`, 18, currentY + 12);
-    doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 18);
-
-    // Column 2
-    const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
-    doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
-    doc.text(`Data Svolgimento: ${dateStr}`, 110, currentY + 12);
-    doc.text(`Valutazione ID: ${sub.id || "N/D"}`, 110, currentY + 18);
-    
-    currentY += 30;
-
-    // 3. DASHBOARD DI PERFORMANCE
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(11);
-    doc.setTextColor(15, 23, 42);
-    doc.text("Dashboard delle Metriche & Valutazione", 15, currentY);
-    currentY += 6;
-
-    // Draw stats box
-    doc.setFillColor(241, 245, 249);
-    doc.rect(15, currentY, 180, 26, "F");
-
-    // Stats 1: Voto IA
-    const gradeIsPending = displaySubmissionGrade(sub) === "N.V.";
-    const gradeText = gradeIsPending ? "N.V." : `${sub.Voto_Suggerito || "N/A"}/10`;
-
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(8);
-    doc.setTextColor(71, 85, 105);
-    doc.text(gradeIsPending ? "VOTO (IN ATTESA DI CORREZIONE)" : "VOTO CONSIGLIATO IA", 20, currentY + 8);
-    doc.setFontSize(16);
-    doc.setTextColor(gradeIsPending ? 185 : 13, gradeIsPending ? 28 : 148, gradeIsPending ? 28 : 136);
-    doc.text(gradeText, 20, currentY + 18);
-
-    // Stats 2: Autovalutazione
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(8);
-    doc.setTextColor(71, 85, 105);
-    doc.text("AUTOVALUTAZIONE META.", 85, currentY + 8);
-    doc.setFontSize(16);
-    doc.setTextColor(79, 70, 229); // Indigo
-    doc.text(`${sub.Autovalutazione || "—"}/10`, 85, currentY + 18);
-
-    // Stats 3: Monitoraggio Integrità
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(8);
-    doc.setTextColor(71, 85, 105);
-    doc.text("MONITORAGGIO INTEGRITÀ", 150, currentY + 8);
-    doc.setFontSize(10);
-    const totalViolations = (sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0);
-    if (totalViolations > 0) {
-      doc.setTextColor(180, 83, 9); // Amber
-      doc.text(`Rilevato (${totalViolations} violazioni)`, 150, currentY + 18);
-    } else {
-      doc.setTextColor(5, 150, 105); // Emerald Green
-      doc.text("Ottima (0 anomalie)", 150, currentY + 18);
-    }
-
-    currentY += 34;
-
-    // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
-    const breakdown = extractBreakdownFromSubmission(sub);
-    if (breakdown) {
-      doc.setFont("Courier", "bold");
-      doc.setFontSize(8.5);
-      const summaryLines: string[] = doc.splitTextToSize(sanitizePdfText(breakdown.formulaSummary || ""), 172);
-      doc.setFont("Helvetica", "normal");
-      doc.setFontSize(7.5);
-      const explRaw = sanitizePdfText(breakdown.explanationLines[0] || "");
-      const explLines: string[] = explRaw ? doc.splitTextToSize(explRaw, 172).slice(0, 2) : [];
-
-      const boxHeight = 12 + summaryLines.length * 4.5 + (explLines.length > 0 ? explLines.length * 4 + 2 : 0);
-      checkPageBreak(boxHeight + 4);
-      doc.setFillColor(248, 250, 252);
-      doc.setDrawColor(203, 213, 225);
-      doc.roundedRect(15, currentY, 180, boxHeight, 2.5, 2.5, "FD");
-
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(9);
-      doc.setTextColor(30, 41, 59);
-      doc.text(`Composizione del Voto: ${sanitizePdfText(breakdown.formulaTitle || "")}`, 19, currentY + 6);
-
-      let boxY = currentY + 12;
-      doc.setFont("Courier", "bold");
-      doc.setFontSize(8.5);
-      doc.setTextColor(67, 56, 202);
-      for (const sLine of summaryLines) {
-        doc.text(sLine, 19, boxY);
-        boxY += 4.5;
+        const list = Array.isArray(evalObj.reflectionDetails) ? [...evalObj.reflectionDetails] : [];
+        const idx = list.findIndex((d: any) => String(d?.id) === String(questionId));
+        const nextEntry = {
+          id: questionId,
+          score: newScore,
+          feedback: newFeedback || (idx >= 0 ? list[idx]?.feedback : "Valutazione inserita dal docente."),
+          teacherEdited: true,
+        };
+        if (idx >= 0) list[idx] = { ...list[idx], ...nextEntry };
+        else list.push(nextEntry);
+        evalObj.reflectionDetails = list;
       }
 
-      if (explLines.length > 0) {
-        boxY += 1.5;
-        doc.setFont("Helvetica", "normal");
-        doc.setFontSize(7.5);
-        doc.setTextColor(71, 85, 105);
-        for (const eLine of explLines) {
-          doc.text(eLine, 19, boxY);
-          boxY += 4;
-        }
+      const oeQuestions = Array.isArray(domandeObj?.openEnded) ? domandeObj.openEnded : [];
+      const rqQuestions = Array.isArray(domandeObj?.sections)
+        ? domandeObj.sections.flatMap((s: any) => s.reflectionQuestions || [])
+        : [];
+      const audit =
+        kind === "open_ended"
+          ? auditSubjectiveEvaluation({
+              questions: oeQuestions,
+              details: evalObj.openEndedDetails || [],
+              getAnswer: (id) => String(ansObj?.oe?.[id] ?? ansObj?.openEnded?.[id] ?? ""),
+              getDetailId: (d) => d?.questionId,
+            })
+          : auditSubjectiveEvaluation({
+              questions: rqQuestions,
+              details: evalObj.reflectionDetails || [],
+              getAnswer: (id) => String(ansObj?.wbRq?.[id] ?? ansObj?.oe?.[id] ?? ""),
+              getDetailId: (d) => d?.id,
+            });
+
+      if (audit.complete) {
+        if (kind === "open_ended") evalObj.openEndedDetails = audit.details;
+        else evalObj.reflectionDetails = audit.details;
+        evalObj.evaluationMode = "ai";
+        delete evalObj.requiresManualReview;
+        delete evalObj.manualReviewReason;
+      } else {
+        evalObj.evaluationMode = "pending";
+        evalObj.requiresManualReview = true;
+        evalObj.manualReviewReason = `Valutazione parziale: restano ${audit.missing.length} quesiti con risposta scritta da valutare.`;
       }
 
-      currentY += boxHeight + 4;
-    }
+      const breakdown = computeGradeBreakdown({
+        tipo: sub.Tipo,
+        examData: domandeObj,
+        answers: ansObj,
+        evaluation: evalObj,
+        punteggioMC: sub.Punteggio_MC,
+        punteggioFIB: sub.Punteggio_FIB,
+        pendingSubjective: audit.complete ? "zero" : "hold",
+      });
 
-    // Parser per i dati IA completi
-    const evalObj = safeParseJson(sub.Full_Evaluation);
+      evalObj.suggestedGrade = breakdown.finalGradeFormatted;
+      evalObj.gradeBreakdown = breakdown;
 
-    // 4. GIUDIZIO DIDATTICO COMPLESSIVO
-    const generalFeedback = sub.Feedback_Generale || evalObj?.overallFeedback || evalObj?.openEndedEvaluation;
-    if (generalFeedback) {
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(15, 23, 42);
-      doc.text("Giudizio Didattico Complessivo", 15, currentY);
-      currentY += 6;
-
-      writeParagraphs(generalFeedback, 9.5, [30, 41, 59], 15);
-      currentY += 6;
-    }
-
-    // 5. ERRORI PRINCIPALI
-    const mainErrors = sub.Errori_Principali || evalObj?.mainErrors;
-    if (mainErrors) {
-      checkPageBreak(15);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(220, 38, 38); // Red
-      doc.text("Errori Principali Evidenziati", 15, currentY);
-      currentY += 6;
-
-      writeParagraphs(mainErrors, 9.5, [185, 28, 28], 15);
-      currentY += 6;
-    }
-
-    // 5.5 PIANO DI RECUPERO IA
-    const recoveryPlan = sub.Piano_Recupero;
-    if (recoveryPlan) {
-      checkPageBreak(15);
-      doc.setFont("Helvetica", "bold");
-      doc.setFontSize(11);
-      doc.setTextColor(13, 148, 136); // Teal
-      doc.text("Piano di Recupero Consigliato dall'IA", 15, currentY);
-      currentY += 6;
-
-      writeParagraphs(recoveryPlan, 9.5, [13, 148, 136], 15);
-      currentY += 6;
-    }
-
-    // 6. DETTAGLI PUNTUALI DOMANDE E RISPOSTE
-    checkPageBreak(25);
-    doc.setFont("Helvetica", "bold");
-    doc.setFontSize(11);
-    doc.setTextColor(15, 23, 42);
-    doc.text("Dettaglio Risposte & Analisi Metacognitiva", 15, currentY);
-    currentY += 6;
-
-    const ansObj = safeParseJson(sub.Risposte_Studente) || {};
-    const domandeObj = safeParseJson(sub.Domande_Esame);
-
-    if (sub.Tipo === "Quiz") {
-      const mcqList = domandeObj?.multipleChoice || [];
-      const oeList = domandeObj?.openEnded || [];
-      const details = evalObj?.openEndedDetails || [];
-
-      // Scelta Multipla
-      if (mcqList.length > 0) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(71, 85, 105);
-        doc.text("A) Sezione Risposte a Scelta Multipla (Crocette)", 15, currentY);
-        currentY += 6;
-
-        mcqList.forEach((q: any, idx: number) => {
-          const selectedOptIdx = ansObj.mc?.[q.id];
-          const opts = Array.isArray(q.options) ? q.options : [];
-          const hasSelection = selectedOptIdx !== undefined && selectedOptIdx !== null && selectedOptIdx !== "";
-          const parsedIdx = hasSelection ? Number(selectedOptIdx) : -1;
-          const selectedOptText =
-            hasSelection && Number.isInteger(parsedIdx) && opts[parsedIdx] !== undefined
-              ? String(opts[parsedIdx])
-              : "Risposta non data o mancante";
-          const correctOptText = opts[q.correctIndex] !== undefined ? String(opts[q.correctIndex]) : "N/D";
-          const isCorrect = hasSelection && Number.isInteger(parsedIdx) && parsedIdx === Number(q.correctIndex);
-          
-          checkPageBreak(18);
-          writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
-          currentY += 1;
-
-          const mcImg = domandeObj?.images?.[q.id];
-          if (mcImg) {
-            checkPageBreak(70);
-            try {
-              const mfmt = mcImg.includes("image/png") ? "PNG" : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg") ? "JPEG" : "PNG";
-              doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
-              currentY += 65;
-            } catch {}
-          }
-
-          if (isCorrect) {
-            writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
-          } else {
-            writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
-            currentY += 1;
-            writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
-          }
-          currentY += 4.5;
-        });
-        currentY += 2;
+      const updatePayload: any = {
+        Voto_Suggerito: breakdown.finalGradeFormatted,
+        Full_Evaluation: JSON.stringify(evalObj),
+      };
+      if (!sub.Voto_Originale_IA && sub.Voto_Suggerito && sub.Voto_Suggerito !== "N.V.") {
+        updatePayload.Voto_Originale_IA = sub.Voto_Suggerito;
       }
 
-      // Domande Aperte: mostra sempre tutti i quesiti della prova, anche quando
-      // la correzione IA è assente o parziale (le risposte restano correggibili).
-      const oeEntries = buildSubjectiveReviewEntries(
-        oeList,
-        details,
-        (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
-        (d) => d.questionId
+      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
+      const updated = { ...sub, ...updatePayload };
+      setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
+      setSelectedSub(updated);
+      showNotify(
+        "success",
+        audit.complete
+          ? `✅ Punteggio quesito aggiornato (${newScore}/10) e voto ricalcolato: ${breakdown.finalGradeFormatted}`
+          : `✅ Punteggio quesito salvato (${newScore}/10). Restano ${audit.missing.length} quesiti aperti da valutare prima del voto finale.`,
+        5000
       );
-      if (oeEntries.length > 0) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(71, 85, 105);
-        doc.text("B) Sezione Sviluppo Domande Aperte & Correzione Didattica", 15, currentY);
-        currentY += 6;
-
-        oeEntries.forEach((entry: any, idx: number) => {
-          const ansText = entry.answer || "Assente";
-          const questionText = entry.question?.question || `Quesito Aperto ${idx + 1}`;
-
-          checkPageBreak(25);
-          writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
-          currentY += 1;
-
-          const oeImg = domandeObj?.images?.[entry.id];
-          if (oeImg) {
-            checkPageBreak(70);
-            try {
-              const ofmt = oeImg.includes("image/png") ? "PNG" : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg") ? "JPEG" : "PNG";
-              doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
-              currentY += 65;
-            } catch {}
-          }
-
-          // Student input box
-          const displayAnsText = ansText === "[VUOTO]" ? "Risposta non compilata o lasciata vuota (scena muta)" : ansText;
-          writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
-          currentY += 1.5;
-
-          if (entry.detail) {
-            // Tutor IA Corrective detail
-            checkPageBreak(12);
-            writeText(`Analisi Correttiva Tutor IA (Voto: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
-            currentY += 1;
-
-            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
-          } else {
-            checkPageBreak(12);
-            writeText("Valutazione IA non disponibile: la risposta va corretta dal docente (usa \"Ricalcola Voto\").", 8.5, true, [185, 28, 28], 15);
-          }
-          currentY += 4;
-        });
-      }
-
-    } else {
-      // Workbook reflections details
-      const sections = domandeObj?.sections || [];
-      const details = evalObj?.reflectionDetails || [];
-
-      if (sections.length > 0) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(71, 85, 105);
-        doc.text("A) Verifiche di Completamento Terminologico (Fill-in-the-Blank)", 15, currentY);
-        currentY += 6;
-
-        sections.forEach((sec: any, secIdx: number) => {
-          const fibList = sec.fillInTheBlank || [];
-          if (fibList.length === 0) return;
-
-          fibList.forEach((fib: any, fIdx: number) => {
-            const rawVal = ansObj.wbFib?.[fib.id];
-            const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
-            const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-            const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-            const { before, after } = getFibSentenceParts(fib.sentence, expected);
-            const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
-
-            checkPageBreak(15);
-            writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
-            currentY += 1;
-
-            const fibImg = domandeObj?.images?.[fib.id];
-            if (fibImg) {
-              checkPageBreak(70);
-              try {
-                const ffmt = fibImg.includes("image/png") ? "PNG" : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg") ? "JPEG" : "PNG";
-                doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
-                currentY += 65;
-              } catch {}
-            }
-
-            writeText(fullText, 8.5, false, [71, 85, 105], 15);
-            currentY += 1;
-            writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
-            currentY += 5;
-          });
-        });
-        currentY += 3;
-      }
-
-      // Reflection questions: always list every reflection of the workbook,
-      // even if the AI did not return a score for some of them.
-      const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-      const rqEntries = buildSubjectiveReviewEntries(
-        rqList,
-        details,
-        (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
-        (d) => d.id
-      );
-      if (rqEntries.length > 0) {
-        checkPageBreak(15);
-        doc.setFont("Helvetica", "bold");
-        doc.setFontSize(10);
-        doc.setTextColor(71, 85, 105);
-        doc.text("B) Domande di Riflessione Critica & Metacognitiva", 15, currentY);
-        currentY += 6;
-
-        rqEntries.forEach((entry: any, idx: number) => {
-          const ansText = entry.answer || "Assente";
-          const questionText = entry.question?.question || `Riflessione Critica ${idx + 1}`;
-
-          checkPageBreak(25);
-          writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
-          currentY += 1;
-
-          const reflImg = domandeObj?.images?.[entry.id];
-          if (reflImg) {
-            checkPageBreak(70);
-            try {
-              const rfmt = reflImg.includes("image/png") ? "PNG" : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg") ? "JPEG" : "PNG";
-              doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
-              currentY += 65;
-            } catch {}
-          }
-
-          // Student input box
-          const displayAnsText = ansText === "[VUOTO]" ? "Risposta non data o lasciata vuota" : ansText;
-          writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
-          currentY += 1.5;
-
-          if (entry.detail) {
-            // Tutor IA evaluation detail
-            checkPageBreak(12);
-            writeText(`Feedback Didattico Customizzato (Punteggio: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
-            currentY += 1;
-
-            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
-          } else {
-            checkPageBreak(12);
-            writeText("Valutazione IA non disponibile: la riflessione va corretta dal docente (usa \"Ricalcola Voto\").", 8.5, true, [185, 28, 28], 15);
-          }
-          currentY += 4;
-        });
-      }
+    } catch (err: any) {
+      setAppAlert({ msg: `Errore salvataggio punteggio quesito: ${err.message}` });
     }
-
-    // 7. FOOTER PAGE SIGNATURE
-    checkPageBreak(18);
-    currentY += 8;
-    doc.setDrawColor(226, 232, 240);
-    doc.line(15, currentY, 195, currentY);
-    currentY += 6;
-    doc.setFont("Helvetica", "italic");
-    doc.setFontSize(7.5);
-    doc.setTextColor(148, 163, 184);
-    doc.text("Firmato digitalmente e certificato da Educational Architect AI Engine. Conservare per il quaderno dei feedback scolastici.", 15, currentY);
-
-    return doc;
   };
 
   // Export a student evaluation with metacognitive details to PDF
   const handleExportPDF = async (sub: SavedSubmission) => {
     try {
-      const { jsPDF } = await import("jspdf");
-      const doc = createSubmissionPdfDoc(sub, jsPDF);
-      const formattedName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
-      doc.save(`esito_ea_${formattedName}_pin_${sub.Pin || "esame"}.pdf`);
+      await exportSubmissionPdf(sub);
     } catch (pdfErr) {
       console.error("PDF generation error:", pdfErr);
       setAppAlert({ msg: "❌ Errore durante l'assemblaggio del PDF. Riprovare." });
@@ -2248,53 +1928,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setZipProgress({ current: 0, total: subsToExport.length });
 
     try {
-      const [{ jsPDF }, JSZipModule] = await Promise.all([
-        import("jspdf"),
-        import("jszip")
-      ]);
-      const JSZip = (JSZipModule as any).default || JSZipModule;
-      const zip = new JSZip();
-
-      const usedFilenames = new Map<string, number>();
-
-      for (let i = 0; i < subsToExport.length; i++) {
-        const sub = subsToExport[i];
-        setZipProgress({ current: i + 1, total: subsToExport.length });
-
-        // Let the event loop cycle so React state can update progress smoothly
-        if (i % 2 === 0) {
-          await new Promise((r) => setTimeout(r, 15));
-        }
-
-        const doc = createSubmissionPdfDoc(sub, jsPDF);
-        const arrayBuffer = doc.output("arraybuffer");
-
-        const rawName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
-        const pinPart = (sub.Pin || "esame").toLowerCase().replace(/[^a-z0-9]/g, "_");
-        let baseFilename = `esito_${rawName}_pin_${pinPart}`;
-        const count = usedFilenames.get(baseFilename) || 0;
-        usedFilenames.set(baseFilename, count + 1);
-        const finalFilename = count > 0 ? `${baseFilename}_${count + 1}.pdf` : `${baseFilename}.pdf`;
-
-        zip.file(finalFilename, arrayBuffer);
-      }
-
-      const zipBlob = await zip.generateAsync({
-        type: "blob",
-        compression: "DEFLATE",
-        compressionOptions: { level: 6 }
+      await exportSubmissionsZip(subsToExport, zipBaseName, (current, total) => {
+        setZipProgress({ current, total });
       });
-
-      const cleanZipName = zipBaseName.toLowerCase().replace(/[^a-z0-9_-]/g, "_");
-      const timestamp = new Date().toISOString().slice(0, 10);
-      const url = URL.createObjectURL(zipBlob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `${cleanZipName}_${timestamp}.zip`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      setTimeout(() => URL.revokeObjectURL(url), 100);
 
       showNotify(
         "success",
@@ -2309,26 +1945,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setZipProgress(null);
     }
   };
-
-  // Aggregated submissions by student interface
-  interface StudentSummary {
-    key: string;
-    name: string;
-    email: string;
-    submissions: SavedSubmission[];
-    totalTests: number;
-    quizCount: number;
-    workbookCount: number;
-    latestDate: string;
-    latestSubmission: SavedSubmission;
-    averageGradeNumber: number | null;
-    averageGradeFormatted: string;
-    // Trend: first vs latest numeric grade (needs >= 2 valid grades)
-    trend: { dir: "up" | "down" | "same"; delta: number } | null;
-    uniquePins: string[];
-    totalTabSwitches: number;
-    totalPasteAttempts: number;
-  }
 
   // Fallback bucket for submissions recorded before session ids existed.
   // Groups by calendar day so two classes that reused the same PIN on the same
@@ -2357,8 +1973,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const downloadCsvFile = (filename: string, headers: string[], rows: Array<Array<unknown>>) => {
     const escapeCSVString = (val: any) => {
       if (val === undefined || val === null) return "";
-      const str = String(val).replace(/"/g, '""');
-      if (str.includes(",") || str.includes("\n") || str.includes("\r") || str.includes('"')) {
+      let raw = String(val);
+      // Neutralize spreadsheet formula injection (=, +, -, @, tab, cr at cell start)
+      if (/^[=+\-@\t\r]/.test(raw)) {
+        raw = `'${raw}`;
+      }
+      const str = raw.replace(/"/g, '""');
+      if (str.includes(";") || str.includes(",") || str.includes("\n") || str.includes("\r") || str.includes('"')) {
         return `"${str}"`;
       }
       return str;
@@ -2366,7 +1987,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
     const csvContent =
       "\uFEFF" +
-      [headers.map(escapeCSVString).join(","), ...rows.map((r) => r.map(escapeCSVString).join(","))].join("\n");
+      [headers.map(escapeCSVString).join(";"), ...rows.map((r) => r.map(escapeCSVString).join(";"))].join("\n");
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
@@ -2543,6 +2164,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         pendingOpen: number;
         hasDiscrepancy: boolean;
         totalViolations: number;
+        examTitle: string;
+        timestampMs: number;
       }
     >();
     submissions.forEach((sub) => {
@@ -2557,12 +2180,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         (sub.AntiCopia_TabSwitch || 0) +
         (sub.AntiCopia_IncollaBloccato || 0) +
         (sub.AntiCopia_SchermoDiviso || 0);
+      const examTitle = getSubmissionExamTitle(sub);
+      const parsedTs = Date.parse(sub.Timestamp);
+      const timestampMs = Number.isNaN(parsedTs) ? 0 : parsedTs;
       map.set(sub.id, {
         displayGrade,
         numericGrade,
         pendingOpen,
         hasDiscrepancy,
         totalViolations,
+        examTitle,
+        timestampMs,
       });
     });
     return map;
@@ -2570,7 +2198,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // Submissions filtered list logic (chronological) with multi-sorting
   const filteredSubmissions = React.useMemo(() => {
-    const q = searchQuery.toLowerCase();
+    const q = searchQuery.toLowerCase().trim();
     const result = submissions.filter(sub => {
       const matchesSearch =
         !q ||
@@ -2583,29 +2211,33 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     result.sort((a, b) => {
+      const metaA = submissionMetaMap.get(a.id);
+      const metaB = submissionMetaMap.get(b.id);
+      const tsA = metaA?.timestampMs ?? 0;
+      const tsB = metaB?.timestampMs ?? 0;
       if (chronologicalSortBy === "grade_desc") {
-        const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
-        const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+        const gradeA = metaA?.numericGrade ?? -1;
+        const gradeB = metaB?.numericGrade ?? -1;
         if (gradeB !== gradeA) return gradeB - gradeA;
-        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+        return tsB - tsA;
       }
       if (chronologicalSortBy === "grade_asc") {
-        const rawA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
-        const rawB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+        const rawA = metaA?.numericGrade ?? -1;
+        const rawB = metaB?.numericGrade ?? -1;
         const gradeA = rawA < 0 ? 99 : rawA;
         const gradeB = rawB < 0 ? 99 : rawB;
         if (gradeA !== gradeB) return gradeA - gradeB;
-        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+        return tsB - tsA;
       }
       if (chronologicalSortBy === "name_asc") {
         return (a.Nome || "").localeCompare(b.Nome || "");
       }
       if (chronologicalSortBy === "violations_desc") {
-        const vA = submissionMetaMap.get(a.id)?.totalViolations ?? 0;
-        const vB = submissionMetaMap.get(b.id)?.totalViolations ?? 0;
+        const vA = metaA?.totalViolations ?? 0;
+        const vB = metaB?.totalViolations ?? 0;
         if (vB !== vA) return vB - vA;
       }
-      return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+      return tsB - tsA;
     });
 
     return result;
@@ -2753,7 +2385,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
     submissions.forEach(sub => {
       const pinClean = (sub.Pin || "").trim();
-      const examTitle = getSubmissionExamTitle(sub);
+      const examTitle = submissionMetaMap.get(sub.id)?.examTitle || getSubmissionExamTitle(sub);
       // Group by PIN + session run id. Reusing the same PIN for a second class
       // creates a new session id, so the two classes never end up in one card.
       // Legacy submissions without a session id fall back to title + day bucket.
@@ -2772,31 +2404,35 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
     map.forEach((examSubs, key) => {
       // Capture oldest and latest submission chronologically
-      const chronologicallySorted = [...examSubs].sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+      const chronologicallySorted = [...examSubs].sort(
+        (a, b) => (submissionMetaMap.get(b.id)?.timestampMs ?? 0) - (submissionMetaMap.get(a.id)?.timestampMs ?? 0)
+      );
       const latestSub = chronologicallySorted[0];
       const oldestSub = chronologicallySorted[chronologicallySorted.length - 1];
 
       // Sort submissions by validated numeric grade descending (N.V. at bottom)
       examSubs.sort((a, b) => {
-        const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
-        const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+        const metaA = submissionMetaMap.get(a.id);
+        const metaB = submissionMetaMap.get(b.id);
+        const gradeA = metaA?.numericGrade ?? -1;
+        const gradeB = metaB?.numericGrade ?? -1;
         if (gradeB !== gradeA) return gradeB - gradeA;
-        return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+        return (metaB?.timestampMs ?? 0) - (metaA?.timestampMs ?? 0);
       });
 
       const pin = examSubs.find(s => s.Pin && s.Pin.trim())?.Pin || "";
 
-      // Determine most descriptive title
+      // Determine most descriptive title using cached meta.examTitle
       let title = "";
       for (const s of examSubs) {
-        const t = s.Session_Titolo?.trim() || getSubmissionExamTitle(s);
+        const t = s.Session_Titolo?.trim() || submissionMetaMap.get(s.id)?.examTitle || getSubmissionExamTitle(s);
         if (t && !t.startsWith("Prova con PIN") && !t.startsWith("Quiz Didattico") && !t.startsWith("Workbook Didattico")) {
           title = t;
           break;
         }
       }
       if (!title) {
-        title = getSubmissionExamTitle(latestSub);
+        title = submissionMetaMap.get(latestSub.id)?.examTitle || getSubmissionExamTitle(latestSub);
       }
 
       const types = new Set(examSubs.map(s => s.Tipo));
@@ -3008,7 +2644,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       ref={timeInputRef}
                       type="time"
                       value={expiryTime}
-                      onChange={(e) => setExpiryTime(e.target.value)}
+                      onChange={(e) => {
+                        setIsExpiryCustom(true);
+                        setExpiryTime(e.target.value);
+                      }}
                       className="w-full p-2.5 bg-slate-950 border border-indigo-500/40 focus:border-amber-400 rounded-xl text-amber-300 font-mono text-sm font-bold outline-none focus:ring-2 focus:ring-amber-400/20 transition-all [color-scheme:dark] [&::-webkit-calendar-picker-indicator]:cursor-pointer [&::-webkit-calendar-picker-indicator]:invert [&::-webkit-calendar-picker-indicator]:opacity-90 hover:[&::-webkit-calendar-picker-indicator]:opacity-100"
                     />
                   </div>
@@ -3053,6 +2692,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         now.setMinutes(now.getMinutes() + preset.mins);
                         const hours = String(now.getHours()).padStart(2, "0");
                         const minutes = String(now.getMinutes()).padStart(2, "0");
+                        setIsExpiryCustom(true);
                         setExpiryTime(`${hours}:${minutes}`);
                       }}
                       className="px-2 py-1 rounded-lg bg-slate-800/80 hover:bg-indigo-600/30 border border-white/10 hover:border-indigo-400/50 text-[10px] font-semibold text-slate-300 hover:text-white transition-all cursor-pointer"
@@ -3063,12 +2703,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   <button
                     type="button"
                     onClick={() => {
-                      const now = new Date();
-                      const hours = String(now.getHours()).padStart(2, "0");
-                      const minutes = String(now.getMinutes()).padStart(2, "0");
-                      setExpiryTime(`${hours}:${minutes}`);
+                      setIsExpiryCustom(false);
+                      setExpiryTime(getCurrentTimeHHMM());
                     }}
-                    className="px-2 py-1 rounded-lg bg-slate-800/80 hover:bg-emerald-600/30 border border-white/10 hover:border-emerald-400/50 text-[10px] font-semibold text-emerald-400 hover:text-emerald-300 transition-all cursor-pointer ml-auto"
+                    className={`px-2 py-1 rounded-lg border text-[10px] font-semibold transition-all cursor-pointer ml-auto ${
+                      !isExpiryCustom
+                        ? "bg-emerald-600/25 border-emerald-400/50 text-emerald-300"
+                        : "bg-slate-800/80 hover:bg-emerald-600/30 border-white/10 hover:border-emerald-400/50 text-emerald-400 hover:text-emerald-300"
+                    }`}
                   >
                     Ora Attuale
                   </button>
@@ -3524,7 +3166,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
                     <div 
                       className="text-xs text-slate-300 space-y-2 leading-relaxed"
-                      dangerouslySetInnerHTML={{ __html: aiAnalysis.reviewHtml }}
+                      dangerouslySetInnerHTML={{ __html: sanitizeAiHtml(aiAnalysis.reviewHtml) }}
                     />
 
                     {aiAnalysis.suggestions && aiAnalysis.suggestions.length > 0 && (
@@ -3585,337 +3227,41 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 )}
               </div>
 
-              {/* Personal Exam Library: synced in Cloud Firestore across all devices */}
-              <div className="bg-slate-900/50 border border-white/10 rounded-2xl p-4 space-y-3">
-                <div className="flex flex-wrap items-center justify-between gap-2">
-                  <div className="min-w-0">
-                    <h3 className="text-xs font-bold text-white flex items-center gap-2">
-                      <BookOpen className="w-3.5 h-3.5 text-teal-400 shrink-0" />
-                      <span>Libreria verifiche salvate</span>
-                      <span className="text-slate-400 font-mono tabular-nums font-normal">
-                        {library.length}
-                      </span>
-                    </h3>
-                    <p className="text-[11px] text-slate-400 mt-0.5 leading-snug">
-                      Sincronizzata nel Cloud · Salva una prova qui e la ritrovi su qualsiasi dispositivo.
-                    </p>
-                  </div>
-
-                  <div className="flex items-center gap-1.5 flex-wrap shrink-0">
-                    <input
-                      ref={libraryImportRef}
-                      type="file"
-                      accept=".json,application/json"
-                      onChange={handleImportLibraryBackup}
-                      className="hidden"
-                    />
-                    {jsonText.trim() && (
-                      <button
-                        type="button"
-                        onClick={() => handleSaveToLibrary("Editor")}
-                        disabled={librarySaving}
-                        title="Salva la verifica presente nell'editor dentro la tua libreria"
-                        className="px-2.5 py-1.5 text-[11px] font-semibold text-emerald-950 bg-emerald-400 hover:bg-emerald-300 rounded-lg cursor-pointer transition-colors disabled:opacity-50 flex items-center gap-1 whitespace-nowrap shrink-0"
-                      >
-                        <PlusCircle className="w-3.5 h-3.5" />
-                        <span>{librarySaving ? "Salvataggio..." : "Salva attuale"}</span>
-                      </button>
-                    )}
-                    <button
-                      type="button"
-                      onClick={handleExportLibraryBackup}
-                      disabled={libraryLoading || library.length === 0}
-                      title="Esporta tutte le tue verifiche salvate in un file di backup"
-                      className="px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg cursor-pointer transition-colors disabled:opacity-40 flex items-center gap-1 whitespace-nowrap shrink-0"
-                    >
-                      <Download className="w-3 h-3" />
-                      <span>Backup</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => libraryImportRef.current?.click()}
-                      disabled={libraryLoading}
-                      title="Importa verifiche da un file di backup"
-                      className="px-2.5 py-1.5 text-[11px] font-medium text-slate-200 hover:text-white bg-white/5 hover:bg-white/10 border border-white/10 rounded-lg cursor-pointer transition-colors disabled:opacity-40 whitespace-nowrap shrink-0"
-                    >
-                      <span>Ripristina</span>
-                    </button>
-                    <button
-                      type="button"
-                      onClick={loadLibrary}
-                      disabled={libraryLoading}
-                      title="Aggiorna elenco verifiche salvate"
-                      className="p-1.5 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-50 shrink-0"
-                    >
-                      <RefreshCw className={`w-3.5 h-3.5 ${libraryLoading ? "animate-spin" : ""}`} />
-                    </button>
-                  </div>
-                </div>
-
-                {/* Search & Type Segmented Filter */}
-                {library.length > 0 && (
-                  <div className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
-                    <div className="relative flex-1">
-                      <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
-                      <input
-                        type="text"
-                        placeholder="Cerca verifica per titolo..."
-                        value={librarySearch}
-                        onChange={(e) => setLibrarySearch(e.target.value)}
-                        className="w-full pl-8 pr-7 py-1.5 text-xs bg-slate-950/80 border border-white/10 focus:border-teal-400 rounded-lg text-white placeholder:text-slate-500 outline-none transition-colors"
-                      />
-                      {librarySearch && (
-                        <button
-                          type="button"
-                          onClick={() => setLibrarySearch("")}
-                          aria-label="Pulisci ricerca"
-                          className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-white cursor-pointer"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
-                      )}
-                    </div>
-                    <div className="flex items-center p-0.5 bg-slate-950/80 border border-white/10 rounded-lg text-[11px] shrink-0">
-                      {(["all", "Quiz", "Workbook"] as const).map((t) => (
-                        <button
-                          key={t}
-                          type="button"
-                          onClick={() => setLibraryTypeFilter(t)}
-                          className={`px-2.5 py-1 rounded-md font-medium transition-colors cursor-pointer whitespace-nowrap shrink-0 ${
-                            libraryTypeFilter === t
-                              ? "bg-teal-500/20 text-teal-300"
-                              : "text-slate-400 hover:text-slate-200"
-                          }`}
-                        >
-                          {t === "all" ? "Tutte" : t}
-                        </button>
-                      ))}
-                    </div>
-                  </div>
-                )}
-
-                {libraryMsg && (
-                  <div className="flex items-center justify-between gap-2 text-[11px] text-teal-200 bg-teal-950/40 border border-teal-500/25 rounded-lg px-3 py-2 leading-snug">
-                    <span>{libraryMsg}</span>
-                    <button
-                      type="button"
-                      onClick={() => setLibraryMsg(null)}
-                      aria-label="Chiudi avviso libreria"
-                      className="text-teal-300/70 hover:text-white cursor-pointer shrink-0"
-                    >
-                      <X className="w-3.5 h-3.5" />
-                    </button>
-                  </div>
-                )}
-
-                {libraryLoading ? (
-                  <div className="space-y-2 py-1">
-                    <div className="h-12 bg-white/5 rounded-lg animate-pulse" />
-                    <div className="h-12 bg-white/5 rounded-lg animate-pulse" />
-                  </div>
-                ) : library.length === 0 ? (
-                  <div className="py-5 px-3 text-center border border-dashed border-white/10 rounded-xl space-y-1.5">
-                    <p className="text-xs font-medium text-slate-300">
-                      Nessuna verifica salvata al momento
-                    </p>
-                    <p className="text-[11px] text-slate-500 max-w-sm mx-auto leading-relaxed">
-                      Genera una prova con l&apos;IA, importala da Google Moduli oppure incolla un JSON nell&apos;editor e premi &ldquo;Salva attuale&rdquo;.
-                    </p>
-                  </div>
-                ) : (() => {
-                  const q = librarySearch.trim().toLowerCase();
-                  const filteredLibrary = library.filter((it) => {
-                    if (libraryTypeFilter !== "all" && it.examType !== libraryTypeFilter) return false;
-                    if (!q) return true;
-                    return (
-                      it.title.toLowerCase().includes(q) ||
-                      (it.source || "").toLowerCase().includes(q)
-                    );
-                  });
-
-                  if (filteredLibrary.length === 0) {
-                    return (
-                      <div className="py-4 px-3 text-center border border-white/10 rounded-xl space-y-2">
-                        <p className="text-xs text-slate-400">
-                          Nessuna verifica corrisponde ai filtri attuali.
-                        </p>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setLibrarySearch("");
-                            setLibraryTypeFilter("all");
-                          }}
-                          className="text-[11px] font-medium text-teal-300 hover:text-teal-200 underline cursor-pointer"
-                        >
-                          Mostra tutte le verifiche
-                        </button>
-                      </div>
-                    );
-                  }
-
-                  return (
-                    <div className="divide-y divide-white/10 max-h-64 overflow-y-auto border border-white/10 rounded-xl bg-slate-950/60">
-                      {filteredLibrary.map((item) => {
-                        const isLoaded = loadedLibraryItemId === item.id;
-                        return (
-                          <div
-                            key={item.id}
-                            className={`px-3 py-2.5 transition-colors hover:bg-white/[0.03] ${
-                              isLoaded ? "bg-teal-500/[0.06]" : ""
-                            }`}
-                          >
-                            {renamingLibraryId === item.id ? (
-                              <form
-                                onSubmit={(e) => {
-                                  e.preventDefault();
-                                  handleSaveRename(item);
-                                }}
-                                className="flex items-center gap-1.5"
-                              >
-                                <input
-                                  type="text"
-                                  value={renamingTitle}
-                                  onChange={(e) => setRenamingTitle(e.target.value)}
-                                  onKeyDown={(e) => {
-                                    if (e.key === "Escape") {
-                                      e.preventDefault();
-                                      handleCancelRename();
-                                    }
-                                  }}
-                                  autoFocus
-                                  placeholder="Nuovo titolo della verifica..."
-                                  className="flex-1 min-w-0 px-2.5 py-1.5 text-xs bg-slate-900 border border-teal-400 focus:border-teal-300 rounded-lg text-white font-medium outline-none"
-                                />
-                                <button
-                                  type="submit"
-                                  disabled={isSavingRename || !renamingTitle.trim()}
-                                  className="px-2.5 py-1.5 bg-teal-500 hover:bg-teal-400 text-teal-950 font-bold text-[11px] rounded-lg transition-colors cursor-pointer flex items-center gap-1 disabled:opacity-50 whitespace-nowrap shrink-0"
-                                >
-                                  {isSavingRename ? (
-                                    <RefreshCw className="w-3 h-3 animate-spin" />
-                                  ) : (
-                                    <Check className="w-3 h-3" />
-                                  )}
-                                  <span>Salva</span>
-                                </button>
-                                <button
-                                  type="button"
-                                  onClick={handleCancelRename}
-                                  disabled={isSavingRename}
-                                  title="Annulla"
-                                  className="p-1.5 text-slate-400 hover:text-white hover:bg-white/10 rounded-lg transition-colors cursor-pointer shrink-0"
-                                >
-                                  <X className="w-3.5 h-3.5" />
-                                </button>
-                              </form>
-                            ) : (
-                              <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
-                                <div className="min-w-0 flex-1">
-                                  <div className="flex items-center gap-2 min-w-0">
-                                    <p
-                                      className="text-xs font-semibold text-white truncate"
-                                      title={item.title}
-                                    >
-                                      {item.title}
-                                    </p>
-                                    {isLoaded && (
-                                      <span className="text-[10px] font-medium text-teal-400 whitespace-nowrap shrink-0">
-                                        · In editor
-                                      </span>
-                                    )}
-                                  </div>
-                                  <p className="text-[11px] text-slate-400 tabular-nums mt-0.5 truncate">
-                                    <span className={item.examType === "Workbook" ? "text-teal-300 font-medium" : "text-indigo-300 font-medium"}>
-                                      {item.examType}
-                                    </span>
-                                    <span aria-hidden="true"> · </span>
-                                    <span>{item.questionCount} quesiti</span>
-                                    {formatLibraryDate(item.updatedAt) && (
-                                      <>
-                                        <span aria-hidden="true"> · </span>
-                                        <span>{formatLibraryDate(item.updatedAt)}</span>
-                                      </>
-                                    )}
-                                    {item.source && (
-                                      <>
-                                        <span aria-hidden="true"> · </span>
-                                        <span>{item.source}</span>
-                                      </>
-                                    )}
-                                    {item.syncedToCloud === false && (
-                                      <>
-                                        <span aria-hidden="true"> · </span>
-                                        <span className="text-amber-300">Solo locale (sync in sospeso)</span>
-                                      </>
-                                    )}
-                                  </p>
-                                </div>
-
-                                <div className="flex items-center gap-1 shrink-0">
-                                  <button
-                                    type="button"
-                                    onClick={() => handleLoadLibraryItem(item)}
-                                    className="px-2.5 py-1 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 border border-teal-500/30 font-semibold text-[11px] rounded-lg flex items-center gap-1 cursor-pointer transition-colors whitespace-nowrap shrink-0"
-                                  >
-                                    <Check className="w-3 h-3" />
-                                    <span>Carica</span>
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleStartRename(item)}
-                                    title={`Rinomina "${item.title}"`}
-                                    className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-white/5 rounded-lg cursor-pointer transition-colors shrink-0"
-                                  >
-                                    <Pencil className="w-3.5 h-3.5" />
-                                  </button>
-                                  <button
-                                    type="button"
-                                    onClick={() => handleExportLibraryItem(item)}
-                                    title={`Scarica "${item.title}" (.json)`}
-                                    className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-white/5 rounded-lg cursor-pointer transition-colors shrink-0"
-                                  >
-                                    <Download className="w-3.5 h-3.5" />
-                                  </button>
-                                  {confirmDeleteLibraryId === item.id ? (
-                                    <div className="flex items-center gap-1">
-                                      <button
-                                        type="button"
-                                        onClick={() => {
-                                          handleDeleteLibraryItem(item);
-                                          setConfirmDeleteLibraryId(null);
-                                        }}
-                                        className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[10px] rounded-lg cursor-pointer transition-colors whitespace-nowrap"
-                                      >
-                                        Elimina
-                                      </button>
-                                      <button
-                                        type="button"
-                                        onClick={() => setConfirmDeleteLibraryId(null)}
-                                        className="px-1.5 py-1 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] rounded-lg cursor-pointer transition-colors"
-                                      >
-                                        Annulla
-                                      </button>
-                                    </div>
-                                  ) : (
-                                    <button
-                                      type="button"
-                                      onClick={() => setConfirmDeleteLibraryId(item.id)}
-                                      title={`Elimina "${item.title}"`}
-                                      className="p-1.5 text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors shrink-0"
-                                    >
-                                      <Trash2 className="w-3.5 h-3.5" />
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            )}
-                          </div>
-                        );
-                      })}
-                    </div>
-                  );
-                })()}
-              </div>
+              <ExamLibraryPanel
+                library={library}
+                libraryLoading={libraryLoading}
+                librarySaving={librarySaving}
+                librarySearch={librarySearch}
+                onLibrarySearchChange={setLibrarySearch}
+                libraryTypeFilter={libraryTypeFilter}
+                onLibraryTypeFilterChange={setLibraryTypeFilter}
+                libraryMsg={libraryMsg}
+                onDismissLibraryMsg={() => setLibraryMsg(null)}
+                loadedLibraryItemId={loadedLibraryItemId}
+                renamingLibraryId={renamingLibraryId}
+                renamingTitle={renamingTitle}
+                isSavingRename={isSavingRename}
+                onRenamingTitleChange={setRenamingTitle}
+                onSaveRename={handleSaveRename}
+                onCancelRename={handleCancelRename}
+                onStartRename={handleStartRename}
+                hasEditorJson={Boolean(jsonText.trim())}
+                onSaveCurrentToLibrary={() => handleSaveToLibrary("Editor")}
+                onExportBackup={handleExportLibraryBackup}
+                onTriggerImportBackup={() => libraryImportRef.current?.click()}
+                onRefreshLibrary={loadLibrary}
+                onLoadItem={handleLoadLibraryItem}
+                onExportItem={handleExportLibraryItem}
+                onDeleteItem={handleDeleteLibraryItem}
+                onShareItem={handleShareLibraryItem}
+                onImportByShareCode={handleImportSharedExamCode}
+                sharedExams={sharedExams}
+                onRevokeShare={handleRevokeShare}
+                onGenerateVariant={handleGenerateVariant}
+                generatingVariantId={generatingVariantId}
+                libraryImportRef={libraryImportRef}
+                onImportBackupFileChange={handleImportLibraryBackup}
+              />
 
               <button
                 onClick={handleActivateSession}
@@ -4871,6 +4217,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                               {/* Expanded Roster for this Exam */}
                               {isExpanded && (
                                 <div className="p-4 bg-slate-900/70 border-t border-white/5 space-y-3 animate-fadeIn">
+                                  <ExamItemAnalysisPanel
+                                    submissions={exam.submissions}
+                                    onGenerateRecoveryExam={(prefill) => {
+                                      setAiModalPrefill(prefill);
+                                      setShowAiModal(true);
+                                    }}
+                                  />
                                   <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-white/5 pb-2">
                                     <div className="flex items-center gap-2 flex-wrap">
                                       <p className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
@@ -5027,7 +4380,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                                     <Printer className="w-3.5 h-3.5" />
                                                   </button>
                                                   <button
-                                                    onClick={() => setSelectedSub(sub)}
+                                                    onClick={() => {
+                                                      const orderedIds = [...exam.submissions]
+                                                        .sort((a, b) => {
+                                                          if (examRosterSort === "grade_desc") {
+                                                            const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                                            const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+                                                            if (gradeB !== gradeA) return gradeB - gradeA;
+                                                            return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                                          }
+                                                          if (examRosterSort === "grade_asc") {
+                                                            const rawA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                                            const rawB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+                                                            const gradeA = rawA < 0 ? 99 : rawA;
+                                                            const gradeB = rawB < 0 ? 99 : rawB;
+                                                            if (gradeA !== gradeB) return gradeA - gradeB;
+                                                            return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                                          }
+                                                          if (examRosterSort === "name_asc") {
+                                                            return (a.Nome || "").localeCompare(b.Nome || "");
+                                                          }
+                                                          return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                                        })
+                                                        .map((s) => s.id);
+                                                      setSpeedGraderScopeIds(orderedIds);
+                                                      setSelectedSub(sub);
+                                                    }}
                                                     className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-colors cursor-pointer"
                                                   >
                                                     Esamina
@@ -5304,7 +4682,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                           <Printer className="w-3.5 h-3.5" />
                                         </button>
                                         <button
-                                          onClick={() => setSelectedSub(sub)}
+                                          onClick={() => {
+                                            setSpeedGraderScopeIds(null);
+                                            setSelectedSub(sub);
+                                          }}
                                           className="px-2.5 py-1 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-400 text-[10px] font-bold rounded cursor-pointer"
                                         >
                                           Esamina
@@ -5335,523 +4716,64 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         </div>
       </div>
 
-      {/* Full Sheet submission review Modal Overlay */}
-      {selectedSub && (
-        <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-white/10 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
-            
-            {/* Modal Header */}
-            <div className="flex justify-between items-center bg-slate-950 p-5 border-b border-white/5">
-              <div className="text-left">
-                <div className="flex items-center gap-2">
-                  <p className="text-[10px] font-bold font-mono uppercase text-teal-400">Verbalizzazione Esame Corretto</p>
-                  {blindGradingMode && (
-                    <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
-                      BLIND GRADING ATTIVO
-                    </span>
-                  )}
-                </div>
-                <h3 className="text-base font-semibold text-white mt-0.5">
-                  {blindGradingMode ? `Studente #${selectedSub.id.slice(-4).toUpperCase()}` : selectedSub.Nome}
-                </h3>
-                <p className="text-[10px] text-slate-400 truncate mt-0.5">
-                  {blindGradingMode ? "• Identità anagrafica nascosta per valutazione oggettiva •" : selectedSub.Email}
-                </p>
-              </div>
-              <div className="flex items-center gap-2 sm:gap-3">
-                <button
-                  onClick={() => handleRecalculateGrade(selectedSub)}
-                  disabled={recalculatingId === selectedSub.id}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 hover:text-amber-200 border border-amber-500/30 text-[11px] font-bold rounded-xl transition-all cursor-pointer disabled:opacity-50"
-                  title="Rivaluta le domande aperte con una nuova correzione IA reale"
-                >
-                  <Wand2 className={`w-3.5 h-3.5 ${recalculatingId === selectedSub.id ? 'animate-spin' : ''}`} />
-                  <span>{recalculatingId === selectedSub.id ? "Ricalcolo..." : "Ricalcola Voto"}</span>
-                </button>
-                <button
-                  onClick={() => handleExportPDF(selectedSub)}
-                  className="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600/10 hover:bg-teal-600 text-teal-400 hover:text-white border border-teal-500/20 hover:border-teal-500 text-[11px] font-bold rounded-xl transition-all cursor-pointer"
-                  title="Esporta valutazione studente in PDF"
-                >
-                  <Download className="w-3.5 h-3.5" />
-                  <span>Esporta PDF</span>
-                </button>
-                <button 
-                  onClick={() => setSelectedSub(null)}
-                  className="p-1.5 hover:bg-white/5 rounded-xl transition-colors text-slate-400 hover:text-white"
-                >
-                  <X className="w-5 h-5" />
-                </button>
-              </div>
-            </div>
-
-            {/* Modal Body scroll content */}
-            <div className="p-6 overflow-y-auto space-y-6 text-slate-100 text-xs leading-relaxed text-left">
-              {/* Evaluation suspended banner: never grade a written answer as 0 */}
-              {(() => {
-                const ev = safeParseJson(selectedSub.Full_Evaluation);
-                if (!isEvaluationPending(ev)) return null;
-                return (
-                  <div className="p-4 bg-rose-500/10 border-2 border-rose-500/40 rounded-xl space-y-2 animate-fadeIn">
-                    <div className="flex items-start gap-2.5">
-                      <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
-                      <div>
-                        <p className="font-bold text-xs text-rose-300">Valutazione sospesa: la prova non è stata valutata</p>
-                        <p className="text-[11px] text-rose-100/80 mt-0.5">
-                          {ev?.manualReviewReason ||
-                            "La correzione automatica non ha valutato tutte le domande aperte. Il voto resta N.V. per non assegnare 0 a risposte scritte."}
-                        </p>
-                        <p className="text-[11px] text-rose-100/70 mt-1">
-                          Controlla qui sotto le risposte (tutte visibili, anche quelle senza voto) e usa <b>Ricalcola Voto</b> o assegna tu il voto.
-                        </p>
-                      </div>
-                    </div>
-                  </div>
-                );
-              })()}
-
-              {/* Discrepancy warning banner */}
-              {hasGradeDiscrepancy(selectedSub) && (
-                <div className="p-4 bg-amber-500/10 border border-amber-500/30 rounded-xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 text-amber-200 animate-fadeIn">
-                  <div className="flex items-start gap-2.5">
-                    <AlertCircle className="w-5 h-5 text-amber-400 shrink-0 mt-0.5" />
-                    <div>
-                      <p className="font-bold text-xs text-amber-300">Anomalia di valutazione rilevata per questa prova</p>
-                      <p className="text-[11px] text-amber-200/80 mt-0.5">
-                        Questo esame a crocette non conteneva domande aperte (15 domande totali, {selectedSub.Punteggio_MC || 13} risposte esatte). L'IA aveva precedentemente attribuito un voto penalizzante (3.5) simulando risposte aperte vuote.
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => handleRecalculateGrade(selectedSub)}
-                    disabled={recalculatingId === selectedSub.id}
-                    className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs shrink-0 cursor-pointer transition-colors shadow-md"
-                  >
-                    {recalculatingId === selectedSub.id ? "Correzione in corso..." : "Correggi Voto Matematico"}
-                  </button>
-                </div>
-              )}
-
-              {/* Quick grades grid */}
-              <div className="grid grid-cols-2 gap-4">
-                <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
-                  <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">Voto Assegnato dall'A.I.</p>
-                  <p className={`text-3xl font-display font-bold mt-1 ${displaySubmissionGrade(selectedSub) === "N.V." ? "text-rose-400" : "text-teal-400"}`}>{displaySubmissionGrade(selectedSub)}</p>
-                  {selectedSub.Voto_Originale_IA && (
-                    <p className="text-[10px] text-slate-500 mt-1">
-                      Originale IA: {selectedSub.Voto_Originale_IA} (ritoccato dal docente)
-                    </p>
-                  )}
-                </div>
-                <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
-                  <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">Autovalutazione Studente</p>
-                  <p className="text-3xl font-display font-medium text-indigo-400 mt-1">{selectedSub.Autovalutazione}/10</p>
-                </div>
-              </div>
-
-              {/* Detailed Grade Breakdown & Mathematical Average */}
-              <GradeCalculationReport breakdown={extractBreakdownFromSubmission(selectedSub)} />
-
-              {isBorderlineSubmission(selectedSub) && (
-                <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-[11px] text-amber-200 leading-relaxed">
-                  ⚠️ <b>Caso limite:</b> la matematica dice 5.5–5.9 ma la parte strutturata è solida (≥70%).
-                  L'arrotondamento non è automatico: la decisione finale spetta a te, docente.
-                </div>
-              )}
-
-              {!gradeEditOpen ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setGradeEditValue(selectedSub.Voto_Suggerito || "");
-                    setGradeEditOpen(true);
-                  }}
-                  className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
-                >
-                  ✏️ Ritocca voto (decisione docente)
-                </button>
-              ) : (
-                <div className="flex items-center gap-2 p-3 bg-slate-950/60 border border-white/10 rounded-xl">
-                  <input
-                    type="text"
-                    value={gradeEditValue}
-                    onChange={(e) => setGradeEditValue(e.target.value)}
-                    placeholder="es. 6, 6+, 7½"
-                    className="flex-1 px-3 py-2 bg-slate-900 border border-white/10 rounded-lg text-white text-sm font-mono outline-none focus:border-amber-400"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => handleManualGrade(selectedSub)}
-                    className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs cursor-pointer transition-colors"
-                  >
-                    Salva
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setGradeEditOpen(false)}
-                    className="px-3 py-2 text-slate-400 hover:text-white text-xs cursor-pointer transition-colors"
-                  >
-                    Annulla
-                  </button>
-                </div>
-              )}
-
-              {/* Anticopy statistics */}
-              {(() => {
-                let infractions: any[] = [];
-                try {
-                  if (selectedSub.AntiCopia_InfractionsLog) {
-                    const parsed = JSON.parse(selectedSub.AntiCopia_InfractionsLog);
-                    if (Array.isArray(parsed)) infractions = parsed;
+      {(() => {
+        const subMap = new Map(submissions.map((s) => [s.id, s]));
+        const speedGraderList: SavedSubmission[] =
+          speedGraderScopeIds && speedGraderScopeIds.length > 0
+            ? speedGraderScopeIds.map((id) => subMap.get(id)).filter((s): s is SavedSubmission => Boolean(s))
+            : filteredSubmissions;
+        const speedIdx = selectedSub ? speedGraderList.findIndex((s) => s.id === selectedSub.id) : -1;
+        return (
+          <SubmissionDetailModal
+            submission={selectedSub}
+            blindGradingMode={blindGradingMode}
+            recalculatingId={recalculatingId}
+            hasGradeDiscrepancy={selectedSub ? hasGradeDiscrepancy(selectedSub) : false}
+            isBorderline={selectedSub ? isBorderlineSubmission(selectedSub) : false}
+            displayGrade={selectedSub ? displaySubmissionGrade(selectedSub) : ""}
+            clusterInfractionsHint={clusterInfractionsHint}
+            onClose={() => {
+              setSelectedSub(null);
+              setSpeedGraderScopeIds(null);
+            }}
+            onRecalculateGrade={handleRecalculateGrade}
+            onExportPDF={handleExportPDF}
+            onOpenPrintModal={(sub) => {
+              setPrintableSub(sub);
+              setShowPrintModal(true);
+            }}
+            onManualGradeSave={handleManualGrade}
+            onRetouchSubjectiveItem={handleRetouchSubjectiveItem}
+            currentIndex={speedIdx >= 0 ? speedIdx : undefined}
+            totalCount={speedIdx >= 0 ? speedGraderList.length : undefined}
+            onNavigate={
+              speedIdx >= 0
+                ? (dir) => {
+                    const nextIdx = dir === "prev" ? speedIdx - 1 : speedIdx + 1;
+                    const nextSub = speedGraderList[nextIdx];
+                    if (nextSub) setSelectedSub(nextSub);
                   }
-                } catch {}
-
-                const totalOutsideSeconds = infractions.reduce((acc, inf) => {
-                  return acc + (Number(inf?.durationSeconds) || 0);
-                }, 0);
-
-                const formatDuration = (seconds?: number) => {
-                  if (seconds === undefined || seconds === null) return "";
-                  if (seconds === 0) return "< 1s (immediato)";
-                  if (seconds < 60) return `${seconds}s`;
-                  const m = Math.floor(seconds / 60);
-                  const s = seconds % 60;
-                  return s > 0 ? `${m}m ${s}s` : `${m}m`;
-                };
-
-                const hint = clusterInfractionsHint(infractions);
-
-                return (
-                  <div className="bg-yellow-500/5 border border-yellow-500/20 p-4 rounded-xl space-y-2.5">
-                    <p className="font-semibold text-yellow-400 flex items-center gap-1.5 text-xs">
-                      <AlertCircle className="w-3.5 h-3.5 shrink-0" />
-                      Statistiche Monitoraggio Integrità Autore
-                    </p>
-                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 text-[11px] text-slate-300">
-                      <p>Uscite / Focus: <b>{selectedSub.AntiCopia_TabSwitch || 0}</b></p>
-                      <p>Incolla bloccati: <b>{selectedSub.AntiCopia_IncollaBloccato || 0}</b></p>
-                      <p>Schermo diviso / intero: <b className={(selectedSub.AntiCopia_SchermoDiviso || 0) > 0 ? "text-rose-400 font-bold" : ""}>{selectedSub.AntiCopia_SchermoDiviso || 0}</b></p>
-                      <p>Tempo tot. fuori pagina: <b className={totalOutsideSeconds > 0 ? "text-amber-300 font-bold" : ""}>{totalOutsideSeconds > 0 ? formatDuration(totalOutsideSeconds) : "0s"}</b></p>
-                    </div>
-
-                    {infractions.length > 0 && (
-                      <div className="mt-2 text-[10px] text-slate-400 font-mono">
-                        <p className="font-bold uppercase text-yellow-500/80">Cronologia Completa:</p>
-                        {hint && (
-                          <p className="mt-1 p-2 rounded-lg bg-rose-500/10 border border-rose-500/30 text-rose-200 text-[10px] font-sans leading-relaxed">
-                            {hint}
-                          </p>
-                        )}
-                        <div className="max-h-36 overflow-y-auto mt-1 space-y-1 pr-1">
-                          {infractions.map((inf: any, idx: number) => {
-                            let label = String(inf.type || "").replace(/_/g, " ");
-                            if (inf.type === "schermo_diviso") label = "Schermo Diviso (Multi-Window)";
-                            else if (inf.type === "uscita_schermo_intero") label = "Uscita Schermo Intero";
-                            else if (inf.type === "abbandono_pagina") label = "Abbandono Finestra / Cambio App";
-                            else if (inf.type === "copia_incolla") label = "Tentativo Copia/Incolla";
-                            else if (inf.type === "tasto_destro") label = "Click Tasto Destro";
-                            else if (inf.type === "tasto_vietato") label = "Scorciatoia / Ispezione";
-
-                            const hasDuration = inf.durationSeconds !== undefined && inf.durationSeconds !== null;
-                            const isAbsence = inf.type === "uscita_schermo_intero" || inf.type === "abbandono_pagina";
-
-                            return (
-                              <div key={idx} className="flex items-start gap-1.5 py-0.5 border-l-2 border-white/10 pl-2">
-                                <span className={`mt-1 w-1.5 h-1.5 rounded-full shrink-0 ${
-                                  inf.severity === "lieve" ? "bg-amber-400" : inf.severity === "grave" ? "bg-rose-400" : "bg-slate-500"
-                                }`} />
-                                <div className="text-[11px] leading-snug">
-                                  <span className="font-mono text-slate-400">[{inf.time}]</span>{" "}
-                                  <span className="font-bold text-slate-200">{label}</span>
-                                  {inf.severity === "lieve" && (
-                                    <span className="ml-1.5 px-1 py-px rounded bg-amber-500/20 text-amber-300 border border-amber-500/30 font-bold text-[9px]">avviso</span>
-                                  )}
-                                  {inf.severity === "grave" && (
-                                    <span className="ml-1.5 px-1 py-px rounded bg-rose-500/20 text-rose-300 border border-rose-500/30 font-bold text-[9px]">violazione</span>
-                                  )}
-                                  {isAbsence && (
-                                    <span className={`ml-1.5 px-1.5 py-0.5 rounded text-[10px] font-sans font-medium inline-flex items-center gap-1 ${
-                                      hasDuration && inf.durationSeconds > 0
-                                        ? "bg-amber-500/20 text-amber-200 border border-amber-500/40 font-semibold"
-                                        : "bg-slate-800 text-slate-400 border border-slate-700"
-                                    }`}>
-                                      ⏱️ Tempo fuori pagina: {hasDuration ? formatDuration(inf.durationSeconds) : "non registrato"}
-                                    </span>
-                                  )}
-                                  {inf.details && !isAbsence && (
-                                    <span className="text-slate-400 text-[10px]"> - {inf.details}</span>
-                                  )}
-                                </div>
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
-                  </div>
-                );
-              })()}
-
-              {/* AI Details parsing */}
-              {(() => {
-                const evalObj = safeParseJson(selectedSub.Full_Evaluation);
-                if (!evalObj) return null;
-
-                return (
-                  <div className="space-y-4">
-                    {/* General notes */}
-                    {evalObj.overallFeedback && (
-                      <div className="p-4 bg-indigo-500/5 border border-indigo-500/10 rounded-xl">
-                        <p className="font-bold uppercase text-[10px] text-indigo-400 mb-1.5">Giudizio Globale</p>
-                        <p dangerouslySetInnerHTML={{ __html: formatMarkdown(evalObj.overallFeedback) }} />
-                      </div>
-                    )}
-
-                    {evalObj.openEndedEvaluation && (
-                      <div className="p-4 bg-indigo-500/5 border border-indigo-500/10 rounded-xl">
-                        <p className="font-bold uppercase text-[10px] text-indigo-400 mb-1.5">Giudizio Globale Aperte</p>
-                        <p dangerouslySetInnerHTML={{ __html: formatMarkdown(evalObj.openEndedEvaluation) }} />
-                      </div>
-                    )}
-
-                    {evalObj.mainErrors && (
-                      <div className="p-4 bg-rose-500/5 border border-rose-500/10 rounded-xl">
-                        <p className="font-bold uppercase text-[10px] text-rose-400 mb-1.5">Errori Principali Evidenziati</p>
-                        <p dangerouslySetInnerHTML={{ __html: formatMarkdown(evalObj.mainErrors) }} />
-                      </div>
-                    )}
-
-                    {selectedSub.Piano_Recupero && (
-                      <div className="p-4 bg-teal-500/5 border border-teal-500/15 rounded-xl">
-                        <p className="font-bold uppercase text-[10px] text-teal-400 mb-1.5 flex items-center gap-1.5">
-                          <span className="w-1.5 h-1.5 bg-teal-400 rounded-full animate-pulse"></span>
-                          Piano di Recupero IA
-                        </p>
-                        <div className="prose prose-invert max-w-none text-slate-300 text-[11.5px] leading-relaxed" dangerouslySetInnerHTML={{ __html: formatMarkdown(selectedSub.Piano_Recupero) }} />
-                      </div>
-                    )}
-
-                    {/* Question by question answers */}
-                    <div className="space-y-3 pt-2">
-                      <p className="font-bold uppercase tracking-wider text-[10px] text-slate-400">Dettaglio Risposte & Correzioni Singole:</p>
-                      {(() => {
-                        const ansObj = safeParseJson(selectedSub.Risposte_Studente) || {};
-                        const domandeObj = safeParseJson(selectedSub.Domande_Esame);
-
-                        if (selectedSub.Tipo === "Quiz") {
-                          const mcqList = domandeObj?.multipleChoice || [];
-                          const oeList = domandeObj?.openEnded || [];
-                          const details = evalObj.openEndedDetails || [];
-                          const oeEntries = buildSubjectiveReviewEntries(
-                            oeList,
-                            details,
-                            (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
-                            (d) => d.questionId
-                          );
-
-                          return (
-                            <div className="space-y-4">
-                              {/* Multiple Choice Sections */}
-                              {mcqList.length > 0 && (
-                                <div className="space-y-2">
-                                  <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">Scelta Multipla</p>
-                                  {mcqList.map((q: any, idx: number) => {
-                                    const selectedOptIdx = ansObj.mc?.[q.id];
-                                    const selectedOptText = selectedOptIdx !== undefined ? q.options[selectedOptIdx] : "Nessuna data";
-                                    const correctOptText = q.options[q.correctIndex];
-                                    const isCorrect = selectedOptIdx === q.correctIndex;
-                                    
-                                    return (
-                                      <div key={idx} className={`p-3 bg-slate-950/60 border ${isCorrect ? 'border-teal-500/20' : 'border-rose-500/20'} rounded-xl space-y-1`}>
-                                        <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA {idx + 1}</p>
-                                        <p className="text-slate-300 text-[11px]">{q.question}</p>
-                                        <div className="mt-2 text-[10px] flex gap-3">
-                                          <span className="text-slate-400">Scelta: <span className={isCorrect ? 'text-teal-400' : 'text-rose-400'}>{selectedOptText}</span></span>
-                                          {!isCorrect && <span className="text-slate-500">| Corretta: <span className="text-teal-400">{correctOptText}</span></span>}
-                                        </div>
-                                        {q.explanation && (
-                                          <p className="mt-1.5 p-1.5 bg-black/30 rounded border border-white/5 text-[10px] text-slate-400 italic">
-                                            💡 Spiegazione: {q.explanation}
-                                          </p>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              )}
-
-                              {/* Open Ended Sections: sempre visibili, anche se la IA non ha ancora corretto */}
-                              {oeEntries.length > 0 ? (
-                                <div className="space-y-2">
-                                  <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">Domande Aperte</p>
-                                  {oeEntries.map((entry: any, idx: number) => {
-                                    const ansText = entry.answer || "Assente";
-                                    const hasEvaluation = !!entry.detail;
-                                    const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
-
-                                    return (
-                                      <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
-                                        <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA APERTA {idx + 1}</p>
-                                        {entry.question?.question && <p className="text-slate-300 text-[11px] mb-1">{entry.question.question}</p>}
-                                        <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
-                                        {hasEvaluation ? (
-                                          <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
-                                            <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({score}/10)</p>
-                                            <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
-                                          </div>
-                                        ) : (
-                                          <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-lg text-amber-200 text-[11px]">
-                                            <p className="font-bold text-[9px] uppercase text-amber-300">Valutazione non disponibile (N.V.)</p>
-                                            <p className="mt-1">La risposta è stata consegnata ma non è stata corretta dall'IA. Usa &ldquo;Ricalcola Voto&rdquo; per ottenere la valutazione, oppure valuta tu il contenuto.</p>
-                                          </div>
-                                        )}
-                                      </div>
-                                    );
-                                  })}
-                                </div>
-                              ) : (
-                                <div className="p-3 bg-teal-500/10 border border-teal-500/20 rounded-xl flex items-center gap-2.5 text-teal-300 text-xs">
-                                  <CheckCircle className="w-4 h-4 text-teal-400 shrink-0" />
-                                  <span>Prova a sola scelta multipla: non sono presenti domande aperte in questa verifica. Il voto è calcolato al 100% sulla correttezza delle crocette.</span>
-                                </div>
-                              )}
-                            </div>
-                          );
-                        } else {
-                          const sections = domandeObj?.sections || [];
-                          const details = evalObj.reflectionDetails || [];
-                          const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-                          const rqEntries = buildSubjectiveReviewEntries(
-                            rqList,
-                            details,
-                            (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
-                            (d) => d.id
-                          );
-
-                          return (
-                            <div className="space-y-4">
-                              {sections.length > 0 && sections.map((sec: any, secIdx: number) => {
-                                const fibList = sec.fillInTheBlank || [];
-                                return (
-                                  <div key={`sec-${secIdx}`} className="space-y-2">
-                                    {fibList.length > 0 && (
-                                      <>
-                                        <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">Completamento (Sezione {secIdx + 1})</p>
-                                        {fibList.map((fib: any, fIdx: number) => {
-                                          const rawVal = ansObj.wbFib?.[fib.id];
-                                          const val = typeof rawVal === "string" ? rawVal : (rawVal?.[0] || "");
-                                          const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-                                          const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-                                          const { before, after } = getFibSentenceParts(fib.sentence, expected);
-
-                                          return (
-                                            <div key={fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
-                                              <p className="font-bold text-slate-300 font-mono text-[10px]">FIB {fIdx + 1}</p>
-                                              <p className="text-slate-300 text-[11px] leading-relaxed">
-                                                <span>{before}</span>
-                                                <span className={`px-1 rounded font-bold ${isCorrect ? 'bg-teal-500/20 text-teal-300' : 'bg-rose-500/20 text-rose-300'}`}>[{val || "____"}]</span>
-                                                <span>{after}</span>
-                                              </p>
-                                              <div className="flex items-center gap-2 mt-1">
-                                                <p className="text-[9px] text-slate-500">Accettate: {expected || fib.answer}</p>
-                                                {isCorrect && val && expected && val.toLowerCase().trim() !== expected.toLowerCase().trim() && (
-                                                  <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-300 border border-teal-500/20">
-                                                    ✓ Variante/Sinonimo
-                                                  </span>
-                                                )}
-                                              </div>
-                                            </div>
-                                          );
-                                        })}
-                                      </>
-                                    )}
-                                  </div>
-                                );
-                              })}
-                              
-                              <div className="space-y-2">
-                                <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">Riflessioni Critiche</p>
-                                {rqEntries.length === 0 ? (
-                                  <p className="text-[11px] text-slate-500 italic">Nessuna riflessione critica presente in questo quaderno.</p>
-                                ) : rqEntries.map((entry: any, idx: number) => {
-                                  const ansText = entry.answer || "Assente";
-                                  const hasEvaluation = !!entry.detail;
-                                  const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
-
-                                  return (
-                                    <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
-                                      <p className="font-bold text-slate-300 font-mono text-[10px]">RIFLESSIONE CRITICA {idx + 1}</p>
-                                      {entry.question?.question && <p className="text-slate-300 text-[11px] mb-1">{entry.question.question}</p>}
-                                      <p className="text-slate-400 italic">Risposta studente: &ldquo;{ansText === "[VUOTO]" ? "[Nessuna risposta valida]" : ansText}&rdquo;</p>
-                                      {hasEvaluation ? (
-                                        <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
-                                          <p className="font-bold text-[9px] text-teal-400 uppercase">Valutazione IA: ({score}/10)</p>
-                                          <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
-                                        </div>
-                                      ) : (
-                                        <div className="p-3 bg-amber-500/10 border border-amber-500/25 rounded-lg text-amber-200 text-[11px]">
-                                          <p className="font-bold text-[9px] uppercase text-amber-300">Valutazione non disponibile (N.V.)</p>
-                                          <p className="mt-1">La riflessione è stata consegnata ma non è stata corretta dall'IA. Usa &ldquo;Ricalcola Voto&rdquo; per ottenere la valutazione, oppure valuta tu il contenuto.</p>
-                                        </div>
-                                      )}
-                                    </div>
-                                  );
-                                })}
-                              </div>
-                            </div>
-                          );
-                        }
-                      })()}
-                    </div>
-                  </div>
-                );
-              })()}
-            </div>
-
-            {/* Modal Footer */}
-            <div className="bg-slate-950 p-4 border-t border-white/5 flex flex-col sm:flex-row justify-between items-center gap-3">
-              <span className="text-[10px] text-slate-500">ID record: {selectedSub.id}</span>
-              <div className="flex items-center gap-2 flex-wrap">
-                <button
-                  onClick={() => {
-                    setPrintableSub(selectedSub);
-                    setShowPrintModal(true);
-                  }}
-                  className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl transition-colors cursor-pointer text-xs"
-                  title="Stampa Scheda Valutazione Didattica Ufficiale"
-                >
-                  <Printer className="w-4 h-4 text-indigo-400" />
-                  <span>Stampa Scheda A4</span>
-                </button>
-                <button
-                  onClick={() => handleExportPDF(selectedSub)}
-                  className="flex items-center gap-1.5 px-3 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
-                >
-                  <Download className="w-4 h-4" />
-                  <span>Scarica PDF Report</span>
-                </button>
-                <button
-                  onClick={() => setSelectedSub(null)}
-                  className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
-                >
-                  Chiudi Esame
-                </button>
-              </div>
-            </div>
-          </div>
-        </div>
-      )}
+                : undefined
+            }
+          />
+        );
+      })()}
 
       {/* AI Exam Generator Modal */}
       <AiExamGeneratorModal
         isOpen={showAiModal}
-        onClose={() => setShowAiModal(false)}
+        initialPrefill={aiModalPrefill}
+        onClose={() => {
+          setShowAiModal(false);
+          setAiModalPrefill(null);
+        }}
         onApplyExam={(generatedJson, newTitle) => {
           setLoadedLibraryItemId(null);
           setJsonText(generatedJson);
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
           handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { asNew: true });
+          setAiModalPrefill(null);
         }}
       />
 

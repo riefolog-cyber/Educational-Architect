@@ -1,17 +1,21 @@
-import React, { useState, useRef } from "react";
+import React, { useState, useRef, useEffect } from "react";
 import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2 } from "lucide-react";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS, type TranscriptFormat } from "../utils/transcriptParser";
+import { getAuthHeaders } from "../firebase";
+import { AiModalPrefill } from "../types";
 
 interface AiExamGeneratorModalProps {
   isOpen: boolean;
   onClose: () => void;
   onApplyExam: (examJson: string, title: string) => void;
+  initialPrefill?: AiModalPrefill | null;
 }
 
 export default function AiExamGeneratorModal({
   isOpen,
   onClose,
-  onApplyExam
+  onApplyExam,
+  initialPrefill = null
 }: AiExamGeneratorModalProps) {
   const [topic, setTopic] = useState("");
   const [gradeLevel, setGradeLevel] = useState("Scuola Secondaria di II Grado (Superiori - 3°/4° anno)");
@@ -39,6 +43,18 @@ export default function AiExamGeneratorModal({
     modelUsed?: string;
     examObj: any;
   } | null>(null);
+
+  useEffect(() => {
+    if (isOpen && initialPrefill) {
+      setTopic(initialPrefill.topic);
+      setExamType(initialPrefill.examType);
+      if (initialPrefill.difficulty) setDifficulty(initialPrefill.difficulty);
+      if (typeof initialPrefill.numQuestions === "number") setNumQuestions(initialPrefill.numQuestions);
+      setSourceTab("topic");
+      setGeneratedResult(null);
+      setError(null);
+    }
+  }, [isOpen, initialPrefill]);
 
   if (!isOpen) return null;
 
@@ -101,11 +117,14 @@ export default function AiExamGeneratorModal({
         difficulty
       };
 
+      const authHeaders = await getAuthHeaders();
+
       let resp = await fetch("/api/generate-exam", {
         method: "POST",
         headers: { 
           "Content-Type": "application/json",
-          "Accept": "application/json"
+          "Accept": "application/json",
+          ...authHeaders
         },
         body: JSON.stringify(payload)
       });
@@ -123,7 +142,10 @@ export default function AiExamGeneratorModal({
         });
         resp = await fetch(`/api/generate-exam?${queryParams.toString()}`, {
           method: "GET",
-          headers: { "Accept": "application/json" }
+          headers: {
+            "Accept": "application/json",
+            ...authHeaders
+          }
         });
       }
 

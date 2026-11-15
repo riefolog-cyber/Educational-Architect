@@ -1,10 +1,13 @@
 import express from "express";
 import path from "path";
 import fs from "fs";
+import os from "os";
 import crypto from "crypto";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
-import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
+import firebaseConfig from "./firebase-applet-config.json";
+import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
+import { stripExamAnswers, restoreExamAnswers } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
@@ -14,12 +17,19 @@ dotenv.config();
 const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Helper for lazy loading Gemini
-const getApiKey = () => process.env.educationaarch || process.env.GEMINI_API_KEY;
+// Helper for lazy loading Gemini: standard GEMINI_API_KEY takes precedence over any legacy alias
+const getCandidateApiKeys = (): string[] => {
+  const candidates = [process.env.GEMINI_API_KEY, process.env.educationaarch]
+    .map((k) => String(k || "").trim())
+    .filter(Boolean);
+  return Array.from(new Set(candidates));
+};
 
-const getAiClient = () => {
+const getApiKey = (): string => getCandidateApiKeys()[0] || "";
+
+const getAiClient = (apiKeyOverride?: string) => {
   return new GoogleGenAI({
-    apiKey: getApiKey() || "missing-key-prevent-crash",
+    apiKey: apiKeyOverride || getApiKey() || "missing-key-prevent-crash",
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -29,10 +39,10 @@ const getAiClient = () => {
 };
 
 const RELIABLE_FALLBACK_MODELS = [
+  "gemini-4-hydrogen",
   "gemini-3.1-flash-lite",
   "gemini-2.5-flash",
-  "gemini-2.5-flash-lite",
-  "gemini-3.8-flash"
+  "gemini-2.5-flash-lite"
 ];
 
 // Per-attempt timeout so a hung upstream request can never trap a queue
@@ -51,15 +61,31 @@ const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
 // then through the global reliable cascade. To retune, just reorder these
 // lists: no other code changes needed.
 const TASK_MODEL_PREFERENCE: Record<string, string[]> = {
-  // Long structured generation: most capable flash model first
-  "generate-exam": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
-  // Grading: fast deterministic models
-  "evaluate": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  // Long structured generation: flagship flash model first
+  "generate-exam": ["gemini-4-hydrogen", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  // Grading: fast accurate flash model
+  "evaluate": ["gemini-4-hydrogen", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
   // Analysis / extension: light tasks, lite models first
-  "analyze-exam": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
-  "extend-exam": ["gemini-3.1-flash-lite", "gemini-3.8-flash", "gemini-2.5-flash"],
+  "analyze-exam": ["gemini-3.1-flash-lite", "gemini-4-hydrogen", "gemini-2.5-flash"],
+  "extend-exam": ["gemini-3.1-flash-lite", "gemini-4-hydrogen", "gemini-2.5-flash"],
   // Free prose: balanced default
-  "recovery-plan": ["gemini-3.8-flash", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+  "recovery-plan": ["gemini-4-hydrogen", "gemini-2.5-flash", "gemini-3.1-flash-lite"],
+};
+
+const buildModelRequestOptions = (baseOptions: any) => {
+  const opts = { ...baseOptions };
+  if (opts.config) {
+    const cfg = { ...opts.config };
+    // Gemini 4 series rejects or deprecates sampling params (temperature/topP/topK/candidateCount)
+    if (String(opts.model || "").startsWith("gemini-4-")) {
+      delete cfg.temperature;
+      delete cfg.topP;
+      delete cfg.topK;
+      delete cfg.candidateCount;
+    }
+    opts.config = cfg;
+  }
+  return opts;
 };
 
 // Robust Generate Content Wrapper for Handling Availability issues
@@ -72,6 +98,9 @@ async function generateWithRetry(options: any, maxRetries = 6) {
     if (!taskModels.includes(m)) taskModels.push(m);
   }
   const onModelUsed = typeof options.onModelUsed === "function" ? options.onModelUsed : null;
+
+  const candidateKeys = getCandidateApiKeys();
+  let keyIndex = 0;
 
   let currentOptions = { ...options };
   delete currentOptions.models;
@@ -99,8 +128,9 @@ async function generateWithRetry(options: any, maxRetries = 6) {
 
   for (let i = 0; i < maxRetries; i++) {
     try {
+      const requestOptions = buildModelRequestOptions(currentOptions);
       const resp = await withAttemptTimeout(
-        getAiClient().models.generateContent(currentOptions),
+        getAiClient(candidateKeys[keyIndex]).models.generateContent(requestOptions),
         110000
       );
       if (onModelUsed) {
@@ -110,6 +140,17 @@ async function generateWithRetry(options: any, maxRetries = 6) {
     } catch (err: any) {
       const errStr = (err.message || "").toLowerCase();
       const errStringified = JSON.stringify(err || {}).toLowerCase();
+
+      const isInvalidOrLeakedKey =
+        /reported as leaked|api key not valid|invalid api key|api_key_invalid|api_key_service_blocked|permission denied/i.test(
+          `${errStr} ${errStringified}`
+        );
+
+      if (isInvalidOrLeakedKey && keyIndex + 1 < candidateKeys.length) {
+        keyIndex++;
+        console.warn(`[Gemini Key Fallback] Primary key rejected; retrying with alternate configured server key (#${keyIndex + 1}).`);
+        continue;
+      }
       
       const isRetryable = err.status === 503 || 
                           err.status === 429 || 
@@ -125,9 +166,9 @@ async function generateWithRetry(options: any, maxRetries = 6) {
                           errStr.includes("quota") ||
                           errStr.includes("resource exhausted") ||
                           errStr.includes("resource_exhausted") ||
-                           errStr.includes("rate limit") ||
-                           errStr.includes("timeout") ||
-                           errStr.includes("timed out") ||
+                          errStr.includes("rate limit") ||
+                          errStr.includes("timeout") ||
+                          errStr.includes("timed out") ||
                           errStringified.includes("503") ||
                           errStringified.includes("429") ||
                           errStringified.includes("resource_exhausted") ||
@@ -213,6 +254,214 @@ function extractResponseText(response: any): string {
 // Middleware for JSON parsing
 app.use(express.json({ limit: '10mb' }));
 
+// --- Security: Per-IP Sliding Window Rate Limiter ---
+function getClientIp(req: express.Request): string {
+  const fwd = String(req.headers["x-forwarded-for"] || "").split(",")[0].trim();
+  return fwd || req.ip || req.socket?.remoteAddress || "unknown";
+}
+
+function createRateLimiter(options: { maxRequests: number; windowMs: number; message: string }) {
+  const hits = new Map<string, number[]>();
+  const timer = setInterval(() => {
+    const cutoff = Date.now() - options.windowMs;
+    for (const [ip, timestamps] of hits) {
+      const fresh = timestamps.filter((t) => t > cutoff);
+      if (fresh.length === 0) hits.delete(ip);
+      else hits.set(ip, fresh);
+    }
+  }, Math.max(30000, options.windowMs));
+  if (typeof timer.unref === "function") timer.unref();
+
+  return (req: express.Request, res: express.Response, next: express.NextFunction) => {
+    if (req.method === "OPTIONS" || req.method === "GET") {
+      // Allow lightweight GET warmup/health probes through unless it's /api/generate-exam with topic
+      if (req.path !== "/api/generate-exam" || !req.query?.topic) {
+        return next();
+      }
+    }
+    const ip = getClientIp(req);
+    const now = Date.now();
+    const cutoff = now - options.windowMs;
+    const list = (hits.get(ip) || []).filter((t) => t > cutoff);
+    if (list.length >= options.maxRequests) {
+      return res.status(429).json({ error: options.message });
+    }
+    list.push(now);
+    hits.set(ip, list);
+    return next();
+  };
+}
+
+// Generous school-NAT-safe limit for student evaluations & recovery plans
+const evalRateLimiter = createRateLimiter({
+  maxRequests: 120,
+  windowMs: 60 * 1000,
+  message: "Troppe richieste di valutazione dallo stesso indirizzo in un minuto. Attendi qualche secondo e riprova."
+});
+
+// Tighter limit for heavy teacher AI endpoints
+const teacherAiRateLimiter = createRateLimiter({
+  maxRequests: 30,
+  windowMs: 60 * 1000,
+  message: "Limite di richieste IA docente raggiunto per questo minuto. Attendi qualche secondo e riprova."
+});
+
+// --- Security: Firebase Teacher Authentication Verification ---
+const PRIMARY_TEACHER_EMAILS = new Set([
+  "riefolog@gmail.com",
+  "riefolo.giovanni@ferrarisfermiclass.it",
+]);
+const teacherAuthCache = new Map<string, { email: string; uid: string; isTeacher: boolean; expiresAt: number }>();
+
+async function checkDocentiFirestoreRole(email: string, idToken: string): Promise<boolean> {
+  try {
+    const projectId = (firebaseConfig as any).projectId;
+    const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
+    if (!projectId) return false;
+    const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents:runQuery`;
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    try {
+      const resp = await fetch(queryUrl, {
+        method: "POST",
+        signal: controller.signal,
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${idToken}`,
+        },
+        body: JSON.stringify({
+          structuredQuery: {
+            from: [{ collectionId: "docenti" }],
+            where: {
+              fieldFilter: {
+                field: { fieldPath: "email" },
+                op: "EQUAL",
+                value: { stringValue: email },
+              },
+            },
+            limit: 3,
+          },
+        }),
+      });
+      if (!resp.ok) return false;
+      const rows = (await resp.json()) as any[];
+      return Array.isArray(rows) && rows.some((r) => r?.document?.fields?.role?.stringValue === "admin");
+    } finally {
+      clearTimeout(t);
+    }
+  } catch {
+    return false;
+  }
+}
+
+async function verifyTeacherFromRequest(
+  req: express.Request
+): Promise<{ ok: true; email: string; uid: string } | { ok: false; status: number; error: string }> {
+  const authHeader = String(req.headers.authorization || "");
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  const idToken = match?.[1]?.trim();
+  if (!idToken) {
+    return {
+      ok: false,
+      status: 401,
+      error: "Autenticazione docente richiesta: accedi con il tuo account Google docente.",
+    };
+  }
+
+  const tokenHash = crypto.createHash("sha256").update(idToken).digest("hex");
+  const cached = teacherAuthCache.get(tokenHash);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (!cached.isTeacher) {
+      return {
+        ok: false,
+        status: 403,
+        error: "Accesso riservato ai docenti autorizzati.",
+      };
+    }
+    return { ok: true, email: cached.email, uid: cached.uid };
+  }
+
+  const apiKey = (firebaseConfig as any).apiKey;
+  if (!apiKey) {
+    return { ok: false, status: 500, error: "Configurazione Firebase del server incompleta." };
+  }
+
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), 6000);
+    let lookupData: any = null;
+    let status = 500;
+    try {
+      const resp = await fetch(
+        `https://identitytoolkit.googleapis.com/v1/accounts:lookup?key=${encodeURIComponent(apiKey)}`,
+        {
+          method: "POST",
+          signal: controller.signal,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ idToken }),
+        }
+      );
+      status = resp.status;
+      lookupData = await resp.json().catch(() => null);
+    } finally {
+      clearTimeout(timer);
+    }
+
+    const fbUser = Array.isArray(lookupData?.users) ? lookupData.users[0] : null;
+    if (status !== 200 || !fbUser?.email || !fbUser?.localId) {
+      return {
+        ok: false,
+        status: 401,
+        error: "Sessione docente scaduta o non valida. Ricarica la pagina e accedi nuovamente.",
+      };
+    }
+
+    const normEmail = String(fbUser.email).trim().toLowerCase();
+    const emailVerified = fbUser.emailVerified === true;
+    const isTeacher =
+      emailVerified &&
+      (PRIMARY_TEACHER_EMAILS.has(normEmail) || (await checkDocentiFirestoreRole(fbUser.email, idToken)));
+
+    teacherAuthCache.set(tokenHash, {
+      email: normEmail,
+      uid: String(fbUser.localId),
+      isTeacher,
+      expiresAt: Date.now() + 5 * 60 * 1000,
+    });
+    if (teacherAuthCache.size > 500) {
+      const now = Date.now();
+      for (const [k, v] of teacherAuthCache) {
+        if (v.expiresAt <= now) teacherAuthCache.delete(k);
+      }
+    }
+
+    if (!isTeacher) {
+      return { ok: false, status: 403, error: "Accesso riservato ai docenti autorizzati." };
+    }
+    return { ok: true, email: normEmail, uid: String(fbUser.localId) };
+  } catch (err) {
+    console.warn("[Auth] Verifica token Firebase non riuscita:", err);
+    return {
+      ok: false,
+      status: 503,
+      error: "Impossibile verificare l'identità docente con Firebase. Riprova tra poco.",
+    };
+  }
+}
+
+async function requireTeacherAuth(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (req.method === "OPTIONS") return res.status(204).end();
+  if (req.method === "GET" && (req.path !== "/api/generate-exam" || !String(req.query?.topic || "").trim())) {
+    return next();
+  }
+  const check = await verifyTeacherFromRequest(req);
+  if ("error" in check) {
+    return res.status(check.status).json({ error: check.error });
+  }
+  (req as any).teacherAuth = check;
+  return next();
+}
+
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
   id: string;
@@ -256,6 +505,51 @@ const MAX_RECOVERY_QUEUE = Math.max(20, Number(process.env.RECOVERY_MAX_QUEUE) |
  * anche il JSON dell'esame (con le immagini) e pesa centinaia di KB. Senza
  * questa pulizia, dopo qualche classe su un'istanza piccola si arriva all'OOM.
  */
+const JOB_DISK_DIR = path.join(os.tmpdir(), "ea_eval_jobs");
+try {
+  fs.mkdirSync(JOB_DISK_DIR, { recursive: true });
+} catch {}
+
+function safeJobFilePath(jobId: string): string | null {
+  const safeId = String(jobId || "").replace(/[^a-zA-Z0-9_-]/g, "");
+  if (!safeId || safeId !== jobId) return null;
+  return path.join(JOB_DISK_DIR, `${safeId}.json`);
+}
+
+function persistJobSnapshot(job: EvaluationJob) {
+  const filePath = safeJobFilePath(job.id);
+  if (!filePath) return;
+  try {
+    const compact = {
+      id: job.id,
+      kind: job.kind,
+      status: job.status,
+      result: job.result,
+      error: job.error,
+      createdAt: job.createdAt,
+    };
+    fs.promises.writeFile(filePath, JSON.stringify(compact), "utf-8").catch(() => {});
+  } catch {}
+}
+
+function readPersistedJobSnapshot(jobId: string): Omit<EvaluationJob, "reqBody"> | null {
+  const filePath = safeJobFilePath(jobId);
+  if (!filePath) return null;
+  try {
+    if (!fs.existsSync(filePath)) return null;
+    const raw = fs.readFileSync(filePath, "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!parsed || typeof parsed.createdAt !== "number") return null;
+    if (Date.now() - parsed.createdAt > JOB_TTL_MS) {
+      fs.promises.unlink(filePath).catch(() => {});
+      return null;
+    }
+    return parsed;
+  } catch {
+    return null;
+  }
+}
+
 function releaseJobHash(jobId: string) {
   for (const [hashKey, cachedJobId] of reqToJobCache.entries()) {
     if (cachedJobId === jobId) reqToJobCache.delete(hashKey);
@@ -263,32 +557,45 @@ function releaseJobHash(jobId: string) {
 }
 
 function purgeOldJobs(now = Date.now()) {
-  if (jobStore.size === 0) return;
+  if (jobStore.size > 0) {
+    const deleteJob = (id: string, job: EvaluationJob) => {
+      jobStore.delete(id);
+      job.reqBody = undefined;
+      releaseJobHash(id);
+      const filePath = safeJobFilePath(id);
+      if (filePath) fs.promises.unlink(filePath).catch(() => {});
+    };
 
-  const deleteJob = (id: string, job: EvaluationJob) => {
-    jobStore.delete(id);
-    job.reqBody = undefined;
-    releaseJobHash(id);
-  };
+    for (const [id, job] of jobStore) {
+      if (job.status !== "completed" && job.status !== "failed") continue;
+      if (now - job.createdAt < JOB_TTL_MS) continue;
+      deleteJob(id, job);
+    }
 
-  for (const [id, job] of jobStore) {
-    if (job.status !== "completed" && job.status !== "failed") continue;
-    if (now - job.createdAt < JOB_TTL_MS) continue;
-    deleteJob(id, job);
+    const finished: Array<[string, EvaluationJob]> = [];
+    for (const [id, job] of jobStore) {
+      if (job.status === "completed" || job.status === "failed") finished.push([id, job]);
+    }
+    if (finished.length > MAX_FINISHED_JOBS) {
+      finished
+        .sort((a, b) => a[1].createdAt - b[1].createdAt)
+        .slice(0, finished.length - MAX_FINISHED_JOBS)
+        .forEach(([id, job]) => deleteJob(id, job));
+    }
   }
 
-  // Hard cap as a second safety net: a burst of classes can create hundreds of
-  // finished jobs well before the TTL expires. Keep only the most recent ones.
-  const finished: Array<[string, EvaluationJob]> = [];
-  for (const [id, job] of jobStore) {
-    if (job.status === "completed" || job.status === "failed") finished.push([id, job]);
-  }
-  if (finished.length > MAX_FINISHED_JOBS) {
-    finished
-      .sort((a, b) => a[1].createdAt - b[1].createdAt)
-      .slice(0, finished.length - MAX_FINISHED_JOBS)
-      .forEach(([id, job]) => deleteJob(id, job));
-  }
+  // Sweep orphaned persisted job files past TTL
+  fs.promises.readdir(JOB_DISK_DIR).then((files) => {
+    for (const f of files) {
+      if (!f.endsWith(".json")) continue;
+      const fp = path.join(JOB_DISK_DIR, f);
+      fs.promises.stat(fp).then((st) => {
+        if (now - st.mtimeMs > JOB_TTL_MS) {
+          fs.promises.unlink(fp).catch(() => {});
+        }
+      }).catch(() => {});
+    }
+  }).catch(() => {});
 }
 
 // Periodic cleanup timer every 5 minutes to continuously prevent memory leaks
@@ -417,6 +724,55 @@ function buildPendingEvaluation(params: {
   };
 }
 
+// --- Session Answer Key Vault (AES-256-GCM) ---
+const VAULT_SECRET_FILE = path.join(os.tmpdir(), "ea_session_secret.key");
+function getSessionVaultKey(): Buffer {
+  const envSecret = String(process.env.SESSION_SECRET || process.env.GEMINI_API_KEY || "").trim();
+  if (envSecret) {
+    return crypto.createHash("sha256").update(`ea_vault:${envSecret}`).digest();
+  }
+  try {
+    if (fs.existsSync(VAULT_SECRET_FILE)) {
+      const saved = fs.readFileSync(VAULT_SECRET_FILE, "utf8").trim();
+      if (saved) return crypto.createHash("sha256").update(saved).digest();
+    }
+    const generated = crypto.randomBytes(32).toString("hex");
+    fs.writeFileSync(VAULT_SECRET_FILE, generated, { mode: 0o600 });
+    return crypto.createHash("sha256").update(generated).digest();
+  } catch {
+    return crypto.createHash("sha256").update("ea_fallback_ephemeral_vault").digest();
+  }
+}
+
+function encryptAnswerKey(answerKey: any): string {
+  const key = getSessionVaultKey();
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
+  const plaintext = Buffer.from(JSON.stringify(answerKey), "utf8");
+  const encrypted = Buffer.concat([cipher.update(plaintext), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  return `${iv.toString("base64url")}.${tag.toString("base64url")}.${encrypted.toString("base64url")}`;
+}
+
+function decryptAnswerKey(token: unknown): any | null {
+  if (typeof token !== "string" || !token.trim()) return null;
+  const parts = token.trim().split(".");
+  if (parts.length !== 3) return null;
+  try {
+    const [ivB64, tagB64, dataB64] = parts;
+    const iv = Buffer.from(ivB64, "base64url");
+    const tag = Buffer.from(tagB64, "base64url");
+    const encrypted = Buffer.from(dataB64, "base64url");
+    const decipher = crypto.createDecipheriv("aes-256-gcm", getSessionVaultKey(), iv);
+    decipher.setAuthTag(tag);
+    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+    return JSON.parse(decrypted.toString("utf8"));
+  } catch (err: any) {
+    console.warn("[SessionVault] Impossibile decifrare answerKey:", err?.message || err);
+    return null;
+  }
+}
+
 async function runEvaluationCore(reqBody: any) {
   const { tipo, prompt, report } = reqBody;
 
@@ -428,7 +784,58 @@ async function runEvaluationCore(reqBody: any) {
     throw new Error("Dati della prova o risposte non pervenute al server.");
   }
 
+  let restoredFromVault = false;
+  if (reqBody.encryptedAnswerKey && report.domande) {
+    const answerKey = decryptAnswerKey(reqBody.encryptedAnswerKey);
+    if (answerKey) {
+      report.domande = restoreExamAnswers(report.domande, answerKey, reqBody.mcOptionOrder);
+      restoredFromVault = true;
+    }
+  }
+
+  // Authoritatively recompute objective scores server-side once keys are present
   const normalizedTipo = String(tipo || "").trim().toLowerCase();
+  if (normalizedTipo === "quiz") {
+    const mcListAll = Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : [];
+    if (mcListAll.length > 0 && report.risposte?.mc) {
+      const mcCalc = mcWeightedScore(mcListAll, report.risposte.mc);
+      report.punteggioMC = mcCalc.correct;
+    }
+  } else if (normalizedTipo === "workbook") {
+    const sectionsAll = Array.isArray(report.domande?.sections) ? report.domande.sections : [];
+    const wbMcAll = [
+      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
+      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
+    ];
+    if (wbMcAll.length > 0 && report.risposte?.mc) {
+      const mcCalc = mcWeightedScore(wbMcAll, report.risposte.mc);
+      report.punteggioMC = mcCalc.correct;
+    }
+    const wbFibAll = [
+      ...(Array.isArray(report.domande?.fillInTheBlank) ? report.domande.fillInTheBlank : []),
+      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
+    ];
+    if (wbFibAll.length > 0 && report.risposte?.wbFib) {
+      const fibCalc = fibWeightedScore(wbFibAll, report.risposte.wbFib, isFibAnswerCorrect);
+      report.punteggioFIB = fibCalc.correct;
+      report.totaleFIB = wbFibAll.length;
+    }
+  }
+
+  const attachAuthoritativeFields = (resObj: any) => {
+    if (!resObj || typeof resObj !== "object") return resObj;
+    if (restoredFromVault && report.domande) {
+      resObj.resolvedDomande = report.domande;
+    }
+    resObj.calculatedMCScore = Number(report.punteggioMC || 0);
+    if (report.punteggioFIB !== undefined) {
+      resObj.calculatedFIBScore = Number(report.punteggioFIB || 0);
+    }
+    if (report.totaleFIB !== undefined) {
+      resObj.totalFIB = Number(report.totaleFIB || 0);
+    }
+    return resObj;
+  };
 
   if (normalizedTipo === "quiz") {
     const mcScore = report.punteggioMC || 0;
@@ -514,7 +921,7 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         evaluation.openEndedDetails = [];
         evaluation.evaluationMode = "ai";
         evaluation.gradeBreakdown = mathBreakdown;
-        return evaluation;
+        return attachAuthoritativeFields(evaluation);
       } catch (aiErr) {
         // Fallback deterministico: se l'IA non è disponibile o fallisce, il voto
         // resta comunque calcolato in modo rigoroso dalle risposte corrette.
@@ -522,14 +929,14 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         const wrongSummary = wrongQuestions.length > 0
           ? `Domande errate: ${wrongQuestions.map(w => `${w.number}) ${w.question} (scelta: ${w.studentChoice} → corretta: ${w.correctChoice})`).join("; ")}.`
           : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
-        return {
+        return attachAuthoritativeFields({
           suggestedGrade: mathGrade,
           mainErrors: wrongSummary,
           openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
           openEndedDetails: [],
           evaluationMode: "deterministic",
           gradeBreakdown: mathBreakdown
-        };
+        });
       }
     }
 
@@ -659,14 +1066,14 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
           "[evaluate] Correzione IA incompleta per il quiz: domande non valutate:",
           audit.missing.map((m) => m.id).join(", ")
         );
-        return buildPendingEvaluation({
+        return attachAuthoritativeFields(buildPendingEvaluation({
           tipo: "Quiz",
           examData: report.domande,
           answers: report.risposte,
           missing: audit.missing,
           punteggioMC: mcScore,
           cause: "correzione IA incompleta",
-        });
+        }));
       }
       evaluation.openEndedDetails = audit.details;
 
@@ -680,7 +1087,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       });
       evaluation.suggestedGrade = mixedBreakdown.finalGradeFormatted;
       evaluation.gradeBreakdown = mixedBreakdown;
-      return evaluation;
+      return attachAuthoritativeFields(evaluation);
     } catch (aiErr) {
       const aiCause = humanAiError(String((aiErr as any)?.message || aiErr));
       console.warn("[evaluate] Correzione IA fallita per quiz con aperte (nessun voto assegnato):", aiCause);
@@ -693,14 +1100,14 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
         getAnswer: (id) => String(report.risposte?.oe?.[id] ?? report.risposte?.openEnded?.[id] ?? ""),
         getDetailId: (d) => d?.questionId,
       });
-      return buildPendingEvaluation({
+      return attachAuthoritativeFields(buildPendingEvaluation({
         tipo: "Quiz",
         examData: report.domande,
         answers: report.risposte,
         missing: audit.missing,
         punteggioMC: mcScore,
         cause: `servizio IA non disponibile — ${aiCause}`,
-      });
+      }));
     }
 
   } else if (normalizedTipo === "workbook") {
@@ -768,19 +1175,19 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         evaluation.fibScore = fibScore;
         evaluation.reflectionDetails = [];
         evaluation.gradeBreakdown = mathBreakdown;
-        return evaluation;
+        return attachAuthoritativeFields(evaluation);
       } catch (aiErr: any) {
         console.warn("[evaluate] Fallback deterministico workbook di soli completamenti:", aiErr?.message || aiErr);
         // Nessuna riflessione da valutare: il voto resta quello dei completamenti.
         const reserveGrade = fibCount > 0 ? mathBreakdown.finalGradeFormatted : "N.V.";
-        return {
+        return attachAuthoritativeFields({
           suggestedGrade: reserveGrade,
           overallFeedback: `Valutazione deterministica (riserva senza IA): frasi completate correttamente ${fibScore}/${fibCount}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
           reflectionDetails: [],
           fibScore: fibScore,
           evaluationMode: "deterministic",
           gradeBreakdown: mathBreakdown
-        };
+        });
       }
     }
 
@@ -895,7 +1302,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
           "[evaluate] Correzione IA incompleta per il workbook: riflessioni non valutate:",
           audit.missing.map((m) => m.id).join(", ")
         );
-        return buildPendingEvaluation({
+        return attachAuthoritativeFields(buildPendingEvaluation({
           tipo: "Workbook",
           examData: report.domande,
           answers: report.risposte,
@@ -903,7 +1310,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
           punteggioFIB: fibScore,
           punteggioMC: Number(report.punteggioMC || 0),
           cause: "correzione IA incompleta",
-        });
+        }));
       }
       evaluation.reflectionDetails = audit.details;
 
@@ -919,7 +1326,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       });
       evaluation.suggestedGrade = mixedBreakdown.finalGradeFormatted;
       evaluation.gradeBreakdown = mixedBreakdown;
-      return evaluation;
+      return attachAuthoritativeFields(evaluation);
     } catch (aiErr: any) {
       const aiCause = humanAiError(String(aiErr?.message || aiErr));
       console.warn("[evaluate] Correzione IA fallita per workbook con riflessioni (nessun voto assegnato):", aiCause);
@@ -931,7 +1338,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         getAnswer: (id) => String(report.risposte?.wbRq?.[id] ?? report.risposte?.oe?.[id] ?? ""),
         getDetailId: (d) => d?.id,
       });
-      return buildPendingEvaluation({
+      return attachAuthoritativeFields(buildPendingEvaluation({
         tipo: "Workbook",
         examData: report.domande,
         answers: report.risposte,
@@ -939,7 +1346,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
         punteggioFIB: fibScore,
         punteggioMC: Number(report.punteggioMC || 0),
         cause: `servizio IA non disponibile — ${aiCause}`,
-      });
+      }));
     }
   }
 
@@ -964,11 +1371,13 @@ function processQueue() {
         const result = await runEvaluationCore(currentJob.reqBody);
         currentJob.status = "completed";
         currentJob.result = result;
+        persistJobSnapshot(currentJob);
         // Release hash from active deduplication cache after 30 seconds
         setTimeout(() => releaseJobHash(currentJob.id), 30000);
       } catch (err: any) {
         currentJob.status = "failed";
         currentJob.error = humanAiError(err?.message || "Errore durante la valutazione");
+        persistJobSnapshot(currentJob);
         // Release hash immediately on error to allow fast retry
         releaseJobHash(currentJob.id);
       } finally {
@@ -988,7 +1397,7 @@ app.get("/api/evaluate/warmup", (_req, res) => {
   res.json({ warmedUp: true, message: "Connection warmed up and cookies verified successfully." });
 });
 
-app.all("/api/evaluate/enqueue", (req, res) => {
+app.all("/api/evaluate/enqueue", evalRateLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   if (req.method !== "POST") {
     return res.status(405).json({ 
@@ -997,6 +1406,14 @@ app.all("/api/evaluate/enqueue", (req, res) => {
   }
   if (!req.body || typeof req.body !== "object") {
     return res.status(400).json({ error: "Richiesta di valutazione priva dei dati della consegna." });
+  }
+
+  // Only verified teachers may request forced AI re-evaluation
+  if (req.body.forceReevaluation === true) {
+    const authCheck = await verifyTeacherFromRequest(req);
+    if ("error" in authCheck) {
+      return res.status(authCheck.status).json({ error: authCheck.error });
+    }
   }
 
   // OPTIMIZATION 1: Request De-duplication Check
@@ -1045,7 +1462,7 @@ app.all("/api/evaluate/enqueue", (req, res) => {
 app.get("/api/evaluate/status/:jobId", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const { jobId } = req.params;
-  const job = jobStore.get(jobId);
+  const job = jobStore.get(jobId) || readPersistedJobSnapshot(jobId);
 
   if (!job) {
     return res.status(404).json({ error: "Job non trovato." });
@@ -1161,10 +1578,12 @@ function processRecoveryQueue() {
       try {
         currentJob.result = await runRecoveryCore(currentJob.reqBody);
         currentJob.status = "completed";
+        persistJobSnapshot(currentJob);
         setTimeout(() => releaseJobHash(currentJob.id), 30000);
       } catch (err: any) {
         currentJob.status = "failed";
         currentJob.error = humanAiError(err?.message || "Errore durante la generazione del piano");
+        persistJobSnapshot(currentJob);
         console.warn("[Piano di recupero]", currentJob.error);
         releaseJobHash(currentJob.id);
       } finally {
@@ -1177,7 +1596,7 @@ function processRecoveryQueue() {
   }
 }
 
-app.post("/api/generate-recovery-plan", (req, res) => {
+app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
   if (!getApiKey()) {
@@ -1228,7 +1647,7 @@ app.post("/api/generate-recovery-plan", (req, res) => {
 });
 
 // API: Health probe & Docimological Analysis & Criteria Optimization
-app.all("/api/analyze-exam", async (req, res) => {
+app.all("/api/analyze-exam", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
@@ -1359,7 +1778,7 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente 
 });
 
 // API: Extend an existing loaded exam JSON with new questions/sections/criteria not present in the original
-app.all("/api/extend-exam-json", async (req, res) => {
+app.all("/api/extend-exam-json", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
@@ -1710,7 +2129,7 @@ REGOLE TASSATIVE:
 });
 
 // API endpoint for generating a complete new exam from an educational topic/text using Gemini
-app.all("/api/generate-exam", async (req, res) => {
+app.all("/api/generate-exam", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
   if (req.method === "OPTIONS") {
     return res.status(204).end();
   }
@@ -1878,6 +2297,118 @@ REGOLE ESSENZIALI:
     return res.status(500).json({ 
       error: "La generazione assistita con IA non è andata a buon fine.", 
       details: error.message 
+    });
+  }
+});
+
+// Teacher-only: prepare student-safe sanitized exam + AES-256-GCM encrypted answer key vault
+app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req, res) => {
+  try {
+    const rawExam = req.body?.examData;
+    if (!rawExam || typeof rawExam !== "object") {
+      return res.status(400).json({ error: "Dati della prova non validi o mancanti." });
+    }
+    const normalized = normalizeExamStructure(JSON.parse(JSON.stringify(rawExam)));
+    const { sanitizedExam, answerKey } = stripExamAnswers(normalized);
+    const encryptedAnswerKey = encryptAnswerKey(answerKey);
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({ status: "success", sanitizedExam, encryptedAnswerKey });
+  } catch (err: any) {
+    console.error("[session/prepare] Failed:", err);
+    return res.status(500).json({ error: "Impossibile preparare la sessione protetta." });
+  }
+});
+
+// Teacher-only: generate parallel Fila B variant from an existing Quiz or Workbook JSON
+app.post("/api/generate-variant", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
+  const examJson = String(req.body?.examJson || "");
+  const titleHint = String(req.body?.title || "").trim();
+
+  if (!getApiKey()) {
+    return res.status(500).json({
+      error: "La chiave API di Gemini non è configurata nell'ambiente. Configura la chiave nei Secrets.",
+    });
+  }
+  if (!examJson.trim()) {
+    return res.status(400).json({ error: "JSON della prova sorgente mancante." });
+  }
+
+  let parsedSource: any = null;
+  try {
+    parsedSource = tolerantJsonParse(examJson);
+  } catch {}
+  if (!parsedSource || typeof parsedSource !== "object") {
+    return res.status(400).json({ error: "Il JSON della prova sorgente non è valido." });
+  }
+
+  const isWorkbook = Array.isArray(parsedSource.sections);
+  const sourceTitle = titleHint || String(parsedSource.title || "Verifica").trim();
+  const variantTitle = /\bfila\s*b\b/i.test(sourceTitle) ? sourceTitle : `${sourceTitle} (Fila B)`;
+
+  try {
+    const systemInstruction = isWorkbook
+      ? `Sei un docente esperto della scuola italiana.
+Riceverai un Workbook didattico (Fila A) in formato JSON. Devi creare una **variante parallela equivalente (Fila B)** dello STESSO livello di difficoltà, argomento e struttura.
+REGOLE TASSATIVE:
+1. Mantieni esattamente lo stesso numero di sezioni, lo stesso numero di frasi fillInTheBlank per sezione, lo stesso numero di eventuali multipleChoice e reflectionQuestions, e gli stessi pesi ("weight").
+2. Riformula completamente i quesiti, le frasi da completare (usando TASSATIVAMENTE '________' al posto della parola mancante, MAI tra parentesi quadre), le opzioni delle crocette e gli spunti di riflessione affinché verifichino le stesse competenze senza essere copiabili dalla Fila A.
+3. Imposta "title" esattamente a "${variantTitle}".
+4. Genera solo JSON valido conforme.`
+      : `Sei un docente esperto della scuola italiana.
+Riceverai una verifica Quiz (Fila A) in formato JSON. Devi creare una **variante parallela equivalente (Fila B)** dello STESSO livello di difficoltà, argomento e struttura.
+REGOLE TASSATIVAMENTE RIGOROSE:
+1. Mantieni esattamente lo stesso numero di domande multipleChoice (${Array.isArray(parsedSource.multipleChoice) ? parsedSource.multipleChoice.length : 0}) e lo stesso numero di domande openEnded (${Array.isArray(parsedSource.openEnded) ? parsedSource.openEnded.length : 0}), oltre agli stessi eventuali "weight".
+2. Cambia formulazione, esempi, dati numerici/storici/testuali e distrattori affinché un alunno seduto vicino a chi fa la Fila A non possa copiare, pur affrontando prove equivalenti per difficoltà e obiettivi.
+3. Distribuisci le risposte esatte ("correctIndex" 0-3) in modo vario.
+4. Imposta "title" esattamente a "${variantTitle}".
+5. Genera solo JSON valido conforme.`;
+
+    let modelUsed = TASK_MODEL_PREFERENCE["generate-exam"][0];
+    const response = await generateWithRetry({
+      model: TASK_MODEL_PREFERENCE["generate-exam"][0],
+      models: TASK_MODEL_PREFERENCE["generate-exam"],
+      onModelUsed: (m: string) => { modelUsed = m; },
+      contents: `Verifica sorgente (Fila A):\n${examJson.slice(0, 45000)}`,
+      config: {
+        systemInstruction,
+        temperature: 0.35,
+        maxOutputTokens: 8192,
+        responseMimeType: "application/json",
+      },
+    });
+
+    const responseText = extractResponseText(response);
+    if (!responseText) {
+      throw new Error("Risposta vuota ricevuta dall'IA.");
+    }
+    const parsedVariantRaw = tolerantJsonParse(responseText);
+    if (!parsedVariantRaw || typeof parsedVariantRaw !== "object") {
+      throw new Error("L'IA ha restituito una struttura non valida per la Fila B.");
+    }
+    const normalized = normalizeExamStructure(parsedVariantRaw);
+    const examObj = {
+      title: variantTitle,
+      ...(isWorkbook
+        ? { sections: normalized.sections || [] }
+        : {
+            multipleChoice: normalized.multipleChoice || [],
+            openEnded: normalized.openEnded || [],
+          }),
+    };
+    return res.json({
+      status: "success",
+      title: examObj.title,
+      examType: isWorkbook ? "workbook" : "quiz",
+      recommendedDurationMinutes: Number(parsedSource.recommendedDurationMinutes || normalized.recommendedDurationMinutes || 45),
+      modelUsed,
+      examObj,
+      formattedJson: JSON.stringify(examObj, null, 2),
+    });
+  } catch (error: any) {
+    console.error("[generate-variant] Failed:", error);
+    return res.status(500).json({
+      error: "Impossibile generare la variante Fila B.",
+      details: humanAiError(error?.message || ""),
     });
   }
 });

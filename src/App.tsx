@@ -201,10 +201,11 @@ export default function App() {
     }
     
     // 1. Fast check for hardcoded teachers
-    const isHardcodedTeacher = 
-      currentUser?.email === "riefolo.giovanni@ferrarisfermiclass.it" || 
-      currentUser?.email === "riefolog@gmail.com";
-    
+    const normalizedEmail = (currentUser?.email || "").trim().toLowerCase();
+    const isHardcodedTeacher =
+      normalizedEmail === "riefolo.giovanni@ferrarisfermiclass.it" ||
+      normalizedEmail === "riefolog@gmail.com";
+
     if (isHardcodedTeacher) {
       setRole("admin");
       return;

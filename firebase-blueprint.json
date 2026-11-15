@@ -59,6 +59,21 @@
         "updatedAt": { "type": "string" }
       },
       "required": ["id", "title", "examJson"]
+    },
+    "shared_exam": {
+      "title": "Verifica Condivisa tra Docenti",
+      "description": "Template verifica esportato con codice breve per importazione da parte di colleghi.",
+      "type": "object",
+      "properties": {
+        "shareCode": { "type": "string" },
+        "teacherEmail": { "type": "string" },
+        "title": { "type": "string" },
+        "examType": { "type": "string" },
+        "examJson": { "type": "string" },
+        "questionCount": { "type": "integer" },
+        "createdAt": { "type": "string" }
+      },
+      "required": ["shareCode", "teacherEmail", "title", "examType", "examJson"]
     }
   },
   "firestore": {
@@ -77,6 +92,10 @@
     "exam_library/{docId}": {
       "schema": "exam_library_item",
       "description": "Collezione delle prove salvate in libreria riutilizzabili."
+    },
+    "shared_exams/{shareCode}": {
+      "schema": "shared_exam",
+      "description": "Collezione delle verifiche condivise con codice breve tra docenti."
     }
   }
 }
