@@ -458,6 +458,7 @@ export default function App() {
     try {
       sessionStorage.removeItem("direct_student_user");
       localStorage.removeItem("direct_student_user");
+      localStorage.removeItem("active_eval_rescue");
     } catch (e) {}
 
     if (auth) {

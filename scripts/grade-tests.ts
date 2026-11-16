@@ -19,6 +19,13 @@ import {
 } from "../src/utils";
 import { computeExamItemAnalysis } from "../src/utils/examAnalytics";
 import { stripExamAnswers, restoreExamAnswers } from "../src/utils/examSecurity";
+import {
+  deriveStudentPseudonym,
+  getSubmissionBlindCode,
+  getStudentRosterBlindCode,
+  scrubPromptPii,
+  scrubAnswersForAi,
+} from "../src/utils/privacyPseudonym";
 
 let passed = 0;
 let failed = 0;
@@ -814,6 +821,101 @@ test("sanitizeAiHtml: blocca script/handler/javascript: ma preserva HTML didatti
   assert.ok(!clean.includes("<iframe"));
   assert.ok(clean.includes("<h3>Analisi</h3>"));
   assert.ok(clean.includes("<strong>sicuro</strong>"));
+});
+
+test("deriveStudentPseudonym: deterministico, opaco e privo di PII", () => {
+  const p1 = deriveStudentPseudonym("mario.rossi@scuola.edu.it", "PIN123");
+  const p2 = deriveStudentPseudonym("MARIO.ROSSI@SCUOLA.EDU.IT", "pin123");
+  const p3 = deriveStudentPseudonym("mario.rossi@scuola.edu.it", "PIN999");
+  const pOther = deriveStudentPseudonym("anna.bianchi@scuola.edu.it", "PIN123");
+  const pAnon = deriveStudentPseudonym("");
+
+  assert.equal(p1, p2);
+  assert.match(p1, /^STU-[A-Z0-9]{6}$/);
+  assert.notEqual(p1, p3);
+  assert.notEqual(p1, pOther);
+  assert.equal(pAnon, "STU-ANON00");
+  assert.ok(!p1.toLowerCase().includes("mario"));
+  assert.ok(!p1.toLowerCase().includes("rossi"));
+});
+
+test("scrubPromptPii: oscura email, telefono, CF e nome preservando date/anni e particelle", () => {
+  const input =
+    "Sono Mario De Luca (RSSMRA05A01H501Z), la mia email è mario.deluca@scuola.it e cellulare +39 333 1234567. Nel 1948 entrò in vigore la Costituzione di Roma.";
+  const res = scrubPromptPii(input, {
+    fullName: "Mario De Luca",
+    email: "mario.deluca@scuola.it",
+  });
+
+  assert.ok(!res.scrubbedText.includes("mario.deluca@scuola.it"));
+  assert.ok(!res.scrubbedText.includes("RSSMRA05A01H501Z"));
+  assert.ok(!res.scrubbedText.includes("333 1234567"));
+  assert.ok(!res.scrubbedText.includes("Mario"));
+  assert.ok(!res.scrubbedText.includes("Luca"));
+  assert.ok(res.scrubbedText.includes("[EMAIL OSCURATA]"));
+  assert.ok(res.scrubbedText.includes("[CODICE FISCALE OSCURATO]"));
+  assert.ok(res.scrubbedText.includes("[TELEFONO OSCURATO]"));
+  assert.ok(res.scrubbedText.includes("[NOME OSCURATO]"));
+  // Historical years and everyday words like "di" / "la" / "de" must stay untouched
+  assert.ok(res.scrubbedText.includes("1948"));
+  assert.ok(res.scrubbedText.includes("la Costituzione di Roma"));
+  assert.ok(res.redactionsCount >= 5);
+});
+
+test("scrubAnswersForAi: pulisce oe/wbRq/wbFib senza mutare l'originale o le crocette mc", () => {
+  const original = {
+    mc: { mc1: 2 },
+    oe: { oe1: "Risposta scritta da Giulia Verdi, giulia.verdi@liceo.it, nel 1948." },
+    wbRq: { rq1: "Tel 347-9876543 per contatto" },
+    wbFib: { f1: "Costituzione" },
+  };
+  const { scrubbedAnswers, redactionsCount, detectedTypes } = scrubAnswersForAi(original, {
+    fullName: "Giulia Verdi",
+    email: "giulia.verdi@liceo.it",
+  });
+
+  assert.equal(scrubbedAnswers.mc.mc1, 2);
+  assert.equal(scrubbedAnswers.wbFib.f1, "Costituzione");
+  assert.ok(!scrubbedAnswers.oe.oe1.includes("Giulia"));
+  assert.ok(!scrubbedAnswers.oe.oe1.includes("Verdi"));
+  assert.ok(!scrubbedAnswers.oe.oe1.includes("giulia.verdi@liceo.it"));
+  assert.ok(scrubbedAnswers.oe.oe1.includes("1948"));
+  assert.ok(!scrubbedAnswers.wbRq.rq1.includes("347-9876543"));
+  // Original object must remain untouched for teacher Firestore record
+  assert.ok(original.oe.oe1.includes("Giulia Verdi"));
+  assert.ok(redactionsCount >= 4);
+  assert.ok(detectedTypes.includes("email"));
+  assert.ok(detectedTypes.includes("telefono"));
+  assert.ok(detectedTypes.includes("nome/cognome"));
+});
+
+test("getSubmissionBlindCode & getStudentRosterBlindCode: niente suffissi .COM/.IT e niente collisioni", () => {
+  const c1 = getSubmissionBlindCode({
+    Email: "luca.bianchi@gmail.com",
+    Pin: "ABC123",
+    Session_Id: "run_1",
+  });
+  const c2 = getSubmissionBlindCode({
+    Email: "sara.neri@gmail.com",
+    Pin: "ABC123",
+    Session_Id: "run_1",
+  });
+  const stored = getSubmissionBlindCode({
+    Pseudo_Id: "stu-7k4m9p",
+    Email: "ignored@gmail.com",
+    Pin: "ZZZ",
+  });
+  const r1 = getStudentRosterBlindCode("luca.bianchi@gmail.com");
+  const r2 = getStudentRosterBlindCode("sara.neri@gmail.com");
+
+  assert.match(c1, /^STU-[A-Z0-9]{6}$/);
+  assert.match(c2, /^STU-[A-Z0-9]{6}$/);
+  assert.notEqual(c1, c2);
+  assert.equal(stored, "STU-7K4M9P");
+  assert.match(r1, /^STU-[A-Z0-9]{6}$/);
+  assert.notEqual(r1, r2);
+  assert.ok(!c1.endsWith("COM"));
+  assert.ok(!r1.endsWith("COM"));
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

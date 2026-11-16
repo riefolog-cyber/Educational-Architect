@@ -119,6 +119,10 @@ export default function AiExamGeneratorModal({
 
       const authHeaders = await getAuthHeaders();
 
+      try {
+        await fetch("/api/evaluate/warmup");
+      } catch {}
+
       let resp = await fetch("/api/generate-exam", {
         method: "POST",
         headers: { 
@@ -129,8 +133,14 @@ export default function AiExamGeneratorModal({
         body: JSON.stringify(payload)
       });
 
-      // If the POST request was blocked by an iframe proxy or redirected to GET
+      // If POST was blocked by a proxy, allow GET fallback only for short topics
+      // so large lecture transcripts never hit 414 URI Too Long or leak into URL logs.
       if (!resp.ok && (resp.status === 404 || resp.status === 405)) {
+        if (topic.trim().length > 1500) {
+          throw new Error(
+            "La richiesta POST è stata bloccata dalla rete/proxy e il testo inserito supera il limite per il fallback URL. Ricarica la pagina o riduci la lunghezza del testo."
+          );
+        }
         console.warn(`[AI Exam Generator] POST /api/generate-exam returned ${resp.status}. Trying query fallback...`);
         const queryParams = new URLSearchParams({
           topic: topic.trim(),

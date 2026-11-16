@@ -10,8 +10,10 @@ import {
   Check,
   ChevronLeft,
   ChevronRight,
+  ShieldCheck,
 } from "lucide-react";
 import { SavedSubmission } from "../types";
+import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import {
   formatMarkdown,
   isFibAnswerCorrect,
@@ -36,6 +38,8 @@ interface SubmissionDetailModalProps {
   onExportPDF: (sub: SavedSubmission) => void;
   onOpenPrintModal: (sub: SavedSubmission) => void;
   onManualGradeSave: (sub: SavedSubmission, newGradeValue: string) => Promise<void>;
+  onValidateSubmission?: (sub: SavedSubmission) => Promise<void>;
+  validatingId?: string | null;
   onRetouchSubjectiveItem: (
     sub: SavedSubmission,
     kind: "open_ended" | "reflection",
@@ -61,6 +65,8 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   onExportPDF,
   onOpenPrintModal,
   onManualGradeSave,
+  onValidateSubmission,
+  validatingId,
   onRetouchSubjectiveItem,
   currentIndex,
   totalCount,
@@ -136,6 +142,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   };
 
   const evalObj = safeParseJson(submission.Full_Evaluation);
+  const blindCode = getSubmissionBlindCode(submission);
 
   return (
     <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -154,7 +161,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               )}
             </div>
             <h3 className="text-base font-semibold text-white mt-0.5">
-              {blindGradingMode ? `Studente #${submission.id.slice(-4).toUpperCase()}` : submission.Nome}
+              {blindGradingMode ? `Studente ${blindCode}` : submission.Nome}
             </h3>
             <p className="text-[10px] text-slate-400 truncate mt-0.5">
               {blindGradingMode ? "• Identità anagrafica nascosta per valutazione oggettiva •" : submission.Email}
@@ -291,17 +298,77 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             </div>
           )}
 
+          <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-slate-950/70 border border-white/10 text-[11px]">
+            <div className="flex flex-wrap items-center gap-3 text-slate-300">
+              <span>
+                Pseudonimo IA: <b className="font-mono text-amber-300">{blindCode}</b>
+              </span>
+              <span className="text-slate-600">·</span>
+              <span>
+                PII filtrate al prompt: <b className="text-teal-300">{Number(submission.PII_Oscurate_Count || 0)}</b>
+              </span>
+            </div>
+            <div className="flex items-center gap-1.5">
+              {submission.Convalida_Docente_At ? (
+                <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
+                  <ShieldCheck className="w-3.5 h-3.5" />
+                  <span>
+                    Convalidato dal docente il{" "}
+                    {new Date(submission.Convalida_Docente_At).toLocaleString("it-IT", {
+                      day: "2-digit",
+                      month: "2-digit",
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                </span>
+              ) : (
+                <span className="text-amber-300 font-medium">
+                  In attesa di convalida docente (Human-in-the-Loop)
+                </span>
+              )}
+            </div>
+          </div>
+
           {!gradeEditOpen ? (
-            <button
-              type="button"
-              onClick={() => {
-                setGradeEditValue(submission.Voto_Suggerito || "");
-                setGradeEditOpen(true);
-              }}
-              className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
-            >
-              ✏️ Ritocca voto finale (decisione docente)
-            </button>
+            <div className="flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={() => {
+                  setGradeEditValue(submission.Voto_Suggerito || "");
+                  setGradeEditOpen(true);
+                }}
+                className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
+              >
+                ✏️ Ritocca voto finale (decisione docente)
+              </button>
+              {onValidateSubmission && (
+                <button
+                  type="button"
+                  disabled={displayGrade === "N.V." || validatingId === submission.id}
+                  onClick={() => onValidateSubmission(submission)}
+                  title={
+                    displayGrade === "N.V."
+                      ? "Completa o ritocca prima il voto (N.V.)"
+                      : "Conferma e registra la convalida ufficiale del docente (traccia human-in-the-loop GDPR / EU AI Act)"
+                  }
+                  className={`px-3.5 py-2 font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-45 disabled:cursor-not-allowed ${
+                    submission.Convalida_Docente_At
+                      ? "bg-emerald-500/15 hover:bg-emerald-500/25 text-emerald-300 border border-emerald-500/35"
+                      : "bg-emerald-600 hover:bg-emerald-500 text-white shadow-sm"
+                  }`}
+                >
+                  <ShieldCheck className="w-4 h-4" />
+                  <span>
+                    {validatingId === submission.id
+                      ? "Convalida..."
+                      : submission.Convalida_Docente_At
+                      ? "✓ Aggiorna Convalida Ufficiale"
+                      : "✓ Convalida Voto Ufficiale"}
+                  </span>
+                </button>
+              )}
+            </div>
           ) : (
             <div className="flex items-center gap-2 p-3 bg-slate-950/60 border border-white/10 rounded-xl">
               <input

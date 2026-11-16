@@ -12,6 +12,11 @@ import {
   isEvaluationPending,
   safeParseJson,
 } from "../utils";
+import { getSubmissionBlindCode } from "./privacyPseudonym";
+
+export interface PdfExportOptions {
+  blindMode?: boolean;
+}
 
 function resolveDisplayGrade(sub: SavedSubmission): string {
   const ev = safeParseJson(sub?.Full_Evaluation);
@@ -65,7 +70,18 @@ export function sanitizePdfText(text: string): string {
   return result;
 }
 
-export function createSubmissionPdfDoc(sub: SavedSubmission, jsPDFConstructor: any) {
+export function createSubmissionPdfDoc(
+  sub: SavedSubmission,
+  jsPDFConstructor: any,
+  options?: PdfExportOptions
+) {
+  const blindMode = Boolean(options?.blindMode);
+  const blindCode = getSubmissionBlindCode(sub);
+  const displayStudentName = blindMode ? `Studente ${blindCode}` : (sub.Nome || "Anonimo");
+  const displayStudentEmail = blindMode
+    ? "Identita anonimizzata (Correzione in Cieco GDPR)"
+    : (sub.Email || "N/D");
+
   const doc = new jsPDFConstructor();
   let currentY = 20;
   const pageHeight = 275;
@@ -77,7 +93,7 @@ export function createSubmissionPdfDoc(sub: SavedSubmission, jsPDFConstructor: a
       doc.setFont("Helvetica", "normal");
       doc.setFontSize(8);
       doc.setTextColor(150, 150, 150);
-      doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(sub.Nome || "")}`, 15, 12);
+      doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(displayStudentName)}`, 15, 12);
       doc.line(15, 14, 195, 14);
       doc.setDrawColor(230, 230, 230);
       currentY = 22;
@@ -172,14 +188,18 @@ export function createSubmissionPdfDoc(sub: SavedSubmission, jsPDFConstructor: a
   doc.setFont("Helvetica", "normal");
   doc.setTextColor(71, 85, 105);
 
-  doc.text(`Studente: ${sanitizePdfText(sub.Nome || "Anonimo")}`, 18, currentY + 6);
-  doc.text(`Email: ${sanitizePdfText(sub.Email || "N/D")}`, 18, currentY + 12);
+  doc.text(`Studente: ${sanitizePdfText(displayStudentName)}`, 18, currentY + 6);
+  doc.text(`Email: ${sanitizePdfText(displayStudentEmail)}`, 18, currentY + 12);
   doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 18);
 
   const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
   doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
   doc.text(`Data Svolgimento: ${dateStr}`, 110, currentY + 12);
-  doc.text(`Valutazione ID: ${sub.id || "N/D"}`, 110, currentY + 18);
+  doc.text(
+    blindMode ? `Codice Cieco: ${blindCode}` : `Valutazione ID: ${sub.id || "N/D"}`,
+    110,
+    currentY + 18
+  );
 
   currentY += 30;
 
@@ -543,12 +563,25 @@ export function createSubmissionPdfDoc(sub: SavedSubmission, jsPDFConstructor: a
     }
   }
 
-  // 7. FOOTER PAGE SIGNATURE
-  checkPageBreak(18);
+  // 7. FOOTER PAGE SIGNATURE & GDPR / HUMAN-IN-THE-LOOP AUDIT
+  checkPageBreak(24);
   currentY += 8;
   doc.setDrawColor(226, 232, 240);
   doc.line(15, currentY, 195, currentY);
   currentY += 6;
+  doc.setFont("Helvetica", "normal");
+  doc.setFontSize(7.5);
+  doc.setTextColor(100, 116, 139);
+  const piiCount = Number(sub.PII_Oscurate_Count || 0);
+  const convalidaText = sub.Convalida_Docente_At
+    ? `Convalida docente: ${new Date(sub.Convalida_Docente_At).toLocaleString("it-IT")}${blindMode ? "" : sub.Convalida_Docente_Email ? ` (${sub.Convalida_Docente_Email})` : ""}`
+    : "Valutazione in attesa di convalida esplicita del docente";
+  doc.text(
+    sanitizePdfText(`Pseudonimo IA: ${blindCode} | PII filtrate al prompt: ${piiCount} | ${convalidaText}`),
+    15,
+    currentY
+  );
+  currentY += 4.5;
   doc.setFont("Helvetica", "italic");
   doc.setFontSize(7.5);
   doc.setTextColor(148, 163, 184);
@@ -557,17 +590,25 @@ export function createSubmissionPdfDoc(sub: SavedSubmission, jsPDFConstructor: a
   return doc;
 }
 
-export async function exportSubmissionPdf(sub: SavedSubmission): Promise<void> {
+export async function exportSubmissionPdf(
+  sub: SavedSubmission,
+  options?: PdfExportOptions
+): Promise<void> {
   const { jsPDF } = await import("jspdf");
-  const doc = createSubmissionPdfDoc(sub, jsPDF);
-  const formattedName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
+  const blindMode = Boolean(options?.blindMode);
+  const doc = createSubmissionPdfDoc(sub, jsPDF, { blindMode });
+  const blindSlug = getSubmissionBlindCode(sub).toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+  const formattedName = blindMode
+    ? blindSlug
+    : (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
   doc.save(`esito_ea_${formattedName}_pin_${sub.Pin || "esame"}.pdf`);
 }
 
 export async function exportSubmissionsZip(
   subsToExport: SavedSubmission[],
   zipBaseName: string,
-  onProgress: (current: number, total: number) => void
+  onProgress: (current: number, total: number) => void,
+  options?: PdfExportOptions
 ): Promise<string> {
   const [{ jsPDF }, JSZipModule] = await Promise.all([
     import("jspdf"),
@@ -575,6 +616,7 @@ export async function exportSubmissionsZip(
   ]);
   const JSZip = (JSZipModule as any).default || JSZipModule;
   const zip = new JSZip();
+  const blindMode = Boolean(options?.blindMode);
 
   const usedFilenames = new Map<string, number>();
 
@@ -586,10 +628,12 @@ export async function exportSubmissionsZip(
       await new Promise((r) => setTimeout(r, 15));
     }
 
-    const doc = createSubmissionPdfDoc(sub, jsPDF);
+    const doc = createSubmissionPdfDoc(sub, jsPDF, { blindMode });
     const arrayBuffer = doc.output("arraybuffer");
 
-    const rawName = (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
+    const rawName = blindMode
+      ? getSubmissionBlindCode(sub).toLowerCase().replace(/[^a-z0-9_-]/g, "_")
+      : (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
     const pinPart = (sub.Pin || "esame").toLowerCase().replace(/[^a-z0-9]/g, "_");
     const baseFilename = `esito_${rawName}_pin_${pinPart}`;
     const count = usedFilenames.get(baseFilename) || 0;

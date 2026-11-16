@@ -58,6 +58,12 @@ export type { LiveSessionSummary, ExamSummary };
 import { exportSubmissionPdf, exportSubmissionsZip } from "../utils/pdfExport";
 import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml } from "../utils";
 import {
+  deriveStudentPseudonym,
+  getSubmissionBlindCode,
+  getStudentRosterBlindCode,
+  scrubAnswersForAi,
+} from "../utils/privacyPseudonym";
+import {
   autoCorrectExamJSON,
   canAutoCorrectStructure,
   tolerantJsonParse,
@@ -360,7 +366,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setDeleteNotify(null);
     }, durationMs);
   };
-  const [blindGradingMode, setBlindGradingMode] = useState(false);
+  const [blindGradingMode, setBlindGradingMode] = useState(true);
+  const [validatingId, setValidatingId] = useState<string | null>(null);
 
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
@@ -1550,17 +1557,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
           });
 
+          const studentPseudoId = deriveStudentPseudonym(
+            sub.Email || sub.id || sub.Nome || "anonimo",
+            sub.Session_Id || sub.Pin || ""
+          );
+          const { scrubbedAnswers: aiSafeQuizAnswers } = scrubAnswersForAi(sanitizedAnswers, {
+            fullName: sub.Nome,
+            email: sub.Email,
+          });
+
           const evaluation = await requestAiReevaluation({
             tipo: "Quiz",
             forceReevaluation: true,
             prompt:
               "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
-            studentEmail: sub.Email || "",
-            studentName: sub.Nome || "Studente",
+            studentPseudoId,
             sessionPin: sub.Pin || sub.Session_Id || "",
             report: {
               domande: domandeObj,
-              risposte: sanitizedAnswers,
+              risposte: aiSafeQuizAnswers,
               punteggioMC: correctCount,
               punteggioMCPesato: mcs.weightedCorrect,
               pesoMCTotale: mcs.weightedTotal,
@@ -1668,17 +1683,25 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             if (detectGibberish(text)) sanitizedAnswers.wbRq[r.id] = "[VUOTO]";
           });
 
+          const studentPseudoId = deriveStudentPseudonym(
+            sub.Email || sub.id || sub.Nome || "anonimo",
+            sub.Session_Id || sub.Pin || ""
+          );
+          const { scrubbedAnswers: aiSafeWbAnswers } = scrubAnswersForAi(sanitizedAnswers, {
+            fullName: sub.Nome,
+            email: sub.Email,
+          });
+
           const evaluation = await requestAiReevaluation({
             tipo: "Workbook",
             forceReevaluation: true,
             prompt:
               "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
-            studentEmail: sub.Email || "",
-            studentName: sub.Nome || "Studente",
+            studentPseudoId,
             sessionPin: sub.Pin || sub.Session_Id || "",
             report: {
               domande: domandeObj,
-              risposte: sanitizedAnswers,
+              risposte: aiSafeWbAnswers,
               punteggioMC: correctMc,
               punteggioFIB: correctFib,
               totaleFIB: fibList.length,
@@ -1781,7 +1804,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
     try {
       const formatted = formatItalianScholasticGrade(Math.min(10, num));
-      const payload: any = { Voto_Suggerito: formatted };
+      const payload: any = {
+        Voto_Suggerito: formatted,
+        Convalida_Docente_At: new Date().toISOString(),
+        Convalida_Docente_Email: String(user?.email || ""),
+      };
       if (!sub.Voto_Originale_IA) payload.Voto_Originale_IA = sub.Voto_Suggerito;
       await updateDoc(doc(dbFirestore, "valutazioni", sub.id), payload);
       const updated = { ...sub, ...payload };
@@ -1789,11 +1816,41 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setSelectedSub(updated);
       showNotify(
         "success",
-        `✅ Voto ritoccato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
+        `✅ Voto ritoccato e convalidato dal docente: ${formatted} (originale IA: ${payload.Voto_Originale_IA || sub.Voto_Originale_IA || "—"})`,
         5000
       );
     } catch (err: any) {
       setAppAlert({ msg: `Errore salvataggio voto: ${err.message}` });
+    }
+  };
+
+  // Explicit Human-in-the-Loop validation stamp (GDPR / MIM Opinion n. 787 & EU AI Act)
+  const handleValidateSubmission = async (sub: SavedSubmission) => {
+    if (!dbFirestore) {
+      setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
+      return;
+    }
+    setValidatingId(sub.id);
+    try {
+      const payload = {
+        Convalida_Docente_At: new Date().toISOString(),
+        Convalida_Docente_Email: String(user?.email || ""),
+      };
+      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), payload);
+      const updated = { ...sub, ...payload };
+      setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
+      if (selectedSub?.id === sub.id) {
+        setSelectedSub(updated);
+      }
+      showNotify(
+        "success",
+        `✅ Valutazione convalidata ufficialmente dal docente (${new Date(payload.Convalida_Docente_At).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}).`,
+        4500
+      );
+    } catch (err: any) {
+      setAppAlert({ msg: `Errore convalida valutazione: ${err.message}` });
+    } finally {
+      setValidatingId(null);
     }
   };
 
@@ -1887,6 +1944,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const updatePayload: any = {
         Voto_Suggerito: breakdown.finalGradeFormatted,
         Full_Evaluation: JSON.stringify(evalObj),
+        Convalida_Docente_At: new Date().toISOString(),
+        Convalida_Docente_Email: String(user?.email || ""),
       };
       if (!sub.Voto_Originale_IA && sub.Voto_Suggerito && sub.Voto_Suggerito !== "N.V.") {
         updatePayload.Voto_Originale_IA = sub.Voto_Suggerito;
@@ -1911,7 +1970,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Export a student evaluation with metacognitive details to PDF
   const handleExportPDF = async (sub: SavedSubmission) => {
     try {
-      await exportSubmissionPdf(sub);
+      await exportSubmissionPdf(sub, { blindMode: blindGradingMode });
     } catch (pdfErr) {
       console.error("PDF generation error:", pdfErr);
       setAppAlert({ msg: "❌ Errore durante l'assemblaggio del PDF. Riprovare." });
@@ -1928,13 +1987,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     setZipProgress({ current: 0, total: subsToExport.length });
 
     try {
-      await exportSubmissionsZip(subsToExport, zipBaseName, (current, total) => {
-        setZipProgress({ current, total });
-      });
+      const effectiveZipName = blindGradingMode ? `${zipBaseName}_cieco` : zipBaseName;
+      await exportSubmissionsZip(
+        subsToExport,
+        effectiveZipName,
+        (current, total) => {
+          setZipProgress({ current, total });
+        },
+        { blindMode: blindGradingMode }
+      );
 
       showNotify(
         "success",
-        `✅ Archivio ZIP generato con successo! Scaricati ${subsToExport.length} report PDF per il registro elettronico.`,
+        `✅ Archivio ZIP generato (${blindGradingMode ? "Modalità Cieca GDPR" : "con nomi reali"}): scaricati ${subsToExport.length} report PDF.`,
         5000
       );
     } catch (err: any) {
@@ -2002,8 +2067,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Export single exam roster directly to CSV for class gradebook
   const handleExportSingleExamCSV = (exam: ExamSummary) => {
     const headers = [
-      "Nome Studente",
-      "Email",
+      blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
+      blindGradingMode ? "Modalità Privacy" : "Email",
       "PIN Sessione",
       "Titolo Prova",
       "Tipologia",
@@ -2013,12 +2078,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       "Incolla Bloccati",
       "Errori Principali",
       "Feedback Generale",
-      "Data e Ora Consegna"
+      "Data e Ora Consegna",
+      "Convalida Docente"
     ];
 
     const rows = exam.submissions.map(sub => [
-      sub.Nome || "Anonimo",
-      sub.Email || "",
+      blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
+      blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
       sub.Pin || exam.pin,
       exam.title,
       sub.Tipo || "",
@@ -2028,11 +2094,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       sub.AntiCopia_IncollaBloccato || 0,
       sub.Errori_Principali || "",
       sub.Feedback_Generale || "",
-      sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : ""
+      sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "",
+      sub.Convalida_Docente_At ? new Date(sub.Convalida_Docente_At).toLocaleString("it-IT") : "In attesa"
     ]);
 
     const cleanTitle = (exam.pin !== "—" ? `pin_${exam.pin}` : exam.title).toLowerCase().replace(/[^a-z0-9]/g, "_");
-    downloadCsvFile(`tabellone_voti_${cleanTitle}.csv`, headers, rows);
+    downloadCsvFile(
+      blindGradingMode ? `tabellone_voti_cieco_${cleanTitle}.csv` : `tabellone_voti_${cleanTitle}.csv`,
+      headers,
+      rows
+    );
+    showNotify(
+      "success",
+      `✅ CSV prova esportato (${blindGradingMode ? "Modalità Cieca GDPR: nomi nascosti" : "con nomi reali"}).`,
+      4000
+    );
   };
 
   // Export current list to CSV for Excel / Google Sheets
@@ -2046,8 +2122,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return;
       }
       const headers = [
-        "Nome Studente",
-        "Email",
+        blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
+        blindGradingMode ? "Modalità Privacy" : "Email",
         "Totale Prove Svolte",
         "Quiz Svolti",
         "Workbook Svolti",
@@ -2059,8 +2135,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         "Tentativi Incolla Bloccati Totali"
       ];
       const rows = filteredStudentSummaries.map(stu => [
-        stu.name,
-        stu.email,
+        blindGradingMode ? `Studente ${getStudentRosterBlindCode(stu.email || stu.key)}` : stu.name,
+        blindGradingMode ? "Identità anonimizzata (GDPR)" : stu.email,
         stu.totalTests,
         stu.quizCount,
         stu.workbookCount,
@@ -2072,7 +2148,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         stu.totalPasteAttempts
       ]);
 
-      downloadCsvFile(`elenco_studenti_prove_fatte_${dateFormatted}.csv`, headers, rows);
+      downloadCsvFile(
+        blindGradingMode
+          ? `elenco_studenti_cieco_${dateFormatted}.csv`
+          : `elenco_studenti_prove_fatte_${dateFormatted}.csv`,
+        headers,
+        rows
+      );
+      showNotify(
+        "success",
+        `✅ CSV riepilogo esportato (${blindGradingMode ? "Modalità Cieca GDPR: nomi nascosti" : "con nomi reali"}).`,
+        4000
+      );
       return;
     }
 
@@ -2124,8 +2211,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
 
     const headers = [
-      "Nome Studente",
-      "Email",
+      blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
+      blindGradingMode ? "Modalità Privacy" : "Email",
       "Tipologia",
       "PIN Sessione",
       "Data e Ora Consegna",
@@ -2134,12 +2221,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       "Uscite Pagina (Tab Switch)",
       "Tentativi Incolla Bloccati",
       "Errori Principali",
-      "Feedback Generale"
+      "Feedback Generale",
+      "Convalida Docente"
     ];
 
     const rows = filteredSubmissions.map(sub => [
-      sub.Nome || "Anonimo",
-      sub.Email || "",
+      blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
+      blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
       sub.Tipo || "",
       sub.Pin || "",
       sub.Timestamp || "",
@@ -2148,10 +2236,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       sub.AntiCopia_TabSwitch || 0,
       sub.AntiCopia_IncollaBloccato || 0,
       sub.Errori_Principali || "",
-      sub.Feedback_Generale || ""
+      sub.Feedback_Generale || "",
+      sub.Convalida_Docente_At ? new Date(sub.Convalida_Docente_At).toLocaleString("it-IT") : "In attesa"
     ]);
 
-    downloadCsvFile(`registro_voti_alunni_${dateFormatted}.csv`, headers, rows);
+    downloadCsvFile(
+      blindGradingMode
+        ? `registro_voti_cieco_${dateFormatted}.csv`
+        : `registro_voti_alunni_${dateFormatted}.csv`,
+      headers,
+      rows
+    );
+    showNotify(
+      "success",
+      `✅ Registro CSV esportato (${blindGradingMode ? "Modalità Cieca GDPR: nomi nascosti" : "con nomi reali"}).`,
+      4000
+    );
   };
 
   // Precompute parsed submission metadata once per submissions update instead of re-parsing JSON on every render row
@@ -2200,11 +2300,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const filteredSubmissions = React.useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     const result = submissions.filter(sub => {
+      const blindCode = getSubmissionBlindCode(sub).toLowerCase();
       const matchesSearch =
         !q ||
-        (sub.Nome || "").toLowerCase().includes(q) ||
-        (sub.Email || "").toLowerCase().includes(q) ||
-        (sub.Pin || "").toLowerCase().includes(q);
+        (blindGradingMode
+          ? blindCode.includes(q) || (sub.Pin || "").toLowerCase().includes(q)
+          : (sub.Nome || "").toLowerCase().includes(q) ||
+            (sub.Email || "").toLowerCase().includes(q) ||
+            (sub.Pin || "").toLowerCase().includes(q) ||
+            blindCode.includes(q));
 
       if (filterType === "All") return matchesSearch;
       return matchesSearch && sub.Tipo === filterType;
@@ -2230,6 +2334,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return tsB - tsA;
       }
       if (chronologicalSortBy === "name_asc") {
+        if (blindGradingMode) {
+          return getSubmissionBlindCode(a).localeCompare(getSubmissionBlindCode(b));
+        }
         return (a.Nome || "").localeCompare(b.Nome || "");
       }
       if (chronologicalSortBy === "violations_desc") {
@@ -2241,7 +2348,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [submissions, submissionMetaMap, searchQuery, filterType, chronologicalSortBy]);
+  }, [submissions, submissionMetaMap, searchQuery, filterType, chronologicalSortBy, blindGradingMode]);
 
   // Aggregated submissions grouped by student
   const studentSummaries: StudentSummary[] = React.useMemo(() => {
@@ -2338,11 +2445,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const filteredStudentSummaries = React.useMemo(() => {
     let result = studentSummaries.filter(stu => {
       const q = searchQuery.toLowerCase().trim();
-      const matchesSearch = !q || (
-        stu.name.toLowerCase().includes(q) ||
-        stu.email.toLowerCase().includes(q) ||
-        stu.uniquePins.some(p => p.toLowerCase().includes(q))
-      );
+      const rosterCode = getStudentRosterBlindCode(stu.email || stu.key).toLowerCase();
+      const matchesSubCode = stu.submissions.some(s => getSubmissionBlindCode(s).toLowerCase().includes(q));
+      const matchesSearch = !q || (blindGradingMode
+        ? rosterCode.includes(q) ||
+          matchesSubCode ||
+          stu.uniquePins.some(p => p.toLowerCase().includes(q))
+        : stu.name.toLowerCase().includes(q) ||
+          stu.email.toLowerCase().includes(q) ||
+          rosterCode.includes(q) ||
+          matchesSubCode ||
+          stu.uniquePins.some(p => p.toLowerCase().includes(q)));
 
       if (!matchesSearch) return false;
       if (filterType === "Quiz") return stu.quizCount > 0;
@@ -2365,10 +2478,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
       if (studentSortBy === "most_tests") {
         if (b.totalTests !== a.totalTests) return b.totalTests - a.totalTests;
-        return a.name.localeCompare(b.name);
+        return blindGradingMode
+          ? getStudentRosterBlindCode(a.email || a.key).localeCompare(getStudentRosterBlindCode(b.email || b.key))
+          : a.name.localeCompare(b.name);
       }
       if (studentSortBy === "name_asc") {
-        return a.name.localeCompare(b.name);
+        return blindGradingMode
+          ? getStudentRosterBlindCode(a.email || a.key).localeCompare(getStudentRosterBlindCode(b.email || b.key))
+          : a.name.localeCompare(b.name);
       }
       if (studentSortBy === "recent") {
         return new Date(b.latestDate).getTime() - new Date(a.latestDate).getTime();
@@ -2377,7 +2494,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [studentSummaries, searchQuery, filterType, studentSortBy]);
+  }, [studentSummaries, searchQuery, filterType, studentSortBy, blindGradingMode]);
 
   // Group submissions by exam / test session
   const examSummaries: ExamSummary[] = React.useMemo(() => {
@@ -2509,9 +2626,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const matchesSearch = !q || (
         ex.title.toLowerCase().includes(q) ||
         ex.pin.toLowerCase().includes(q) ||
-        ex.submissions.some(s => 
-          (s.Nome || "").toLowerCase().includes(q) || 
-          (s.Email || "").toLowerCase().includes(q)
+        ex.submissions.some(s =>
+          blindGradingMode
+            ? getSubmissionBlindCode(s).toLowerCase().includes(q)
+            : (s.Nome || "").toLowerCase().includes(q) ||
+              (s.Email || "").toLowerCase().includes(q) ||
+              getSubmissionBlindCode(s).toLowerCase().includes(q)
         )
       );
 
@@ -2546,7 +2666,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [examSummaries, searchQuery, filterType, examSortBy]);
+  }, [examSummaries, searchQuery, filterType, examSortBy, blindGradingMode]);
 
   const expandAllExams = () => {
     setExpandedExamKeys(new Set(filteredExamSummaries.map(e => e.key)));
@@ -3595,7 +3715,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     <input
                       type="text"
                       placeholder={
-                        submissionViewMode === "by_exam"
+                        blindGradingMode
+                          ? submissionViewMode === "by_exam"
+                            ? "Cerca prova per titolo, PIN sessione o codice anonimo (es. STU-...)..."
+                            : "Cerca per codice anonimo (es. STU-7K4M9P) o PIN prova..."
+                          : submissionViewMode === "by_exam"
                           ? "Cerca prova per titolo, PIN sessione o studente..."
                           : submissionViewMode === "by_student"
                           ? "Cerca studente per nome, e-mail o PIN prova..."
@@ -3656,7 +3780,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       title="Attiva la modalità di correzione in cieco anonimizzando i nomi degli studenti (conforme a GDPR e Regolamento d'Istituto)"
                     >
                       {blindGradingMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-                      <span>{blindGradingMode ? "Cieco: ATTIVO" : "Correzione in Cieco"}</span>
+                      <span>{blindGradingMode ? "Cieco: ATTIVO (Mostra Nomi)" : "Correzione in Cieco"}</span>
                     </button>
                     <button
                       onClick={() => setFilterType("All")}
@@ -3794,7 +3918,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   <div>
                                     <div className="flex items-center gap-2 flex-wrap">
                                       <p className="font-bold text-white text-xs sm:text-sm">
-                                        {blindGradingMode ? `Studente #${stu.key.slice(-4).toUpperCase()}` : stu.name}
+                                        {blindGradingMode
+                                          ? `Studente ${getStudentRosterBlindCode(stu.email || stu.key)}`
+                                          : stu.name}
                                       </p>
                                       {studentSortBy === "highest_avg" && sIdx < 3 && (
                                         <span className="text-[11px] font-semibold text-amber-300">
@@ -4219,6 +4345,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                 <div className="p-4 bg-slate-900/70 border-t border-white/5 space-y-3 animate-fadeIn">
                                   <ExamItemAnalysisPanel
                                     submissions={exam.submissions}
+                                    examTitle={exam.title}
                                     onGenerateRecoveryExam={(prefill) => {
                                       setAiModalPrefill(prefill);
                                       setShowAiModal(true);
@@ -4317,6 +4444,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                               return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                             }
                                             if (examRosterSort === "name_asc") {
+                                              if (blindGradingMode) {
+                                                return getSubmissionBlindCode(a).localeCompare(getSubmissionBlindCode(b));
+                                              }
                                               return (a.Nome || "").localeCompare(b.Nome || "");
                                             }
                                             return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
@@ -4340,7 +4470,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                               <td className="p-2">
                                                 {blindGradingMode ? (
                                                   <span className="font-mono font-bold text-amber-300">
-                                                    Studente #{sub.id.slice(-4).toUpperCase()}
+                                                    Studente {getSubmissionBlindCode(sub)}
                                                   </span>
                                                 ) : (
                                                   <div>
@@ -4398,6 +4528,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                                             return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
                                                           }
                                                           if (examRosterSort === "name_asc") {
+                                                            if (blindGradingMode) {
+                                                              return getSubmissionBlindCode(a).localeCompare(getSubmissionBlindCode(b));
+                                                            }
                                                             return (a.Nome || "").localeCompare(b.Nome || "");
                                                           }
                                                           return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
@@ -4576,7 +4709,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   {blindGradingMode ? (
                                     <div>
                                       <p className="font-mono font-bold text-amber-300 truncate text-[11px] sm:text-xs">
-                                        Studente #{sub.id.slice(-4).toUpperCase()}
+                                        Studente {getSubmissionBlindCode(sub)}
                                       </p>
                                       <p className="hidden sm:block text-[9px] text-slate-500 font-mono italic truncate mt-0.5">
                                         • Identità Cieca (GDPR) •
@@ -4743,6 +4876,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               setShowPrintModal(true);
             }}
             onManualGradeSave={handleManualGrade}
+            onValidateSubmission={handleValidateSubmission}
+            validatingId={validatingId}
             onRetouchSubjectiveItem={handleRetouchSubjectiveItem}
             currentIndex={speedIdx >= 0 ? speedIdx : undefined}
             totalCount={speedIdx >= 0 ? speedGraderList.length : undefined}
@@ -4799,6 +4934,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           setPrintableSub(null);
         }}
         submission={printableSub}
+        blindGradingMode={blindGradingMode}
         examTitle={materia || printableSub?.Tipo}
         examImages={safeParseJson(printableSub?.Domande_Esame)?.images}
       />

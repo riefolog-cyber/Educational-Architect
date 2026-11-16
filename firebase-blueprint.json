@@ -16,7 +16,11 @@
         "AntiCopia_IncollaBloccato": { "type": "integer" },
         "AntiCopia_InfractionsLog": { "type": "string" },
         "Full_Evaluation": { "type": "string" },
-        "Risposte_Studente": { "type": "string" }
+        "Risposte_Studente": { "type": "string" },
+        "Pseudo_Id": { "type": "string" },
+        "PII_Oscurate_Count": { "type": "integer" },
+        "Convalida_Docente_At": { "type": "string" },
+        "Convalida_Docente_Email": { "type": "string" }
       },
       "required": ["Timestamp", "Tipo", "Email"]
     },

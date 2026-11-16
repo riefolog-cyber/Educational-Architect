@@ -79,6 +79,11 @@ import {
   recoveryProgressPercent,
   type RecoveryProgress
 } from "../utils/recoveryProgress";
+import { deriveStudentPseudonym, scrubAnswersForAi } from "../utils/privacyPseudonym";
+
+function getLiveStudentDocId(email?: string | null, targetPin?: string | null): string {
+  return deriveStudentPseudonym(email || "anonimo", String(targetPin || "").trim().toUpperCase());
+}
 
 export interface MissingQuestionItem {
   id: string;
@@ -469,7 +474,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const activeAns = override?.answers || answers;
     const activeRunId = override?.runId ?? sessionRunId;
     try {
-      const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+      const liveDocId = getLiveStudentDocId(user.email, targetPin);
       let answeredCount = 0;
       let totalQuestions = 1;
       let mcDoneCount = 0;
@@ -523,14 +528,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       let joinedAt = joinedAtBySessionRef.current[joinedKey];
       if (!joinedAt) {
         try {
-          joinedAt = sessionStorage.getItem(`exam_joined_${targetPin}_${safeKey}`) || "";
+          joinedAt = sessionStorage.getItem(`exam_joined_${targetPin}_${liveDocId}`) || "";
         } catch {
           joinedAt = "";
         }
         if (!joinedAt) joinedAt = new Date().toISOString();
         joinedAtBySessionRef.current[joinedKey] = joinedAt;
         try {
-          sessionStorage.setItem(`exam_joined_${targetPin}_${safeKey}`, joinedAt);
+          sessionStorage.setItem(`exam_joined_${targetPin}_${liveDocId}`, joinedAt);
         } catch {
           // Storage disabled: the in-memory ref still keeps it stable.
         }
@@ -554,7 +559,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         };
       }
 
-      const docRef = doc(dbFirestore, "active_sessions", targetPin, "live_students", safeKey);
+      const docRef = doc(dbFirestore, "active_sessions", targetPin, "live_students", liveDocId);
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
@@ -724,9 +729,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     const pinToUse = (sessionPin || pin || "").trim().toUpperCase();
     if (!dbFirestore || !pinToUse || !user?.email) return;
     try {
-      const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
+      const liveDocId = getLiveStudentDocId(user.email, pinToUse);
       await setDoc(
-        doc(dbFirestore, "active_sessions", pinToUse, "live_students", safeKey),
+        doc(dbFirestore, "active_sessions", pinToUse, "live_students", liveDocId),
         {
           locked,
           lockState: locked ? "locked" : "unlocked",
@@ -800,8 +805,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // writes a new remoteUnlockId and locked: false on this student's live_students document.
   useEffect(() => {
     if (!dbFirestore || !sessionPin || !user?.email) return;
-    const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
-    const studentDocRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", safeKey);
+    const liveDocId = getLiveStudentDocId(user.email, sessionPin);
+    const studentDocRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", liveDocId);
     const unsubscribe = onSnapshot(
       studentDocRef,
       (snap) => {
@@ -1093,8 +1098,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         let cloudStudentData: any = null;
         // Check if teacher has already unlocked this student in Firestore + fetch cloud draft
         if (user?.email) {
-          const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
-          const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", savedPin, "live_students", safeKey));
+          const liveDocId = getLiveStudentDocId(user.email, savedPin);
+          const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", savedPin, "live_students", liveDocId));
           if (studentSnap.exists()) {
             cloudStudentData = studentSnap.data();
           }
@@ -1203,15 +1208,25 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const parsedAnswers = safeParseJson(submission.Risposte_Studente) || {};
       const parsedExamData = safeParseJson(submission.Domande_Esame) || {};
 
+      const studentPseudoId = deriveStudentPseudonym(
+        user?.email || submission?.Email || user?.displayName || "anonimo",
+        submission?.Session_Id || submission?.Pin || ""
+      );
+      const { scrubbedAnswers: safeRecoveryAnswers } = scrubAnswersForAi(parsedAnswers, {
+        fullName: user?.displayName || submission?.Nome,
+        email: user?.email || submission?.Email,
+      });
+
       // Il piano passa da una coda dedicata sul server: con tutta la classe che
       // lo chiede insieme, le correzioni degli elaborati non perdono posti.
       const planHtml = await requestRecoveryPlan(
         {
           tipo: submission.Tipo,
+          studentPseudoId,
           suggestedGrade: submission.Voto_Suggerito,
           studentSelfGrade: submission.Autovalutazione,
           evaluation: finalEvalObj,
-          answers: parsedAnswers,
+          answers: safeRecoveryAnswers,
           examData: parsedExamData
         },
         setRecoveryProgress
@@ -1380,8 +1395,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           let cloudStudentData: any = null;
           if (dbFirestore && user?.email) {
             try {
-              const safeKey = (user.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
-              const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", safeKey));
+              const liveDocId = getLiveStudentDocId(user.email, formattedPin);
+              const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", liveDocId));
               if (studentSnap.exists()) {
                 const sData = studentSnap.data();
                 cloudStudentData = sData;
@@ -2524,6 +2539,15 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           const timestamp = new Date().toISOString();
           const cleanVal = (val: any) => (val === undefined || val === null) ? "" : val;
 
+          const resolvedPseudoId = String(
+            rescue.studentPseudoId ||
+            rescue.payload?.studentPseudoId ||
+            deriveStudentPseudonym(
+              user?.email || user?.displayName || "anonimo",
+              rescue.sessionRunId || rescue.sessionPin || ""
+            )
+          );
+
           const submissionData: any = {
             Timestamp: timestamp,
             Docente_Email: cleanVal(rescue.teacherEmail),
@@ -2533,6 +2557,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Session_Titolo: cleanVal(rescue.examTitle),
             Nome: user?.displayName || "Studente",
             Email: user?.email || "scuola.utente@scuola.it",
+            Pseudo_Id: resolvedPseudoId,
+            PII_Oscurate_Count: Number(rescue.piiRedactionsCount ?? 0),
             Voto_Suggerito: cleanVal(finalEval.suggestedGrade),
             Autovalutazione: cleanVal(rescue.studentSelfGrade),
             AntiCopia_TabSwitch: rescue.behavior.tabSwitches,
@@ -2556,11 +2582,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             submissionData.Feedback_Generale = cleanVal(finalEval.overallFeedback);
           }
 
-          const safeKey = (user?.email || "anonimo").replace(/[^a-zA-Z0-9_-]/g, "_");
           const cleanRunId = String(rescue.sessionRunId || "").replace(/[^a-zA-Z0-9_-]/g, "_");
           let savedDocId = "";
           if (cleanRunId) {
-            const deterministicId = `sub_${cleanRunId}_${safeKey}`;
+            const pseudoKey = resolvedPseudoId.replace(/[^a-zA-Z0-9_-]/g, "_");
+            const deterministicId = `sub_${cleanRunId}_${pseudoKey}`;
             const deterministicRef = doc(dbFirestore, "valutazioni", deterministicId);
             try {
               await setDoc(deterministicRef, submissionData);
@@ -2794,17 +2820,30 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       IMPORTANTE: Fornisci per ogni risposta un feedback SINTETICO E CONCISO (massimo 2-3 frasi) in un italiano colloquiale ma corretto, parlando direttamente al discente ("Hai riflettuto bene su questo..."). Questo è essenziale per ragioni tecniche del sistema.`;
     }
 
+    const studentPseudoId = deriveStudentPseudonym(
+      user?.email || user?.displayName || "anonimo",
+      sessionRunId || sessionPin || ""
+    );
+    const piiScrubResult = scrubAnswersForAi(sanitizedAnswers, {
+      fullName: user?.displayName,
+      email: user?.email,
+    });
+    if (piiScrubResult.redactionsCount > 0) {
+      setInfractionToastMsg(
+        `🛡️ Privacy by Design: oscurati automaticamente ${piiScrubResult.redactionsCount} dati personali (${piiScrubResult.detectedTypes.join(", ")}) prima dell'invio all'IA.`
+      );
+    }
+
     const payload = {
       tipo: examType === "quiz" ? "Quiz" : "Workbook",
       prompt: evaluationPrompt,
-      studentEmail: user?.email || "",
-      studentName: user?.displayName || "Studente",
+      studentPseudoId,
       sessionPin: sessionPin || "",
       encryptedAnswerKey: encryptedAnswerKey || "",
       mcOptionOrder: mcOptionOrderRef.current || {},
       report: {
         domande: examPayload,
-        risposte: sanitizedAnswers,
+        risposte: piiScrubResult.scrubbedAnswers,
         punteggioMC: calculatedMCScore,
         punteggioFIB: calculatedFIBScore,
         totaleFIB: totalFIB,
@@ -2879,7 +2918,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         studentSelfGrade,
         calculatedMCScore,
         calculatedFIBScore,
-        totalFIB
+        totalFIB,
+        studentPseudoId,
+        piiRedactionsCount: piiScrubResult.redactionsCount
       };
       localStorage.setItem("active_eval_rescue", JSON.stringify(rescuePayload));
 
@@ -4509,16 +4550,26 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                       setGeneratingPlan(true);
                       setRecoveryProgress(null);
                       try {
+                        const studentPseudoId = deriveStudentPseudonym(
+                          user?.email || user?.displayName || "anonimo",
+                          sessionRunId || sessionPin || ""
+                        );
+                        const { scrubbedAnswers: safeRecoveryAnswers } = scrubAnswersForAi(answers, {
+                          fullName: user?.displayName,
+                          email: user?.email,
+                        });
+
                         // Accodato sul server e atteso qui: la correzione degli
                         // altri elaborati non viene rallentata dai piani richiesti
                         // da tutta la classe.
                         const planHtml = await requestRecoveryPlan(
                           {
                             tipo: examType === "quiz" ? "Quiz" : "Workbook",
+                            studentPseudoId,
                             suggestedGrade: evaluation?.suggestedGrade,
                             studentSelfGrade: studentSelfGrade,
                             evaluation: evaluation,
-                            answers: answers,
+                            answers: safeRecoveryAnswers,
                             examData: examData
                           },
                           setRecoveryProgress
@@ -5110,7 +5161,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       )}
       {infractionToastMsg && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[9998] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
-          ⚠️ {infractionToastMsg}
+          {/^[🟢🛡️✅⚠️]/.test(infractionToastMsg) ? infractionToastMsg : `⚠️ ${infractionToastMsg}`}
         </div>
       )}
 

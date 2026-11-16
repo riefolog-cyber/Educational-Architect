@@ -38,17 +38,17 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                 <ShieldCheck className="w-6 h-6" />
               </div>
               <div>
-                <div className="flex items-center gap-2">
+                <div className="flex items-center gap-2 flex-wrap">
                   <span className="text-[10px] font-mono font-bold uppercase tracking-wider text-teal-400">
-                    GDPR & Privacy by Design
+                    GDPR &amp; Parere Garante n. 787/2026
                   </span>
                   <span className="text-slate-500 text-xs" aria-hidden="true">·</span>
                   <span className="text-[11px] font-mono font-semibold text-amber-300">
-                    Blind Grading Attivo
+                    Pseudonimizzazione &amp; Blind Grading Attivo
                   </span>
                 </div>
                 <h3 className="text-lg sm:text-xl font-display font-bold text-white mt-1">
-                  Principio della Correzione in Cieco & Tutela Dati
+                  Pseudonimizzazione, Filtro PII &amp; Correzione in Cieco
                 </h3>
               </div>
             </div>
@@ -72,7 +72,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                 Separazione netta tra Identità Anagrafica e Contenuto Didattico
               </p>
               <p className="text-xs text-slate-300 leading-relaxed">
-                Per conformità al <b>GDPR (Regolamento UE 2016/679, Art. 5 e Art. 25 - Privacy by Design)</b> e al <b>Regolamento d'Istituto</b>, l'applicazione adotta un'architettura a barriera protettiva con <b>Correzione in Cieco (Blind Grading)</b>. I modelli di intelligenza artificiale non ricevono né trattano alcun dato anagrafico degli studenti.
+                In conformità al <b>GDPR (Regolamento UE 2016/679, Art. 5 e Art. 25 — Privacy by Design)</b> e alle indicazioni tecniche del <b>MIM / Garante per la protezione dei dati personali (Parere n. 787 del 20 ottobre 2026)</b> sulla pseudonimizzazione delle utenze e l'uso consapevole dell'IA a scuola, l'applicazione isola l'anagrafica degli alunni tramite codice pseudonimo <b>STU-XXXX</b>, filtro automatico anti-PII nei prompt e <b>Correzione in Cieco</b> attiva di default.
               </p>
             </div>
 
@@ -107,9 +107,9 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                     2
                   </div>
                   <div>
-                    <p className="font-bold text-white text-xs sm:text-sm">Database Protetto & Anonimizzazione</p>
+                    <p className="font-bold text-white text-xs sm:text-sm">Pseudonimizzazione (STU-XXXX) &amp; Filtro Automatico PII</p>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      L'elaborato viene isolato in ambiente crittografato. Il server separa l'anagrafica dalle risposte prima di inoltrare la richiesta di correzione.
+                      L'identità reale resta confinata nel registro scolastico Firestore. Prima dell'invio al server e all'IA, l'utenza viene sostituita da un codice pseudonimo (es. <code className="text-teal-300">STU-7K4M9P</code>) e un filtro automatico oscura eventuali email, numeri di telefono, codici fiscali o nomi propri scritti per errore nelle risposte aperte.
                     </p>
                   </div>
                 </div>
@@ -132,7 +132,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 mt-0.5">
-                      L'IA riceve <b>esclusivamente</b>: Traccia del quesito + Risposta didattica fornita + Griglia/Rubrica del docente. <b>Nessun nome, email, genere o informazione di profilo</b> viene mai trasmesso.
+                      L'IA riceve <b>esclusivamente</b>: Traccia del quesito + Risposta didattica depurata (senza dati personali nei prompt) + Griglia/Rubrica del docente. Nessun dato biometrico, emotivo o anagrafico viene mai elaborato.
                     </p>
                   </div>
                 </div>
@@ -169,11 +169,11 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                     <div className="flex items-center gap-2">
                       <p className="font-bold text-emerald-400 text-xs sm:text-sm">Docente (Human-in-the-Loop)</p>
                       <span className="text-[9px] font-mono bg-emerald-500/20 text-emerald-300 px-1.5 py-0.5 rounded">
-                        Verbalizzazione Ufficiale
+                        Blind Grading di Default
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 mt-0.5">
-                      Il docente revisiona, può mantenere la modalità "Correzione in Cieco" nella dashboard per evitare pregiudizi, e valida il voto finale ufficiale.
+                      La dashboard docente apre le consegne in <b>Correzione in Cieco</b> attiva di default (<code className="text-emerald-300">Studente #XXXX</code>) per valutare senza pregiudizi; il docente mostra i nomi reali solo al momento della verbalizzazione ufficiale del voto.
                     </p>
                   </div>
                 </div>
@@ -185,20 +185,20 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
               <div className="bg-slate-950/70 p-3.5 rounded-2xl border border-white/5 space-y-1.5">
                 <div className="flex items-center gap-1.5 text-teal-400 font-bold text-xs">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Minimizzazione Dati</span>
+                  <span>Pseudonimo STU-XXXX</span>
                 </div>
                 <p className="text-[11px] text-slate-400 leading-normal">
-                  In accordo con l'Art. 5 GDPR, all'IA arrivano solo le risposte grezze: zero nomi, account Google o indirizzi email.
+                  Art. 5 GDPR &amp; Parere Garante 787/2026: verso server e coda IA viaggiano solo codici pseudonimi e mai nomi o email.
                 </p>
               </div>
 
               <div className="bg-slate-950/70 p-3.5 rounded-2xl border border-white/5 space-y-1.5">
                 <div className="flex items-center gap-1.5 text-amber-300 font-bold text-xs">
                   <Scale className="w-3.5 h-3.5" />
-                  <span>Imparzialità Totale</span>
+                  <span>Filtro PII &amp; Blind Grading</span>
                 </div>
                 <p className="text-[11px] text-slate-400 leading-normal">
-                  La correzione in cieco neutralizza ogni forma di bias inconsapevole, assicurando pari trattamento ad ogni studente.
+                  Oscuramento automatico dei dati personali nei testi liberi prima dell'invio all'IA e revisione cieca predefinita per il docente.
                 </p>
               </div>
 
@@ -234,7 +234,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
           {/* Footer */}
           <div className="bg-slate-950 p-4 sm:p-5 border-t border-white/10 flex flex-col sm:flex-row items-center justify-between gap-3 shrink-0">
             <p className="text-[11px] text-slate-500 font-mono text-center sm:text-left">
-              Regolamento UE 2016/679 (GDPR) &bull; Privacy by Design
+              GDPR (UE 2016/679) &bull; Linee Guida MIM / Parere Garante n. 787/2026
             </p>
             <button
               id="privacy-modal-confirm-btn"
@@ -266,15 +266,15 @@ export function PrivacyBannerBox({ onOpenModal }: { onOpenModal: () => void }) {
           <div>
             <div className="flex items-center gap-2 flex-wrap">
               <span className="text-xs font-bold text-white group-hover:text-teal-300 transition-colors">
-                Garanzia Privacy & Correzione in Cieco (Blind Grading)
+                Garanzia Privacy, Pseudonimizzazione &amp; Correzione in Cieco
               </span>
               <span className="text-slate-500 text-xs" aria-hidden="true">·</span>
               <span className="text-[11px] font-mono text-teal-400 font-medium">
-                Conforme GDPR
+                GDPR &amp; Parere Garante n. 787/2026
               </span>
             </div>
             <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
-              Separazione netta tra identità anagrafica e contenuto didattico. L'IA valuta le risposte senza conoscere il nome dell'alunno.
+              Utenze pseudonimizzate (<span className="text-slate-300 font-mono">STU-XXXX</span>), filtro automatico anti dati personali nei prompt e Correzione in Cieco attiva di default: l'IA valuta le risposte senza conoscere identità, email o nome dell'alunno.
             </p>
           </div>
         </div>

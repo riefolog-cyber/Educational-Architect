@@ -11,6 +11,7 @@ import { stripExamAnswers, restoreExamAnswers } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
+import { deriveStudentPseudonym, scrubPromptPii, scrubAnswersForAi } from "./src/utils/privacyPseudonym";
 
 dotenv.config();
 
@@ -606,15 +607,21 @@ const reqToJobCache = new Map<string, string>();
 
 function getRequestHash(body: any): string {
   try {
-    const student = body?.studentEmail || body?.report?.email || (body?.prompt?.match(/Email:\s*([^\)]+)/)?.[1]?.trim() || "");
+    const pseudoId =
+      typeof body?.studentPseudoId === "string" && body.studentPseudoId.trim()
+        ? body.studentPseudoId.trim()
+        : deriveStudentPseudonym(
+            body?.studentEmail || body?.report?.email || "",
+            body?.sessionPin || ""
+          );
     const pin = body?.sessionPin || "";
     const tipo = body?.tipo || "";
-    // Unique key consisting of student identifier, PIN, test type and content of answers
+    // Unique key consisting of opaque pseudonym, PIN, test type and content of answers
     const answersContent = JSON.stringify(body?.report?.risposte || {});
     // Teacher recalculation asks for a genuinely new AI verdict: never reuse the
     // job created by the original submission (dedup cache lasts 30 seconds).
     const forceNonce = body?.forceReevaluation ? `_${Date.now()}_${Math.random().toString(36).slice(2, 8)}` : "";
-    return `${student}_${pin}_${tipo}_${answersContent}${forceNonce}`;
+    return `${pseudoId}_${pin}_${tipo}_${answersContent}${forceNonce}`;
   } catch (err) {
     return "hash_" + Math.random().toString(36).substring(7);
   }
@@ -822,6 +829,13 @@ async function runEvaluationCore(reqBody: any) {
     }
   }
 
+  const piiIdentity = {
+    fullName: typeof reqBody?.studentName === "string" ? reqBody.studentName : undefined,
+    email: typeof reqBody?.studentEmail === "string" ? reqBody.studentEmail : undefined,
+  };
+  const safePrompt = scrubPromptPii(String(prompt || ""), piiIdentity).scrubbedText;
+  const { scrubbedAnswers: aiSafeAnswers } = scrubAnswersForAi(report.risposte || {}, piiIdentity);
+
   const attachAuthoritativeFields = (resObj: any) => {
     if (!resObj || typeof resObj !== "object") return resObj;
     if (restoredFromVault && report.domande) {
@@ -984,7 +998,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
       const response = await generateWithRetry({
         model: TASK_MODEL_PREFERENCE["evaluate"][0],
         models: TASK_MODEL_PREFERENCE["evaluate"],
-        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${safePrompt}\n\nQuesiti aperti dell'esame: ${JSON.stringify(oeList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(aiSafeAnswers)}`,
         config: {
           systemInstruction,
           temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
@@ -1146,7 +1160,7 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         const response = await generateWithRetry({
           model: TASK_MODEL_PREFERENCE["evaluate"][0],
           models: TASK_MODEL_PREFERENCE["evaluate"],
-          contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(report.risposte)}`,
+          contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(aiSafeAnswers)}`,
           config: {
             systemInstruction,
             temperature: 0.1,
@@ -1230,7 +1244,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       const response = await generateWithRetry({
         model: TASK_MODEL_PREFERENCE["evaluate"][0],
         models: TASK_MODEL_PREFERENCE["evaluate"],
-        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${prompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(report.risposte)}`,
+        contents: `[MODALITÀ CORREZIONE IN CIECO / BLIND GRADING ATTIVA]\nPrompt e rubrica di correzione del docente: ${safePrompt}\n\nDomande di riflessione dell'esame (usa gli eventuali 'criteria' come rubrica di valutazione): ${JSON.stringify(rqList.map((q: any) => ({ id: q.id, question: q.question, ...(q.criteria ? { criteria: q.criteria } : {}) })))}\n\nRisposte didattiche da valutare: ${JSON.stringify(aiSafeAnswers)}`,
         config: {
           systemInstruction,
           temperature: 0.1, // Max deterministic grading, avoids random creative formatting lag
@@ -1516,6 +1530,26 @@ async function runRecoveryCore(reqBody: any) {
     ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
     : "AVVERTENZA FONDAMENTALE SULLA STRUTTURA: Questa prova NON contiene domande a risposta aperta (è composta esclusivamente da domande a risposta multipla o completamenti testo). NON citare in nessun caso 'risposte brevi', 'superficiali', 'risposte non argomentate' o 'spazi lasciati in bianco'. Concentrati rigorosamente sui concetti teorici delle crocette errate e sui nodi concettuali da consolidare.";
 
+  const { scrubbedAnswers: safeAnswers } = scrubAnswersForAi(answers || {});
+  const safeEvaluation =
+    evaluation && typeof evaluation === "object"
+      ? {
+          ...evaluation,
+          mainErrors:
+            typeof evaluation.mainErrors === "string"
+              ? scrubPromptPii(evaluation.mainErrors).scrubbedText
+              : evaluation.mainErrors,
+          openEndedEvaluation:
+            typeof evaluation.openEndedEvaluation === "string"
+              ? scrubPromptPii(evaluation.openEndedEvaluation).scrubbedText
+              : evaluation.openEndedEvaluation,
+          overallFeedback:
+            typeof evaluation.overallFeedback === "string"
+              ? scrubPromptPii(evaluation.overallFeedback).scrubbedText
+              : evaluation.overallFeedback,
+        }
+      : evaluation;
+
   const prompt = `Sei un docente tutor empatico, saggio ed esperto di scuola secondaria di secondo grado italiana (scuola superiore).
 Il tuo obiettivo è generare un **Piano di Studio e Recupero Didattico Personalizzato** su misura per uno studente che ha completato una prova di verifica.
 
@@ -1526,8 +1560,8 @@ DATI DI COPERTURA E RISULTATI:
 - Voto Consigliato dall'IA: ${suggestedGrade || "N/A"}
 - Autovalutazione dello Studente: ${studentSelfGrade || "N/A"}/10
 - Domande dell'Esame (JSON strutturato): ${JSON.stringify(examData || {})}
-- Risposte dello Studente (JSON): ${JSON.stringify(answers || {})}
-- Valutazione Estesa (Giudizio e Dettaglio Punteggi): ${JSON.stringify(evaluation || {})}
+- Risposte dello Studente (JSON): ${JSON.stringify(safeAnswers || {})}
+- Valutazione Estesa (Giudizio e Dettaglio Punteggi): ${JSON.stringify(safeEvaluation || {})}
 
 IL TUO COMPITO:
 1. Analizza le lacune teoriche e concettuali commesse dallo studente.
@@ -1668,7 +1702,8 @@ app.all("/api/analyze-exam", teacherAiRateLimiter, requireTeacherAuth, async (re
   }
 
   try {
-    const promptContents = `Esame attuale (JSON):\n${examJson}${customInstruction ? `\n\nIstruzioni / Richieste aggiuntive del docente:\n${customInstruction}` : ""}`;
+    const safeCustomInstruction = customInstruction ? scrubPromptPii(String(customInstruction)).scrubbedText : "";
+    const promptContents = `Esame attuale (JSON):\n${examJson}${safeCustomInstruction ? `\n\nIstruzioni / Richieste aggiuntive del docente:\n${safeCustomInstruction}` : ""}`;
 
     const response = await generateWithRetry({
       model: "gemini-3.1-flash-lite",
@@ -1678,8 +1713,8 @@ app.all("/api/analyze-exam", teacherAiRateLimiter, requireTeacherAuth, async (re
         systemInstruction: `Sei un esperto accademico e consulente senior di psicometria, progettazione didattica, docimologia scolastica e valutazione formativa della scuola media superiore italiana.
 Analizza accuratamente il test/esame scolastico in formato JSON fornito dal docente.
 
-${customInstruction ? `ATTENZIONE: Il docente ha fornito queste indicazioni o richieste di miglioramento specifiche:
-"${customInstruction}"
+${safeCustomInstruction ? `ATTENZIONE: Il docente ha fornito queste indicazioni o richieste di miglioramento specifiche:
+"${safeCustomInstruction}"
 DEVI tassativamente tenerne conto e applicarle concretamente nell'esame ottimizzato!` : ""}
 
 Il tuo compito è:
@@ -1772,7 +1807,7 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente 
     console.error("AI Exam analysis failed:", error);
     return res.status(500).json({ 
       error: "L'analisi dei criteri tramite Intelligenza Artificiale è fallita.", 
-      details: error.message 
+      details: humanAiError(error?.message || "")
     });
   }
 });
@@ -1819,10 +1854,12 @@ app.all("/api/extend-exam-json", teacherAiRateLimiter, requireTeacherAuth, async
 
     const isInputWorkbook = !!(baseExam.sections && Array.isArray(baseExam.sections));
 
+    const safeInstruction = scrubPromptPii(instruction.trim()).scrubbedText;
+
     const response = await generateWithRetry({
       model: "gemini-3.1-flash-lite",
       models: TASK_MODEL_PREFERENCE["extend-exam"],
-      contents: `Esame attuale caricato dal docente:\n${examJson}\n\nRichiesta del docente (cosa aggiungere di NUOVO):\n${instruction.trim()}\nTipo di contenuto: ${additionType || "automatico/misto"}`,
+      contents: `Esame attuale caricato dal docente:\n${examJson}\n\nRichiesta del docente (cosa aggiungere di NUOVO):\n${safeInstruction}\nTipo di contenuto: ${additionType || "automatico/misto"}`,
       config: {
         systemInstruction: `Sei un docente e progettista didattico esperto della scuola secondaria italiana.
 Il tuo compito è generare ESCLUSIVAMENTE I NUOVI CONTENUTI RICHIESTI dal docente da aggiungere all'esame, coerenti con l'argomento e il livello scolastico.
@@ -2123,7 +2160,7 @@ REGOLE TASSATIVE:
     console.error("AI Exam extension failed:", error);
     return res.status(500).json({ 
       error: "Impossibile aggiungere i nuovi contenuti all'esame.", 
-      details: error.message 
+      details: humanAiError(error?.message || "")
     });
   }
 });
@@ -2160,6 +2197,11 @@ app.all("/api/generate-exam", teacherAiRateLimiter, requireTeacherAuth, async (r
 
   if (!topic || !topic.trim()) {
     return res.status(400).json({ error: "Specificare un argomento o un testo per la generazione della verifica." });
+  }
+  if (isGet && topic.trim().length > 2000) {
+    return res.status(414).json({
+      error: "Testo troppo lungo per la chiamata GET via URL: usa il metodo POST."
+    });
   }
 
   try {
@@ -2247,12 +2289,13 @@ REGOLE ESSENZIALI:
 4. Genera solo JSON valido conforme.`;
     }
 
+    const safeTopic = scrubPromptPii(topic).scrubbedText;
     let modelUsed = TASK_MODEL_PREFERENCE["generate-exam"][0];
     const response = await generateWithRetry({
       model: TASK_MODEL_PREFERENCE["generate-exam"][0],
       models: TASK_MODEL_PREFERENCE["generate-exam"],
       onModelUsed: (m: string) => { modelUsed = m; },
-      contents: `Argomento o testo della verifica didattica:\n${topic}${topic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}`,
+      contents: `Argomento o testo della verifica didattica:\n${safeTopic}${safeTopic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}`,
       config: {
         systemInstruction: promptSystem,
         temperature: 0.2,
@@ -2296,7 +2339,7 @@ REGOLE ESSENZIALI:
     console.error("AI Exam generation failed:", error);
     return res.status(500).json({ 
       error: "La generazione assistita con IA non è andata a buon fine.", 
-      details: error.message 
+      details: humanAiError(error?.message || "")
     });
   }
 });
@@ -2408,6 +2451,118 @@ REGOLE TASSATIVAMENTE RIGOROSE:
     console.error("[generate-variant] Failed:", error);
     return res.status(500).json({
       error: "Impossibile generare la variante Fila B.",
+      details: humanAiError(error?.message || ""),
+    });
+  }
+});
+
+// Teacher-only: pseudonymized aggregate class error synthesis + 15-minute remediation micro-lesson
+app.post("/api/class-error-summary", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
+  const rawTitle = String(req.body?.examTitle || "Verifica di classe").trim();
+  const totalSubmissions = Math.max(1, Number(req.body?.totalSubmissions) || 1);
+  const rawWeakItems = Array.isArray(req.body?.weakItems) ? req.body.weakItems : [];
+
+  if (rawWeakItems.length === 0) {
+    return res.status(400).json({
+      error: "Nessun quesito sotto soglia disponibile per generare la sintesi degli errori.",
+    });
+  }
+  if (!getApiKey()) {
+    return res.status(500).json({
+      error: "La chiave API di Gemini non è configurata nell'ambiente.",
+    });
+  }
+
+  try {
+    const safeTitle = scrubPromptPii(rawTitle).scrubbedText.slice(0, 160);
+    const cleanedItems = rawWeakItems.slice(0, 6).map((item: any, idx: number) => {
+      const kind = String(item?.kind || "quesito").slice(0, 32);
+      const question = scrubPromptPii(String(item?.question || "")).scrubbedText.slice(0, 300);
+      const metricLabel = scrubPromptPii(String(item?.metricLabel || "")).scrubbedText.slice(0, 120);
+      const commonWrong = item?.commonWrong
+        ? scrubPromptPii(String(item.commonWrong)).scrubbedText.slice(0, 200)
+        : "";
+      const samples = Array.isArray(item?.sampleErrors)
+        ? item.sampleErrors
+            .slice(0, 5)
+            .map((s: any) => scrubPromptPii(String(s || "")).scrubbedText.trim().slice(0, 240))
+            .filter(Boolean)
+        : [];
+      return { idx: idx + 1, kind, question, metricLabel, commonWrong, samples };
+    });
+
+    const formattedBlocks = cleanedItems
+      .map((it) => {
+        const lines = [
+          `${it.idx}. [${it.kind}] ${it.question}`,
+          `   Esito classe: ${it.metricLabel}`,
+        ];
+        if (it.commonWrong) lines.push(`   Errore ricorrente: ${it.commonWrong}`);
+        if (it.samples.length > 0) {
+          lines.push(`   Campioni anonimi di risposte deboli/errate:\n   - ${it.samples.join("\n   - ")}`);
+        }
+        return lines.join("\n");
+      })
+      .join("\n\n");
+
+    const response = await generateWithRetry({
+      model: TASK_MODEL_PREFERENCE["analyze-exam"][0],
+      models: TASK_MODEL_PREFERENCE["analyze-exam"],
+      contents: `Titolo verifica: ${safeTitle}\nConsegne analizzate (aggregate e anonimizzate): ${totalSubmissions}\n\nQuesiti critici rilevati:\n${formattedBlocks}`,
+      config: {
+        systemInstruction: `Sei un formatore e docente esperto di didattica della scuola secondaria italiana.
+Ricevi statistiche aggregate e campioni anonimi (privi di nomi) degli errori commessi da una classe in una verifica.
+Produci una sintesi operativa concisa per aiutare il docente a fare un debriefing mirato in classe in 15 minuti.
+
+Rispondi ESCLUSIVAMENTE in JSON valido con questo schema:
+- summaryHtml: Breve quadro sintetico in HTML pulito (solo <p>, <strong>, <ul>, <li> — niente <html>/<body>/<script>) che riassume i pattern di errore emersi nella classe.
+- keyMisconceptions: Array di 2-4 stringhe brevi che descrivono gli equivoci concettuali ricorrenti.
+- lessonPlan15Min: Array di 3-4 passi pratici e sequenziali (es. "Min 0-4: ...", "Min 4-9: ...", "Min 9-15: ...") per spiegare e recuperare quei concetti in 15 minuti di lezione frontale/attiva.`,
+        temperature: 0.2,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            summaryHtml: { type: Type.STRING },
+            keyMisconceptions: { type: Type.ARRAY, items: { type: Type.STRING } },
+            lessonPlan15Min: { type: Type.ARRAY, items: { type: Type.STRING } },
+          },
+          required: ["summaryHtml", "keyMisconceptions", "lessonPlan15Min"],
+        },
+      },
+    });
+
+    const responseText = extractResponseText(response);
+    if (!responseText) {
+      throw new Error("Risposta vuota ricevuta dal modello IA.");
+    }
+    const parsed = tolerantJsonParse(responseText);
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Struttura JSON non valida ricevuta dal modello IA.");
+    }
+
+    const safeSummaryHtml = String(parsed.summaryHtml || "")
+      .replace(/<(script|iframe|object|embed|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
+      .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
+      .replace(/javascript\s*:/gi, "");
+
+    return res.json({
+      status: "success",
+      summary: {
+        summaryHtml: safeSummaryHtml,
+        keyMisconceptions: Array.isArray(parsed.keyMisconceptions)
+          ? parsed.keyMisconceptions.map((s: any) => String(s || "").trim()).filter(Boolean).slice(0, 6)
+          : [],
+        lessonPlan15Min: Array.isArray(parsed.lessonPlan15Min)
+          ? parsed.lessonPlan15Min.map((s: any) => String(s || "").trim()).filter(Boolean).slice(0, 6)
+          : [],
+      },
+    });
+  } catch (error: any) {
+    console.error("[class-error-summary] Failed:", error);
+    return res.status(500).json({
+      error: "Impossibile generare la sintesi errori della classe.",
       details: humanAiError(error?.message || ""),
     });
   }

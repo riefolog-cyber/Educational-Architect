@@ -159,6 +159,14 @@ export interface SavedSubmission {
   Piano_Recupero?: string;
   Session_Id?: string;   // Unique run id of the live session (separates classes reusing the same PIN)
   Session_Titolo?: string;
+  /** Opaque pseudonym derived on submit and used across blind-grading views. */
+  Pseudo_Id?: string;
+  /** Number of PII fragments automatically masked prior to AI evaluation. */
+  PII_Oscurate_Count?: number;
+  /** ISO timestamp when the teacher validated/conferred the final grade. */
+  Convalida_Docente_At?: string;
+  /** Institutional email of the teacher who validated the final grade. */
+  Convalida_Docente_Email?: string;
 }
 
 export interface LiveSessionSummary {

@@ -1,18 +1,32 @@
 import React, { useMemo, useState } from "react";
-import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles } from "lucide-react";
+import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X } from "lucide-react";
 import { SavedSubmission, AiModalPrefill } from "../types";
 import { computeExamItemAnalysis } from "../utils/examAnalytics";
+import { getAuthHeaders } from "../firebase";
+import { safeParseJson, sanitizeAiHtml } from "../utils";
+import { scrubPromptPii } from "../utils/privacyPseudonym";
 
 interface ExamItemAnalysisPanelProps {
   submissions: SavedSubmission[];
+  examTitle?: string;
   onGenerateRecoveryExam?: (prefill: AiModalPrefill) => void;
+}
+
+interface ClassErrorSummaryResult {
+  summaryHtml: string;
+  keyMisconceptions: string[];
+  lessonPlan15Min: string[];
 }
 
 const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo(({
   submissions,
+  examTitle,
   onGenerateRecoveryExam,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const [synthesizingErrors, setSynthesizingErrors] = useState(false);
+  const [synthesisError, setSynthesisError] = useState<string | null>(null);
+  const [errorSynthesis, setErrorSynthesis] = useState<ClassErrorSummaryResult | null>(null);
 
   const analysis = useMemo(() => {
     if (submissions.length === 0) return null;
@@ -53,6 +67,114 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
       numQuestions: Math.min(10, Math.max(4, analysis.weakTopicsCount * 2)),
       label: `Recupero mirato su ${analysis.weakTopicsCount} argomenti critici`,
     });
+  };
+
+  const handleSynthesizeClassErrors = async () => {
+    if (synthesizingErrors) return;
+    setSynthesizingErrors(true);
+    setSynthesisError(null);
+    try {
+      const weakItemsPayload: Array<{
+        kind: string;
+        question: string;
+        metricLabel: string;
+        commonWrong?: string;
+        sampleErrors?: string[];
+      }> = [];
+
+      analysis.mcStats
+        .filter((m) => m.needsReview)
+        .slice(0, 3)
+        .forEach((m) => {
+          weakItemsPayload.push({
+            kind: "Scelta Multipla",
+            question: scrubPromptPii(m.question).scrubbedText,
+            metricLabel: `${m.accuracyPercent}% corrette (${m.correctCount}/${m.totalResponses})`,
+            commonWrong: m.topWrongOption
+              ? `${scrubPromptPii(m.topWrongOption.text).scrubbedText} (${m.topWrongOption.count} volte)`
+              : undefined,
+          });
+        });
+
+      analysis.fibStats
+        .filter((f) => f.needsReview)
+        .slice(0, 2)
+        .forEach((f) => {
+          weakItemsPayload.push({
+            kind: "Completamento",
+            question: scrubPromptPii(`${f.sentence} [attesa: ${f.expectedAnswer}]`).scrubbedText,
+            metricLabel: `${f.accuracyPercent}% esatte (${f.correctCount}/${f.totalResponses})`,
+            commonWrong: f.topWrongAnswer
+              ? `${scrubPromptPii(f.topWrongAnswer.text).scrubbedText} (${f.topWrongAnswer.count} volte)`
+              : undefined,
+          });
+        });
+
+      analysis.subjectiveStats
+        .filter((s) => s.needsReview)
+        .slice(0, 3)
+        .forEach((s) => {
+          const sampleErrors: string[] = [];
+          for (const sub of submissions) {
+            if (sampleErrors.length >= 5) break;
+            const ans = safeParseJson(sub.Risposte_Studente) || {};
+            const ev = safeParseJson(sub.Full_Evaluation) || {};
+            const rawAns =
+              s.kind === "open_ended"
+                ? String(ans?.oe?.[s.id] ?? ans?.openEnded?.[s.id] ?? "")
+                : String(ans?.wbRq?.[s.id] ?? ans?.oe?.[s.id] ?? "");
+            if (!rawAns.trim() || rawAns.trim() === "[VUOTO]") continue;
+            const details =
+              s.kind === "open_ended"
+                ? Array.isArray(ev?.openEndedDetails)
+                  ? ev.openEndedDetails
+                  : []
+                : Array.isArray(ev?.reflectionDetails)
+                ? ev.reflectionDetails
+                : [];
+            const detail = details.find((d: any) => String(s.kind === "open_ended" ? d?.questionId : d?.id) === String(s.id));
+            if (detail && Number(detail.score) >= 6) continue;
+            const scrubbed = scrubPromptPii(rawAns, { fullName: sub.Nome, email: sub.Email }).scrubbedText.trim();
+            if (scrubbed) sampleErrors.push(scrubbed.slice(0, 220));
+          }
+          weakItemsPayload.push({
+            kind: s.kind === "open_ended" ? "Domanda Aperta" : "Riflessione Critica",
+            question: scrubPromptPii(s.question).scrubbedText,
+            metricLabel: s.averageScore !== null ? `media ${s.averageScore.toFixed(1)}/10` : "N.V.",
+            sampleErrors,
+          });
+        });
+
+      const resolvedTitle =
+        examTitle ||
+        submissions[0]?.Session_Titolo ||
+        safeParseJson(submissions[0]?.Domande_Esame)?.title ||
+        "Verifica di classe";
+
+      const authHeaders = await getAuthHeaders();
+      const resp = await fetch("/api/class-error-summary", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          ...authHeaders,
+        },
+        body: JSON.stringify({
+          examTitle: resolvedTitle,
+          totalSubmissions: analysis.totalSubmissions,
+          weakItems: weakItemsPayload,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || data.error) {
+        throw new Error(data.details || data.error || "Sintesi errori non disponibile.");
+      }
+      setErrorSynthesis(data.summary);
+    } catch (err: any) {
+      setSynthesisError(err?.message || "Impossibile generare la sintesi errori della classe.");
+    } finally {
+      setSynthesizingErrors(false);
+    }
   };
 
   return (
@@ -96,19 +218,94 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
 
       {isOpen && (
         <div className="p-3.5 border-t border-white/10 space-y-4">
-          {analysis.weakTopicsCount > 0 && onGenerateRecoveryExam && (
-            <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25">
-              <p className="text-[11px] text-amber-200 leading-snug">
-                Rilevati <b>{analysis.weakTopicsCount}</b> quesiti sotto soglia (&lt;50% accuratezza o media &lt;5.5).
-              </p>
-              <button
-                type="button"
-                onClick={handleGenerateRecoveryClick}
-                className="px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap"
-              >
-                <Sparkles className="w-3.5 h-3.5" />
-                <span>Genera prova di recupero sugli errori</span>
-              </button>
+          {analysis.weakTopicsCount > 0 && (
+            <div className="space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25">
+                <p className="text-[11px] text-amber-200 leading-snug">
+                  Rilevati <b>{analysis.weakTopicsCount}</b> quesiti sotto soglia (&lt;50% accuratezza o media &lt;5.5).
+                </p>
+                <div className="flex items-center gap-2 flex-wrap">
+                  <button
+                    type="button"
+                    onClick={handleSynthesizeClassErrors}
+                    disabled={synthesizingErrors}
+                    className="px-3 py-1.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 border border-indigo-400/30 font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap disabled:opacity-50"
+                    title="Genera in modo anonimizzato i pattern di errore della classe e una traccia di ripasso da 15 minuti"
+                  >
+                    {synthesizingErrors ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <BookOpenCheck className="w-3.5 h-3.5" />
+                    )}
+                    <span>{synthesizingErrors ? "Sintesi in corso..." : "Sintesi errori classe (15 min)"}</span>
+                  </button>
+                  {onGenerateRecoveryExam && (
+                    <button
+                      type="button"
+                      onClick={handleGenerateRecoveryClick}
+                      className="px-3 py-1.5 rounded-lg bg-amber-400 hover:bg-amber-300 text-slate-950 font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap"
+                    >
+                      <Sparkles className="w-3.5 h-3.5" />
+                      <span>Genera prova di recupero sugli errori</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {synthesisError && (
+                <div className="p-2.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-200 text-[11px]">
+                  ⚠️ {synthesisError}
+                </div>
+              )}
+
+              {errorSynthesis && (
+                <div className="p-3.5 rounded-xl bg-indigo-950/35 border border-indigo-500/30 space-y-2.5 text-xs">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-indigo-300 flex items-center gap-1.5">
+                      <BookOpenCheck className="w-3.5 h-3.5" />
+                      <span>Debriefing Errori Classe (Elaborazione Anonimizzata)</span>
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setErrorSynthesis(null)}
+                      className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 cursor-pointer"
+                      title="Chiudi sintesi"
+                    >
+                      <X className="w-3.5 h-3.5" />
+                    </button>
+                  </div>
+                  {errorSynthesis.summaryHtml && (
+                    <div
+                      className="text-[11px] text-slate-200 leading-relaxed space-y-1 prose prose-invert max-w-none"
+                      dangerouslySetInnerHTML={{ __html: sanitizeAiHtml(errorSynthesis.summaryHtml) }}
+                    />
+                  )}
+                  {errorSynthesis.keyMisconceptions.length > 0 && (
+                    <div className="space-y-1">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-amber-300">
+                        Nodi Concettuali Fraintesi
+                      </p>
+                      <ul className="list-disc pl-4 space-y-0.5 text-[11px] text-slate-200">
+                        {errorSynthesis.keyMisconceptions.map((m, idx) => (
+                          <li key={idx}>{m}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {errorSynthesis.lessonPlan15Min.length > 0 && (
+                    <div className="space-y-1 pt-1 border-t border-white/10">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-teal-300">
+                        Scaletta Ripasso Guidato (15 Minuti in Aula)
+                      </p>
+                      <ul className="list-decimal pl-4 space-y-0.5 text-[11px] text-slate-200">
+                        {errorSynthesis.lessonPlan15Min.map((step, idx) => (
+                          <li key={idx}>{step}</li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                </div>
+              )}
             </div>
           )}
           {analysis.mcStats.length > 0 && (

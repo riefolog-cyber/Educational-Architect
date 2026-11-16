@@ -2,15 +2,22 @@ import React from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
 import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
+import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 
 interface PrintableReportModalProps {
   isOpen: boolean;
   onClose: () => void;
   submission: {
+    id?: string;
     Nome?: string;
     Email?: string;
     Tipo?: string;
     Pin?: string;
+    Session_Id?: string;
+    Pseudo_Id?: string;
+    PII_Oscurate_Count?: number;
+    Convalida_Docente_At?: string;
+    Convalida_Docente_Email?: string;
     Timestamp?: string;
     Voto_Suggerito?: string;
     Autovalutazione?: string;
@@ -23,6 +30,7 @@ interface PrintableReportModalProps {
   } | null;
   examTitle?: string;
   examImages?: Record<string, string>;
+  blindGradingMode?: boolean;
 }
 
 export default function PrintableReportModal({
@@ -30,9 +38,18 @@ export default function PrintableReportModal({
   onClose,
   submission,
   examTitle,
-  examImages
+  examImages,
+  blindGradingMode = false,
 }: PrintableReportModalProps) {
   if (!isOpen || !submission) return null;
+
+  const blindCode = getSubmissionBlindCode(submission);
+  const displayStudentName = blindGradingMode
+    ? `Studente ${blindCode}`
+    : (submission.Nome || "Studente");
+  const displayStudentEmail = blindGradingMode
+    ? "Identità anonimizzata (Correzione in Cieco GDPR)"
+    : (submission.Email || "N.D.");
 
   // Parse nested evaluation details safely
   const evaluationObj = safeParseJson(submission.Full_Evaluation);
@@ -123,11 +140,13 @@ export default function PrintableReportModal({
             <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Studente / Candidato</span>
-                <span className="text-xs font-bold text-slate-900 block">{submission.Nome || "Studente"}</span>
+                <span className="text-xs font-bold text-slate-900 block">{displayStudentName}</span>
               </div>
               <div>
-                <span className="text-[9px] uppercase font-bold text-slate-500 block">Email Istituzionale</span>
-                <span className="text-xs font-mono text-slate-700 block truncate">{submission.Email || "N.D."}</span>
+                <span className="text-[9px] uppercase font-bold text-slate-500 block">
+                  {blindGradingMode ? "Modalità Privacy" : "Email Istituzionale"}
+                </span>
+                <span className="text-xs font-mono text-slate-700 block truncate">{displayStudentEmail}</span>
               </div>
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Materia / Titolo</span>
@@ -288,6 +307,18 @@ export default function PrintableReportModal({
                 <p className="text-[10px] uppercase font-bold text-slate-600">Presa Visione Genitore / Tutore</p>
                 <div className="border-b border-dotted border-slate-400 w-3/4 mx-auto"></div>
               </div>
+            </div>
+
+            <div className="p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-[10px] text-slate-600 flex flex-wrap items-center justify-between gap-2">
+              <span>
+                Pseudonimo IA: <b className="font-mono">{blindCode}</b> · PII filtrate dal prompt:{" "}
+                <b>{Number(submission.PII_Oscurate_Count || 0)}</b>
+              </span>
+              <span>
+                {submission.Convalida_Docente_At
+                  ? `Convalidato dal docente il ${new Date(submission.Convalida_Docente_At).toLocaleString("it-IT")}`
+                  : "Valutazione IA in attesa di convalida docente"}
+              </span>
             </div>
 
             <p className="text-[8px] text-slate-400 text-center uppercase tracking-widest">

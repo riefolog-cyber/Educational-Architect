@@ -17,11 +17,14 @@ import {
   X,
   StopCircle,
   MessageSquare,
-  Send
+  Send,
+  Eye,
+  EyeOff
 } from "lucide-react";
 import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
 import type { LiveSessionSummary } from "../types";
+import { deriveStudentPseudonym } from "../utils/privacyPseudonym";
 
 export interface LiveStudentData {
   id: string;
@@ -95,7 +98,13 @@ export default function ClassroomLiveMonitor({
   const [noticeText, setNoticeText] = useState("");
   const [sendingNotice, setSendingNotice] = useState(false);
   const [noticeSentId, setNoticeSentId] = useState<string | null>(null);
+  const [blindLimMode, setBlindLimMode] = useState(false);
   const progressChangedAtRef = useRef<Record<string, { answered: number; changedAt: number }>>({});
+
+  const getMonitorCode = (s: Pick<LiveStudentData, "id" | "studentEmail">) =>
+    deriveStudentPseudonym(s.studentEmail || s.id || "anonimo", pin || "");
+  const getMonitorName = (s: Pick<LiveStudentData, "id" | "studentName" | "studentEmail">) =>
+    blindLimMode ? `Studente ${getMonitorCode(s)}` : s.studentName;
 
   const timersRef = useRef<number[]>([]);
   const scheduleTimer = (fn: () => void, ms: number) => {
@@ -227,11 +236,11 @@ export default function ClassroomLiveMonitor({
   ).length;
   const connectedCount = inProgressCount + submittedCount + waitingCount;
   const submittedNamesSummary = submittedStudents.length === 1
-    ? submittedStudents[0].studentName
+    ? getMonitorName(submittedStudents[0])
     : submittedStudents.length === 2
-    ? `${submittedStudents[0].studentName}, ${submittedStudents[1].studentName}`
+    ? `${getMonitorName(submittedStudents[0])}, ${getMonitorName(submittedStudents[1])}`
     : submittedStudents.length > 2
-    ? `${submittedStudents[0].studentName} + ${submittedStudents.length - 1} altri`
+    ? `${getMonitorName(submittedStudents[0])} + ${submittedStudents.length - 1} altri`
     : "";
 
   const getRelativeTime = (isoString: string) => {
@@ -244,9 +253,12 @@ export default function ClassroomLiveMonitor({
   // Filter and prioritize students (locked students first so teacher sees them immediately)
   const filteredStudents = resolvedStudents
     .filter((s) => {
-      const matchesSearch =
-        s.studentName.toLowerCase().includes(search.toLowerCase()) ||
-        s.studentEmail.toLowerCase().includes(search.toLowerCase());
+      const q = search.toLowerCase().trim();
+      const matchesSearch = !q || (blindLimMode
+        ? getMonitorCode(s).toLowerCase().includes(q)
+        : s.studentName.toLowerCase().includes(q) ||
+          s.studentEmail.toLowerCase().includes(q) ||
+          getMonitorCode(s).toLowerCase().includes(q));
 
       if (!matchesSearch) return false;
 
@@ -264,8 +276,8 @@ export default function ClassroomLiveMonitor({
       const aAlerts = a.tabSwitches > 0 || a.pasteAttempts > 0 ? 1 : 0;
       const bAlerts = b.tabSwitches > 0 || b.pasteAttempts > 0 ? 1 : 0;
       if (bAlerts !== aAlerts) return bAlerts - aAlerts;
-      // 3. Alphabetical
-      return (a.studentName || "").localeCompare(b.studentName || "");
+      // 3. Alphabetical (respect blind LIM mode so order doesn't reveal surname)
+      return getMonitorName(a).localeCompare(getMonitorName(b));
     });
 
   const handleClearRoom = async () => {
@@ -589,6 +601,19 @@ export default function ClassroomLiveMonitor({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          <button
+            type="button"
+            onClick={() => setBlindLimMode((prev) => !prev)}
+            className={`px-3 py-1.5 rounded-xl border text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors ${
+              blindLimMode
+                ? "bg-amber-500/20 border-amber-500/40 text-amber-200 hover:bg-amber-500/30"
+                : "bg-slate-950/70 border-white/10 text-slate-300 hover:text-white hover:border-white/25"
+            }`}
+            title="Oscura nomi, email e dettagli infrazioni quando proietti il monitor sulla LIM in classe"
+          >
+            {blindLimMode ? <EyeOff className="w-3.5 h-3.5 text-amber-300" /> : <Eye className="w-3.5 h-3.5 text-slate-400" />}
+            <span>{blindLimMode ? "Modalità LIM: Cieca" : "Modalità LIM (Cieca)"}</span>
+          </button>
           <div
             className="px-3 py-1.5 rounded-xl bg-emerald-500/10 border border-emerald-500/30 text-xs font-semibold text-emerald-200 flex items-center gap-1.5"
             title="Sblocco diretto: puoi sbloccare qualsiasi alunno bloccato cliccando direttamente 'Sblocca' accanto al suo nome nell'elenco sottostante"
@@ -712,7 +737,7 @@ export default function ClassroomLiveMonitor({
                   <p className="text-xs sm:text-sm font-bold text-white flex items-center gap-2">
                     <span>
                       {lockedList.length === 1
-                        ? `1 studente bloccato: ${lockedList[0].studentName}`
+                        ? `1 studente bloccato: ${getMonitorName(lockedList[0])}`
                         : `${lockedList.length} studenti hanno la prova attualmente bloccata`}
                     </span>
                     <span className="text-[11px] uppercase font-mono font-bold text-red-300 tracking-wider">
@@ -721,7 +746,7 @@ export default function ClassroomLiveMonitor({
                   </p>
                   <p className="text-[11px] text-red-200/90 mt-0.5">
                     {lockedList.length === 1
-                      ? `La prova di ${lockedList[0].studentName} è in attesa del tuo sblocco. Clicca su "Sblocca" per farlo ripartire istantaneamente.`
+                      ? `La prova di ${getMonitorName(lockedList[0])} è in attesa del tuo sblocco. Clicca su "Sblocca" per farlo ripartire istantaneamente.`
                       : "Gli studenti bloccati visualizzano la schermata di attesa e possono riprendere solo con il tuo sblocco."}
                   </p>
                 </div>
@@ -733,12 +758,12 @@ export default function ClassroomLiveMonitor({
                     onClick={() => handleRemoteUnlock(lockedList[0].id)}
                     disabled={unlockingId === lockedList[0].id}
                     className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-50"
-                    title={`Sblocca immediatamente la prova di ${lockedList[0].studentName}`}
+                    title={`Sblocca immediatamente la prova di ${getMonitorName(lockedList[0])}`}
                   >
                     {unlockSuccessId === lockedList[0].id ? (
                       <>
                         <Check className="w-4 h-4" />
-                        <span>{lockedList[0].studentName} Sbloccato ✓</span>
+                        <span>{getMonitorName(lockedList[0])} Sbloccato ✓</span>
                       </>
                     ) : unlockingId === lockedList[0].id ? (
                       <>
@@ -748,7 +773,7 @@ export default function ClassroomLiveMonitor({
                     ) : (
                       <>
                         <Unlock className="w-4 h-4" />
-                        <span>Sblocca {lockedList[0].studentName}</span>
+                        <span>Sblocca {getMonitorName(lockedList[0])}</span>
                       </>
                     )}
                   </button>
@@ -803,22 +828,22 @@ export default function ClassroomLiveMonitor({
                     onClick={() => handleRemoteUnlock(ls.id)}
                     disabled={unlockingId === ls.id}
                     className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-200 hover:text-white text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-50"
-                    title={`Sblocca solo ${ls.studentName}`}
+                    title={`Sblocca solo ${getMonitorName(ls)}`}
                   >
                     {unlockSuccessId === ls.id ? (
                       <>
                         <Check className="w-3 h-3 text-emerald-400" />
-                        <span>{ls.studentName} ✓</span>
+                        <span>{getMonitorName(ls)} ✓</span>
                       </>
                     ) : unlockingId === ls.id ? (
                       <>
                         <RefreshCw className="w-3 h-3 animate-spin" />
-                        <span>{ls.studentName}...</span>
+                        <span>{getMonitorName(ls)}...</span>
                       </>
                     ) : (
                       <>
                         <Unlock className="w-3 h-3 text-emerald-400" />
-                        <span>Sblocca {ls.studentName}</span>
+                        <span>Sblocca {getMonitorName(ls)}</span>
                       </>
                     )}
                   </button>
@@ -916,7 +941,11 @@ export default function ClassroomLiveMonitor({
           <Search className="w-4 h-4 text-slate-500 absolute left-3 top-2.5" />
           <input
             type="text"
-            placeholder="Cerca alunno per nome o cognome..."
+            placeholder={
+              blindLimMode
+                ? "Cerca codice anonimo (es. STU-7K4M9P)..."
+                : "Cerca alunno per nome o cognome..."
+            }
             value={search}
             onChange={(e) => setSearch(e.target.value)}
             className="w-full pl-9 pr-3 py-2 bg-slate-950/80 border border-white/10 rounded-xl text-white text-xs outline-none focus:border-indigo-400"
@@ -1047,7 +1076,9 @@ export default function ClassroomLiveMonitor({
                         />
                         <div>
                           <h4 className="text-xs sm:text-sm font-bold text-white flex items-center gap-1.5 flex-wrap">
-                            <span>{student.studentName}</span>
+                            <span className={blindLimMode ? "font-mono text-amber-300" : ""}>
+                              {getMonitorName(student)}
+                            </span>
                             {student.status === "submitted" && (
                               <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
                                 <CheckCircle2 className="w-3 h-3 text-emerald-400" />
@@ -1075,7 +1106,7 @@ export default function ClassroomLiveMonitor({
                             {student.locked && (
                               <span
                                 className="text-[10px] font-bold px-2.5 py-0.5 rounded-lg bg-red-500/30 text-red-100 border border-red-500/60 flex items-center gap-1 animate-pulse"
-                                title={student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina"}
+                                title={blindLimMode ? "Prova bloccata" : (student.lockReason || "Prova bloccata: lo studente ha lasciato la pagina")}
                               >
                                 <Lock className="w-3 h-3 text-red-300" />
                                 PROVA BLOCCATA
@@ -1087,7 +1118,9 @@ export default function ClassroomLiveMonitor({
                               </span>
                             )}
                           </h4>
-                          <p className="text-[10px] text-slate-400 font-mono mt-0.5">{student.studentEmail}</p>
+                          <p className="text-[10px] text-slate-400 font-mono mt-0.5">
+                            {blindLimMode ? "• Identità nascosta (Modalità LIM) •" : student.studentEmail}
+                          </p>
                         </div>
                       </div>
 
@@ -1146,7 +1179,7 @@ export default function ClassroomLiveMonitor({
                           onClick={() => handleRemoteUnlock(student.id)}
                           disabled={unlockingId === student.id}
                           className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
-                          title={`Sblocca la prova di ${student.studentName} con 1 click`}
+                          title={`Sblocca la prova di ${getMonitorName(student)} con 1 click`}
                         >
                           {unlockSuccessId === student.id ? (
                             <>
@@ -1172,14 +1205,21 @@ export default function ClassroomLiveMonitor({
                           <span>Consegna Registrata</span>
                         </div>
                       ) : hasAlerts ? (
-                        <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
-                          <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
-                          <span>
-                            {student.tabSwitches > 0 && `${student.tabSwitches} uscite`}
-                            {student.tabSwitches > 0 && student.pasteAttempts > 0 && ", "}
-                            {student.pasteAttempts > 0 && `${student.pasteAttempts} incolla bloccati`}
-                          </span>
-                        </div>
+                        blindLimMode ? (
+                          <div className="px-2.5 py-1 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-200 text-[11px] font-semibold flex items-center gap-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 text-amber-300 shrink-0" />
+                            <span>Nota monitor (LIM Cieca)</span>
+                          </div>
+                        ) : (
+                          <div className="px-2.5 py-1 rounded-xl bg-red-500/15 border border-red-500/30 text-red-300 text-[11px] font-semibold flex items-center gap-1.5">
+                            <AlertTriangle className="w-3.5 h-3.5 text-red-400 shrink-0" />
+                            <span>
+                              {student.tabSwitches > 0 && `${student.tabSwitches} uscite`}
+                              {student.tabSwitches > 0 && student.pasteAttempts > 0 && ", "}
+                              {student.pasteAttempts > 0 && `${student.pasteAttempts} incolla bloccati`}
+                            </span>
+                          </div>
+                        )
                       ) : isOffline ? (
                         <div className="px-2.5 py-1 rounded-xl bg-slate-500/10 border border-slate-500/20 text-slate-400 text-[10px] font-medium flex items-center gap-1">
                           <Clock className="w-3 h-3" />
@@ -1204,7 +1244,7 @@ export default function ClassroomLiveMonitor({
                               setNoticeText(student.teacherNotice || "");
                             }
                           }}
-                          title={`Invia un messaggio mirato a ${student.studentName}`}
+                          title={`Invia un messaggio mirato a ${getMonitorName(student)}`}
                           className={`px-2 py-1 rounded-lg text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-colors shrink-0 ${
                             noticeSentId === student.id
                               ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
@@ -1229,7 +1269,7 @@ export default function ClassroomLiveMonitor({
                           type="button"
                           onClick={() => handleRemoveStudent(student.id)}
                           disabled={removingId === student.id}
-                          title={`Rimuovi ${student.studentName} da questo monitor d'aula`}
+                          title={`Rimuovi ${getMonitorName(student)} da questo monitor d'aula`}
                           className="p-1.5 text-slate-500 hover:text-red-400 hover:bg-red-500/10 rounded-lg transition-colors cursor-pointer shrink-0 disabled:opacity-40"
                         >
                           <Trash2 className="w-3.5 h-3.5" />
@@ -1250,7 +1290,7 @@ export default function ClassroomLiveMonitor({
                         type="text"
                         value={noticeText}
                         onChange={(e) => setNoticeText(e.target.value)}
-                        placeholder={`Scrivi un avviso rapido a ${student.studentName} (es. 'Mancano 5 minuti, procedi alla consegna')...`}
+                        placeholder={`Scrivi un avviso rapido a ${getMonitorName(student)} (es. 'Mancano 5 minuti, procedi alla consegna')...`}
                         maxLength={240}
                         autoFocus
                         className="flex-1 px-3 py-1.5 text-xs bg-slate-950 border border-indigo-400/40 focus:border-indigo-400 rounded-lg text-white outline-none"
