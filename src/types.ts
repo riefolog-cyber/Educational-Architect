@@ -169,6 +169,8 @@ export interface SavedSubmission {
   Convalida_Docente_Email?: string;
   /** True when solutions & explanations are deferred until the teacher publishes them. */
   Soluzioni_Differite?: boolean;
+  /** Which exam variant row (Fila A or Fila B) was assigned to this student. */
+  Assigned_Fila?: 'A' | 'B';
 }
 
 export interface BesOptions {
@@ -198,6 +200,12 @@ export interface LiveSessionSummary {
   solutionsReleasedAt?: string;
   /** Teacher-configured inclusive accommodations (BES/DSA) for this session. */
   besOptions?: BesOptions;
+  /** When true, the session automatically alternates Fila A and Fila B under the same PIN. */
+  mixFilaAB?: boolean;
+  /** Title of the Fila B variant when mixFilaAB is enabled. */
+  filaBTitle?: string;
+  /** When true, students can dictate/record voice answers for open questions via Gemini Audio. */
+  allowAudioAnswers?: boolean;
 }
 
 export interface ExamSummary {

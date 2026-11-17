@@ -40,7 +40,9 @@ import {
   AlertCircle,
   ArrowRight,
   Volume2,
-  Square
+  Square,
+  Mic,
+  Loader2
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
@@ -80,6 +82,7 @@ import {
   type RecoveryProgress
 } from "../utils/recoveryProgress";
 import { deriveStudentPseudonym, scrubAnswersForAi } from "../utils/privacyPseudonym";
+import { assignDeterministicFila } from "../utils/examSecurity";
 import {
   saveScopedExamLock,
   loadScopedExamLock,
@@ -289,7 +292,19 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [deferSolutionsSession, setDeferSolutionsSession] = useState<boolean>(false);
   const [solutionsReleased, setSolutionsReleased] = useState<boolean>(true);
   const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
+  const [assignedFila, setAssignedFila] = useState<"A" | "B" | undefined>(undefined);
+  const assignedFilaRef = useRef<"A" | "B" | undefined>(undefined);
+  const besExpiryIsoRef = useRef<string | null>(null);
+  const [allowAudioAnswersSession, setAllowAudioAnswersSession] = useState<boolean>(false);
+  const [recordingAudioForId, setRecordingAudioForId] = useState<string | null>(null);
+  const [transcribingAudioForId, setTranscribingAudioForId] = useState<string | null>(null);
+  const [audioRecordSeconds, setAudioRecordSeconds] = useState<number>(0);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const audioChunksRef = useRef<Blob[]>([]);
+  const audioTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const [pastSessionSolutionsReleased, setPastSessionSolutionsReleased] = useState<Record<string, boolean>>({});
+  const [unlockedPastSubmissions, setUnlockedPastSubmissions] = useState<Record<string, { examData?: any; mainErrors?: string }>>({});
+  const [pastUnlockingId, setPastUnlockingId] = useState<string | null>(null);
 
   // Answers State
   const [answers, setAnswers] = useState<Answers>({
@@ -424,6 +439,207 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       >
         {isSpeaking ? <Square className="w-3 h-3 fill-current" /> : <Volume2 className="w-3 h-3" />}
         <span>{isSpeaking ? "Stop" : "Ascolta"}</span>
+      </button>
+    );
+  };
+
+  useEffect(() => {
+    return () => {
+      if (audioTimerRef.current) clearInterval(audioTimerRef.current);
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
+    };
+  }, []);
+
+  const appendAudioTranscript = useCallback(
+    (targetType: "oe" | "wbRq" | "both", qId: string, transcript: string) => {
+      const clean = transcript.trim();
+      if (!clean) return;
+      setAnswers((prev) => {
+        const nextOe = { ...prev.oe };
+        const nextWbRq = { ...prev.wbRq };
+        if (targetType === "oe" || targetType === "both") {
+          const cur = (nextOe[qId] || "").trimEnd();
+          nextOe[qId] = cur ? `${cur}\n${clean}` : clean;
+        }
+        if (targetType === "wbRq" || targetType === "both") {
+          const cur = (nextWbRq[qId] || "").trimEnd();
+          nextWbRq[qId] = cur ? `${cur}\n${clean}` : clean;
+        }
+        const next: Answers = { ...prev, oe: nextOe, wbRq: nextWbRq };
+        saveDraft(sessionPin, next);
+        return next;
+      });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [sessionPin]
+  );
+
+  const handleToggleAudioRecording = async (
+    fieldKey: string,
+    targetType: "oe" | "wbRq" | "both",
+    qId: string
+  ) => {
+    if (!isExamActive || isTimeCurrentlyExpired()) {
+      setAppAlert({ msg: "⚠️ Il tempo d'esame è scaduto: non è più possibile registrare risposte." });
+      return;
+    }
+    if (recordingAudioForId === fieldKey) {
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
+      if (audioTimerRef.current) {
+        clearInterval(audioTimerRef.current);
+        audioTimerRef.current = null;
+      }
+      setRecordingAudioForId(null);
+      return;
+    }
+
+    if (recordingAudioForId || transcribingAudioForId) {
+      setInfractionToastMsg("Completa prima la registrazione o trascrizione attualmente in corso.");
+      return;
+    }
+
+    if (typeof MediaRecorder === "undefined" || !navigator.mediaDevices?.getUserMedia) {
+      setAppAlert({ msg: "⚠️ Questo browser o dispositivo non supporta la registrazione vocale dal microfono." });
+      return;
+    }
+
+    isInteractingWithInAppDialogRef.current = true;
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      scheduleDialogInteractionEnd(1500);
+
+      const mimeCandidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"];
+      const chosenMime = mimeCandidates.find((m) => {
+        try {
+          return MediaRecorder.isTypeSupported(m);
+        } catch {
+          return false;
+        }
+      });
+
+      const recorder = chosenMime ? new MediaRecorder(stream, { mimeType: chosenMime }) : new MediaRecorder(stream);
+      audioChunksRef.current = [];
+      mediaRecorderRef.current = recorder;
+      setRecordingAudioForId(fieldKey);
+      setAudioRecordSeconds(0);
+
+      if (audioTimerRef.current) clearInterval(audioTimerRef.current);
+      audioTimerRef.current = setInterval(() => {
+        setAudioRecordSeconds((prev) => {
+          const next = prev + 1;
+          if (next >= 90) {
+            try {
+              if (recorder.state !== "inactive") recorder.stop();
+            } catch {}
+          }
+          return next;
+        });
+      }, 1000);
+
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          audioChunksRef.current.push(ev.data);
+        }
+      };
+
+      recorder.onstop = async () => {
+        if (audioTimerRef.current) {
+          clearInterval(audioTimerRef.current);
+          audioTimerRef.current = null;
+        }
+        stream.getTracks().forEach((t) => t.stop());
+        setRecordingAudioForId(null);
+
+        const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || chosenMime || "audio/webm" });
+        audioChunksRef.current = [];
+        if (blob.size < 400) {
+          setInfractionToastMsg("Registrazione troppo breve: tieni premuto o parla più vicino al microfono.");
+          return;
+        }
+
+        setTranscribingAudioForId(fieldKey);
+        try {
+          const dataUrl: string = await new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onloadend = () => resolve(String(reader.result || ""));
+            reader.onerror = () => reject(new Error("Errore lettura audio"));
+            reader.readAsDataURL(blob);
+          });
+          const resp = await fetch("/api/transcribe-audio", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              audioBase64: dataUrl,
+              mimeType: blob.type || "audio/webm",
+              studentName: user?.displayName || "",
+              studentEmail: user?.email || "",
+            }),
+          });
+          const data = await resp.json().catch(() => ({}));
+          if (!resp.ok || !data?.transcript) {
+            throw new Error(data?.error || "Trascrizione audio non riuscita.");
+          }
+          appendAudioTranscript(targetType, qId, String(data.transcript));
+          setInfractionToastMsg("🎙️ Risposta vocale trascritta nel campo di testo!");
+        } catch (err: any) {
+          setAppAlert({ msg: `⚠️ ${err?.message || "Impossibile trascrivere la registrazione vocale."}` });
+        } finally {
+          setTranscribingAudioForId(null);
+        }
+      };
+
+      recorder.start(250);
+    } catch (permErr: any) {
+      scheduleDialogInteractionEnd(1500);
+      setRecordingAudioForId(null);
+      setAppAlert({
+        msg: `⚠️ Accesso al microfono non consentito o non disponibile (${permErr?.message || "permesso negato"}). Puoi comunque scrivere la risposta manualmente.`,
+      });
+    }
+  };
+
+  const renderAudioAnswerButton = (fieldKey: string, targetType: "oe" | "wbRq" | "both", qId: string) => {
+    if (!allowAudioAnswersSession) return null;
+    const isRec = recordingAudioForId === fieldKey;
+    const isTrans = transcribingAudioForId === fieldKey;
+    return (
+      <button
+        type="button"
+        disabled={isTrans || (!!recordingAudioForId && !isRec)}
+        onClick={() => handleToggleAudioRecording(fieldKey, targetType, qId)}
+        className={`inline-flex items-center gap-1.5 px-2.5 py-1 rounded-lg border text-[11px] font-bold transition-all cursor-pointer disabled:opacity-50 ${
+          isRec
+            ? "bg-rose-600/25 border-rose-400 text-rose-200 animate-pulse"
+            : isTrans
+            ? "bg-sky-500/20 border-sky-400/50 text-sky-200"
+            : "bg-sky-500/15 border-sky-500/35 text-sky-200 hover:bg-sky-500/25"
+        }`}
+        title="Registra una risposta vocale e trascrivila automaticamente"
+      >
+        {isTrans ? (
+          <>
+            <Loader2 className="w-3.5 h-3.5 animate-spin" />
+            <span>Trascrizione audio...</span>
+          </>
+        ) : isRec ? (
+          <>
+            <Square className="w-3 h-3 fill-current" />
+            <span>Ferma ({audioRecordSeconds}s / 90s)</span>
+          </>
+        ) : (
+          <>
+            <Mic className="w-3.5 h-3.5" />
+            <span>🎙️ Risposta Vocale</span>
+          </>
+        )}
       </button>
     );
   };
@@ -578,6 +794,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         };
       }
 
+      const activeAssignedFila = assignedFilaRef.current || assignedFila;
+      const activeBesExpiry = besExpiryIsoRef.current;
       const docRef = doc(dbFirestore, "active_sessions", targetPin, "live_students", liveDocId);
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
@@ -593,12 +811,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         joinedAt,
         sessionRunId: activeRunId,
         status,
+        ...(activeBesExpiry ? { besExpiryIso: activeBesExpiry } : {}),
+        ...(activeAssignedFila ? { assignedFila: activeAssignedFila } : {}),
         ...draftFields,
       }, { merge: true });
     } catch (err) {
       console.warn("Live progress sync skipped:", err);
     }
-  }, [dbFirestore, sessionPin, sessionRunId, user?.email, user?.displayName, examType, examData, answers, behavior.tabSwitches, behavior.pasteAttempts]);
+  }, [dbFirestore, sessionPin, sessionRunId, user?.email, user?.displayName, examType, examData, answers, behavior.tabSwitches, behavior.pasteAttempts, assignedFila]);
 
   // Keeps the latest progress data available to the periodic heartbeat without
   // restarting the interval on every keystroke.
@@ -1065,22 +1285,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (sessionSnap.exists()) {
         const sessionData = sessionSnap.data();
         const restoredRunId = sessionData.sessionId || sessionData.sessionRunId || "";
-        const parsedExam = safeParseJson(sessionData.data ?? sessionData.examData);
-        let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
-        if (examContent) {
-          examContent = applyClientMcRandomization(examContent, !!sessionData.randomizeQuestions, savedPin, restoredRunId);
-          setExamData(examContent);
-          setExamType(examContent.sections ? "workbook" : "quiz");
-        }
-        setEncryptedAnswerKey(String(sessionData.encryptedAnswerKey || ""));
-        setExpiryTime(sessionData.expiry || null);
-        setBackendUrl(sessionData.backendUrl || null);
-        setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
-        setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
-        setSessionRunId(restoredRunId);
-
         let cloudStudentData: any = null;
-        // Check if teacher has already unlocked this student in Firestore + fetch cloud draft
         if (user?.email) {
           const liveDocId = getLiveStudentDocId(user.email, savedPin);
           const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", savedPin, "live_students", liveDocId));
@@ -1088,6 +1293,46 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             cloudStudentData = studentSnap.data();
           }
         }
+
+        const hasMixFila = !!(sessionData.mixFilaAB && sessionData.filaBData);
+        const studentFila: "A" | "B" | undefined = hasMixFila
+          ? (cloudStudentData?.assignedFila === "A" || cloudStudentData?.assignedFila === "B"
+              ? cloudStudentData.assignedFila
+              : assignDeterministicFila(user?.email, restoredRunId || savedPin))
+          : undefined;
+        assignedFilaRef.current = studentFila;
+        setAssignedFila(studentFila);
+
+        const rawTemplate = studentFila === "B" && sessionData.filaBData
+          ? sessionData.filaBData
+          : (sessionData.data ?? sessionData.examData);
+        const selectedKey = studentFila === "B" && sessionData.encryptedFilaBAnswerKey
+          ? sessionData.encryptedFilaBAnswerKey
+          : sessionData.encryptedAnswerKey;
+
+        const parsedExam = safeParseJson(rawTemplate);
+        let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
+        if (examContent) {
+          examContent = applyClientMcRandomization(examContent, !!sessionData.randomizeQuestions, savedPin, restoredRunId);
+          setExamData(examContent);
+          setExamType(examContent.sections ? "workbook" : "quiz");
+        }
+        setEncryptedAnswerKey(String(selectedKey || ""));
+        setDeferSolutionsSession(!!sessionData.deferSolutions);
+        setSolutionsReleased(sessionData.deferSolutions ? !!sessionData.solutionsReleased : true);
+        setAllowAudioAnswersSession(!!sessionData.allowAudioAnswers);
+
+        const besOpts: BesOptions = sessionData.besOptions || {};
+        const extraPct: 0 | 25 | 50 = besOpts.extraTimePercent === 50 ? 50 : besOpts.extraTimePercent === 25 ? 25 : 0;
+        setBesExtraTimePercent(extraPct);
+        const restoredBesExpiry = cloudStudentData?.besExpiryIso || null;
+        besExpiryIsoRef.current = extraPct > 0 ? (restoredBesExpiry || sessionData.expiry || null) : null;
+        setExpiryTime(restoredBesExpiry || sessionData.expiry || null);
+        setBackendUrl(sessionData.backendUrl || null);
+        setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
+        setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
+        setSessionRunId(restoredRunId);
+
         restoreDraftWithCloudFallback(savedPin, restoredRunId, cloudStudentData);
         if (cloudStudentData?.locked === false && cloudStudentData?.lockState === "unlocked") {
           releaseExamLockRef.current("remote");
@@ -1099,38 +1344,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
   };
 
-  // Restore locked session on mount if any lock marker is present
+  // Restore locked session on mount using strictly student-scoped storage
   useEffect(() => {
-    let savedPin = "";
-    let savedReason = "";
-    try {
-      const activeLockRaw = localStorage.getItem("active_exam_lock") || sessionStorage.getItem("active_exam_lock");
-      if (activeLockRaw) {
-        const parsed = JSON.parse(activeLockRaw);
-        if (parsed?.locked) {
-          savedPin = String(parsed.pin || "").trim().toUpperCase();
-          savedReason = String(parsed.reason || "Prova precedentemente bloccata dal docente o dal sistema");
-        }
-      }
-      if (!savedPin) {
-        for (let i = 0; i < localStorage.length; i++) {
-          const k = localStorage.key(i);
-          if (k && k.startsWith("exam_lock_")) {
-            const raw = localStorage.getItem(k);
-            if (raw) {
-              const p = JSON.parse(raw);
-              if (p?.locked) {
-                savedPin = k.replace("exam_lock_", "").trim().toUpperCase();
-                savedReason = String(p.reason || "Prova bloccata");
-                break;
-              }
-            }
-          }
-        }
-      }
-    } catch {}
+    const scopedLock = loadScopedExamLock(user?.email);
+    const savedPin = String(scopedLock?.pin || "").trim().toUpperCase();
+    const savedReason = String(scopedLock?.reason || "Prova precedentemente bloccata dal docente o dal sistema");
 
-    if (savedPin) {
+    if (scopedLock?.locked && savedPin) {
       lockedRef.current = true;
       setExamLocked(true);
       setLockReason(savedReason);
@@ -1245,39 +1465,114 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
   }, [activeSubTab]);
 
-  // Real-time listener: unlock deferred solutions immediately on the results screen as soon as teacher releases them
+  // Real-time listener: unlock & decrypt deferred solutions as soon as teacher releases them
   useEffect(() => {
     if (activeScreen !== "results" || !deferSolutionsSession || solutionsReleased || !dbFirestore || !sessionPin) {
       return;
     }
     const cleanPin = sessionPin.trim().toUpperCase();
+    let unlockedTriggered = false;
     const unsub = onSnapshot(
       doc(dbFirestore, "active_sessions", cleanPin),
-      (snap) => {
-        if (!snap.exists()) return;
+      async (snap) => {
+        if (!snap.exists() || unlockedTriggered) return;
         const d = snap.data();
         if (d?.solutionsReleased === true || d?.deferSolutions === false) {
-          setSolutionsReleased(true);
+          unlockedTriggered = true;
+          try {
+            const resp = await fetch("/api/session/unlock-solutions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                pin: cleanPin,
+                sessionId: sessionRunId || "",
+                assignedFila: assignedFilaRef.current || "",
+                encryptedAnswerKey: encryptedAnswerKey || "",
+                examData,
+                mcOptionOrder: mcOptionOrderRef.current || {},
+                answers,
+                tipo: examType === "quiz" ? "Quiz" : "Workbook",
+              }),
+            });
+            const data = await resp.json().catch(() => null);
+            if (resp.ok && data?.unlocked) {
+              if (data.resolvedDomande) setExamData(data.resolvedDomande);
+              setEvaluation((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      ...(data.mainErrors ? { mainErrors: data.mainErrors } : {}),
+                      deferredSolutionsLocked: false,
+                    }
+                  : prev
+              );
+            }
+          } catch (unlockErr) {
+            console.warn("Errore sblocco soluzioni differite:", unlockErr);
+          } finally {
+            setSolutionsReleased(true);
+          }
         }
       },
       (err) => console.warn("Ascolto rilascio soluzioni:", err)
     );
     return () => unsub();
-  }, [activeScreen, deferSolutionsSession, solutionsReleased, sessionPin]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeScreen, deferSolutionsSession, solutionsReleased, sessionPin, sessionRunId, encryptedAnswerKey, examType]);
 
-  // History view: if a past submission had deferred solutions, check whether teacher released them for that PIN
+  // History view: if a past submission had deferred solutions, verify Session_Id match and unlock via server vault
   useEffect(() => {
     if (!selectedPastSub?.Soluzioni_Differite || !selectedPastSub?.Pin || !dbFirestore) return;
     if (pastSessionSolutionsReleased[selectedPastSub.id]) return;
     const cleanPin = String(selectedPastSub.Pin).trim().toUpperCase();
     if (!cleanPin) return;
+    let cancelled = false;
     getDoc(doc(dbFirestore, "active_sessions", cleanPin))
-      .then((snap) => {
-        if (snap.exists() && snap.data()?.solutionsReleased === true) {
-          setPastSessionSolutionsReleased((prev) => ({ ...prev, [selectedPastSub.id]: true }));
+      .then(async (snap) => {
+        if (cancelled || !snap.exists()) return;
+        const sData = snap.data();
+        const snapSessionId = String(sData?.sessionId || "").trim();
+        const subSessionId = String(selectedPastSub.Session_Id || "").trim();
+        if (snapSessionId && subSessionId && snapSessionId !== subSessionId) {
+          return;
+        }
+        if (sData?.solutionsReleased === true || sData?.deferSolutions === false) {
+          setPastUnlockingId(selectedPastSub.id);
+          try {
+            const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
+            const parsedAnswers = safeParseJson(selectedPastSub.Risposte_Studente) || {};
+            const resp = await fetch("/api/session/unlock-solutions", {
+              method: "POST",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                pin: cleanPin,
+                sessionId: subSessionId,
+                assignedFila: selectedPastSub.Assigned_Fila || "",
+                examData: parsedExamData,
+                answers: parsedAnswers,
+                tipo: selectedPastSub.Tipo || "Quiz",
+              }),
+            });
+            const data = await resp.json().catch(() => null);
+            if (!cancelled && resp.ok && data?.unlocked) {
+              setUnlockedPastSubmissions((prev) => ({
+                ...prev,
+                [selectedPastSub.id]: {
+                  examData: data.resolvedDomande || parsedExamData,
+                  mainErrors: data.mainErrors,
+                },
+              }));
+              setPastSessionSolutionsReleased((prev) => ({ ...prev, [selectedPastSub.id]: true }));
+            }
+          } finally {
+            if (!cancelled) setPastUnlockingId(null);
+          }
         }
       })
       .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
   }, [selectedPastSub, pastSessionSolutionsReleased]);
 
   // Check custom pins (Firebase or Local Templates)
@@ -1327,10 +1622,66 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             return;
           }
 
-          // Check expiry
-          if (sessionData.expiry) {
+          const currentRunIdForInit = String(sessionData.sessionId || sessionData.sessionRunId || "");
+
+          // Fetch live_students telemetry BEFORE checking expiry & selecting track, so anchored BES expiry
+          // and assigned Fila survive device changes in school labs
+          let cloudStudentData: any = null;
+          if (dbFirestore && user?.email) {
+            try {
+              const liveDocId = getLiveStudentDocId(user.email, formattedPin);
+              const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", liveDocId));
+              if (studentSnap.exists()) {
+                cloudStudentData = studentSnap.data();
+              }
+            } catch {}
+          }
+
+          // Compute effective BES/DSA expiry FIRST before rejecting late-entry BES students
+          const besOpts: BesOptions = sessionData.besOptions || {};
+          const extraPct: 0 | 25 | 50 =
+            besOpts.extraTimePercent === 50 ? 50 : besOpts.extraTimePercent === 25 ? 25 : 0;
+
+          let effectiveExpiry: string | null = sessionData.expiry || null;
+          let anchoredBesIso: string | null = null;
+          if (effectiveExpiry && extraPct > 0) {
+            const besAnchorKey = `ea_bes_expiry_${normalizeIdentityKey(user?.email)}_${formattedPin}_${currentRunIdForInit || "default"}`;
+            const cloudBesIso =
+              cloudStudentData?.besExpiryIso &&
+              (!cloudStudentData?.sessionRunId || !currentRunIdForInit || cloudStudentData.sessionRunId === currentRunIdForInit) &&
+              !isNaN(new Date(String(cloudStudentData.besExpiryIso)).getTime())
+                ? String(cloudStudentData.besExpiryIso)
+                : null;
+            if (cloudBesIso) {
+              anchoredBesIso = cloudBesIso;
+              effectiveExpiry = cloudBesIso;
+              try { localStorage.setItem(besAnchorKey, cloudBesIso); } catch {}
+            } else {
+              let savedBesExpiry: string | null = null;
+              try { savedBesExpiry = localStorage.getItem(besAnchorKey); } catch {}
+              if (savedBesExpiry && !isNaN(new Date(savedBesExpiry).getTime())) {
+                anchoredBesIso = savedBesExpiry;
+                effectiveExpiry = savedBesExpiry;
+              } else {
+                const baseMs = new Date(effectiveExpiry).getTime();
+                if (!isNaN(baseMs)) {
+                  const createdMs = sessionData.createdAt ? new Date(sessionData.createdAt).getTime() : NaN;
+                  const refDurationMs = !isNaN(createdMs) && baseMs > createdMs
+                    ? baseMs - createdMs
+                    : Math.max(baseMs - Date.now(), 10 * 60 * 1000);
+                  const extraMs = Math.round(Math.max(refDurationMs, 10 * 60 * 1000) * (extraPct / 100));
+                  const extendedIso = new Date(baseMs + extraMs).toISOString();
+                  anchoredBesIso = extendedIso;
+                  effectiveExpiry = extendedIso;
+                  try { localStorage.setItem(besAnchorKey, extendedIso); } catch {}
+                }
+              }
+            }
+          }
+
+          if (effectiveExpiry) {
             const now = new Date();
-            const target = new Date(sessionData.expiry);
+            const target = new Date(effectiveExpiry);
             if (now > target) {
               setPinError(`Il tempo massimo è scaduto alle ${target.toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}.`);
               setPinLoading(false);
@@ -1351,9 +1702,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             const alreadySubmitted = attemptsSnap.docs.some(d => {
               const row = d.data() as any;
               const rowRunId = String(row.Session_Id || "");
-              // Matching run: same session launch. Legacy rows without Session_Id
-              // are treated conservatively (block) — the teacher can still free
-              // a second attempt by deleting the submission in the dashboard.
               return currentRunId && rowRunId ? rowRunId === currentRunId : true;
             });
             if (alreadySubmitted) {
@@ -1365,12 +1713,36 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             console.warn("Verifica consegne precedente non riuscita, prosigo:", dupErr);
           }
 
-          const currentRunIdForInit = String(sessionData.sessionId || sessionData.sessionRunId || "");
           setSessionPin(formattedPin);
           setSessionRunId(currentRunIdForInit);
-          setEncryptedAnswerKey(String(sessionData.encryptedAnswerKey || ""));
+          setBesExtraTimePercent(extraPct);
+          besExpiryIsoRef.current = anchoredBesIso;
+          if (besOpts.autoOpenAccessibilityBar) {
+            setShowAccessibilityBar(true);
+          }
+          setExpiryTime(effectiveExpiry);
+          setAllowAudioAnswersSession(!!sessionData.allowAudioAnswers);
 
-          const parsedExam = safeParseJson(sessionData.data);
+          // Mixed Fila A / Fila B deterministic selection under a single PIN
+          const hasMixFila = !!(sessionData.mixFilaAB && sessionData.filaBData);
+          const studentFila: "A" | "B" | undefined = hasMixFila
+            ? (cloudStudentData?.assignedFila === "A" || cloudStudentData?.assignedFila === "B"
+                ? cloudStudentData.assignedFila
+                : assignDeterministicFila(user?.email, currentRunIdForInit || formattedPin))
+            : undefined;
+          assignedFilaRef.current = studentFila;
+          setAssignedFila(studentFila);
+
+          const rawTemplate = studentFila === "B" && sessionData.filaBData
+            ? sessionData.filaBData
+            : sessionData.data;
+          const selectedKey = studentFila === "B" && sessionData.encryptedFilaBAnswerKey
+            ? sessionData.encryptedFilaBAnswerKey
+            : sessionData.encryptedAnswerKey;
+
+          setEncryptedAnswerKey(String(selectedKey || ""));
+
+          const parsedExam = safeParseJson(rawTemplate);
           let examContent = parsedExam ? normalizeExamStructure(parsedExam) : null;
 
           // Anti-cheat: Randomize questions and options if enabled by teacher (recording mcOptionOrder for server grading)
@@ -1392,38 +1764,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setDeferSolutionsSession(isDeferred);
           setSolutionsReleased(isReleasedNow);
 
-          const besOpts: BesOptions = sessionData.besOptions || {};
-          const extraPct: 0 | 25 | 50 =
-            besOpts.extraTimePercent === 50 ? 50 : besOpts.extraTimePercent === 25 ? 25 : 0;
-          setBesExtraTimePercent(extraPct);
-          if (besOpts.autoOpenAccessibilityBar) {
-            setShowAccessibilityBar(true);
-          }
-
-          let effectiveExpiry: string | null = sessionData.expiry || null;
-          if (effectiveExpiry && extraPct > 0) {
-            const besAnchorKey = `ea_bes_expiry_${normalizeIdentityKey(user?.email)}_${formattedPin}_${currentRunIdForInit || "default"}`;
-            try {
-              const savedBesExpiry = localStorage.getItem(besAnchorKey);
-              if (savedBesExpiry && !isNaN(new Date(savedBesExpiry).getTime())) {
-                effectiveExpiry = savedBesExpiry;
-              } else {
-                const baseMs = new Date(effectiveExpiry).getTime();
-                if (!isNaN(baseMs)) {
-                  const remainingMs = Math.max(baseMs - Date.now(), 10 * 60 * 1000);
-                  const extraMs = Math.round(remainingMs * (extraPct / 100));
-                  const extendedIso = new Date(baseMs + extraMs).toISOString();
-                  localStorage.setItem(besAnchorKey, extendedIso);
-                  effectiveExpiry = extendedIso;
-                }
-              }
-            } catch {}
-          }
-          setExpiryTime(effectiveExpiry);
-
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
           setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
+
           // Restore a lock applied before a page reload scoped strictly to this student + PIN
           let isLockedNow = false;
           let currentLockReason = "";
@@ -1433,22 +1777,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             currentLockReason = restoredLock.reason || "Prova precedentemente bloccata per allontanamento";
           }
 
-          let cloudStudentData: any = null;
-          if (dbFirestore && user?.email) {
-            try {
-              const liveDocId = getLiveStudentDocId(user.email, formattedPin);
-              const studentSnap = await getDoc(doc(dbFirestore, "active_sessions", formattedPin, "live_students", liveDocId));
-              if (studentSnap.exists()) {
-                const sData = studentSnap.data();
-                cloudStudentData = sData;
-                if (sData?.locked === true && sData?.lockState === "locked") {
-                  isLockedNow = true;
-                  currentLockReason = String(sData?.lockReason || currentLockReason || "Prova bloccata dal docente o dal sistema di integrità");
-                } else if (sData?.locked === false && sData?.lockState === "unlocked") {
-                  isLockedNow = false;
-                }
-              }
-            } catch {}
+          if (cloudStudentData) {
+            if (cloudStudentData?.locked === true && cloudStudentData?.lockState === "locked") {
+              isLockedNow = true;
+              currentLockReason = String(cloudStudentData?.lockReason || currentLockReason || "Prova bloccata dal docente o dal sistema di integrità");
+            } else if (cloudStudentData?.locked === false && cloudStudentData?.lockState === "unlocked") {
+              isLockedNow = false;
+            }
           }
 
           const currentRunId = String(sessionData.sessionId || sessionData.sessionRunId || "");
@@ -2600,6 +2935,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             )
           );
 
+          const resolvedFila = rescue.assignedFila || assignedFilaRef.current || undefined;
           const submissionData: any = {
             Timestamp: timestamp,
             Docente_Email: cleanVal(rescue.teacherEmail),
@@ -2620,7 +2956,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Full_Evaluation: JSON.stringify(finalEval),
             Risposte_Studente: JSON.stringify(rescue.answers),
             Domande_Esame: serializeExamForSubmission(rescue.examData),
-            Soluzioni_Differite: !!(rescue.deferSolutions && !rescue.solutionsReleased)
+            Soluzioni_Differite: !!(rescue.deferSolutions && !rescue.solutionsReleased),
+            ...(resolvedFila ? { Assigned_Fila: resolvedFila } : {}),
           };
 
           if (rescue.examType === "quiz") {
@@ -2717,6 +3054,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setExpiryTime(data.expiryTime || null);
           setDeferSolutionsSession(!!data.deferSolutions);
           setSolutionsReleased(data.deferSolutions ? !!data.solutionsReleased : true);
+          assignedFilaRef.current = data.assignedFila || undefined;
+          setAssignedFila(data.assignedFila || undefined);
           setBackendUrl(data.backendUrl || null);
           setTeacherEmail(data.teacherEmail || "");
           setAnswers(data.answers || { mc: {}, oe: {}, wbFib: {}, wbRq: {} });
@@ -2898,6 +3237,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       sessionPin: sessionPin || "",
       encryptedAnswerKey: encryptedAnswerKey || "",
       mcOptionOrder: mcOptionOrderRef.current || {},
+      deferSolutions: deferSolutionsSession && !solutionsReleased,
       report: {
         domande: examPayload,
         risposte: piiScrubResult.scrubbedAnswers,
@@ -2970,6 +3310,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         expiryTime,
         deferSolutions: deferSolutionsSession,
         solutionsReleased,
+        assignedFila: assignedFilaRef.current || assignedFila,
         backendUrl,
         teacherEmail,
         answers,
@@ -2995,6 +3336,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   const handleRestart = () => {
     stopSpeech();
+    if (audioTimerRef.current) {
+      clearInterval(audioTimerRef.current);
+      audioTimerRef.current = null;
+    }
+    try {
+      if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+        mediaRecorderRef.current.stop();
+      }
+    } catch {}
+    setRecordingAudioForId(null);
+    setTranscribingAudioForId(null);
+    setAudioRecordSeconds(0);
     persistExamLock(false);
     try {
       sessionStorage.removeItem("active_student_session");
@@ -3007,6 +3360,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     lastTeacherNoticeAtRef.current = null;
     warn5MinShownRef.current = false;
     warn1MinShownRef.current = false;
+    assignedFilaRef.current = undefined;
+    setAssignedFila(undefined);
+    besExpiryIsoRef.current = null;
+    setAllowAudioAnswersSession(false);
+    setDeferSolutionsSession(false);
+    setSolutionsReleased(false);
     setActiveScreen("enter-pin");
     setPin("");
     setSessionPin("");
@@ -3180,7 +3539,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   (() => {
                     const parsedEval = safeParseJson(selectedPastSub.Full_Evaluation) || {};
                     const parsedAnswers = safeParseJson(selectedPastSub.Risposte_Studente) || {};
-                    const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
+                    const unlockedPast = unlockedPastSubmissions[selectedPastSub.id];
+                    const parsedExamData = unlockedPast?.examData || safeParseJson(selectedPastSub.Domande_Esame) || {};
 
                     const pastIsPending =
                       isEvaluationPending(parsedEval) ||
@@ -3191,6 +3551,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                     const pastSolutionsMasked =
                       Boolean(selectedPastSub.Soluzioni_Differite) &&
                       !pastSessionSolutionsReleased[selectedPastSub.id];
+                    const effectiveMainErrors = pastSolutionsMasked
+                      ? null
+                      : unlockedPast?.mainErrors || selectedPastSub.Errori_Principali || parsedEval?.mainErrors;
 
                     return (
                       <div className="space-y-6 animate-fadeIn text-left text-slate-100">
@@ -3204,7 +3567,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
                         <div className="p-4 bg-slate-950/60 border border-white/5 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                           <div>
-                            <div className="flex items-center gap-2">
+                            <div className="flex items-center gap-2 flex-wrap">
                               <span className={`text-[10px] uppercase font-bold px-2 py-0.5 rounded-full border ${
                                 selectedPastSub.Tipo === "Quiz"
                                   ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
@@ -3213,6 +3576,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 {selectedPastSub.Tipo || "Verifica"}
                               </span>
                               <span className="text-xs text-slate-400 font-semibold font-mono">PIN: {selectedPastSub.Pin}</span>
+                              {selectedPastSub.Assigned_Fila && (
+                                <span className="text-[10px] uppercase font-bold px-2 py-0.5 rounded-md bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                                  Fila {selectedPastSub.Assigned_Fila}
+                                </span>
+                              )}
                             </div>
                             <p className="text-xs text-slate-400 mt-1.5">Svolto il: {selectedPastSub.Timestamp ? new Date(selectedPastSub.Timestamp).toLocaleString("it-IT") : "N/D"}</p>
                           </div>
@@ -3234,6 +3602,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           </div>
                         </div>
 
+                        {pastUnlockingId === selectedPastSub.id && (
+                          <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-200 text-xs flex items-center gap-2">
+                            <Loader2 className="w-4 h-4 animate-spin shrink-0" />
+                            <span>Sblocco soluzioni differite in corso dal registro sicuro...</span>
+                          </div>
+                        )}
+
                         {/* AI Personalized Study & Recovery Plan Section */}
                         <div className="bg-gradient-to-br from-indigo-950/30 to-slate-950/60 border border-indigo-500/25 p-5 rounded-2xl space-y-4">
                           <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-indigo-500/10 pb-3">
@@ -3241,7 +3616,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               <Sparkles className="w-5 h-5 text-indigo-400 animate-pulse" />
                               <h4 className="text-xs font-bold uppercase tracking-wider">Docenza Tutor: Piano di Recupero IA</h4>
                             </div>
-                            {!selectedPastSub.Piano_Recupero && !isEvaluationPending(parsedEval) && (
+                            {!selectedPastSub.Piano_Recupero && !isEvaluationPending(parsedEval) && !pastSolutionsMasked && (
                               <button
                                 onClick={() => handleGenerateRecoveryPlan(selectedPastSub.id, selectedPastSub)}
                                 disabled={generatingPlan}
@@ -3289,6 +3664,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     </div>
                                   )}
                                 </div>
+                              ) : pastSolutionsMasked ? (
+                                <div className="space-y-1 text-amber-200/80">
+                                  <p>🔒 Il Piano di Recupero personalizzato sarà generabile dopo la pubblicazione delle soluzioni da parte del docente.</p>
+                                </div>
                               ) : (
                                 <div className="space-y-2">
                                   <p>Nessun piano di ripasso personalizzato attivo per questo compito.</p>
@@ -3313,8 +3692,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           </div>
                         )}
 
-                        {/* Critical Errors recap (if stored) */}
-                        {(selectedPastSub.Errori_Principali || parsedEval?.mainErrors) && (
+                        {/* Critical Errors recap (masked while deferred solutions locked) */}
+                        {!pastSolutionsMasked && effectiveMainErrors && (
                           <div className="bg-rose-950/30 border border-rose-500/20 p-4.5 rounded-2xl space-y-2">
                             <h4 className="text-xs font-semibold tracking-wider text-rose-300 uppercase flex items-center gap-1.5">
                               <AlertTriangle className="w-4 h-4 text-rose-400" />
@@ -3322,7 +3701,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                             </h4>
                             <div 
                               className="text-xs text-rose-100/90 leading-relaxed"
-                              dangerouslySetInnerHTML={{ __html: formatMarkdown(selectedPastSub.Errori_Principali || parsedEval.mainErrors) }}
+                              dangerouslySetInnerHTML={{ __html: formatMarkdown(effectiveMainErrors) }}
                             />
                           </div>
                         )}
@@ -3637,7 +4016,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               className="p-3.5 bg-slate-950/45 hover:bg-slate-950 border border-white/5 hover:border-white/10 rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-all active:scale-[0.99] group"
                             >
                               <div className="space-y-1">
-                                <div className="flex items-center gap-2">
+                                <div className="flex items-center gap-2 flex-wrap">
                                   <span className={`text-[9px] uppercase font-semibold px-2 py-0.5 rounded-full border ${
                                     sub.Tipo === "Quiz"
                                       ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
@@ -3646,6 +4025,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     {sub.Tipo}
                                   </span>
                                   <span className="text-xs text-slate-400 font-semibold font-mono">PIN: {sub.Pin}</span>
+                                  {sub.Assigned_Fila && (
+                                    <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                                      Fila {sub.Assigned_Fila}
+                                    </span>
+                                  )}
                                 </div>
                                 <p className="text-[10px] text-slate-500">Svolto il: {dateStr}</p>
                                 {sub.Piano_Recupero && (
@@ -3984,9 +4368,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             </div>
 
             <div className="border-b border-white/5 pb-4 mb-6 text-center">
-              <p className="text-xs uppercase font-mono tracking-wider text-teal-400 font-semibold mb-1">
-                {examType === "quiz" ? "Quiz dell'Istituto" : "Quaderno Workbook"}
-              </p>
+              <div className="flex items-center justify-center gap-2 mb-1 flex-wrap">
+                <p className="text-xs uppercase font-mono tracking-wider text-teal-400 font-semibold">
+                  {examType === "quiz" ? "Quiz dell'Istituto" : "Quaderno Workbook"}
+                </p>
+                {assignedFila && (
+                  <span className="px-2 py-0.5 rounded-md bg-indigo-500/20 border border-indigo-400/40 text-indigo-200 text-[10px] font-bold uppercase tracking-wider">
+                    Traccia Fila {assignedFila}
+                  </span>
+                )}
+              </div>
               <h2 className="text-xl sm:text-2xl font-display font-bold text-white">
                 {examType === "quiz" ? (examData?.title || "Test Valutativo") : (examData?.title || "Workbook Inattivo")}
               </h2>
@@ -4065,6 +4456,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               </span>
                               {q.question}
                               {renderSpeakButton(String(q.question || ""), `quiz_oe_${q.id || qIdx}`)}
+                              {renderAudioAnswerButton(`quiz_oe_${q.id || qIdx}`, "oe", q.id)}
                               <QuestionMeta q={q} />
                             </p>
                             <QuestionFigure src={examData?.images?.[q.id]} />
@@ -4108,6 +4500,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               </span>
                               {q.question}
                               {renderSpeakButton(String(q.question || ""), `quiz_rq_${q.id || qIdx}`)}
+                              {renderAudioAnswerButton(`quiz_rq_${q.id || qIdx}`, "both", q.id)}
                               <QuestionMeta q={q} tone="teal" />
                             </p>
                             <div className="space-y-1.5">
@@ -4320,6 +4713,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                 <p className="text-xs font-semibold text-slate-300">
                                   {rIdx + 1}. {rq.question}
                                   {renderSpeakButton(String(rq.question || ""), `wb_sec_${sIdx}_rq_${rq.id || rIdx}`)}
+                                  {renderAudioAnswerButton(`wb_sec_${sIdx}_rq_${rq.id || rIdx}`, "wbRq", rq.id)}
                                   <QuestionMeta q={rq} tone="teal" />
                                 </p>
                                 <textarea
@@ -4472,8 +4866,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               <p className="text-xs font-semibold tracking-widest text-slate-500 uppercase">
                 Scheda corretta ricevuta ✓
               </p>
-              <h2 className="text-2xl font-display font-bold text-white mt-1">
-                Risultati della Valutazione
+              <h2 className="text-2xl font-display font-bold text-white mt-1 flex items-center justify-center gap-2 flex-wrap">
+                <span>Risultati della Valutazione</span>
+                {assignedFila && (
+                  <span className="px-2.5 py-0.5 rounded-lg bg-indigo-500/20 border border-indigo-400/40 text-indigo-200 text-xs font-bold uppercase tracking-wider">
+                    Fila {assignedFila}
+                  </span>
+                )}
               </h2>
             </div>
 
@@ -4538,7 +4937,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   {examType === "quiz" ? "Punteggio Crocette" : "Fill-in-blank"}
                 </p>
                 <p className="text-2xl font-display font-bold text-white mt-2">
-                  {examType === "quiz" ? (
+                  {deferSolutionsSession && !solutionsReleased ? (
+                    <span className="text-base text-amber-300 font-bold">🔒 Differito</span>
+                  ) : examType === "quiz" ? (
                     <>
                       {Object.keys(answers.mc).reduce((acc, qId) => {
                         const question = examData?.multipleChoice?.find((q: any) => q.id === qId);
@@ -4560,8 +4961,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             </div>
 
-            {/* Detailed Grade Calculation & Average breakdown */}
-            {evaluation && (
+            {/* Detailed Grade Calculation & Average breakdown (hidden until deferred solutions are unlocked) */}
+            {evaluation && (!deferSolutionsSession || solutionsReleased) && (
               <GradeCalculationReport
                 breakdown={computeGradeBreakdown({
                   tipo: examType === "quiz" ? "Quiz" : "Workbook",
@@ -4608,8 +5009,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
-            {/* Critical Errors recap */}
-            {evaluation?.mainErrors && (
+            {/* Critical Errors recap (hidden until deferred solutions are unlocked) */}
+            {(!deferSolutionsSession || solutionsReleased) && evaluation?.mainErrors && (
               <div className="bg-rose-950/30 border border-rose-500/20 p-5 rounded-2xl space-y-2">
                 <h4 className="text-xs font-semibold tracking-wider text-rose-300 uppercase">
                   Errori Principali Rilevati

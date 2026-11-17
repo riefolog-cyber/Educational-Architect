@@ -28,7 +28,8 @@
         "PII_Oscurate_Count": { "type": "integer" },
         "Convalida_Docente_At": { "type": "string" },
         "Convalida_Docente_Email": { "type": "string" },
-        "Soluzioni_Differite": { "type": "boolean" }
+        "Soluzioni_Differite": { "type": "boolean" },
+        "Assigned_Fila": { "type": "string", "enum": ["A", "B"] }
       },
       "required": ["Timestamp", "Tipo", "Email", "Voto_Suggerito"]
     },
@@ -59,7 +60,10 @@
         "deferSolutions": { "type": "boolean" },
         "solutionsReleased": { "type": "boolean" },
         "solutionsReleasedAt": { "type": "string" },
-        "besOptions": { "type": "object" }
+        "besOptions": { "type": "object" },
+        "mixFilaAB": { "type": "boolean" },
+        "filaBTitle": { "type": "string" },
+        "allowAudioAnswers": { "type": "boolean" }
       },
       "required": ["pin", "expiry"]
     },
@@ -83,7 +87,9 @@
         "lockState": { "type": "string" },
         "lockReason": { "type": "string" },
         "draftAnswersJson": { "type": "string" },
-        "draftUpdatedAt": { "type": "string" }
+        "draftUpdatedAt": { "type": "string" },
+        "besExpiryIso": { "type": "string" },
+        "assignedFila": { "type": "string", "enum": ["A", "B"] }
       },
       "required": ["studentEmail"]
     },

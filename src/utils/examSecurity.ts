@@ -32,6 +32,17 @@ function deterministicHash(input: string): number {
 }
 
 /**
+ * Deterministically assigns "A" or "B" for a student in a mixed-row session
+ * so page reloads or PC switches keep the same assigned variant.
+ */
+export function assignDeterministicFila(email?: string | null, seed?: string | null): "A" | "B" {
+  const normEmail = String(email || "").trim().toLowerCase();
+  const normSeed = String(seed || "").trim().toUpperCase();
+  const h = deterministicHash(`${normEmail}|${normSeed}`);
+  return h % 2 === 0 ? "A" : "B";
+}
+
+/**
  * Produces a student-safe copy of examData with all solution fields removed
  * (`correctIndex`, `answer`, `explanation`, and inline `[word]` FIB hints)
  * plus a compact key map suitable for encrypted server-side scoring.

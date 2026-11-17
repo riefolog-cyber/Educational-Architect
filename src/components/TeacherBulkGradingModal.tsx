@@ -19,6 +19,13 @@ import {
 } from "../utils/gradebookExport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { downloadTextFile } from "../utils/examLibrary";
+import {
+  detectGradeDiscrepancy,
+  getPendingSubjectiveCount,
+  isEvaluationPending,
+  parseItalianGrade,
+  safeParseJson,
+} from "../utils";
 
 export interface BulkValidationUpdate {
   id: string;
@@ -59,6 +66,7 @@ export default function TeacherBulkGradingModal({
   const [preset, setPreset] = useState<GradebookExportPreset>("argo_didup");
   const [onlyValidatedExport, setOnlyValidatedExport] = useState(false);
   const [applyRoundingOnValidate, setApplyRoundingOnValidate] = useState(true);
+  const [quickFilter, setQuickFilter] = useState<"all" | "unvalidated" | "violations" | "attention" | "pending">("all");
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isSaving, setIsSaving] = useState(false);
@@ -73,14 +81,70 @@ export default function TeacherBulkGradingModal({
     return Array.from(pins).sort();
   }, [submissions]);
 
-  const rows = useMemo(() => {
+  const pinFiltered = useMemo(() => {
     return submissions.filter((s) => {
       if (selectedPin === "ALL") return true;
       return String(s.Pin || "").trim().toUpperCase() === selectedPin;
     });
   }, [submissions, selectedPin]);
 
+  const getViolationsCount = (s: SavedSubmission) =>
+    Number(s.AntiCopia_TabSwitch || 0) +
+    Number(s.AntiCopia_IncollaBloccato || 0) +
+    Number(s.AntiCopia_SchermoDiviso || 0);
+
+  const isSubPending = (s: SavedSubmission) =>
+    isEvaluationPending(safeParseJson(s.Full_Evaluation)) ||
+    getPendingSubjectiveCount(s) > 0 ||
+    s.Voto_Suggerito === "N.V.";
+
+  const quickCounts = useMemo(() => {
+    let unvalidated = 0;
+    let violations = 0;
+    let attention = 0;
+    let pending = 0;
+    for (const s of pinFiltered) {
+      if (!s.Convalida_Docente_At) unvalidated++;
+      if (getViolationsCount(s) > 0) violations++;
+      const g = parseItalianGrade(s.Voto_Suggerito);
+      if (detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6)) attention++;
+      if (isSubPending(s)) pending++;
+    }
+    return { all: pinFiltered.length, unvalidated, violations, attention, pending };
+  }, [pinFiltered]);
+
+  const rows = useMemo(() => {
+    return pinFiltered.filter((s) => {
+      if (quickFilter === "unvalidated") return !s.Convalida_Docente_At;
+      if (quickFilter === "violations") return getViolationsCount(s) > 0;
+      if (quickFilter === "attention") {
+        const g = parseItalianGrade(s.Voto_Suggerito);
+        return detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6);
+      }
+      if (quickFilter === "pending") return isSubPending(s);
+      return true;
+    });
+  }, [pinFiltered, quickFilter]);
+
   if (!isOpen) return null;
+
+  const cleanUnvalidatedRows = rows.filter(
+    (s) =>
+      !s.Convalida_Docente_At &&
+      !isSubPending(s) &&
+      getViolationsCount(s) === 0 &&
+      !!s.Voto_Suggerito &&
+      s.Voto_Suggerito !== "N.V."
+  );
+
+  const handleSelectCleanUnvalidated = () => {
+    setSelectedIds(new Set(cleanUnvalidatedRows.map((r) => r.id)));
+    if (cleanUnvalidatedRows.length === 0) {
+      setStatusMsg("⚠️ Nessun elaborato regolare non ancora convalidato nella vista corrente.");
+    } else {
+      setStatusMsg(`✅ Selezionati ${cleanUnvalidatedRows.length} elaborati regolari pronti per la convalida.`);
+    }
+  };
 
   const allSelected = rows.length > 0 && rows.every((r) => selectedIds.has(r.id));
 
@@ -262,6 +326,48 @@ export default function TeacherBulkGradingModal({
           </div>
         </div>
 
+        {/* Quick Filters & Smart Selection row */}
+        <div className="px-4 sm:px-5 py-2.5 bg-slate-950/60 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(
+              [
+                { id: "all", label: "Tutti", count: quickCounts.all },
+                { id: "unvalidated", label: "Da convalidare", count: quickCounts.unvalidated },
+                { id: "violations", label: "Con infrazioni", count: quickCounts.violations },
+                { id: "attention", label: "Voti < 6 / Discrepanze", count: quickCounts.attention },
+                { id: "pending", label: "Sospesi N.V.", count: quickCounts.pending },
+              ] as const
+            ).map((f) => (
+              <button
+                key={f.id}
+                type="button"
+                onClick={() => {
+                  setQuickFilter(f.id);
+                  setSelectedIds(new Set());
+                }}
+                className={`px-2.5 py-1 rounded-lg font-semibold cursor-pointer border transition-colors flex items-center gap-1.5 ${
+                  quickFilter === f.id
+                    ? "bg-indigo-600/30 border-indigo-400/60 text-indigo-100"
+                    : "bg-slate-900 border-white/10 text-slate-400 hover:text-white"
+                }`}
+              >
+                <span>{f.label}</span>
+                <span className="font-mono text-[10px] opacity-80">{f.count}</span>
+              </button>
+            ))}
+          </div>
+          <button
+            type="button"
+            onClick={handleSelectCleanUnvalidated}
+            disabled={cleanUnvalidatedRows.length === 0}
+            className="px-3 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-40 border border-emerald-500/35 text-emerald-200 font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+            title="Seleziona in 1 click gli elaborati non convalidati, valutati e senza segnalazioni anti-copia"
+          >
+            <Check className="w-3.5 h-3.5" />
+            <span>Seleziona regolari ({cleanUnvalidatedRows.length})</span>
+          </button>
+        </div>
+
         {/* Options row & notifications */}
         <div className="px-4 sm:px-5 py-2.5 bg-slate-900 border-b border-white/5 flex flex-wrap items-center justify-between gap-3 text-[11px]">
           <div className="flex flex-wrap items-center gap-4">
@@ -340,9 +446,25 @@ export default function TeacherBulkGradingModal({
                           />
                         </td>
                         <td className="p-3">
-                          <p className="font-bold text-white">
-                            {blindGradingMode ? `Studente ${code}` : (sub.Nome || "Studente")}
-                          </p>
+                          <div className="flex items-center gap-1.5 flex-wrap">
+                            <p className="font-bold text-white">
+                              {blindGradingMode ? `Studente ${code}` : (sub.Nome || "Studente")}
+                            </p>
+                            {sub.Assigned_Fila && (
+                              <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ${
+                                sub.Assigned_Fila === "B"
+                                  ? "bg-purple-500/15 text-purple-200 border-purple-500/30"
+                                  : "bg-sky-500/15 text-sky-200 border-sky-500/30"
+                              }`}>
+                                Fila {sub.Assigned_Fila}
+                              </span>
+                            )}
+                            {getViolationsCount(sub) > 0 && (
+                              <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-rose-500/15 text-rose-300 border border-rose-500/30">
+                                ⚠ {getViolationsCount(sub)}
+                              </span>
+                            )}
+                          </div>
                           <p className="text-[10px] text-slate-400 font-mono">
                             {blindGradingMode ? code : sub.Email}
                           </p>

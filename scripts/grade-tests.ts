@@ -18,7 +18,7 @@ import {
   sanitizeAiHtml,
 } from "../src/utils";
 import { computeExamItemAnalysis } from "../src/utils/examAnalytics";
-import { stripExamAnswers, restoreExamAnswers } from "../src/utils/examSecurity";
+import { stripExamAnswers, restoreExamAnswers, assignDeterministicFila } from "../src/utils/examSecurity";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -1091,6 +1091,24 @@ test("BES reduceDistractors (4 -> 3 opzioni) preserva il grading esatto dopo res
   const restored = restoreExamAnswers(sanitizedExam, answerKey, { q1: newOrder });
   const restoredOptions = newOrder.map((origIdx) => sanitizedExam.multipleChoice[0].options[origIdx]);
   assert.equal(restoredOptions[restored.multipleChoice[0].correctIndex], "Roma");
+});
+
+test("assignDeterministicFila: assegnazione stabile A/B e bilanciata su una classe", () => {
+  const f1 = assignDeterministicFila("mario.rossi@scuola.it", "sess_2026_1");
+  const f2 = assignDeterministicFila("  MARIO.ROSSI@SCUOLA.IT ", "sess_2026_1");
+  assert.ok(f1 === "A" || f1 === "B");
+  assert.equal(f1, f2);
+
+  // Check across 30 students that both Fila A and Fila B are assigned
+  let countA = 0;
+  let countB = 0;
+  for (let i = 1; i <= 30; i++) {
+    const f = assignDeterministicFila(`studente.${i}@scuola.edu.it`, "PIN_MISTO_1");
+    assert.ok(f === "A" || f === "B");
+    if (f === "A") countA++;
+    else countB++;
+  }
+  assert.ok(countA > 0 && countB > 0, `attesi sia A che B, ricevuti A=${countA}, B=${countB}`);
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

@@ -353,7 +353,7 @@ async function checkDocentiFirestoreRole(email: string, idToken: string): Promis
       });
       if (!resp.ok) return false;
       const rows = (await resp.json()) as any[];
-      return Array.isArray(rows) && rows.some((r) => r?.document?.fields?.role?.stringValue === "admin");
+      return Array.isArray(rows) && rows.some((r) => ["admin", "teacher"].includes(String(r?.document?.fields?.role?.stringValue || "")));
     } finally {
       clearTimeout(t);
     }
@@ -829,6 +829,7 @@ function decryptAnswerKey(token: unknown): any | null {
 
 async function runEvaluationCore(reqBody: any) {
   const { tipo, prompt, report } = reqBody;
+  const deferSolutions = Boolean(reqBody?.deferSolutions);
 
   if (!getApiKey()) {
     throw new Error("La chiave API di Gemini non è configurata nell'ambiente.");
@@ -885,8 +886,11 @@ async function runEvaluationCore(reqBody: any) {
 
   const attachAuthoritativeFields = (resObj: any) => {
     if (!resObj || typeof resObj !== "object") return resObj;
-    if (restoredFromVault && report.domande) {
+    if (restoredFromVault && report.domande && !deferSolutions) {
       resObj.resolvedDomande = report.domande;
+    }
+    if (deferSolutions) {
+      resObj.deferredSolutionsLocked = true;
     }
     resObj.calculatedMCScore = Number(report.punteggioMC || 0);
     if (report.punteggioFIB !== undefined) {
@@ -929,6 +933,7 @@ async function runEvaluationCore(reqBody: any) {
       });
       const mathGrade = mathBreakdown.finalGradeFormatted;
 
+      const deferredNotice = "Soluzioni e dettagli degli errori nascosti fino al rilascio da parte del docente.";
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova è un Quiz composto ESCLUSIVAMENTE da domande a scelta multipla (crocette). In questo esame NON sono presenti domande aperte.
 Lo studente ha ottenuto un punteggio di ${mcScore} risposte esatte su ${mcCount} domande (punteggio matematico: ${((mcScore / (mcCount || 1)) * 10).toFixed(1)}/10), con voto scolastico: ${mathGrade}.
@@ -937,9 +942,11 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
 
 [DIRETTIVE DI VALUTAZIONE E DOCIMOLOGIA]
 1. Sintesi errori concettuali ("mainErrors"):
-   ${wrongQuestions.length > 0 
-     ? `Spiega in modo pedagogico, chiaro e costruttivo i concetti delle domande in cui l'alunno ha sbagliato (${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}" [Scelta studente: "${w.studentChoice}" vs Corretta: "${w.correctChoice}"]`).join("; ")}). Chiarisci perché l'opzione corretta è quella valida, senza toni punitivi.`
-     : `L'alunno ha risposto correttamente a tutte le domande del quiz (punteggio pieno ${mcScore}/${mcCount}). Esprimi compiacimento per l'impeccabile preparazione.`}
+   ${deferSolutions
+     ? `MODALITÀ SOLUZIONI DIFFERITE ATTIVA: NON menzionare MAI né in "mainErrors" né in "openEndedEvaluation" quali domande ha sbagliato lo studente, né i testi dei quesiti, né le opzioni corrette/errate. Per "mainErrors" scrivi testualmente: "${deferredNotice}".`
+     : wrongQuestions.length > 0 
+       ? `Spiega in modo pedagogico, chiaro e costruttivo i concetti delle domande in cui l'alunno ha sbagliato (${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}" [Scelta studente: "${w.studentChoice}" vs Corretta: "${w.correctChoice}"]`).join("; ")}). Chiarisci perché l'opzione corretta è quella valida, senza toni punitivi.`
+       : `L'alunno ha risposto correttamente a tutte le domande del quiz (punteggio pieno ${mcScore}/${mcCount}). Esprimi compiacimento per l'impeccabile preparazione.`}
 2. Giudizio complessivo ("openEndedEvaluation"):
    Fornisci un giudizio didattico complessivo equilibrato, positivo e motivante sull'andamento della prova a scelta multipla (${mcScore}/${mcCount}, voto ${mathGrade}).
    Dedica l'ultimo paragrafo all'analisi metacognitiva: confronta il voto matematico (${mathGrade}) con l'autovalutazione dell'alunno (${report.autovalutazione}/10).
@@ -951,7 +958,9 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         const response = await generateWithRetry({
           model: TASK_MODEL_PREFERENCE["evaluate"][0],
           models: TASK_MODEL_PREFERENCE["evaluate"],
-          contents: `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
+          contents: deferSolutions
+            ? `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Le domande errate e le soluzioni sono oscurate per rilascio differito.`
+            : `Valuta la prova a scelta multipla dello studente. Punteggio: ${mcScore}/${mcCount}. Domande errate: ${JSON.stringify(wrongQuestions)}`,
           config: {
             systemInstruction,
             temperature: 0.1,
@@ -978,6 +987,9 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         if (!evaluation || typeof evaluation !== "object" || Array.isArray(evaluation)) {
           throw new Error("Struttura JSON di valutazione non valida.");
         }
+        if (deferSolutions) {
+          evaluation.mainErrors = deferredNotice;
+        }
         evaluation.suggestedGrade = mathGrade;
         evaluation.openEndedDetails = [];
         evaluation.evaluationMode = "ai";
@@ -987,13 +999,15 @@ Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non spe
         // Fallback deterministico: se l'IA non è disponibile o fallisce, il voto
         // resta comunque calcolato in modo rigoroso dalle risposte corrette.
         console.warn("[evaluate] Fallback deterministico MC-only:", aiErr?.message || aiErr);
-        const wrongSummary = wrongQuestions.length > 0
-          ? `Domande errate: ${wrongQuestions.map(w => `${w.number}) ${w.question} (scelta: ${w.studentChoice} → corretta: ${w.correctChoice})`).join("; ")}.`
-          : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
+        const wrongSummary = deferSolutions
+          ? deferredNotice
+          : wrongQuestions.length > 0
+            ? `Domande errate: ${wrongQuestions.map(w => `${w.number}) ${w.question} (scelta: ${w.studentChoice} → corretta: ${w.correctChoice})`).join("; ")}.`
+            : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
         return attachAuthoritativeFields({
           suggestedGrade: mathGrade,
           mainErrors: wrongSummary,
-          openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
+          openEndedEvaluation: `Valutazione deterministica (riserva senza IA): punteggio ${mcScore}/${mcCount}, voto scolastico ${mathGrade}. ${deferSolutions ? "Le soluzioni dettagliate saranno pubblicate dal docente a fine prova." : wrongQuestions.length > 0 ? "Rivedi i concetti delle domande errate indicate sopra." : "Ottima preparazione: tutte le risposte sono corrette."} Metacognizione: autovalutazione studente ${report.autovalutazione || "N/D"}/10.`,
           openEndedDetails: [],
           evaluationMode: "deterministic",
           gradeBreakdown: mathBreakdown
@@ -2480,10 +2494,11 @@ REGOLE ESSENZIALI:
   }
 });
 
-// Teacher-only: prepare student-safe sanitized exam + AES-256-GCM encrypted answer key vault
+// Teacher-only: prepare student-safe sanitized exam + AES-256-GCM encrypted answer key vault (+ optional Fila B)
 app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req, res) => {
   try {
     const rawExam = req.body?.examData;
+    const rawFilaB = req.body?.filaBExamData;
     const reduceDistractors = Boolean(req.body?.reduceDistractors);
     if (!rawExam || typeof rawExam !== "object") {
       return res.status(400).json({ error: "Dati della prova non validi o mancanti." });
@@ -2491,11 +2506,169 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
     const normalized = normalizeExamStructure(JSON.parse(JSON.stringify(rawExam)));
     const { sanitizedExam, answerKey } = stripExamAnswers(normalized, { reduceDistractors });
     const encryptedAnswerKey = encryptAnswerKey(answerKey);
+
+    let sanitizedFilaBExam: any = undefined;
+    let encryptedFilaBAnswerKey: string | undefined = undefined;
+    if (rawFilaB && typeof rawFilaB === "object") {
+      const normalizedB = normalizeExamStructure(JSON.parse(JSON.stringify(rawFilaB)));
+      const strippedB = stripExamAnswers(normalizedB, { reduceDistractors });
+      sanitizedFilaBExam = strippedB.sanitizedExam;
+      encryptedFilaBAnswerKey = encryptAnswerKey(strippedB.answerKey);
+    }
+
     res.setHeader("Cache-Control", "no-store");
-    return res.json({ status: "success", sanitizedExam, encryptedAnswerKey });
+    return res.json({
+      status: "success",
+      sanitizedExam,
+      encryptedAnswerKey,
+      ...(sanitizedFilaBExam ? { sanitizedFilaBExam, encryptedFilaBAnswerKey } : {}),
+    });
   } catch (err: any) {
     console.error("[session/prepare] Failed:", err);
     return res.status(500).json({ error: "Impossibile preparare la sessione protetta." });
+  }
+});
+
+// Student/Class endpoint: decrypt and restore deferred solutions ONLY once Firestore confirms teacher released them
+app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const cleanPin = String(req.body?.pin || "").trim().toUpperCase();
+    const requestedSessionId = String(req.body?.sessionId || "").trim();
+    const encryptedAnswerKey = String(req.body?.encryptedAnswerKey || "").trim();
+    const examData = req.body?.examData;
+    const mcOptionOrder = req.body?.mcOptionOrder;
+    const answers = req.body?.answers;
+    const tipo = String(req.body?.tipo || "Quiz");
+
+    if (!cleanPin || !examData || typeof examData !== "object") {
+      return res.status(400).json({ error: "Parametri sessione mancanti." });
+    }
+
+    // Verify against Firestore active_sessions/{pin} unless caller is an authenticated teacher
+    const teacherCheck = await verifyTeacherFromRequest(req);
+    if (!teacherCheck.ok) {
+      const projectId = (firebaseConfig as any).projectId;
+      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
+      if (!projectId) {
+        return res.status(500).json({ error: "Configurazione Firebase del server incompleta." });
+      }
+      const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`;
+      const fsResp = await fetch(docUrl);
+      if (!fsResp.ok) {
+        return res.status(403).json({ error: "Sessione non più attiva o soluzioni non rilasciate pubblicamente." });
+      }
+      const fsDoc: any = await fsResp.json().catch(() => null);
+      const fields = fsDoc?.fields || {};
+      const fsSessionId = String(fields?.sessionId?.stringValue || "").trim();
+      const fsDefer = Boolean(fields?.deferSolutions?.booleanValue);
+      const fsReleased = Boolean(fields?.solutionsReleased?.booleanValue);
+
+      if (requestedSessionId && fsSessionId && requestedSessionId !== fsSessionId) {
+        return res.status(403).json({ error: "Questo PIN appartiene a una sessione diversa." });
+      }
+      if (fsDefer && !fsReleased) {
+        return res.status(403).json({ error: "Le soluzioni non sono ancora state pubblicate dal docente." });
+      }
+    }
+
+    let resolvedDomande = examData;
+    let keySource = encryptedAnswerKey;
+    const assignedFila = String(req.body?.assignedFila || "").trim().toUpperCase();
+    if (!keySource) {
+      // Fallback: fetch key from active_sessions doc if client didn't hold encryptedAnswerKey
+      const projectId = (firebaseConfig as any).projectId;
+      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
+      if (projectId) {
+        const fsResp = await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`);
+        if (fsResp.ok) {
+          const fsDoc: any = await fsResp.json().catch(() => null);
+          const fields = fsDoc?.fields || {};
+          keySource = assignedFila === "B" && fields?.encryptedFilaBAnswerKey?.stringValue
+            ? String(fields.encryptedFilaBAnswerKey.stringValue)
+            : String(fields?.encryptedAnswerKey?.stringValue || "");
+        }
+      }
+    }
+
+    if (keySource) {
+      const answerKey = decryptAnswerKey(keySource);
+      if (answerKey) {
+        resolvedDomande = restoreExamAnswers(examData, answerKey, mcOptionOrder);
+      }
+    }
+
+    let mainErrors: string | undefined;
+    if (tipo.toLowerCase() === "quiz" && Array.isArray(resolvedDomande?.multipleChoice)) {
+      const wrongList: string[] = [];
+      resolvedDomande.multipleChoice.forEach((q: any, idx: number) => {
+        const uIdx = answers?.mc?.[q.id];
+        if (uIdx === undefined || uIdx === null || Number(uIdx) !== Number(q.correctIndex)) {
+          const chosenText = uIdx !== undefined && q.options?.[uIdx] ? q.options[uIdx] : "Nessuna";
+          const correctText = q.options?.[q.correctIndex] || "Opzione corretta";
+          wrongList.push(`${idx + 1}) ${q.question} (scelta: ${chosenText} → corretta: ${correctText})`);
+        }
+      });
+      mainErrors = wrongList.length > 0
+        ? `Domande errate: ${wrongList.join("; ")}.`
+        : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
+    }
+
+    return res.json({ status: "success", unlocked: true, resolvedDomande, mainErrors });
+  } catch (err: any) {
+    console.error("[session/unlock-solutions] Failed:", err);
+    return res.status(500).json({ error: "Impossibile sbloccare le soluzioni." });
+  }
+});
+
+// Student oral answer transcription via Gemini Audio (gemini-3.5-transcribe)
+app.post("/api/transcribe-audio", evalRateLimiter, async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  if (!getApiKey()) {
+    return res.status(500).json({ error: "La chiave API di Gemini non è configurata." });
+  }
+  const rawAudio = typeof req.body?.audioBase64 === "string" ? req.body.audioBase64.trim() : "";
+  const rawMime = typeof req.body?.mimeType === "string" ? req.body.mimeType.trim() : "audio/webm";
+  const baseMime = rawMime.split(";")[0].trim().toLowerCase();
+  const allowedAudioMimes = new Set(["audio/webm", "audio/mp4", "audio/mpeg", "audio/mp3", "audio/ogg", "audio/wav", "audio/aac"]);
+
+  if (!rawAudio) {
+    return res.status(400).json({ error: "Registrazione audio mancante." });
+  }
+  if (!allowedAudioMimes.has(baseMime)) {
+    return res.status(400).json({ error: `Formato audio non supportato (${baseMime}).` });
+  }
+  const cleanBase64 = rawAudio.replace(/^data:audio\/[a-z0-9.+-]+(?:;[^;,]+)*;base64,/i, "");
+  if (cleanBase64.length > 6_000_000) {
+    return res.status(413).json({ error: "La registrazione audio supera il limite massimo consentito (circa 4 MB)." });
+  }
+
+  try {
+    const ai = getAiClient();
+    const response = await withAttemptTimeout(
+      ai.models.generateContent({
+        model: "gemini-3.5-transcribe",
+        contents: {
+          parts: [
+            { inlineData: { mimeType: baseMime === "audio/mp3" ? "audio/mpeg" : baseMime, data: cleanBase64 } },
+            { text: "Trascrivi fedelmente questo audio parlato da uno studente in lingua italiana scolastica con punteggiatura corretta. Restituisci esclusivamente la trascrizione, senza commenti aggiuntivi o prefissi." },
+          ],
+        },
+      }),
+      35000
+    );
+    const rawText = String(extractResponseText(response) || "").trim();
+    if (!rawText) {
+      return res.status(422).json({ error: "Audio non comprensibile o silenzioso: riprova a registrare più vicino al microfono." });
+    }
+    const { scrubbedText } = scrubPromptPii(rawText, {
+      fullName: typeof req.body?.studentName === "string" ? req.body.studentName : undefined,
+      email: typeof req.body?.studentEmail === "string" ? req.body.studentEmail : undefined,
+    });
+    return res.json({ status: "success", transcript: scrubbedText });
+  } catch (err: any) {
+    console.error("[transcribe-audio] Failed:", err);
+    return res.status(500).json({ error: humanAiError(err?.message || "Errore durante la trascrizione audio.") });
   }
 });
 

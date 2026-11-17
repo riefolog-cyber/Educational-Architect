@@ -49,7 +49,8 @@ import {
   PlusCircle,
   Undo2,
   FileUp,
-  Archive
+  Archive,
+  Mic
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType, getAuthHeaders } from "../firebase";
@@ -376,6 +377,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
   const [besReduceDistractors, setBesReduceDistractors] = useState<boolean>(false);
   const [besAutoOpenBar, setBesAutoOpenBar] = useState<boolean>(false);
+  const [mixFilaAB, setMixFilaAB] = useState<boolean>(false);
+  const [filaBExamJson, setFilaBExamJson] = useState<string>("");
+  const [filaBTitle, setFilaBTitle] = useState<string>("");
+  const [generatingFilaB, setGeneratingFilaB] = useState<boolean>(false);
+  const [allowAudioAnswers, setAllowAudioAnswers] = useState<boolean>(false);
   const [showBulkGradingModal, setShowBulkGradingModal] = useState<boolean>(false);
   const [togglingSolutionsPin, setTogglingSolutionsPin] = useState<string | null>(null);
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
@@ -499,11 +505,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           sessionId: d.sessionId || "",
           active: !!d.active,
           teacherEmail: d.teacherEmail || user.email,
-          unlockCode: d.unlockCode || "",
           deferSolutions: !!d.deferSolutions,
           solutionsReleased: d.deferSolutions ? !!d.solutionsReleased : true,
           solutionsReleasedAt: d.solutionsReleasedAt || null,
           besOptions: d.besOptions || undefined,
+          mixFilaAB: !!d.mixFilaAB,
+          filaBTitle: d.filaBTitle || undefined,
+          allowAudioAnswers: !!d.allowAudioAnswers,
         });
       });
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
@@ -1220,9 +1228,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       return;
     }
 
-    // 6-digit unlock code: a student whose exam got locked after leaving the
-    // page must enter it (or be unlocked from the live monitor) to resume.
-    const unlockCode = String(Math.floor(100000 + Math.random() * 900000));
+    let filaBExamObj: any = null;
+    if (mixFilaAB) {
+      filaBExamObj = validateExamJSON(filaBExamJson);
+      if (!filaBExamObj && canAutoCorrectStructure(filaBExamJson)) {
+        const repairedB = autoCorrectExamJSON(filaBExamJson, (filaBTitle || `${examObj.title || "Verifica"} (Fila B)`).trim());
+        if (repairedB.success) {
+          filaBExamObj = validateExamJSON(repairedB.correctedJson);
+        }
+      }
+      if (!filaBExamObj) {
+        setAppAlert({ msg: "⚠️ Hai attivato Fila A/B Mista: genera prima la Variante Fila B con IA o selezionala dalla libreria." });
+        return;
+      }
+      normalizeExamStructure(filaBExamObj);
+      if (!filaBExamObj.title) {
+        filaBExamObj.title = filaBTitle || `${examObj.title || "Esame"} (Fila B)`;
+      }
+    }
 
     if (dbFirestore) {
       try {
@@ -1248,11 +1271,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const prepResp = await fetch("/api/session/prepare", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
-          body: JSON.stringify({ examData: examObj, reduceDistractors: besReduceDistractors }),
+          body: JSON.stringify({
+            examData: examObj,
+            ...(filaBExamObj ? { filaBExamData: filaBExamObj } : {}),
+            reduceDistractors: besReduceDistractors,
+          }),
         });
         const prepData = await prepResp.json().catch(() => ({}));
         if (!prepResp.ok || !prepData?.sanitizedExam || !prepData?.encryptedAnswerKey) {
           throw new Error(prepData?.error || "Impossibile proteggere le chiavi di risposta sul server.");
+        }
+        if (mixFilaAB && (!prepData?.sanitizedFilaBExam || !prepData?.encryptedFilaBAnswerKey)) {
+          throw new Error("Impossibile proteggere la variante Fila B sul server.");
         }
         const sanitizedExam = prepData.sanitizedExam;
         const encryptedAnswerKey = prepData.encryptedAnswerKey;
@@ -1262,6 +1292,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           reduceDistractors: besReduceDistractors,
           autoOpenAccessibilityBar: besAutoOpenBar,
         };
+
+        const filaBExtra = mixFilaAB && prepData?.sanitizedFilaBExam
+          ? {
+              mixFilaAB: true,
+              filaBTitle: filaBExamObj.title || filaBTitle || `${examObj.title || "Esame"} (Fila B)`,
+              filaBData: prepData.sanitizedFilaBExam,
+              encryptedFilaBAnswerKey: prepData.encryptedFilaBAnswerKey,
+            }
+          : { mixFilaAB: false };
 
         const sessionPayload = {
           data: sanitizedExam,
@@ -1274,8 +1313,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           deferSolutions,
           solutionsReleased: !deferSolutions,
           besOptions: besOptionsPayload,
+          allowAudioAnswers,
+          ...filaBExtra,
           severityPreset: "normale",
-          unlockCode,
           active: true,
           createdAt: new Date().toISOString()
         };
@@ -1297,8 +1337,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           deferSolutions,
           solutionsReleased: !deferSolutions,
           besOptions: besOptionsPayload,
+          allowAudioAnswers,
+          ...filaBExtra,
           severityPreset: "normale",
-          unlockCode,
           active: true,
           createdAt: new Date().toISOString(),
           sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -3107,6 +3148,125 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       <span className="text-slate-200 font-semibold">Apri barra leggibilità BES all'avvio</span>
                     </label>
                   </div>
+                </div>
+
+                {/* Audio Oral Answers Toggle (Gemini Transcribe for DSA/Inclusion) */}
+                <label className="flex items-center gap-2.5 p-2.5 bg-sky-950/20 border border-sky-500/20 rounded-xl cursor-pointer hover:bg-sky-950/35 transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={allowAudioAnswers}
+                    onChange={(e) => setAllowAudioAnswers(e.target.checked)}
+                    className="w-4 h-4 accent-sky-500 rounded cursor-pointer"
+                  />
+                  <div className="text-left">
+                    <span className="text-[11px] font-bold text-sky-200 flex items-center gap-1.5">
+                      <Mic className="w-3.5 h-3.5 text-sky-400" />
+                      <span>Abilita Risposta Vocale (Trascrizione Audio su Domande Aperte)</span>
+                    </span>
+                    <p className="text-[10px] text-slate-300/80 leading-normal">
+                      Consente agli studenti (utile per disgrafia/DSA) di dettare la risposta al microfono trascrivendola nel foglio.
+                    </p>
+                  </div>
+                </label>
+
+                {/* Mixed Fila A / Fila B under Single PIN */}
+                <div className="p-3 bg-purple-950/20 border border-purple-500/25 rounded-xl space-y-2.5 text-left">
+                  <label className="flex items-center gap-2.5 cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={mixFilaAB}
+                      onChange={(e) => setMixFilaAB(e.target.checked)}
+                      className="w-4 h-4 accent-purple-500 rounded cursor-pointer"
+                    />
+                    <div>
+                      <span className="text-[11px] font-bold text-purple-200 flex items-center gap-1.5">
+                        <Shuffle className="w-3.5 h-3.5 text-purple-400" />
+                        <span>Fila A / Fila B Mista sotto un solo PIN</span>
+                      </span>
+                      <p className="text-[10px] text-slate-300/80 leading-normal">
+                        Assegna automaticamente in modo alternato e deterministico la traccia A e la variante B ai banchi con lo stesso PIN.
+                      </p>
+                    </div>
+                  </label>
+
+                  {mixFilaAB && (
+                    <div className="pt-2 border-t border-purple-500/20 space-y-2 text-[10px]">
+                      <div className="flex flex-wrap items-center gap-2">
+                        <button
+                          type="button"
+                          disabled={generatingFilaB || !jsonText.trim()}
+                          onClick={async () => {
+                            if (generatingFilaB || !jsonText.trim()) return;
+                            setGeneratingFilaB(true);
+                            try {
+                              const authHeaders = await getAuthHeaders();
+                              const resp = await fetch("/api/generate-variant", {
+                                method: "POST",
+                                headers: { "Content-Type": "application/json", ...authHeaders },
+                                body: JSON.stringify({ examJson: jsonText, title: materia.trim() || undefined }),
+                              });
+                              const data = await resp.json().catch(() => ({}));
+                              if (!resp.ok || data?.error || !data?.formattedJson) {
+                                throw new Error(data?.details || data?.error || "Errore generazione Fila B.");
+                              }
+                              setFilaBExamJson(data.formattedJson);
+                              setFilaBTitle(data.title || `${materia.trim() || "Verifica"} (Fila B)`);
+                              showNotify("success", "Variante Fila B generata e agganciata alla sessione!");
+                            } catch (err: any) {
+                              showNotify("error", err?.message || "Impossibile generare la Fila B.");
+                            } finally {
+                              setGeneratingFilaB(false);
+                            }
+                          }}
+                          className="px-3 py-1.5 rounded-lg bg-purple-600 hover:bg-purple-500 disabled:opacity-40 text-white font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+                        >
+                          {generatingFilaB ? (
+                            <>
+                              <RefreshCw className="w-3 h-3 animate-spin" />
+                              <span>Generazione Fila B...</span>
+                            </>
+                          ) : (
+                            <>
+                              <Sparkles className="w-3 h-3" />
+                              <span>{filaBExamJson ? "Rigenera Fila B con IA" : "Genera Fila B con IA"}</span>
+                            </>
+                          )}
+                        </button>
+
+                        {library.length > 0 && (
+                          <select
+                            value=""
+                            onChange={(e) => {
+                              const picked = library.find((it) => it.id === e.target.value);
+                              if (picked) {
+                                setFilaBExamJson(picked.examJson);
+                                setFilaBTitle(picked.title);
+                              }
+                            }}
+                            className="flex-1 min-w-[160px] p-1.5 bg-slate-950 border border-white/15 rounded-lg text-slate-200 outline-none"
+                          >
+                            <option value="">Oppure scegli Fila B da libreria...</option>
+                            {library.map((it) => (
+                              <option key={it.id} value={it.id}>
+                                {it.title} ({it.tipo})
+                              </option>
+                            ))}
+                          </select>
+                        )}
+                      </div>
+
+                      {filaBExamJson ? (
+                        <p className="text-emerald-300 font-semibold flex items-center gap-1.5">
+                          <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                          <span>Fila B pronta: {filaBTitle || "Variante personalizzata"}</span>
+                        </p>
+                      ) : (
+                        <p className="text-amber-300/90">
+                          Nessuna Fila B ancora collegata: clicca &quot;Genera Fila B con IA&quot; oppure seleziona una traccia dalla libreria.
+                        </p>
+                      )}
+                    </div>
+                  )}
                 </div>
 
                 {/* Validation Error Message */}

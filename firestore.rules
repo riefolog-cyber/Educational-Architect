@@ -85,18 +85,28 @@ service cloud.firestore {
           'pin', 'title', 'expiry', 'teacherEmail', 'teacherId', 'data',
           'encryptedAnswerKey', 'randomizeQuestions', 'deferSolutions',
           'solutionsReleased', 'solutionsReleasedAt', 'besOptions',
-          'severityPreset', 'unlockCode', 'active', 'createdAt',
-          'sessionId', 'backendUrl'
+          'mixFilaAB', 'filaBData', 'encryptedFilaBAnswerKey', 'filaBTitle',
+          'allowAudioAnswers', 'severityPreset', 'unlockCode', 'active',
+          'createdAt', 'sessionId', 'backendUrl'
         ]) &&
         data.pin is string && data.pin.size() > 0 && data.pin.size() <= 40 &&
         data.expiry is string && data.expiry.size() > 0 && data.expiry.size() <= 64 &&
         data.teacherEmail is string && data.teacherEmail.size() > 0 && data.teacherEmail.size() <= 200 &&
         data.active is bool &&
         (!('title' in data) || (data.title is string && data.title.size() <= 300)) &&
+        (!('teacherId' in data) || (data.teacherId is string && data.teacherId.size() <= 128)) &&
+        (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128)) &&
+        (!('backendUrl' in data) || (data.backendUrl is string && data.backendUrl.size() <= 200)) &&
+        (!('severityPreset' in data) || (data.severityPreset is string && data.severityPreset.size() <= 40)) &&
         (!('encryptedAnswerKey' in data) || (data.encryptedAnswerKey is string && data.encryptedAnswerKey.size() <= 300000)) &&
+        (!('encryptedFilaBAnswerKey' in data) || (data.encryptedFilaBAnswerKey is string && data.encryptedFilaBAnswerKey.size() <= 300000)) &&
+        (!('filaBTitle' in data) || (data.filaBTitle is string && data.filaBTitle.size() <= 300)) &&
         (!('randomizeQuestions' in data) || data.randomizeQuestions is bool) &&
         (!('deferSolutions' in data) || data.deferSolutions is bool) &&
         (!('solutionsReleased' in data) || data.solutionsReleased is bool) &&
+        (!('mixFilaAB' in data) || data.mixFilaAB is bool) &&
+        (!('allowAudioAnswers' in data) || data.allowAudioAnswers is bool) &&
+        (!('besOptions' in data) || data.besOptions is map) &&
         (!('solutionsReleasedAt' in data) || (data.solutionsReleasedAt is string && data.solutionsReleasedAt.size() <= 64));
     }
 
@@ -111,7 +121,8 @@ service cloud.firestore {
           'AntiCopia_TabSwitch', 'AntiCopia_IncollaBloccato', 'AntiCopia_SchermoDiviso', 'AntiCopia_InfractionsLog',
           'Errori_Principali', 'Feedback_Generale', 'Full_Evaluation',
           'Risposte_Studente', 'Domande_Esame', 'Piano_Recupero',
-          'Convalida_Docente_At', 'Convalida_Docente_Email', 'Soluzioni_Differite'
+          'Convalida_Docente_At', 'Convalida_Docente_Email', 'Soluzioni_Differite',
+          'Assigned_Fila'
         ]) &&
         data.Timestamp is string && data.Timestamp.size() > 0 && data.Timestamp.size() <= 64 &&
         data.Tipo in ['Quiz', 'Workbook'] &&
@@ -127,7 +138,8 @@ service cloud.firestore {
         (!('Risposte_Studente' in data) || (data.Risposte_Studente is string && data.Risposte_Studente.size() <= 250000)) &&
         (!('Domande_Esame' in data) || (data.Domande_Esame is string && data.Domande_Esame.size() <= 600000)) &&
         (!('Piano_Recupero' in data) || (data.Piano_Recupero is string && data.Piano_Recupero.size() <= 40000)) &&
-        (!('Soluzioni_Differite' in data) || data.Soluzioni_Differite is bool);
+        (!('Soluzioni_Differite' in data) || data.Soluzioni_Differite is bool) &&
+        (!('Assigned_Fila' in data) || data.Assigned_Fila in ['A', 'B']);
     }
 
     function isValidSubmissionCreate(data) {
@@ -151,6 +163,7 @@ service cloud.firestore {
           'tabSwitches', 'pasteAttempts', 'lastHeartbeat', 'status',
           'joinedAt', 'sessionRunId', 'locked', 'lockState', 'lockReason',
           'lockedAt', 'draftAnswersJson', 'draftUpdatedAt',
+          'besExpiryIso', 'assignedFila',
           'remoteUnlockId', 'unlockedAt', 'unlockedBy',
           'teacherNotice', 'teacherNoticeAt'
         ]) &&
@@ -159,6 +172,8 @@ service cloud.firestore {
         (!('draftAnswersJson' in data) || (data.draftAnswersJson is string && data.draftAnswersJson.size() <= 220000)) &&
         (!('draftUpdatedAt' in data) || (data.draftUpdatedAt is string && data.draftUpdatedAt.size() <= 64)) &&
         (!('lastHeartbeat' in data) || (data.lastHeartbeat is string && data.lastHeartbeat.size() <= 64)) &&
+        (!('besExpiryIso' in data) || (data.besExpiryIso is string && data.besExpiryIso.size() <= 64)) &&
+        (!('assignedFila' in data) || data.assignedFila in ['A', 'B']) &&
         (!('lockReason' in data) || (data.lockReason is string && data.lockReason.size() <= 400)) &&
         (!('answeredCount' in data) || data.answeredCount is int) &&
         (!('totalQuestions' in data) || data.totalQuestions is int) &&
@@ -219,8 +234,6 @@ service cloud.firestore {
     }
 
     // Collection for exam submissions and evaluations
-    // Note: Students access via Direct Student Access (school email + PIN) and can only create valid payloads
-    // without teacher validation stamps or update Piano_Recupero; grade changes and deletes require an authenticated teacher.
     match /valutazioni/{valId} {
       allow get: if isValidId(valId);
       allow list: if isTeacher() || (resource.data.Email is string && resource.data.Email.size() > 0);

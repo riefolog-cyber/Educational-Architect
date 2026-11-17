@@ -31,30 +31,59 @@ import {
 
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
-// Helper to retry failed dynamic module imports (e.g. transient dev-proxy / chunk cache hiccups)
+// Helper to retry failed dynamic module imports (e.g. transient dev-proxy / stale Vite dep cache)
+function isChunkOrModuleFetchError(err: unknown): boolean {
+  const msg = String((err as any)?.message || err || "").toLowerCase();
+  return (
+    msg.includes("failed to fetch dynamically imported module") ||
+    msg.includes("importing a module script failed") ||
+    msg.includes("loading chunk") ||
+    msg.includes("outdated optimize dep")
+  );
+}
+
 function lazyWithRetry<T extends React.ComponentType<any>>(
   factory: () => Promise<{ default: T }>,
+  moduleKey: string,
   retries = 3
 ): React.LazyExoticComponent<T> {
   return lazy(async () => {
+    const reloadFlagKey = `ea_module_reload_${moduleKey}`;
     let lastError: unknown;
     for (let attempt = 0; attempt < retries; attempt++) {
       try {
-        return await factory();
+        const mod = await factory();
+        try {
+          sessionStorage.removeItem(reloadFlagKey);
+        } catch {}
+        return mod;
       } catch (err) {
         lastError = err;
         if (attempt < retries - 1) {
-          await new Promise((resolve) => setTimeout(resolve, 350 * (attempt + 1)));
+          await new Promise((resolve) => setTimeout(resolve, 400 * (attempt + 1)));
         }
       }
     }
+
+    if (typeof window !== "undefined" && isChunkOrModuleFetchError(lastError)) {
+      try {
+        const lastReload = Number(sessionStorage.getItem(reloadFlagKey) || "0");
+        const now = Date.now();
+        if (!Number.isFinite(lastReload) || now - lastReload > 15000) {
+          sessionStorage.setItem(reloadFlagKey, String(now));
+          window.location.reload();
+          return new Promise<{ default: T }>(() => {});
+        }
+      } catch {}
+    }
+
     throw lastError;
   });
 }
 
 // Code splitting: students load only the student bundle, teachers only the (much larger) dashboard bundle.
-const StudentView = lazyWithRetry(() => import("./components/StudentView"));
-const TeacherDashboard = lazyWithRetry(() => import("./components/TeacherDashboard"));
+const StudentView = lazyWithRetry(() => import("./components/StudentView"), "student");
+const TeacherDashboard = lazyWithRetry(() => import("./components/TeacherDashboard"), "teacher");
 import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
 import { isAppleMobile } from "./utils";
 import { wipeSharedPcStudentStorage } from "./utils/clientStorage";

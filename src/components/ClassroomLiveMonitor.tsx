@@ -46,6 +46,7 @@ export interface LiveStudentData {
   lockedAt?: string;
   teacherNotice?: string;
   teacherNoticeAt?: string;
+  assignedFila?: "A" | "B";
 }
 
 interface ClassroomLiveMonitorProps {
@@ -177,6 +178,7 @@ export default function ClassroomLiveMonitor({
             lockedAt: data.lockedAt || "",
             teacherNotice: typeof data.teacherNotice === "string" ? data.teacherNotice : undefined,
             teacherNoticeAt: typeof data.teacherNoticeAt === "string" ? data.teacherNoticeAt : undefined,
+            assignedFila: data.assignedFila === "A" || data.assignedFila === "B" ? data.assignedFila : undefined,
           });
         });
 
@@ -534,6 +536,16 @@ export default function ClassroomLiveMonitor({
                       {s.besOptions?.reduceDistractors && (
                         <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30 font-bold">
                           3 opzioni
+                        </span>
+                      )}
+                      {s.mixFilaAB && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-purple-500/15 text-purple-200 border border-purple-500/30 font-bold">
+                          🔀 Fila A/B
+                        </span>
+                      )}
+                      {s.allowAudioAnswers && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-200 border border-sky-500/30 font-bold">
+                          🎙️ Audio aperte
                         </span>
                       )}
                     </div>
@@ -1138,6 +1150,15 @@ export default function ClassroomLiveMonitor({
                             <span className={blindLimMode ? "font-mono text-amber-300" : ""}>
                               {getMonitorName(student)}
                             </span>
+                            {student.assignedFila && (
+                              <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ${
+                                student.assignedFila === "B"
+                                  ? "bg-purple-500/20 text-purple-200 border-purple-500/35"
+                                  : "bg-sky-500/20 text-sky-200 border-sky-500/35"
+                              }`}>
+                                Fila {student.assignedFila}
+                              </span>
+                            )}
                             {student.status === "submitted" && (
                               <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
                                 <CheckCircle2 className="w-3 h-3 text-emerald-400" />
