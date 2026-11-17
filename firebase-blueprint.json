@@ -8,21 +8,29 @@
         "Timestamp": { "type": "string" },
         "Docente_Email": { "type": "string" },
         "Tipo": { "type": "string" },
+        "Pin": { "type": "string" },
+        "Session_Id": { "type": "string" },
+        "Session_Titolo": { "type": "string" },
         "Nome": { "type": "string" },
         "Email": { "type": "string" },
         "Voto_Suggerito": { "type": "string" },
+        "Voto_Originale_IA": { "type": "string" },
         "Autovalutazione": { "type": "string" },
         "AntiCopia_TabSwitch": { "type": "integer" },
         "AntiCopia_IncollaBloccato": { "type": "integer" },
+        "AntiCopia_SchermoDiviso": { "type": "integer" },
         "AntiCopia_InfractionsLog": { "type": "string" },
         "Full_Evaluation": { "type": "string" },
         "Risposte_Studente": { "type": "string" },
+        "Domande_Esame": { "type": "string" },
+        "Piano_Recupero": { "type": "string" },
         "Pseudo_Id": { "type": "string" },
         "PII_Oscurate_Count": { "type": "integer" },
         "Convalida_Docente_At": { "type": "string" },
-        "Convalida_Docente_Email": { "type": "string" }
+        "Convalida_Docente_Email": { "type": "string" },
+        "Soluzioni_Differite": { "type": "boolean" }
       },
-      "required": ["Timestamp", "Tipo", "Email"]
+      "required": ["Timestamp", "Tipo", "Email", "Voto_Suggerito"]
     },
     "docente": {
       "title": "Docente",
@@ -43,9 +51,41 @@
         "pin": { "type": "string" },
         "title": { "type": "string" },
         "expiry": { "type": "string" },
-        "teacherEmail": { "type": "string" }
+        "teacherEmail": { "type": "string" },
+        "teacherId": { "type": "string" },
+        "sessionId": { "type": "string" },
+        "active": { "type": "boolean" },
+        "randomizeQuestions": { "type": "boolean" },
+        "deferSolutions": { "type": "boolean" },
+        "solutionsReleased": { "type": "boolean" },
+        "solutionsReleasedAt": { "type": "string" },
+        "besOptions": { "type": "object" }
       },
       "required": ["pin", "expiry"]
+    },
+    "live_student": {
+      "title": "Stato Live Studente",
+      "description": "Telemetria di avanzamento, blocchi anti-copia e bozza cloud di uno studente in sessione.",
+      "type": "object",
+      "properties": {
+        "studentName": { "type": "string" },
+        "studentEmail": { "type": "string" },
+        "answeredCount": { "type": "integer" },
+        "totalQuestions": { "type": "integer" },
+        "currentProgressPercent": { "type": "integer" },
+        "tabSwitches": { "type": "integer" },
+        "pasteAttempts": { "type": "integer" },
+        "lastHeartbeat": { "type": "string" },
+        "joinedAt": { "type": "string" },
+        "sessionRunId": { "type": "string" },
+        "status": { "type": "string" },
+        "locked": { "type": "boolean" },
+        "lockState": { "type": "string" },
+        "lockReason": { "type": "string" },
+        "draftAnswersJson": { "type": "string" },
+        "draftUpdatedAt": { "type": "string" }
+      },
+      "required": ["studentEmail"]
     },
     "exam_library_item": {
       "title": "Verifica Salvata in Libreria",
@@ -92,6 +132,10 @@
     "active_sessions/{sessionId}": {
       "schema": "active_session",
       "description": "Collezione delle sessioni attive d'esame."
+    },
+    "active_sessions/{sessionId}/live_students/{studentId}": {
+      "schema": "live_student",
+      "description": "Sottocollezione dello stato live e delle bozze salvate per ciascun alunno."
     },
     "exam_library/{docId}": {
       "schema": "exam_library_item",

@@ -167,6 +167,17 @@ export interface SavedSubmission {
   Convalida_Docente_At?: string;
   /** Institutional email of the teacher who validated the final grade. */
   Convalida_Docente_Email?: string;
+  /** True when solutions & explanations are deferred until the teacher publishes them. */
+  Soluzioni_Differite?: boolean;
+}
+
+export interface BesOptions {
+  /** Percentage of extra time granted to BES/DSA students (0, 25, or 50). */
+  extraTimePercent?: 0 | 25 | 50;
+  /** When true, each 4-option MC question is trimmed to 3 options by removing 1 distractor. */
+  reduceDistractors?: boolean;
+  /** Automatically expand the BES/DSA reading bar when the exam opens. */
+  autoOpenAccessibilityBar?: boolean;
 }
 
 export interface LiveSessionSummary {
@@ -179,6 +190,14 @@ export interface LiveSessionSummary {
   teacherEmail: string;
   /** 6-digit code the teacher gives to a student whose exam was locked. */
   unlockCode?: string;
+  /** If true, detailed solutions/explanations stay hidden from students until published. */
+  deferSolutions?: boolean;
+  /** True once the teacher publishes deferred solutions to the class. */
+  solutionsReleased?: boolean;
+  /** ISO timestamp when deferred solutions were published. */
+  solutionsReleasedAt?: string;
+  /** Teacher-configured inclusive accommodations (BES/DSA) for this session. */
+  besOptions?: BesOptions;
 }
 
 export interface ExamSummary {

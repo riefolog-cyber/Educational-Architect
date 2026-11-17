@@ -53,7 +53,7 @@ import {
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType, getAuthHeaders } from "../firebase";
-import { SavedSubmission, LiveSessionSummary, ExamSummary, StudentSummary, AiModalPrefill } from "../types";
+import { SavedSubmission, LiveSessionSummary, ExamSummary, StudentSummary, AiModalPrefill, BesOptions } from "../types";
 export type { LiveSessionSummary, ExamSummary };
 import { exportSubmissionPdf, exportSubmissionsZip } from "../utils/pdfExport";
 import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml } from "../utils";
@@ -97,6 +97,7 @@ import PrintableReportModal from "./PrintableReportModal";
 import ExamLibraryPanel from "./ExamLibraryPanel";
 import ExamItemAnalysisPanel from "./ExamItemAnalysisPanel";
 import SubmissionDetailModal from "./SubmissionDetailModal";
+import TeacherBulkGradingModal, { BulkValidationUpdate } from "./TeacherBulkGradingModal";
 
 interface TeacherDashboardProps {
   user: any;
@@ -371,6 +372,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
+  const [deferSolutions, setDeferSolutions] = useState<boolean>(false);
+  const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
+  const [besReduceDistractors, setBesReduceDistractors] = useState<boolean>(false);
+  const [besAutoOpenBar, setBesAutoOpenBar] = useState<boolean>(false);
+  const [showBulkGradingModal, setShowBulkGradingModal] = useState<boolean>(false);
+  const [togglingSolutionsPin, setTogglingSolutionsPin] = useState<string | null>(null);
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
   const [aiModalPrefill, setAiModalPrefill] = useState<AiModalPrefill | null>(null);
   const [showFormsModal, setShowFormsModal] = useState<boolean>(false);
@@ -492,7 +499,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           sessionId: d.sessionId || "",
           active: !!d.active,
           teacherEmail: d.teacherEmail || user.email,
-          unlockCode: d.unlockCode || ""
+          unlockCode: d.unlockCode || "",
+          deferSolutions: !!d.deferSolutions,
+          solutionsReleased: d.deferSolutions ? !!d.solutionsReleased : true,
+          solutionsReleasedAt: d.solutionsReleasedAt || null,
+          besOptions: d.besOptions || undefined,
         });
       });
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
@@ -609,6 +620,84 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setTerminatingAll(false);
       await handleLoadActiveSessions();
     }
+  };
+
+  // Deferred Solutions Release: publish or re-hide exact solutions live for the class
+  const handleToggleSolutionsReleased = async (targetPin: string, nextReleased: boolean) => {
+    const cleanPin = (targetPin || "").trim().toUpperCase();
+    if (!cleanPin || !dbFirestore) return;
+    setTogglingSolutionsPin(cleanPin);
+    try {
+      const nowIso = new Date().toISOString();
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+        solutionsReleased: nextReleased,
+        solutionsReleasedAt: nextReleased ? nowIso : "",
+      });
+      setActiveSessions((prev) =>
+        prev.map((s) =>
+          s.pin === cleanPin
+            ? { ...s, solutionsReleased: nextReleased, solutionsReleasedAt: nextReleased ? nowIso : null }
+            : s
+        )
+      );
+      showNotify(
+        "success",
+        nextReleased
+          ? `Soluzioni sbloccate in tempo reale per la sessione ${cleanPin}.`
+          : `Soluzioni nuovamente nascoste per la sessione ${cleanPin}.`
+      );
+    } catch (err: any) {
+      showNotify("error", `Impossibile aggiornare il rilascio soluzioni: ${err?.message || "errore"}`);
+    } finally {
+      setTogglingSolutionsPin(null);
+    }
+  };
+
+  // Bulk grade override + validation from TeacherBulkGradingModal
+  const handleBulkValidationSave = async (updates: BulkValidationUpdate[]) => {
+    if (!dbFirestore || updates.length === 0) return;
+    const nowIso = new Date().toISOString();
+    const teacherEmailVal = user?.email || "docente";
+    const chunkSize = 400;
+    for (let i = 0; i < updates.length; i += chunkSize) {
+      const chunk = updates.slice(i, i + chunkSize);
+      const batch = writeBatch(dbFirestore);
+      chunk.forEach((upd) => {
+        const subRef = doc(dbFirestore!, "valutazioni", upd.id);
+        const existing = submissions.find((s) => s.id === upd.id);
+        const patch: Record<string, any> = {
+          Convalida_Docente_At: nowIso,
+          Convalida_Docente_Email: teacherEmailVal,
+        };
+        if (upd.nextGrade && upd.nextGrade !== existing?.Voto_Suggerito) {
+          patch.Voto_Suggerito = upd.nextGrade;
+          if (!existing?.Voto_Originale_IA && existing?.Voto_Suggerito) {
+            patch.Voto_Originale_IA = existing.Voto_Suggerito;
+          }
+        }
+        batch.update(subRef, patch);
+      });
+      await batch.commit();
+    }
+
+    const updateMap = new Map(updates.map((u) => [u.id, u]));
+    setSubmissions((prev) =>
+      prev.map((s) => {
+        const upd = updateMap.get(s.id);
+        if (!upd) return s;
+        return {
+          ...s,
+          Voto_Originale_IA:
+            !s.Voto_Originale_IA && upd.nextGrade && upd.nextGrade !== s.Voto_Suggerito
+              ? s.Voto_Suggerito
+              : s.Voto_Originale_IA,
+          Voto_Suggerito: upd.nextGrade || s.Voto_Suggerito,
+          Convalida_Docente_At: nowIso,
+          Convalida_Docente_Email: teacherEmailVal,
+        };
+      })
+    );
+    showNotify("success", `Convalidate ${updates.length} verifiche nel registro ufficiale.`);
   };
 
   // Diagnostic checklist for JSON validation
@@ -1159,7 +1248,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const prepResp = await fetch("/api/session/prepare", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
-          body: JSON.stringify({ examData: examObj }),
+          body: JSON.stringify({ examData: examObj, reduceDistractors: besReduceDistractors }),
         });
         const prepData = await prepResp.json().catch(() => ({}));
         if (!prepResp.ok || !prepData?.sanitizedExam || !prepData?.encryptedAnswerKey) {
@@ -1167,6 +1256,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
         const sanitizedExam = prepData.sanitizedExam;
         const encryptedAnswerKey = prepData.encryptedAnswerKey;
+
+        const besOptionsPayload: BesOptions = {
+          extraTimePercent: besExtraTimePercent,
+          reduceDistractors: besReduceDistractors,
+          autoOpenAccessibilityBar: besAutoOpenBar,
+        };
 
         const sessionPayload = {
           data: sanitizedExam,
@@ -1176,6 +1271,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           teacherEmail: user?.email || "docente_sandbox@scuola.it",
           backendUrl: "AI_STUDIO_GENAI_INTEGRATA",
           randomizeQuestions,
+          deferSolutions,
+          solutionsReleased: !deferSolutions,
+          besOptions: besOptionsPayload,
           severityPreset: "normale",
           unlockCode,
           active: true,
@@ -1196,6 +1294,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           data: sanitizedExam,
           encryptedAnswerKey,
           randomizeQuestions,
+          deferSolutions,
+          solutionsReleased: !deferSolutions,
+          besOptions: besOptionsPayload,
           severityPreset: "normale",
           unlockCode,
           active: true,
@@ -2301,13 +2402,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const q = searchQuery.toLowerCase().trim();
     const result = submissions.filter(sub => {
       const blindCode = getSubmissionBlindCode(sub).toLowerCase();
+      const examTitle = (submissionMetaMap.get(sub.id)?.examTitle || "").toLowerCase();
       const matchesSearch =
         !q ||
         (blindGradingMode
-          ? blindCode.includes(q) || (sub.Pin || "").toLowerCase().includes(q)
+          ? blindCode.includes(q) || (sub.Pin || "").toLowerCase().includes(q) || examTitle.includes(q)
           : (sub.Nome || "").toLowerCase().includes(q) ||
             (sub.Email || "").toLowerCase().includes(q) ||
             (sub.Pin || "").toLowerCase().includes(q) ||
+            examTitle.includes(q) ||
             blindCode.includes(q));
 
       if (filterType === "All") return matchesSearch;
@@ -2942,6 +3045,70 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </div>
                 </label>
 
+                {/* Deferred Solutions Release Toggle */}
+                <label className="flex items-center gap-2.5 p-2.5 bg-amber-950/20 border border-amber-500/20 rounded-xl cursor-pointer hover:bg-amber-950/35 transition-colors">
+                  <input
+                    type="checkbox"
+                    checked={deferSolutions}
+                    onChange={(e) => setDeferSolutions(e.target.checked)}
+                    className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                  />
+                  <div className="text-left">
+                    <span className="text-[11px] font-bold text-amber-200 flex items-center gap-1.5">
+                      <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                      <span>Rilascio Differito delle Soluzioni</span>
+                    </span>
+                    <p className="text-[10px] text-slate-300/80 leading-normal">
+                      Chi consegna in anticipo vede il riepilogo ma NON le risposte esatte/spiegazioni finché non le sblocchi con 1 click dal Monitor d'Aula.
+                    </p>
+                  </div>
+                </label>
+
+                {/* BES / DSA Session Inclusivity Controls */}
+                <div className="p-3 bg-teal-950/20 border border-teal-500/20 rounded-xl space-y-2.5 text-left">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-bold text-teal-200 flex items-center gap-1.5">
+                      <span>♿ Strumenti Didattici BES / DSA (Sessione)</span>
+                    </span>
+                    <div className="flex items-center gap-1">
+                      {([0, 25, 50] as const).map((pct) => (
+                        <button
+                          key={pct}
+                          type="button"
+                          onClick={() => setBesExtraTimePercent(pct)}
+                          className={`px-2 py-0.5 rounded-lg text-[10px] font-bold cursor-pointer border transition-colors ${
+                            besExtraTimePercent === pct
+                              ? "bg-teal-500/25 border-teal-400 text-teal-200"
+                              : "bg-slate-950/60 border-white/10 text-slate-400 hover:text-white"
+                          }`}
+                        >
+                          {pct === 0 ? "Tempo std" : `+${pct}% tempo`}
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 text-[10px]">
+                    <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-950/50 border border-white/10 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={besReduceDistractors}
+                        onChange={(e) => setBesReduceDistractors(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-teal-500 rounded cursor-pointer"
+                      />
+                      <span className="text-slate-200 font-semibold">Riduci distrattori crocette (4 → 3 opzioni)</span>
+                    </label>
+                    <label className="flex items-center gap-2 p-2 rounded-lg bg-slate-950/50 border border-white/10 cursor-pointer">
+                      <input
+                        type="checkbox"
+                        checked={besAutoOpenBar}
+                        onChange={(e) => setBesAutoOpenBar(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-teal-500 rounded cursor-pointer"
+                      />
+                      <span className="text-slate-200 font-semibold">Apri barra leggibilità BES all'avvio</span>
+                    </label>
+                  </div>
+                </div>
+
                 {/* Validation Error Message */}
                 {validationError && (
                   <div className="space-y-2">
@@ -3474,8 +3641,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 onRefreshSessions={handleLoadActiveSessions}
                 onTerminateSession={handleTerminateSession}
                 onTerminateAllSessions={handleTerminateAllSessions}
+                onToggleSolutionsReleased={handleToggleSolutionsReleased}
                 terminatingPin={terminatingPin}
                 terminatingAll={terminatingAll}
+                togglingSolutionsPin={togglingSolutionsPin}
               />
             ) : (
               <>
@@ -3538,6 +3707,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     >
                       <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
                       <span>Info Accesso Account</span>
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setShowBulkGradingModal(true)}
+                      disabled={filteredSubmissions.length === 0}
+                      className="flex items-center gap-1.5 py-1.5 px-3 bg-emerald-600/20 hover:bg-emerald-600/35 text-emerald-200 font-bold rounded-xl text-xs transition-colors cursor-pointer border border-emerald-500/35 disabled:opacity-40"
+                      title="Convalida massiva, arrotondamento voti e export per Argo DidUP, Axios e ClasseViva"
+                    >
+                      <Award className="w-3.5 h-3.5 text-emerald-300" />
+                      <span>Registro Rapido & CSV</span>
                     </button>
                     <button
                       onClick={handleExportCSV}
@@ -4902,14 +5081,27 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           setShowAiModal(false);
           setAiModalPrefill(null);
         }}
-        onApplyExam={(generatedJson, newTitle) => {
+        onApplyExam={async (generatedJson, newTitle, parallelVariant) => {
           setLoadedLibraryItemId(null);
           setJsonText(generatedJson);
           if (newTitle) setMateria(newTitle);
           validateExamJSON(generatedJson);
-          handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { asNew: true });
+          await handleSaveToLibrary("Generatore IA", generatedJson, newTitle, { asNew: true });
+          if (parallelVariant?.formattedJson) {
+            await handleSaveToLibrary("Generatore IA (Fila B)", parallelVariant.formattedJson, parallelVariant.title, { asNew: true });
+            showNotify("success", `Salvate entrambe le varianti in Libreria: "${newTitle}" e "${parallelVariant.title}".`);
+          }
           setAiModalPrefill(null);
         }}
+      />
+
+      {/* Bulk Validation & Electronic Register Export Modal */}
+      <TeacherBulkGradingModal
+        isOpen={showBulkGradingModal}
+        onClose={() => setShowBulkGradingModal(false)}
+        submissions={filteredSubmissions}
+        blindGradingMode={blindGradingMode}
+        onSaveBulkValidation={handleBulkValidationSave}
       />
 
       {/* Google Forms Import Modal */}
@@ -4935,7 +5127,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }}
         submission={printableSub}
         blindGradingMode={blindGradingMode}
-        examTitle={materia || printableSub?.Tipo}
+        examTitle={
+          printableSub?.Session_Titolo ||
+          safeParseJson(printableSub?.Domande_Esame)?.title ||
+          printableSub?.Tipo ||
+          "Verifica Scolastica"
+        }
         examImages={safeParseJson(printableSub?.Domande_Esame)?.images}
       />
 

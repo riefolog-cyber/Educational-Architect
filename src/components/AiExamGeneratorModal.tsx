@@ -1,13 +1,18 @@
 import React, { useState, useRef, useEffect } from "react";
-import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2 } from "lucide-react";
+import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2, ShieldCheck, CopyPlus } from "lucide-react";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS, type TranscriptFormat } from "../utils/transcriptParser";
 import { getAuthHeaders } from "../firebase";
 import { AiModalPrefill } from "../types";
 
+export interface ParallelVariantOutput {
+  title: string;
+  formattedJson: string;
+}
+
 interface AiExamGeneratorModalProps {
   isOpen: boolean;
   onClose: () => void;
-  onApplyExam: (examJson: string, title: string) => void;
+  onApplyExam: (examJson: string, title: string, parallelVariant?: ParallelVariantOutput | null) => void;
   initialPrefill?: AiModalPrefill | null;
 }
 
@@ -25,8 +30,9 @@ export default function AiExamGeneratorModal({
   const [includeOpenEnded, setIncludeOpenEnded] = useState<boolean>(true);
 
   const [isLoading, setIsLoading] = useState(false);
+  const [loadingStatus, setLoadingStatus] = useState("");
   const [error, setError] = useState<string | null>(null);
-  const [sourceTab, setSourceTab] = useState<"topic" | "transcript">("topic");
+  const [sourceTab, setSourceTab] = useState<"topic" | "transcript" | "pdf">("topic");
   const [transcriptFileName, setTranscriptFileName] = useState<string | null>(null);
   const [transcriptMeta, setTranscriptMeta] = useState<{
     format: TranscriptFormat;
@@ -35,6 +41,12 @@ export default function AiExamGeneratorModal({
   } | null>(null);
   const [transcriptNotice, setTranscriptNotice] = useState<string | null>(null);
   const transcriptInputRef = useRef<HTMLInputElement | null>(null);
+  const pdfInputRef = useRef<HTMLInputElement | null>(null);
+  const [pdfFileName, setPdfFileName] = useState<string | null>(null);
+  const [pdfSizeKb, setPdfSizeKb] = useState<number>(0);
+  const [pdfBase64, setPdfBase64] = useState<string | null>(null);
+  const [strictSourceOnly, setStrictSourceOnly] = useState<boolean>(true);
+  const [generateParallelVariant, setGenerateParallelVariant] = useState<boolean>(false);
   const [generatedResult, setGeneratedResult] = useState<{
     title: string;
     formattedJson: string;
@@ -42,6 +54,7 @@ export default function AiExamGeneratorModal({
     summaryDescription: string;
     modelUsed?: string;
     examObj: any;
+    parallelVariant?: ParallelVariantOutput | null;
   } | null>(null);
 
   useEffect(() => {
@@ -93,29 +106,100 @@ export default function AiExamGeneratorModal({
     setTopic("");
   };
 
+  const handlePdfOrNoteFile = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = "";
+    if (!file) return;
+    setError(null);
+
+    const isPdf = file.type === "application/pdf" || file.name.toLowerCase().endsWith(".pdf");
+    if (isPdf) {
+      if (file.size > 6 * 1024 * 1024) {
+        setError("Il PDF selezionato supera 6 MB. Comprimi o riduci le pagine prima di caricarlo.");
+        return;
+      }
+      const reader = new FileReader();
+      reader.onload = (event) => {
+        const result = String(event.target?.result || "");
+        const commaIdx = result.indexOf(",");
+        const base64Part = commaIdx >= 0 ? result.slice(commaIdx + 1) : result;
+        if (!base64Part) {
+          setError("Impossibile leggere il contenuto del file PDF.");
+          return;
+        }
+        setPdfBase64(base64Part);
+        setPdfFileName(file.name);
+        setPdfSizeKb(Math.max(1, Math.round(file.size / 1024)));
+        setStrictSourceOnly(true);
+        setGeneratedResult(null);
+      };
+      reader.onerror = () => setError("Lettura del PDF non riuscita. Riprova con un altro file.");
+      reader.readAsDataURL(file);
+      return;
+    }
+
+    const reader = new FileReader();
+    reader.onload = (event) => {
+      try {
+        const raw = String(event.target?.result || "");
+        const parsed = parseTranscriptFile(file.name, raw);
+        if (!parsed.text) {
+          setError(parsed.notice || "Impossibile estrarre testo dagli appunti selezionati.");
+          return;
+        }
+        setPdfBase64(null);
+        setPdfFileName(file.name);
+        setPdfSizeKb(Math.max(1, Math.round(file.size / 1024)));
+        setTopic(parsed.text);
+        setStrictSourceOnly(true);
+        setGeneratedResult(null);
+      } catch (err: any) {
+        setError("Lettura file non riuscita: " + (err?.message || "formato non supportato."));
+      }
+    };
+    reader.onerror = () => setError("Lettura file appunti non riuscita.");
+    reader.readAsText(file);
+  };
+
+  const handleRemovePdf = () => {
+    setPdfBase64(null);
+    setPdfFileName(null);
+    setPdfSizeKb(0);
+  };
+
   const handleGenerate = async () => {
-    if (!topic.trim()) {
+    const hasPdf = Boolean(pdfBase64);
+    if (!topic.trim() && !hasPdf) {
       setError(
         sourceTab === "transcript"
           ? "Carica prima un file di trascrizione (.srt, .vtt o .txt) oppure incolla il testo nel campo qui sotto."
+          : sourceTab === "pdf"
+          ? "Carica un documento PDF/appunti oppure aggiungi il testo guida qui sotto."
           : "Inserisci un argomento o incolla degli appunti/testo didattico per continuare."
       );
       return;
     }
 
     setIsLoading(true);
+    setLoadingStatus("Generazione verifica principale (Fila A) con IA...");
     setError(null);
     setGeneratedResult(null);
 
     try {
-      const payload = {
+      const payload: Record<string, any> = {
         topic: topic.trim(),
         gradeLevel,
         examType,
         numQuestions,
         includeOpenEnded,
-        difficulty
+        difficulty,
+        strictSourceOnly: sourceTab === "pdf" || sourceTab === "transcript" ? strictSourceOnly : false,
+        sourceFileName: pdfFileName || transcriptFileName || undefined,
       };
+      if (pdfBase64) {
+        payload.pdfBase64 = pdfBase64;
+        payload.pdfMimeType = "application/pdf";
+      }
 
       const authHeaders = await getAuthHeaders();
 
@@ -125,7 +209,7 @@ export default function AiExamGeneratorModal({
 
       let resp = await fetch("/api/generate-exam", {
         method: "POST",
-        headers: { 
+        headers: {
           "Content-Type": "application/json",
           "Accept": "application/json",
           ...authHeaders
@@ -133,15 +217,13 @@ export default function AiExamGeneratorModal({
         body: JSON.stringify(payload)
       });
 
-      // If POST was blocked by a proxy, allow GET fallback only for short topics
-      // so large lecture transcripts never hit 414 URI Too Long or leak into URL logs.
+      // Allow GET fallback only for short topic-only prompts without PDF
       if (!resp.ok && (resp.status === 404 || resp.status === 405)) {
-        if (topic.trim().length > 1500) {
+        if (pdfBase64 || topic.trim().length > 1500) {
           throw new Error(
-            "La richiesta POST è stata bloccata dalla rete/proxy e il testo inserito supera il limite per il fallback URL. Ricarica la pagina o riduci la lunghezza del testo."
+            "La richiesta POST è stata bloccata dalla rete/proxy e la fonte selezionata supera il limite per il fallback URL."
           );
         }
-        console.warn(`[AI Exam Generator] POST /api/generate-exam returned ${resp.status}. Trying query fallback...`);
         const queryParams = new URLSearchParams({
           topic: topic.trim(),
           gradeLevel,
@@ -164,25 +246,57 @@ export default function AiExamGeneratorModal({
         throw new Error(data.details || data.error || "Impossibile generare la verifica con l'IA.");
       }
 
+      let parallelVariant: ParallelVariantOutput | null = null;
+      if (generateParallelVariant && data.formattedJson) {
+        setLoadingStatus("Generazione variante parallela (Fila B) per prevenzione copie...");
+        try {
+          const varResp = await fetch("/api/generate-variant", {
+            method: "POST",
+            headers: {
+              "Content-Type": "application/json",
+              "Accept": "application/json",
+              ...authHeaders
+            },
+            body: JSON.stringify({
+              examJson: data.formattedJson,
+              title: data.title,
+            }),
+          });
+          const varData = await varResp.json().catch(() => ({}));
+          if (varResp.ok && varData?.formattedJson) {
+            parallelVariant = {
+              title: varData.title || `${data.title} (Fila B)`,
+              formattedJson: varData.formattedJson,
+            };
+          } else {
+            console.warn("Generazione Fila B non riuscita:", varData?.error);
+          }
+        } catch (varErr) {
+          console.warn("Errore generazione Fila B:", varErr);
+        }
+      }
+
       setGeneratedResult({
         title: data.title,
         formattedJson: data.formattedJson,
         recommendedDurationMinutes: data.recommendedDurationMinutes || 45,
         summaryDescription: data.summaryDescription || "",
         modelUsed: data.modelUsed || "",
-        examObj: data.examObj
+        examObj: data.examObj,
+        parallelVariant,
       });
     } catch (err: any) {
       console.error("AI Generation error:", err);
       setError(err.message || "Si è verificato un errore durante la generazione della verifica.");
     } finally {
       setIsLoading(false);
+      setLoadingStatus("");
     }
   };
 
   const handleConfirmAndApply = () => {
     if (!generatedResult) return;
-    onApplyExam(generatedResult.formattedJson, generatedResult.title);
+    onApplyExam(generatedResult.formattedJson, generatedResult.title, generatedResult.parallelVariant || null);
     onClose();
   };
 
@@ -226,33 +340,99 @@ export default function AiExamGeneratorModal({
 
           {!generatedResult ? (
             <>
-              {/* Source selection: topic/text vs video transcript */}
-              <div className="grid grid-cols-2 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold">
+              {/* Source selection: topic/text vs PDF/notes vs video transcript */}
+              <div className="grid grid-cols-3 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold gap-1">
                 <button
                   type="button"
                   onClick={() => setSourceTab("topic")}
-                  className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                     sourceTab === "topic"
                       ? "bg-indigo-600 text-white shadow-md font-bold"
                       : "text-slate-400 hover:text-white"
                   }`}
                 >
-                  <BookOpen className="w-3.5 h-3.5" />
+                  <BookOpen className="w-3.5 h-3.5 shrink-0" />
                   <span>Argomento / Testo</span>
                 </button>
                 <button
                   type="button"
+                  onClick={() => setSourceTab("pdf")}
+                  className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                    sourceTab === "pdf"
+                      ? "bg-amber-600 text-white shadow-md font-bold"
+                      : "text-slate-400 hover:text-white"
+                  }`}
+                >
+                  <FileText className="w-3.5 h-3.5 shrink-0" />
+                  <span>Da PDF / Appunti</span>
+                </button>
+                <button
+                  type="button"
                   onClick={() => setSourceTab("transcript")}
-                  className={`py-2 px-3 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
+                  className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                     sourceTab === "transcript"
                       ? "bg-teal-600 text-white shadow-md font-bold"
                       : "text-slate-400 hover:text-white"
                   }`}
                 >
-                  <Clapperboard className="w-3.5 h-3.5" />
-                  <span>Trascrizione video (SRT/TXT)</span>
+                  <Clapperboard className="w-3.5 h-3.5 shrink-0" />
+                  <span>Video (SRT/TXT)</span>
                 </button>
               </div>
+
+              {sourceTab === "pdf" && (
+                <div className="p-3.5 rounded-2xl bg-amber-950/25 border border-amber-500/25 space-y-2.5">
+                  <input
+                    ref={pdfInputRef}
+                    type="file"
+                    accept=".pdf,application/pdf,.txt,.md,text/plain"
+                    onChange={handlePdfOrNoteFile}
+                    className="hidden"
+                  />
+                  {!pdfFileName ? (
+                    <button
+                      type="button"
+                      onClick={() => pdfInputRef.current?.click()}
+                      className="w-full py-4 px-3 rounded-xl border-2 border-dashed border-amber-500/40 hover:border-amber-400 hover:bg-amber-500/10 text-amber-200 text-xs font-semibold flex flex-col items-center gap-1.5 cursor-pointer transition-all"
+                    >
+                      <FileUp className="w-5 h-5" />
+                      <span>Carica dispensa PDF o appunti del docente (.pdf, .txt, .md)</span>
+                      <span className="text-[10px] font-normal text-amber-300/75">
+                        PDF fino a 6 MB inviati direttamente al motore multimodale Gemini
+                      </span>
+                    </button>
+                  ) : (
+                    <div className="flex items-center justify-between gap-2 p-2.5 bg-slate-950/60 border border-white/10 rounded-xl">
+                      <div className="flex items-center gap-2 min-w-0">
+                        <FileText className="w-4 h-4 text-amber-400 shrink-0" />
+                        <div className="min-w-0">
+                          <p className="text-white text-xs font-semibold truncate">{pdfFileName}</p>
+                          <p className="text-[10px] text-slate-400 font-mono">
+                            {pdfBase64 ? "PDF multimodale pronto" : "Testo estratto nell'editor"} • {pdfSizeKb} KB
+                          </p>
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-1.5 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => pdfInputRef.current?.click()}
+                          className="px-2.5 py-1.5 bg-amber-600/20 hover:bg-amber-600/30 text-amber-200 text-[11px] font-bold rounded-lg border border-amber-500/30 cursor-pointer transition-colors"
+                        >
+                          Cambia
+                        </button>
+                        <button
+                          type="button"
+                          onClick={handleRemovePdf}
+                          title="Rimuovi documento"
+                          className="p-1.5 text-slate-400 hover:text-rose-300 hover:bg-rose-500/10 rounded-lg cursor-pointer transition-colors"
+                        >
+                          <Trash2 className="w-4 h-4" />
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              )}
 
               {sourceTab === "transcript" && (
                 <div className="p-3.5 rounded-2xl bg-teal-950/30 border border-teal-500/20 space-y-2.5">
@@ -438,22 +618,62 @@ export default function AiExamGeneratorModal({
               </div>
 
               {/* Extra toggles */}
-              {examType === "quiz" && (
-                <label className="flex items-center gap-2.5 p-3 rounded-2xl bg-slate-950/50 border border-white/10 cursor-pointer hover:bg-slate-950/80 transition-colors">
+              <div className="space-y-2.5">
+                {examType === "quiz" && (
+                  <label className="flex items-center gap-2.5 p-3 rounded-2xl bg-slate-950/50 border border-white/10 cursor-pointer hover:bg-slate-950/80 transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={includeOpenEnded}
+                      onChange={(e) => setIncludeOpenEnded(e.target.checked)}
+                      className="w-4 h-4 accent-indigo-500 rounded cursor-pointer"
+                    />
+                    <div>
+                      <span className="font-bold text-white">Includi domanda di riflessione critica aperta</span>
+                      <p className="text-[10px] text-slate-400">
+                        Aggiunge 1 o 2 quesiti aperti per valutare la proprietà lessicale e l'argomentazione personale oltre alle crocette.
+                      </p>
+                    </div>
+                  </label>
+                )}
+
+                {(sourceTab === "pdf" || sourceTab === "transcript" || Boolean(pdfBase64)) && (
+                  <label className="flex items-center gap-2.5 p-3 rounded-2xl bg-amber-950/20 border border-amber-500/25 cursor-pointer hover:bg-amber-950/35 transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={strictSourceOnly}
+                      onChange={(e) => setStrictSourceOnly(e.target.checked)}
+                      className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                    />
+                    <div>
+                      <span className="font-bold text-amber-200 flex items-center gap-1.5">
+                        <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Ancora rigorosamente al documento</span>
+                      </span>
+                      <p className="text-[10px] text-slate-300/80">
+                        I quesiti useranno esclusivamente i contenuti e le definizioni presenti nella tua dispensa o trascrizione, senza nozioni esterne.
+                      </p>
+                    </div>
+                  </label>
+                )}
+
+                <label className="flex items-center gap-2.5 p-3 rounded-2xl bg-indigo-950/25 border border-indigo-500/25 cursor-pointer hover:bg-indigo-950/40 transition-colors">
                   <input
                     type="checkbox"
-                    checked={includeOpenEnded}
-                    onChange={(e) => setIncludeOpenEnded(e.target.checked)}
+                    checked={generateParallelVariant}
+                    onChange={(e) => setGenerateParallelVariant(e.target.checked)}
                     className="w-4 h-4 accent-indigo-500 rounded cursor-pointer"
                   />
                   <div>
-                    <span className="font-bold text-white">Includi domanda di riflessione critica aperta</span>
-                    <p className="text-[10px] text-slate-400">
-                      Aggiunge 1 o 2 quesiti aperti per valutare la proprietà lessicale e l'argomentazione personale oltre alle crocette.
+                    <span className="font-bold text-indigo-200 flex items-center gap-1.5">
+                      <CopyPlus className="w-3.5 h-3.5 text-indigo-400" />
+                      <span>Genera anche Variante Parallela (Fila B)</span>
+                    </span>
+                    <p className="text-[10px] text-slate-300/80">
+                      Crea automaticamente una seconda versione equivalente (Fila B) e la salva nella tua Libreria Verifiche pronta per l'altra metà classe.
                     </p>
                   </div>
                 </label>
-              )}
+              </div>
             </>
           ) : (
             /* Result Preview Screen */
@@ -474,6 +694,12 @@ export default function AiExamGeneratorModal({
                       </span>
                     )}
                   </p>
+                  {generatedResult.parallelVariant && (
+                    <p className="mt-1.5 text-[11px] text-indigo-200 bg-indigo-500/15 border border-indigo-500/30 rounded-lg px-2.5 py-1 inline-flex items-center gap-1.5">
+                      <CopyPlus className="w-3.5 h-3.5 text-indigo-300" />
+                      <span>Pronta anche la variante parallela: <b>{generatedResult.parallelVariant.title}</b></span>
+                    </p>
+                  )}
                 </div>
               </div>
 
@@ -523,13 +749,13 @@ export default function AiExamGeneratorModal({
               <button
                 type="button"
                 onClick={handleGenerate}
-                disabled={isLoading || !topic.trim()}
+                disabled={isLoading || (!topic.trim() && !pdfBase64)}
                 className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-bold rounded-xl text-xs flex items-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer transition-all active:scale-[0.98]"
               >
                 {isLoading ? (
                   <>
                     <Loader2 className="w-4 h-4 animate-spin" />
-                    <span>{topic.trim().length > 15000 ? "Testo lungo: elaborazione in corso, può richiedere qualche minuto..." : "Elaborazione didattica in corso..."}</span>
+                    <span>{loadingStatus || (topic.trim().length > 15000 ? "Testo lungo: elaborazione in corso, può richiedere qualche minuto..." : "Elaborazione didattica in corso...")}</span>
                   </>
                 ) : (
                   <>

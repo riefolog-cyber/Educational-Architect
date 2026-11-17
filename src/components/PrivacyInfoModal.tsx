@@ -72,7 +72,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                 Separazione netta tra Identità Anagrafica e Contenuto Didattico
               </p>
               <p className="text-xs text-slate-300 leading-relaxed">
-                In conformità al <b>GDPR (Regolamento UE 2016/679, Art. 5 e Art. 25 — Privacy by Design)</b> e alle indicazioni tecniche del <b>MIM / Garante per la protezione dei dati personali (Parere n. 787 del 20 ottobre 2026)</b> sulla pseudonimizzazione delle utenze e l'uso consapevole dell'IA a scuola, l'applicazione isola l'anagrafica degli alunni tramite codice pseudonimo <b>STU-XXXX</b>, filtro automatico anti-PII nei prompt e <b>Correzione in Cieco</b> attiva di default.
+                In conformità al <b>GDPR (Regolamento UE 2016/679, Art. 5 e Art. 25 — Privacy by Design)</b> e alle indicazioni tecniche del <b>MIM / Garante per la protezione dei dati personali (Parere n. 787 del 20 ottobre 2026)</b> sulla pseudonimizzazione delle utenze e l'uso consapevole dell'IA a scuola, l'applicazione isola l'anagrafica degli alunni tramite codice pseudonimo <b>STU-XXXXXX</b>, filtro automatico anti-PII nei prompt, pulizia post-sessione su PC condivisi e <b>Correzione in Cieco</b> attiva di default.
               </p>
             </div>
 
@@ -89,9 +89,9 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                     1
                   </div>
                   <div>
-                    <p className="font-bold text-white text-xs sm:text-sm">Studente Autenticato</p>
+                    <p className="font-bold text-white text-xs sm:text-sm">Studente Autenticato (Workspace o Accesso Diretto)</p>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      L'alunno accede con il proprio account scolastico autorizzato (Google Workspace for Education) e compila il test.
+                      L'alunno accede con il proprio account scolastico (Google Workspace for Education) oppure tramite Accesso Diretto d&apos;aula verificato con Nome/Cognome/Email, e su PC condiviso può azzerare ogni dato locale al termine della prova.
                     </p>
                   </div>
                 </div>
@@ -107,9 +107,9 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                     2
                   </div>
                   <div>
-                    <p className="font-bold text-white text-xs sm:text-sm">Pseudonimizzazione (STU-XXXX) &amp; Filtro Automatico PII</p>
+                    <p className="font-bold text-white text-xs sm:text-sm">Pseudonimizzazione (STU-XXXXXX) &amp; Filtro Automatico PII</p>
                     <p className="text-xs text-slate-400 mt-0.5">
-                      L'identità reale resta confinata nel registro scolastico Firestore. Prima dell'invio al server e all'IA, l'utenza viene sostituita da un codice pseudonimo (es. <code className="text-teal-300">STU-7K4M9P</code>) e un filtro automatico oscura eventuali email, numeri di telefono, codici fiscali o nomi propri scritti per errore nelle risposte aperte.
+                      L'identità reale resta confinata nel registro scolastico Firestore. Prima dell'invio al server e all'IA, l'utenza viene sostituita da un codice pseudonimo univoco (es. <code className="text-teal-300">STU-7K4M9P</code>) e un filtro automatico oscura eventuali email, numeri di telefono, codici fiscali o nomi propri scritti per errore nelle risposte aperte.
                     </p>
                   </div>
                 </div>
@@ -173,7 +173,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                       </span>
                     </div>
                     <p className="text-xs text-slate-300 mt-0.5">
-                      La dashboard docente apre le consegne in <b>Correzione in Cieco</b> attiva di default (<code className="text-emerald-300">Studente #XXXX</code>) per valutare senza pregiudizi; il docente mostra i nomi reali solo al momento della verbalizzazione ufficiale del voto.
+                      La dashboard docente apre le consegne in <b>Correzione in Cieco</b> attiva di default (<code className="text-emerald-300">Studente STU-7K4M9P</code>) per valutare senza pregiudizi; il docente mostra i nomi reali solo al momento della verbalizzazione ufficiale del voto.
                     </p>
                   </div>
                 </div>
@@ -185,7 +185,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
               <div className="bg-slate-950/70 p-3.5 rounded-2xl border border-white/5 space-y-1.5">
                 <div className="flex items-center gap-1.5 text-teal-400 font-bold text-xs">
                   <CheckCircle2 className="w-3.5 h-3.5" />
-                  <span>Pseudonimo STU-XXXX</span>
+                  <span>Pseudonimo STU-XXXXXX</span>
                 </div>
                 <p className="text-[11px] text-slate-400 leading-normal">
                   Art. 5 GDPR &amp; Parere Garante 787/2026: verso server e coda IA viaggiano solo codici pseudonimi e mai nomi o email.
@@ -274,7 +274,7 @@ export function PrivacyBannerBox({ onOpenModal }: { onOpenModal: () => void }) {
               </span>
             </div>
             <p className="text-[11px] text-slate-400 mt-0.5 leading-relaxed">
-              Utenze pseudonimizzate (<span className="text-slate-300 font-mono">STU-XXXX</span>), filtro automatico anti dati personali nei prompt e Correzione in Cieco attiva di default: l'IA valuta le risposte senza conoscere identità, email o nome dell'alunno.
+              Utenze pseudonimizzate (<span className="text-slate-300 font-mono">STU-XXXXXX</span>), filtro automatico anti dati personali nei prompt e Correzione in Cieco attiva di default: l'IA valuta le risposte senza conoscere identità, email o nome dell'alunno.
             </p>
           </div>
         </div>

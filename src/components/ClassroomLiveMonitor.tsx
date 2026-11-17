@@ -58,8 +58,10 @@ interface ClassroomLiveMonitorProps {
   onRefreshSessions?: () => void;
   onTerminateSession?: (pin: string) => void;
   onTerminateAllSessions?: () => void;
+  onToggleSolutionsReleased?: (pin: string, nextReleased: boolean) => Promise<void>;
   terminatingPin?: string | null;
   terminatingAll?: boolean;
+  togglingSolutionsPin?: string | null;
 }
 
 // A student is considered truly "in exam" only while the heartbeat keeps flowing
@@ -75,8 +77,10 @@ export default function ClassroomLiveMonitor({
   onRefreshSessions,
   onTerminateSession,
   onTerminateAllSessions,
+  onToggleSolutionsReleased,
   terminatingPin = null,
-  terminatingAll = false
+  terminatingAll = false,
+  togglingSolutionsPin = null
 }: ClassroomLiveMonitorProps) {
   const [students, setStudents] = useState<LiveStudentData[]>([]);
   const [loading, setLoading] = useState(true);
@@ -510,6 +514,29 @@ export default function ClassroomLiveMonitor({
                         Scadenza: {new Date(s.expiry).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
                       </p>
                     )}
+                    <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
+                      {s.deferSolutions && (
+                        <span
+                          className={`text-[9px] px-1.5 py-0.5 rounded font-bold border ${
+                            s.solutionsReleased
+                              ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                              : "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                          }`}
+                        >
+                          {s.solutionsReleased ? "🔓 Soluzioni Pubblicate" : "🔒 Soluzioni Differite"}
+                        </span>
+                      )}
+                      {!!s.besOptions?.extraTimePercent && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30 font-bold">
+                          ♿ BES +{s.besOptions.extraTimePercent}% tempo
+                        </span>
+                      )}
+                      {s.besOptions?.reduceDistractors && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30 font-bold">
+                          3 opzioni
+                        </span>
+                      )}
+                    </div>
                   </button>
                   {onTerminateSession && (
                     confirmingPin === s.pin ? (
@@ -601,6 +628,38 @@ export default function ClassroomLiveMonitor({
         </div>
 
         <div className="flex items-center gap-2 flex-wrap">
+          {(() => {
+            const activeMonitoredSession = sessions.find((s) => s.pin === pin);
+            if (!activeMonitoredSession?.deferSolutions || !onToggleSolutionsReleased) return null;
+            const released = !!activeMonitoredSession.solutionsReleased;
+            const isBusy = togglingSolutionsPin === activeMonitoredSession.pin;
+            return (
+              <button
+                type="button"
+                disabled={isBusy}
+                onClick={() => onToggleSolutionsReleased(activeMonitoredSession.pin, !released)}
+                className={`px-3 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50 ${
+                  released
+                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30"
+                    : "bg-amber-500/20 border-amber-500/40 text-amber-200 hover:bg-amber-500/30"
+                }`}
+                title={
+                  released
+                    ? "Nascondi nuovamente le risposte esatte e le spiegazioni agli studenti"
+                    : "Sblocca in tempo reale risposte esatte e spiegazioni per tutta la classe"
+                }
+              >
+                {isBusy ? (
+                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                ) : released ? (
+                  <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                ) : (
+                  <Lock className="w-3.5 h-3.5 text-amber-300" />
+                )}
+                <span>{released ? "Soluzioni Pubbliche (Nascondi)" : "Pubblica Soluzioni alla Classe"}</span>
+              </button>
+            );
+          })()}
           <button
             type="button"
             onClick={() => setBlindLimMode((prev) => !prev)}

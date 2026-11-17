@@ -268,7 +268,11 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
           <div className="grid grid-cols-2 gap-4">
             <div className="bg-slate-950/60 p-4 rounded-xl border border-white/5 text-center">
               <p className="text-[10px] tracking-wider uppercase text-slate-500 font-bold">
-                Voto Assegnato dall&apos;A.I.
+                {submission.Voto_Originale_IA
+                  ? "Voto Finale (Ritoccato Docente)"
+                  : submission.Convalida_Docente_At
+                  ? "Voto Convalidato dal Docente"
+                  : "Voto Proposto dall'A.I."}
               </p>
               <p className={`text-3xl font-display font-bold mt-1 ${displayGrade === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
                 {displayGrade}
@@ -697,7 +701,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                   ) : hasEvaluation ? (
                                     <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
                                       <p className="font-bold text-[9px] text-teal-400 uppercase">
-                                        Valutazione IA: ({score}/10)
+                                        {entry.detail?.teacherEdited ? `Valutazione Docente: (${score}/10)` : `Valutazione IA: (${score}/10)`}
                                       </p>
                                       <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
                                     </div>
@@ -867,7 +871,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                 ) : hasEvaluation ? (
                                   <div className="p-3 bg-indigo-500/5 border border-indigo-500/10 rounded-lg text-indigo-200 text-[11px]">
                                     <p className="font-bold text-[9px] text-teal-400 uppercase">
-                                      Valutazione IA: ({score}/10)
+                                      {entry.detail?.teacherEdited ? `Valutazione Docente: (${score}/10)` : `Valutazione IA: (${score}/10)`}
                                     </p>
                                     <p className="mt-1" dangerouslySetInnerHTML={{ __html: formatMarkdown(entry.detail.feedback) }} />
                                   </div>

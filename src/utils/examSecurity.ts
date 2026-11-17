@@ -22,12 +22,26 @@ function maskBracketedFibAnswer(sentence: unknown): string {
   return s.replace(/\[([^\]]+)\]/, "___");
 }
 
+function deterministicHash(input: string): number {
+  let h = 2166136261;
+  for (let i = 0; i < input.length; i++) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return h >>> 0;
+}
+
 /**
  * Produces a student-safe copy of examData with all solution fields removed
  * (`correctIndex`, `answer`, `explanation`, and inline `[word]` FIB hints)
  * plus a compact key map suitable for encrypted server-side scoring.
+ * When `options.reduceDistractors` is true (BES/DSA accommodation), 4+ option MC items
+ * deterministically drop 1 incorrect distractor while keeping `answerKey.mc` aligned.
  */
-export function stripExamAnswers(examData: any): {
+export function stripExamAnswers(
+  examData: any,
+  options?: { reduceDistractors?: boolean }
+): {
   sanitizedExam: any;
   answerKey: ExtractedAnswerKey;
 } {
@@ -37,13 +51,38 @@ export function stripExamAnswers(examData: any): {
     fib: {},
     explanations: {},
   };
+  const reduceDistractors = Boolean(options?.reduceDistractors);
 
   const stripMcList = (list: any[]) => {
     for (const q of list) {
       if (!q || typeof q !== "object") continue;
       const qId = String(q.id || "");
-      if (qId && q.correctIndex !== undefined && q.correctIndex !== null) {
-        answerKey.mc[qId] = Number(q.correctIndex);
+      let effectiveCorrect =
+        q.correctIndex !== undefined && q.correctIndex !== null ? Number(q.correctIndex) : undefined;
+
+      if (
+        reduceDistractors &&
+        Array.isArray(q.options) &&
+        q.options.length >= 4 &&
+        effectiveCorrect !== undefined &&
+        effectiveCorrect >= 0 &&
+        effectiveCorrect < q.options.length
+      ) {
+        const wrongIndices: number[] = [];
+        for (let i = 0; i < q.options.length; i++) {
+          if (i !== effectiveCorrect) wrongIndices.push(i);
+        }
+        if (wrongIndices.length > 0) {
+          const dropPick = wrongIndices[deterministicHash(qId || String(q.question || "")) % wrongIndices.length];
+          q.options = q.options.filter((_: any, idx: number) => idx !== dropPick);
+          if (dropPick < effectiveCorrect) {
+            effectiveCorrect -= 1;
+          }
+        }
+      }
+
+      if (qId && effectiveCorrect !== undefined && !Number.isNaN(effectiveCorrect)) {
+        answerKey.mc[qId] = effectiveCorrect;
       }
       if (qId && typeof q.explanation === "string" && q.explanation.trim()) {
         answerKey.explanations[qId] = q.explanation;

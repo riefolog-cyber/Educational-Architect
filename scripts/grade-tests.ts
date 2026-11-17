@@ -26,6 +26,20 @@ import {
   scrubPromptPii,
   scrubAnswersForAi,
 } from "../src/utils/privacyPseudonym";
+import {
+  saveScopedExamLock,
+  loadScopedExamLock,
+  clearScopedExamLock,
+  wipeSharedPcStudentStorage,
+  type StorageLike,
+} from "../src/utils/clientStorage";
+import {
+  roundScholasticGrade,
+  formatGradeForRegister,
+  sanitizeCsvCell,
+  buildElectronicRegisterCsv,
+} from "../src/utils/gradebookExport";
+import { SavedSubmission } from "../src/types";
 
 let passed = 0;
 let failed = 0;
@@ -916,6 +930,167 @@ test("getSubmissionBlindCode & getStudentRosterBlindCode: niente suffissi .COM/.
   assert.notEqual(r1, r2);
   assert.ok(!c1.endsWith("COM"));
   assert.ok(!r1.endsWith("COM"));
+});
+
+test("sanitizeAiHtml: blocca SVG/Math/Style/data-URI mantenendo HTML didattico e link HTTPS", () => {
+  const dirty =
+    `<div><svg onload="alert(1)"><circle /></svg><style>body{display:none}</style><math><mi>x</mi></math>` +
+    `<a href="https://esempio.edu.it/risorsa" onclick="evil()">Fonte</a>` +
+    `<a href="data:text/html,<script>1</script>">Mal</a>` +
+    `<p style="color:red">Testo <strong>chiaro</strong></p></div>`;
+  const clean = sanitizeAiHtml(dirty);
+  assert.ok(!clean.includes("<svg"));
+  assert.ok(!clean.includes("<style"));
+  assert.ok(!clean.includes("<math"));
+  assert.ok(!clean.includes("onload"));
+  assert.ok(!clean.includes("onclick"));
+  assert.ok(!clean.includes("data:text/html"));
+  assert.ok(!clean.includes("style="));
+  assert.ok(clean.includes('href="https://esempio.edu.it/risorsa"'));
+  assert.ok(clean.includes("<strong>chiaro</strong>"));
+});
+
+test("clientStorage: isolamento blocchi tra studenti su PC condiviso e pulizia al logout", () => {
+  const makeMockStorage = (): StorageLike => {
+    const map = new Map<string, string>();
+    return {
+      get length() {
+        return map.size;
+      },
+      key: (i: number) => Array.from(map.keys())[i] ?? null,
+      getItem: (k: string) => map.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        map.set(k, v);
+      },
+      removeItem: (k: string) => {
+        map.delete(k);
+      },
+    };
+  };
+
+  const ls = makeMockStorage();
+  const ss = makeMockStorage();
+
+  saveScopedExamLock("mario.rossi@scuola.it", "COMPITO1", true, "Tab switch", ls, ss);
+
+  // Same student + same PIN restores lock
+  const loadedMario = loadScopedExamLock("MARIO.ROSSI@SCUOLA.IT", "COMPITO1", ls, ss);
+  assert.ok(loadedMario);
+  assert.equal(loadedMario.reason, "Tab switch");
+
+  // Different student on shared PC does NOT inherit Mario's lock
+  const loadedAnna = loadScopedExamLock("anna.bianchi@scuola.it", "COMPITO1", ls, ss);
+  assert.equal(loadedAnna, null);
+
+  // Clear scoped lock clears Mario's lock
+  clearScopedExamLock("mario.rossi@scuola.it", "COMPITO1", ls, ss);
+  assert.equal(loadScopedExamLock("mario.rossi@scuola.it", "COMPITO1", ls, ss), null);
+
+  // Shared PC wipe cleans identity + draft keys
+  ls.setItem("direct_student_user", "{}");
+  ls.setItem("saved_student_email", "mario@scuola.it");
+  ls.setItem("draft_PIN1_mario", "{}");
+  ls.setItem("active_eval_rescue", "{}");
+  ls.setItem("ea_bes_expiry_mario_PIN1", "2026-01-01");
+  ls.setItem("teacher_library_cache", "keep-me");
+  wipeSharedPcStudentStorage(ls, ss);
+  assert.equal(ls.getItem("direct_student_user"), null);
+  assert.equal(ls.getItem("saved_student_email"), null);
+  assert.equal(ls.getItem("draft_PIN1_mario"), null);
+  assert.equal(ls.getItem("active_eval_rescue"), null);
+  assert.equal(ls.getItem("ea_bes_expiry_mario_PIN1"), null);
+  assert.equal(ls.getItem("teacher_library_cache"), "keep-me");
+});
+
+test("gradebookExport: arrotondamenti italiani, protezione CSV formula injection e modalita cieca", () => {
+  near(roundScholasticGrade(6.62, "quarters"), 6.5);
+  near(roundScholasticGrade(6.78, "halves"), 7);
+  near(roundScholasticGrade(6.49, "integers"), 6);
+  near(roundScholasticGrade(6.51, "integers"), 7);
+  const r65 = formatGradeForRegister(6.5, "quarters");
+  assert.equal(r65.registerDecimal, "6,5");
+  assert.equal(r65.scholasticLabel, "6.5 (6½)");
+  const r725 = formatGradeForRegister(7.25, "quarters");
+  assert.equal(r725.registerDecimal, "7,25");
+  assert.equal(r725.scholasticLabel, "7.3 (7+)");
+
+  // Formula injection neutralization (quoted CSV cells)
+  assert.equal(sanitizeCsvCell("=CMD|'/C calc'!A0"), "\"'=CMD|'/C calc'!A0\"");
+  assert.equal(sanitizeCsvCell("+SUM(A1:A2)"), "\"'+SUM(A1:A2)\"");
+
+  const sampleSub: SavedSubmission = {
+    id: "sub1",
+    Timestamp: "2026-10-15T09:00:00Z",
+    Docente_Email: "prof@scuola.it",
+    Tipo: "Quiz",
+    Pin: "PIN9",
+    Session_Titolo: "Verifica Storia",
+    Nome: "Mario Rossi",
+    Email: "mario.rossi@scuola.it",
+    Pseudo_Id: "STU-7K4M9P",
+    Voto_Suggerito: "7+",
+    Autovalutazione: "7",
+    AntiCopia_TabSwitch: 0,
+    AntiCopia_IncollaBloccato: 0,
+    AntiCopia_InfractionsLog: "[]",
+    Full_Evaluation: "{}",
+    Risposte_Studente: "{}",
+    Convalida_Docente_At: "2026-10-15T10:00:00Z",
+  };
+
+  const blindCsv = buildElectronicRegisterCsv([sampleSub], {
+    preset: "argo_didup",
+    roundingMode: "halves",
+    blindMode: true,
+    onlyValidated: true,
+  });
+  assert.ok(!blindCsv.includes("Mario Rossi"));
+  assert.ok(!blindCsv.includes("mario.rossi@scuola.it"));
+  assert.ok(blindCsv.includes("STU-7K4M9P"));
+  assert.ok(blindCsv.includes("Voto Decimale (Argo)"));
+
+  const classeVivaCsv = buildElectronicRegisterCsv([sampleSub], {
+    preset: "classeviva",
+    roundingMode: "exact",
+    blindMode: false,
+    onlyValidated: false,
+  });
+  assert.ok(classeVivaCsv.includes("Cognome e Nome / Codice"));
+  assert.ok(classeVivaCsv.includes("Mario Rossi"));
+});
+
+test("BES reduceDistractors (4 -> 3 opzioni) preserva il grading esatto dopo restoreExamAnswers", () => {
+  const originalExam = {
+    title: "BES Quiz",
+    multipleChoice: [
+      {
+        id: "q1",
+        question: "Capitale d'Italia?",
+        options: ["Milano", "Roma", "Torino", "Napoli"],
+        correctIndex: 1,
+        explanation: "Roma è la capitale.",
+        weight: 2,
+      },
+      {
+        id: "q2",
+        question: "Domanda già a 3 opzioni",
+        options: ["A", "B", "C"],
+        correctIndex: 0,
+      },
+    ],
+  };
+
+  const { sanitizedExam, answerKey } = stripExamAnswers(originalExam, { reduceDistractors: true });
+  assert.equal(sanitizedExam.multipleChoice[0].options.length, 3);
+  assert.equal(sanitizedExam.multipleChoice[1].options.length, 3);
+  assert.ok(sanitizedExam.multipleChoice[0].options.includes("Roma"));
+  assert.equal(sanitizedExam.multipleChoice[0].options[answerKey.mc["q1"]], "Roma");
+
+  // Simulate client shuffling those 3 options: rotate left by 1
+  const newOrder = [1, 2, 0];
+  const restored = restoreExamAnswers(sanitizedExam, answerKey, { q1: newOrder });
+  const restoredOptions = newOrder.map((origIdx) => sanitizedExam.multipleChoice[0].options[origIdx]);
+  assert.equal(restoredOptions[restored.multipleChoice[0].correctIndex], "Roma");
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

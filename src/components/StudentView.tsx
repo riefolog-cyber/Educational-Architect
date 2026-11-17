@@ -45,8 +45,8 @@ import {
 
 import PrintableReportModal from "./PrintableReportModal";
 
-import { db, dbFirestore, handleFirestoreError, OperationType } from "../firebase";
-import { Answers, Behavior, Evaluation, Infraction } from "../types";
+import { db, dbFirestore, handleFirestoreError, reportFirestoreError, OperationType } from "../firebase";
+import { Answers, Behavior, Evaluation, Infraction, BesOptions } from "../types";
 import {
   formatMarkdown,
   detectGibberish,
@@ -80,6 +80,13 @@ import {
   type RecoveryProgress
 } from "../utils/recoveryProgress";
 import { deriveStudentPseudonym, scrubAnswersForAi } from "../utils/privacyPseudonym";
+import {
+  saveScopedExamLock,
+  loadScopedExamLock,
+  clearScopedExamLock,
+  wipeSharedPcStudentStorage,
+  normalizeIdentityKey
+} from "../utils/clientStorage";
 
 function getLiveStudentDocId(email?: string | null, targetPin?: string | null): string {
   return deriveStudentPseudonym(email || "anonimo", String(targetPin || "").trim().toUpperCase());
@@ -180,6 +187,7 @@ async function requestRecoveryPlan(
   let attempt = 0;
   let reenqueues = 0;
   let jobId = "";
+  let jobToken = "";
 
   while (Date.now() < deadline) {
     if (!jobId) {
@@ -203,19 +211,26 @@ async function requestRecoveryPlan(
           : { status: "queued", position: Math.max(1, Number(data.position) || 1) }
       );
       jobId = String(data.jobId);
+      jobToken = String(data.jobToken || "");
       continue;
     }
 
     await new Promise((resolve) => setTimeout(resolve, Math.min(900 + attempt * 150, 2500)));
     attempt++;
 
-    const statusResponse = await fetch(`/api/evaluate/status/${encodeURIComponent(jobId)}`);
+    const statusUrl = jobToken
+      ? `/api/evaluate/status/${encodeURIComponent(jobId)}?token=${encodeURIComponent(jobToken)}`
+      : `/api/evaluate/status/${encodeURIComponent(jobId)}`;
+    const statusResponse = await fetch(statusUrl, {
+      headers: jobToken ? { "x-job-token": jobToken } : undefined,
+    });
     if (statusResponse.status === 404) {
       // Server riavviato: il job non esiste più, si riaccoda (max 3 volte).
       if (++reenqueues > 3) {
         throw new Error("Il server si è riavviato più volte: riprova tra qualche minuto.");
       }
       jobId = "";
+      jobToken = "";
       continue;
     }
     if (!statusResponse.ok) {
@@ -271,6 +286,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const [expiryTime, setExpiryTime] = useState<string | null>(null);
   const [backendUrl, setBackendUrl] = useState<string | null>(null);
   const [teacherEmail, setTeacherEmail] = useState<string>("sconosciuto");
+  const [deferSolutionsSession, setDeferSolutionsSession] = useState<boolean>(false);
+  const [solutionsReleased, setSolutionsReleased] = useState<boolean>(true);
+  const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
+  const [pastSessionSolutionsReleased, setPastSessionSolutionsReleased] = useState<Record<string, boolean>>({});
 
   // Answers State
   const [answers, setAnswers] = useState<Answers>({
@@ -681,47 +700,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   }, [infractionToastMsg]);
 
   // ---- Hard exam lock (released only by the teacher) ----------------------
-  const lockStorageKey = (pinValue: string) => `exam_lock_${pinValue.trim().toUpperCase()}`;
-
   const persistExamLock = (locked: boolean, reason?: string) => {
     const pinToUse = (sessionPin || pin || "").trim().toUpperCase();
-    try {
-      if (locked) {
-        const payload = JSON.stringify({
-          locked: true,
-          pin: pinToUse,
-          reason: reason || "",
-          at: new Date().toISOString()
-        });
-        if (pinToUse) {
-          sessionStorage.setItem(lockStorageKey(pinToUse), payload);
-          localStorage.setItem(lockStorageKey(pinToUse), payload);
-        }
-        localStorage.setItem("active_exam_lock", payload);
-        sessionStorage.setItem("active_exam_lock", payload);
-      } else {
-        if (pinToUse) {
-          sessionStorage.removeItem(lockStorageKey(pinToUse));
-          localStorage.removeItem(lockStorageKey(pinToUse));
-        }
-        localStorage.removeItem("active_exam_lock");
-        sessionStorage.removeItem("active_exam_lock");
-        try {
-          const keysToRemove: string[] = [];
-          for (let i = 0; i < localStorage.length; i++) {
-            const k = localStorage.key(i);
-            if (k && k.startsWith("exam_lock_")) keysToRemove.push(k);
-          }
-          keysToRemove.forEach((k) => {
-            try {
-              localStorage.removeItem(k);
-              sessionStorage.removeItem(k);
-            } catch {}
-          });
-        } catch {}
-      }
-    } catch {
-      // Storage disabled (private mode): the lock still applies for this tab.
+    if (locked) {
+      saveScopedExamLock(user?.email, pinToUse, true, reason || "");
+    } else {
+      clearScopedExamLock(user?.email, pinToUse);
     }
   };
 
@@ -1217,12 +1201,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         email: user?.email || submission?.Email,
       });
 
-      // Il piano passa da una coda dedicata sul server: con tutta la classe che
-      // lo chiede insieme, le correzioni degli elaborati non perdono posti.
       const planHtml = await requestRecoveryPlan(
         {
           tipo: submission.Tipo,
           studentPseudoId,
+          studentName: user?.displayName || submission?.Nome || "",
+          studentEmail: user?.email || submission?.Email || "",
           suggestedGrade: submission.Voto_Suggerito,
           studentSelfGrade: submission.Autovalutazione,
           evaluation: finalEvalObj,
@@ -1260,6 +1244,41 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       loadHistory();
     }
   }, [activeSubTab]);
+
+  // Real-time listener: unlock deferred solutions immediately on the results screen as soon as teacher releases them
+  useEffect(() => {
+    if (activeScreen !== "results" || !deferSolutionsSession || solutionsReleased || !dbFirestore || !sessionPin) {
+      return;
+    }
+    const cleanPin = sessionPin.trim().toUpperCase();
+    const unsub = onSnapshot(
+      doc(dbFirestore, "active_sessions", cleanPin),
+      (snap) => {
+        if (!snap.exists()) return;
+        const d = snap.data();
+        if (d?.solutionsReleased === true || d?.deferSolutions === false) {
+          setSolutionsReleased(true);
+        }
+      },
+      (err) => console.warn("Ascolto rilascio soluzioni:", err)
+    );
+    return () => unsub();
+  }, [activeScreen, deferSolutionsSession, solutionsReleased, sessionPin]);
+
+  // History view: if a past submission had deferred solutions, check whether teacher released them for that PIN
+  useEffect(() => {
+    if (!selectedPastSub?.Soluzioni_Differite || !selectedPastSub?.Pin || !dbFirestore) return;
+    if (pastSessionSolutionsReleased[selectedPastSub.id]) return;
+    const cleanPin = String(selectedPastSub.Pin).trim().toUpperCase();
+    if (!cleanPin) return;
+    getDoc(doc(dbFirestore, "active_sessions", cleanPin))
+      .then((snap) => {
+        if (snap.exists() && snap.data()?.solutionsReleased === true) {
+          setPastSessionSolutionsReleased((prev) => ({ ...prev, [selectedPastSub.id]: true }));
+        }
+      })
+      .catch(() => {});
+  }, [selectedPastSub, pastSessionSolutionsReleased]);
 
   // Check custom pins (Firebase or Local Templates)
   const handleCheckPin = async () => {
@@ -1367,29 +1386,51 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
           setExamData(examContent);
           setExamType(examContent?.sections ? "workbook" : "quiz");
-          setExpiryTime(sessionData.expiry || null);
+
+          const isDeferred = !!sessionData.deferSolutions;
+          const isReleasedNow = isDeferred ? !!sessionData.solutionsReleased : true;
+          setDeferSolutionsSession(isDeferred);
+          setSolutionsReleased(isReleasedNow);
+
+          const besOpts: BesOptions = sessionData.besOptions || {};
+          const extraPct: 0 | 25 | 50 =
+            besOpts.extraTimePercent === 50 ? 50 : besOpts.extraTimePercent === 25 ? 25 : 0;
+          setBesExtraTimePercent(extraPct);
+          if (besOpts.autoOpenAccessibilityBar) {
+            setShowAccessibilityBar(true);
+          }
+
+          let effectiveExpiry: string | null = sessionData.expiry || null;
+          if (effectiveExpiry && extraPct > 0) {
+            const besAnchorKey = `ea_bes_expiry_${normalizeIdentityKey(user?.email)}_${formattedPin}_${currentRunIdForInit || "default"}`;
+            try {
+              const savedBesExpiry = localStorage.getItem(besAnchorKey);
+              if (savedBesExpiry && !isNaN(new Date(savedBesExpiry).getTime())) {
+                effectiveExpiry = savedBesExpiry;
+              } else {
+                const baseMs = new Date(effectiveExpiry).getTime();
+                if (!isNaN(baseMs)) {
+                  const remainingMs = Math.max(baseMs - Date.now(), 10 * 60 * 1000);
+                  const extraMs = Math.round(remainingMs * (extraPct / 100));
+                  const extendedIso = new Date(baseMs + extraMs).toISOString();
+                  localStorage.setItem(besAnchorKey, extendedIso);
+                  effectiveExpiry = extendedIso;
+                }
+              }
+            } catch {}
+          }
+          setExpiryTime(effectiveExpiry);
+
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
           setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
-          // Restore a lock applied before a page reload: refreshing must not
-          // be a way to get back into the exam without the teacher.
+          // Restore a lock applied before a page reload scoped strictly to this student + PIN
           let isLockedNow = false;
           let currentLockReason = "";
-          try {
-            const storedLock = localStorage.getItem(`exam_lock_${formattedPin}`) ||
-                               sessionStorage.getItem(`exam_lock_${formattedPin}`) ||
-                               localStorage.getItem("active_exam_lock") ||
-                               sessionStorage.getItem("active_exam_lock");
-            if (storedLock) {
-              const parsedLock = JSON.parse(storedLock);
-              const lockPin = String(parsedLock?.pin || "").trim().toUpperCase();
-              if (parsedLock?.locked && (!lockPin || lockPin === formattedPin)) {
-                isLockedNow = true;
-                currentLockReason = String(parsedLock.reason || "Prova precedentemente bloccata per allontanamento");
-              }
-            }
-          } catch {
-            // Ignore unreadable lock markers.
+          const restoredLock = loadScopedExamLock(user?.email, formattedPin);
+          if (restoredLock) {
+            isLockedNow = true;
+            currentLockReason = restoredLock.reason || "Prova precedentemente bloccata per allontanamento";
           }
 
           let cloudStudentData: any = null;
@@ -2369,6 +2410,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       const MAX_WAIT_MS = 15 * 60 * 1000;
       let pollingStartedAt = Date.now();
       let currentJobId = jobId;
+      let currentJobToken = String(rescue?.jobToken || "");
       let reenqueues = 0;
       const MAX_REENQUEUES = 3; // Survive server restarts transparently
       while (true) {
@@ -2385,7 +2427,15 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         }
         isFirstPoll = false;
 
-        const statusResp = await fetchWithRetry(`/api/evaluate/status/${currentJobId}`, {}, 3, 1000);
+        const statusUrl = currentJobToken
+          ? `/api/evaluate/status/${encodeURIComponent(currentJobId)}?token=${encodeURIComponent(currentJobToken)}`
+          : `/api/evaluate/status/${encodeURIComponent(currentJobId)}`;
+        const statusResp = await fetchWithRetry(
+          statusUrl,
+          currentJobToken ? { headers: { "x-job-token": currentJobToken } } : {},
+          3,
+          1000
+        );
         if (!statusResp.ok) {
           if (statusResp.status === 404 && rescue.payload && reenqueues < MAX_REENQUEUES) {
             // Job lost (server restarted): re-enqueue the same payload automatically
@@ -2401,7 +2451,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                 const reEnqueueData = await reEnqueueResp.json();
                 if (reEnqueueData.jobId) {
                   currentJobId = reEnqueueData.jobId;
+                  currentJobToken = String(reEnqueueData.jobToken || "");
                   rescue.jobId = currentJobId;
+                  rescue.jobToken = currentJobToken;
                   try {
                     localStorage.setItem("active_eval_rescue", JSON.stringify(rescue));
                   } catch {}
@@ -2567,7 +2619,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             AntiCopia_InfractionsLog: JSON.stringify(rescue.behavior.infractionsLog),
             Full_Evaluation: JSON.stringify(finalEval),
             Risposte_Studente: JSON.stringify(rescue.answers),
-            Domande_Esame: serializeExamForSubmission(rescue.examData)
+            Domande_Esame: serializeExamForSubmission(rescue.examData),
+            Soluzioni_Differite: !!(rescue.deferSolutions && !rescue.solutionsReleased)
           };
 
           if (rescue.examType === "quiz") {
@@ -2615,8 +2668,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           });
         } catch (dbErr: any) {
           console.error("Errore salvataggio firestore:", dbErr);
-          setSavingStatus("⚠️ Connessione al database di classe non riuscita.");
-          handleFirestoreError(dbErr, OperationType.CREATE, "valutazioni");
+          const dbInfo = reportFirestoreError(dbErr, OperationType.CREATE, "valutazioni");
+          setSavingStatus(
+            `⚠️ Registrazione su Cloud non riuscita (${dbInfo.error}). Le tue risposte restano comunque al sicuro in locale su questo dispositivo.`
+          );
         }
       } else {
         setSavingStatus("⚠️ Database scolastico non connesso. I voti non sono stati scritti su Firebase permanente.");
@@ -2660,6 +2715,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setEncryptedAnswerKey(data.encryptedAnswerKey || "");
           mcOptionOrderRef.current = data.mcOptionOrder || {};
           setExpiryTime(data.expiryTime || null);
+          setDeferSolutionsSession(!!data.deferSolutions);
+          setSolutionsReleased(data.deferSolutions ? !!data.solutionsReleased : true);
           setBackendUrl(data.backendUrl || null);
           setTeacherEmail(data.teacherEmail || "");
           setAnswers(data.answers || { mc: {}, oe: {}, wbFib: {}, wbRq: {} });
@@ -2895,12 +2952,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         throw new Error(`Errore JSON in Enqueue. Ricevuto: ${enqueueRaw.substring(0, 200)}`);
       }
       const jobId = enqueueData.jobId;
+      const jobToken = String(enqueueData.jobToken || "");
 
       // Persist the rescue anchor state in case of connection drop or refreshes.
-      // Includes the full server payload so a lost job can be re-enqueued
-      // automatically if the server restarts (Render free tier).
       const rescuePayload = {
         jobId,
+        jobToken,
         payload,
         savedAt: Date.now(),
         sessionPin,
@@ -2911,6 +2968,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         encryptedAnswerKey: encryptedAnswerKey || "",
         mcOptionOrder: mcOptionOrderRef.current || {},
         expiryTime,
+        deferSolutions: deferSolutionsSession,
+        solutionsReleased,
         backendUrl,
         teacherEmail,
         answers,
@@ -2977,6 +3036,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           <div className="flex items-center gap-1.5 font-bold font-mono">
             <Timer className={`w-4 h-4 ${timerUrgent ? "text-red-400" : "text-emerald-400"}`} />
             <span>{remainingTimeText}</span>
+            {besExtraTimePercent > 0 && (
+              <span className="ml-1 px-1.5 py-0.5 rounded bg-teal-500/20 border border-teal-500/35 text-[10px] font-bold text-teal-200">
+                ♿ +{besExtraTimePercent}%
+              </span>
+            )}
           </div>
           <span className="text-slate-600 hidden sm:inline" aria-hidden="true">·</span>
           <span className="hidden sm:inline-flex items-center gap-1 text-[11px] text-emerald-400 font-medium">
@@ -3015,22 +3079,27 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                 <p className="text-[10px] text-slate-400 font-mono">BENVENUTO/A</p>
                 <p className="text-sm font-semibold text-white truncate max-w-[150px] sm:max-w-xs">{user?.displayName || "Studente"}</p>
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex items-center gap-2 flex-wrap justify-end">
                 {onBack && (
-                  <button 
-                    onClick={onBack} 
+                  <button
+                    onClick={onBack}
                     className="flex items-center gap-1.5 text-xs text-indigo-300 hover:text-indigo-200 transition-colors bg-white/5 hover:bg-white/10 px-3 py-1.5 rounded-xl border border-white/10 cursor-pointer"
                   >
                     <ArrowLeft className="w-3.5 h-3.5" />
                     Home App
                   </button>
                 )}
-                <button 
-                  onClick={onLogout} 
+                <button
+                  type="button"
+                  onClick={() => {
+                    wipeSharedPcStudentStorage();
+                    onLogout();
+                  }}
+                  title="Pulisce i dati salvati su questo PC scolastico e cambia studente"
                   className="flex items-center gap-1.5 text-xs text-red-400 hover:text-red-300 transition-colors bg-red-500/5 px-3 py-1.5 rounded-xl border border-red-500/10 cursor-pointer"
                 >
                   <LogOut className="w-3.5 h-3.5" />
-                  Esci
+                  Cambia Alunno / Esci
                 </button>
               </div>
             </div>
@@ -3119,6 +3188,9 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                     const pastGrade = pastIsPending
                       ? "N.V."
                       : selectedPastSub.Voto_Suggerito || "N/A";
+                    const pastSolutionsMasked =
+                      Boolean(selectedPastSub.Soluzioni_Differite) &&
+                      !pastSessionSolutionsReleased[selectedPastSub.id];
 
                     return (
                       <div className="space-y-6 animate-fadeIn text-left text-slate-100">
@@ -3284,31 +3356,40 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         {/* Detailed Quiz/Workbook MCQ Correctness Recap */}
                         {((parsedExamData?.multipleChoice && parsedExamData.multipleChoice.length > 0) || (parsedExamData?.sections && parsedExamData.sections.some((s: any) => s.multipleChoice && s.multipleChoice.length > 0))) && (
                           <div className="space-y-4 pt-2">
-                            <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                              Dettaglio Risposte Sezione Multipla:
-                            </h4>
+                            <div className="flex items-center justify-between gap-2 flex-wrap">
+                              <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                                Dettaglio Risposte Sezione Multipla:
+                              </h4>
+                              {pastSolutionsMasked && (
+                                <span className="text-[10px] px-2 py-0.5 rounded-lg bg-amber-500/15 border border-amber-500/30 text-amber-200 font-semibold">
+                                  🔒 Soluzioni differite dal docente
+                                </span>
+                              )}
+                            </div>
                             <div className="grid grid-cols-1 gap-2.5">
                               {[...(parsedExamData?.multipleChoice || []), ...((parsedExamData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
                                 const selectedOptIndex = parsedAnswers?.mc?.[q.id];
                                 const isCorrect = selectedOptIndex === q.correctIndex;
                                 const uAns = q.options[selectedOptIndex] || "Scelta mancante";
                                 return (
-                                  <div 
-                                    key={q.id} 
+                                  <div
+                                    key={q.id}
                                     className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                      isCorrect 
-                                        ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300" 
+                                      pastSolutionsMasked
+                                        ? "bg-slate-900/50 border-white/10 text-slate-300"
+                                        : isCorrect
+                                        ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                                         : "bg-red-950/15 border-red-500/20 text-red-300"
                                     }`}
                                   >
-                                    <span className="font-bold text-sm">{isCorrect ? "✅" : "❌"}</span>
+                                    <span className="font-bold text-sm">{pastSolutionsMasked ? "📝" : isCorrect ? "✅" : "❌"}</span>
                                     <div>
                                       <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
                                       <QuestionFigure src={parsedExamData?.images?.[q.id]} />
                                       <p className="mt-1">
                                         La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                                       </p>
-                                      {!isCorrect && (
+                                      {!pastSolutionsMasked && !isCorrect && (
                                         <p className="mt-1 text-emerald-400">
                                           Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
                                         </p>
@@ -3351,18 +3432,22 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                           <div
                                             key={fib.id || fIdx}
                                             className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                              isCorrect
+                                              pastSolutionsMasked
+                                                ? "bg-slate-900/50 border-white/10 text-slate-300"
+                                                : isCorrect
                                                 ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                                                 : "bg-red-950/15 border-red-500/20 text-red-300"
                                             }`}
                                           >
-                                            <span className="font-bold text-sm shrink-0">{isCorrect ? "✅" : "❌"}</span>
+                                            <span className="font-bold text-sm shrink-0">{pastSolutionsMasked ? "📝" : isCorrect ? "✅" : "❌"}</span>
                                             <div className="space-y-1.5 flex-1">
                                               <p className="font-semibold text-slate-200">
                                                 {before}
                                                 <span
                                                   className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
-                                                    isCorrect
+                                                    pastSolutionsMasked
+                                                      ? "bg-slate-800 text-slate-200 border-white/15"
+                                                      : isCorrect
                                                       ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
                                                       : "bg-red-500/20 text-red-200 border-red-500/30"
                                                   }`}
@@ -3376,12 +3461,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                                 <p className="text-slate-400">
                                                   La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
                                                 </p>
-                                                {!isCorrect && expected && (
+                                                {!pastSolutionsMasked && !isCorrect && expected && (
                                                   <p className="text-emerald-400">
                                                     Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
                                                   </p>
                                                 )}
-                                                {isSynonymAcceptance && (
+                                                {!pastSolutionsMasked && isSynonymAcceptance && (
                                                   <p className="text-teal-300 text-[10.5px] italic">
                                                     💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
                                                   </p>
@@ -4536,6 +4621,21 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               </div>
             )}
 
+            {/* Deferred Solutions Live Lock Notice */}
+            {deferSolutionsSession && !solutionsReleased && (
+              <div className="bg-amber-950/40 border border-amber-500/35 rounded-2xl p-4 sm:p-5 space-y-1.5">
+                <div className="flex items-center gap-2 text-amber-300">
+                  <Lock className="w-4 h-4 shrink-0" />
+                  <h4 className="text-xs font-bold uppercase tracking-wider">
+                    Soluzioni Differite dal Docente (Sessione in Corso)
+                  </h4>
+                </div>
+                <p className="text-xs text-amber-100/90 leading-relaxed">
+                  Per tutelare chi sta ancora svolgendo la verifica in classe, le risposte corrette e le spiegazioni restano nascoste fino allo sblocco da parte del docente. Questa pagina si aggiornerà automaticamente appena verranno pubblicate.
+                </p>
+              </div>
+            )}
+
             {/* Real-time AI Personalized Study & Recovery Plan Section directly on the report card */}
             <div className="bg-gradient-to-br from-indigo-950/40 via-indigo-950/20 to-slate-950/60 border border-indigo-500/20 p-5 rounded-2xl space-y-4">
               <div className="flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 border-b border-indigo-500/10 pb-3">
@@ -4543,7 +4643,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   <Sparkles className="w-5 h-5 text-indigo-400 animate-pulse" />
                   <h4 className="text-xs font-bold uppercase tracking-wider">Docenza Tutor: Piano di Recupero Personalizzato</h4>
                 </div>
-                {!activePlanHtml && !isEvaluationPending(evaluation) && (
+                {!activePlanHtml && !isEvaluationPending(evaluation) && (!deferSolutionsSession || solutionsReleased) && (
                   <button
                     onClick={async () => {
                       if (generatingPlan) return;
@@ -4559,13 +4659,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                           email: user?.email,
                         });
 
-                        // Accodato sul server e atteso qui: la correzione degli
-                        // altri elaborati non viene rallentata dai piani richiesti
-                        // da tutta la classe.
                         const planHtml = await requestRecoveryPlan(
                           {
                             tipo: examType === "quiz" ? "Quiz" : "Workbook",
                             studentPseudoId,
+                            studentName: user?.displayName || "",
+                            studentEmail: user?.email || "",
                             suggestedGrade: evaluation?.suggestedGrade,
                             studentSelfGrade: studentSelfGrade,
                             evaluation: evaluation,
@@ -4659,30 +4758,33 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                 </h4>
                 <div className="grid grid-cols-1 gap-2.5">
                   {[...(examData?.multipleChoice || []), ...((examData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
+                    const hideSol = deferSolutionsSession && !solutionsReleased;
                     const isCorrect = answers.mc[q.id] === q.correctIndex;
                     const uAns = q.options[answers.mc[q.id]] || "Scelta mancante";
                     return (
-                      <div 
-                        key={q.id} 
+                      <div
+                        key={q.id}
                         className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                          isCorrect 
-                            ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300" 
+                          hideSol
+                            ? "bg-slate-900/50 border-white/10 text-slate-300"
+                            : isCorrect
+                            ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                             : "bg-red-950/15 border-red-500/20 text-red-300"
                         }`}
                       >
-                        <span className="font-bold text-sm">{isCorrect ? "✅" : "❌"}</span>
+                        <span className="font-bold text-sm">{hideSol ? "📝" : isCorrect ? "✅" : "❌"}</span>
                         <div>
                           <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
                           <QuestionFigure src={examData?.images?.[q.id]} />
                           <p className="mt-1">
                             La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                           </p>
-                          {!isCorrect && (
+                          {!hideSol && !isCorrect && (
                             <p className="mt-1 text-emerald-400">
                               Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
                             </p>
                           )}
-                          {q.explanation && (
+                          {!hideSol && q.explanation && (
                             <div className="mt-2 text-[11px] text-slate-300 bg-black/30 p-2 rounded-lg border border-white/5 flex items-start gap-1.5">
                               <span className="shrink-0">💡</span>
                               <span><strong className="text-slate-200">Spiegazione:</strong> {q.explanation}</span>
@@ -4771,6 +4873,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                         )}
                         <div className="grid grid-cols-1 gap-2.5">
                           {fibList.map((fib: any, fIdx: number) => {
+                            const hideSol = deferSolutionsSession && !solutionsReleased;
                             const rawVal = answers.wbFib?.[fib.id] ?? "";
                             const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
                             const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
@@ -4782,18 +4885,22 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                               <div
                                 key={fib.id || fIdx}
                                 className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                  isCorrect
+                                  hideSol
+                                    ? "bg-slate-900/50 border-white/10 text-slate-300"
+                                    : isCorrect
                                     ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                                     : "bg-red-950/15 border-red-500/20 text-red-300"
                                 }`}
                               >
-                                <span className="font-bold text-sm shrink-0">{isCorrect ? "✅" : "❌"}</span>
+                                <span className="font-bold text-sm shrink-0">{hideSol ? "📝" : isCorrect ? "✅" : "❌"}</span>
                                 <div className="space-y-1.5 flex-1">
                                   <p className="font-semibold text-slate-200">
                                     {before}
                                     <span
                                       className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
-                                        isCorrect
+                                        hideSol
+                                          ? "bg-slate-800 text-slate-200 border-white/15"
+                                          : isCorrect
                                           ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
                                           : "bg-red-500/20 text-red-200 border-red-500/30"
                                       }`}
@@ -4807,12 +4914,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                                     <p className="text-slate-400">
                                       La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
                                     </p>
-                                    {!isCorrect && expected && (
+                                    {!hideSol && !isCorrect && expected && (
                                       <p className="text-emerald-400">
                                         Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
                                       </p>
                                     )}
-                                    {isSynonymAcceptance && (
+                                    {!hideSol && isSynonymAcceptance && (
                                       <p className="text-teal-300 text-[10.5px] italic">
                                         💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
                                       </p>

@@ -57,6 +57,7 @@ const StudentView = lazyWithRetry(() => import("./components/StudentView"));
 const TeacherDashboard = lazyWithRetry(() => import("./components/TeacherDashboard"));
 import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
 import { isAppleMobile } from "./utils";
+import { wipeSharedPcStudentStorage } from "./utils/clientStorage";
 
 // Helper to detect if user opened the link inside an in-app browser (WebView like WhatsApp, Classroom, etc.)
 function checkIsInAppBrowser(): boolean {
@@ -455,11 +456,7 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
-    try {
-      sessionStorage.removeItem("direct_student_user");
-      localStorage.removeItem("direct_student_user");
-      localStorage.removeItem("active_eval_rescue");
-    } catch (e) {}
+    wipeSharedPcStudentStorage();
 
     if (auth) {
       try {

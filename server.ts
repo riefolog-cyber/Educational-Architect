@@ -319,6 +319,9 @@ async function checkDocentiFirestoreRole(email: string, idToken: string): Promis
     const projectId = (firebaseConfig as any).projectId;
     const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
     if (!projectId) return false;
+    const cleanEmail = String(email || "").trim();
+    const candidates = Array.from(new Set([cleanEmail, cleanEmail.toLowerCase()].filter(Boolean)));
+    if (candidates.length === 0) return false;
     const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents:runQuery`;
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 5000);
@@ -336,8 +339,12 @@ async function checkDocentiFirestoreRole(email: string, idToken: string): Promis
             where: {
               fieldFilter: {
                 field: { fieldPath: "email" },
-                op: "EQUAL",
-                value: { stringValue: email },
+                op: "IN",
+                value: {
+                  arrayValue: {
+                    values: candidates.map((v) => ({ stringValue: v })),
+                  },
+                },
               },
             },
             limit: 3,
@@ -466,6 +473,8 @@ async function requireTeacherAuth(req: express.Request, res: express.Response, n
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
   id: string;
+  /** Per-job opaque capability token required to poll /api/evaluate/status/:jobId */
+  jobToken: string;
   /** Correzione di un elaborato oppure piano di recupero: due corsie separate. */
   kind: "evaluate" | "recovery";
   status: "pending" | "processing" | "completed" | "failed";
@@ -523,6 +532,7 @@ function persistJobSnapshot(job: EvaluationJob) {
   try {
     const compact = {
       id: job.id,
+      jobToken: job.jobToken,
       kind: job.kind,
       status: job.status,
       result: job.result,
@@ -548,6 +558,17 @@ function readPersistedJobSnapshot(jobId: string): Omit<EvaluationJob, "reqBody">
     return parsed;
   } catch {
     return null;
+  }
+}
+
+function isValidJobToken(job: Pick<EvaluationJob, "jobToken">, provided: unknown): boolean {
+  if (!job.jobToken) return true;
+  const candidate = String(provided || "").trim();
+  if (!candidate || candidate.length !== job.jobToken.length) return false;
+  try {
+    return crypto.timingSafeEqual(Buffer.from(candidate, "utf8"), Buffer.from(job.jobToken, "utf8"));
+  } catch {
+    return false;
   }
 }
 
@@ -733,22 +754,36 @@ function buildPendingEvaluation(params: {
 
 // --- Session Answer Key Vault (AES-256-GCM) ---
 const VAULT_SECRET_FILE = path.join(os.tmpdir(), "ea_session_secret.key");
+let cachedVaultKey: Buffer | null = null;
 function getSessionVaultKey(): Buffer {
-  const envSecret = String(process.env.SESSION_SECRET || process.env.GEMINI_API_KEY || "").trim();
+  if (cachedVaultKey) return cachedVaultKey;
+  const envSecret = String(process.env.SESSION_SECRET || "").trim();
   if (envSecret) {
-    return crypto.createHash("sha256").update(`ea_vault:${envSecret}`).digest();
+    cachedVaultKey = crypto.createHash("sha256").update(`ea_vault:${envSecret}`).digest();
+    return cachedVaultKey;
   }
   try {
     if (fs.existsSync(VAULT_SECRET_FILE)) {
       const saved = fs.readFileSync(VAULT_SECRET_FILE, "utf8").trim();
-      if (saved) return crypto.createHash("sha256").update(saved).digest();
+      if (saved) {
+        cachedVaultKey = crypto.createHash("sha256").update(saved).digest();
+        return cachedVaultKey;
+      }
     }
     const generated = crypto.randomBytes(32).toString("hex");
     fs.writeFileSync(VAULT_SECRET_FILE, generated, { mode: 0o600 });
-    return crypto.createHash("sha256").update(generated).digest();
+    cachedVaultKey = crypto.createHash("sha256").update(generated).digest();
+    return cachedVaultKey;
   } catch {
-    return crypto.createHash("sha256").update("ea_fallback_ephemeral_vault").digest();
+    cachedVaultKey = crypto.createHash("sha256").update("ea_fallback_ephemeral_vault").digest();
+    return cachedVaultKey;
   }
+}
+
+function getLegacyGeminiVaultKey(): Buffer | null {
+  const apiSecret = String(process.env.GEMINI_API_KEY || "").trim();
+  if (!apiSecret) return null;
+  return crypto.createHash("sha256").update(`ea_vault:${apiSecret}`).digest();
 }
 
 function encryptAnswerKey(answerKey: any): string {
@@ -761,6 +796,13 @@ function encryptAnswerKey(answerKey: any): string {
   return `${iv.toString("base64url")}.${tag.toString("base64url")}.${encrypted.toString("base64url")}`;
 }
 
+function decryptWithKey(iv: Buffer, tag: Buffer, encrypted: Buffer, key: Buffer): any {
+  const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
+  decipher.setAuthTag(tag);
+  const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
+  return JSON.parse(decrypted.toString("utf8"));
+}
+
 function decryptAnswerKey(token: unknown): any | null {
   if (typeof token !== "string" || !token.trim()) return null;
   const parts = token.trim().split(".");
@@ -770,10 +812,15 @@ function decryptAnswerKey(token: unknown): any | null {
     const iv = Buffer.from(ivB64, "base64url");
     const tag = Buffer.from(tagB64, "base64url");
     const encrypted = Buffer.from(dataB64, "base64url");
-    const decipher = crypto.createDecipheriv("aes-256-gcm", getSessionVaultKey(), iv);
-    decipher.setAuthTag(tag);
-    const decrypted = Buffer.concat([decipher.update(encrypted), decipher.final()]);
-    return JSON.parse(decrypted.toString("utf8"));
+    try {
+      return decryptWithKey(iv, tag, encrypted, getSessionVaultKey());
+    } catch {
+      const legacyKey = getLegacyGeminiVaultKey();
+      if (legacyKey) {
+        return decryptWithKey(iv, tag, encrypted, legacyKey);
+      }
+      throw new Error("Decryption failed with primary vault key");
+    }
   } catch (err: any) {
     console.warn("[SessionVault] Impossibile decifrare answerKey:", err?.message || err);
     return null;
@@ -1440,6 +1487,7 @@ app.all("/api/evaluate/enqueue", evalRateLimiter, async (req, res) => {
       const position = evaluationQueue.indexOf(existingJobId);
       return res.json({ 
         jobId: existingJobId, 
+        jobToken: existingJob.jobToken,
         status: existingJob.status, 
         position: position !== -1 ? position + 1 : 0,
         cached: true
@@ -1456,9 +1504,11 @@ app.all("/api/evaluate/enqueue", evalRateLimiter, async (req, res) => {
     });
   }
 
-  const jobId = "job_" + Math.random().toString(36).substring(2, 15) + Date.now();
+  const jobId = `job_${crypto.randomUUID()}`;
+  const jobToken = crypto.randomBytes(16).toString("hex");
   const job: EvaluationJob = {
     id: jobId,
+    jobToken,
     kind: "evaluate",
     status: "pending",
     reqBody: req.body,
@@ -1470,7 +1520,7 @@ app.all("/api/evaluate/enqueue", evalRateLimiter, async (req, res) => {
   evaluationQueue.push(jobId);
   processQueue(); // trigger processing loop
   
-  res.json({ jobId, status: "pending", position: evaluationQueue.length });
+  res.json({ jobId, jobToken, status: "pending", position: evaluationQueue.length });
 });
 
 app.get("/api/evaluate/status/:jobId", (req, res) => {
@@ -1480,6 +1530,11 @@ app.get("/api/evaluate/status/:jobId", (req, res) => {
 
   if (!job) {
     return res.status(404).json({ error: "Job non trovato." });
+  }
+
+  const providedToken = req.headers["x-job-token"] ?? req.query.token;
+  if (!isValidJobToken(job, providedToken)) {
+    return res.status(403).json({ error: "Accesso non autorizzato allo stato del job." });
   }
 
   if (job.status === "pending") {
@@ -1530,23 +1585,54 @@ async function runRecoveryCore(reqBody: any) {
     ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
     : "AVVERTENZA FONDAMENTALE SULLA STRUTTURA: Questa prova NON contiene domande a risposta aperta (è composta esclusivamente da domande a risposta multipla o completamenti testo). NON citare in nessun caso 'risposte brevi', 'superficiali', 'risposte non argomentate' o 'spazi lasciati in bianco'. Concentrati rigorosamente sui concetti teorici delle crocette errate e sui nodi concettuali da consolidare.";
 
-  const { scrubbedAnswers: safeAnswers } = scrubAnswersForAi(answers || {});
+  const piiIdentity = {
+    fullName: typeof reqBody?.studentName === "string" ? reqBody.studentName : undefined,
+    email: typeof reqBody?.studentEmail === "string" ? reqBody.studentEmail : undefined,
+  };
+  const scrubStringFieldsDeep = (val: any): any => {
+    if (typeof val === "string") return scrubPromptPii(val, piiIdentity).scrubbedText;
+    if (Array.isArray(val)) return val.map(scrubStringFieldsDeep);
+    if (val && typeof val === "object") {
+      const out: Record<string, any> = {};
+      for (const [k, v] of Object.entries(val)) {
+        if (k === "images") continue; // Omit large image URLs from prompt payload
+        out[k] = scrubStringFieldsDeep(v);
+      }
+      return out;
+    }
+    return val;
+  };
+
+  const { scrubbedAnswers: safeAnswers } = scrubAnswersForAi(answers || {}, piiIdentity);
+  const safeExamData = scrubStringFieldsDeep(examData || {});
   const safeEvaluation =
     evaluation && typeof evaluation === "object"
       ? {
           ...evaluation,
           mainErrors:
             typeof evaluation.mainErrors === "string"
-              ? scrubPromptPii(evaluation.mainErrors).scrubbedText
+              ? scrubPromptPii(evaluation.mainErrors, piiIdentity).scrubbedText
               : evaluation.mainErrors,
           openEndedEvaluation:
             typeof evaluation.openEndedEvaluation === "string"
-              ? scrubPromptPii(evaluation.openEndedEvaluation).scrubbedText
+              ? scrubPromptPii(evaluation.openEndedEvaluation, piiIdentity).scrubbedText
               : evaluation.openEndedEvaluation,
           overallFeedback:
             typeof evaluation.overallFeedback === "string"
-              ? scrubPromptPii(evaluation.overallFeedback).scrubbedText
+              ? scrubPromptPii(evaluation.overallFeedback, piiIdentity).scrubbedText
               : evaluation.overallFeedback,
+          openEndedDetails: Array.isArray(evaluation.openEndedDetails)
+            ? evaluation.openEndedDetails.map((d: any) => ({
+                ...d,
+                feedback: typeof d?.feedback === "string" ? scrubPromptPii(d.feedback, piiIdentity).scrubbedText : d?.feedback,
+              }))
+            : evaluation.openEndedDetails,
+          reflectionDetails: Array.isArray(evaluation.reflectionDetails)
+            ? evaluation.reflectionDetails.map((d: any) => ({
+                ...d,
+                feedback: typeof d?.feedback === "string" ? scrubPromptPii(d.feedback, piiIdentity).scrubbedText : d?.feedback,
+              }))
+            : evaluation.reflectionDetails,
         }
       : evaluation;
 
@@ -1559,7 +1645,7 @@ DATI DI COPERTURA E RISULTATI:
 - Tipologia Prova: ${tipo || "Verifica"}
 - Voto Consigliato dall'IA: ${suggestedGrade || "N/A"}
 - Autovalutazione dello Studente: ${studentSelfGrade || "N/A"}/10
-- Domande dell'Esame (JSON strutturato): ${JSON.stringify(examData || {})}
+- Domande dell'Esame (JSON strutturato): ${JSON.stringify(safeExamData || {})}
 - Risposte dello Studente (JSON): ${JSON.stringify(safeAnswers || {})}
 - Valutazione Estesa (Giudizio e Dettaglio Punteggi): ${JSON.stringify(safeEvaluation || {})}
 
@@ -1650,6 +1736,7 @@ app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
       return res.json({
         status: existingJob.status,
         jobId: existingJobId,
+        jobToken: existingJob.jobToken,
         position: position !== -1 ? position + 1 : 0,
         cached: true,
       });
@@ -1662,9 +1749,11 @@ app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
     });
   }
 
-  const jobId = "plan_" + Math.random().toString(36).substring(2, 15) + Date.now();
+  const jobId = `plan_${crypto.randomUUID()}`;
+  const jobToken = crypto.randomBytes(16).toString("hex");
   const job: EvaluationJob = {
     id: jobId,
+    jobToken,
     kind: "recovery",
     status: "pending",
     reqBody: req.body,
@@ -1677,7 +1766,7 @@ app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
   processRecoveryQueue();
 
   console.log(`[Piano di recupero] Accodato ${jobId} (posizione ${recoveryQueue.length}, lavoratori ${activeRecoveryWorkers}/${MAX_RECOVERY_WORKERS}).`);
-  return res.json({ status: "pending", jobId, position: recoveryQueue.length });
+  return res.json({ status: "pending", jobId, jobToken, position: recoveryQueue.length });
 });
 
 // API: Health probe & Docimological Analysis & Criteria Optimization
@@ -1693,6 +1782,12 @@ app.all("/api/analyze-exam", teacherAiRateLimiter, requireTeacherAuth, async (re
 
   if (!examJson) {
     return res.status(400).json({ error: "Nessun contenuto JSON fornito per l'analisi dei criteri." });
+  }
+  if (String(examJson).length > 400000) {
+    return res.status(413).json({ error: "Il file JSON dell'esame supera il limite massimo consentito (400 KB)." });
+  }
+  if (customInstruction && String(customInstruction).length > 4000) {
+    return res.status(400).json({ error: "Le indicazioni personalizzate non possono superare i 4.000 caratteri." });
   }
 
   if (!getApiKey()) {
@@ -1826,8 +1921,14 @@ app.all("/api/extend-exam-json", teacherAiRateLimiter, requireTeacherAuth, async
   if (!examJson || typeof examJson !== "string") {
     return res.status(400).json({ error: "Nessun contenuto JSON dell'esame fornito." });
   }
+  if (examJson.length > 400000) {
+    return res.status(413).json({ error: "Il file JSON dell'esame supera il limite massimo consentito (400 KB)." });
+  }
   if (!instruction || !instruction.trim()) {
     return res.status(400).json({ error: "Specifica cosa desideri aggiungere all'esame." });
+  }
+  if (String(instruction).length > 4000) {
+    return res.status(400).json({ error: "La richiesta di estensione non può superare i 4.000 caratteri." });
   }
   if (!getApiKey()) {
     return res.status(500).json({ 
@@ -2173,12 +2274,16 @@ app.all("/api/generate-exam", teacherAiRateLimiter, requireTeacherAuth, async (r
 
   const isGet = req.method === "GET";
   const params = isGet ? req.query : (req.body || {});
-  const topic = (params.topic as string) || "";
-  const gradeLevel = (params.gradeLevel as string) || "";
-  const examType = (params.examType as string) || "";
+  const topic = String(params.topic || "");
+  const gradeLevel = String(params.gradeLevel || "");
+  const examType = String(params.examType || "");
   const numQuestions = params.numQuestions;
   const includeOpenEnded = params.includeOpenEnded === true || params.includeOpenEnded === "true";
-  const difficulty = (params.difficulty as string) || "";
+  const difficulty = String(params.difficulty || "");
+  const strictSourceOnly = params.strictSourceOnly === true || params.strictSourceOnly === "true";
+  const sourceFileName = String(params.sourceFileName || "").trim();
+  const pdfBase64Raw = !isGet && typeof params.pdfBase64 === "string" ? params.pdfBase64.trim() : "";
+  const pdfMimeType = !isGet && typeof params.pdfMimeType === "string" ? params.pdfMimeType.trim() : "application/pdf";
 
   // If a simple ping / health check GET request is received without topic
   if (isGet && (!topic || !topic.trim())) {
@@ -2195,8 +2300,19 @@ app.all("/api/generate-exam", teacherAiRateLimiter, requireTeacherAuth, async (r
     });
   }
 
-  if (!topic || !topic.trim()) {
-    return res.status(400).json({ error: "Specificare un argomento o un testo per la generazione della verifica." });
+  if (!topic.trim() && !pdfBase64Raw) {
+    return res.status(400).json({ error: "Specificare un argomento, un testo o caricare un documento PDF per generare la verifica." });
+  }
+  if (topic.length > 120000) {
+    return res.status(413).json({ error: "Il testo inserito supera il limite massimo consentito (120.000 caratteri)." });
+  }
+  if (pdfBase64Raw) {
+    if (pdfMimeType !== "application/pdf") {
+      return res.status(400).json({ error: "Sono supportati solo allegati PDF (application/pdf)." });
+    }
+    if (pdfBase64Raw.length > 9000000) {
+      return res.status(413).json({ error: "Il PDF allegato supera il limite massimo di circa 6 MB." });
+    }
   }
   if (isGet && topic.trim().length > 2000) {
     return res.status(414).json({
@@ -2209,13 +2325,16 @@ app.all("/api/generate-exam", teacherAiRateLimiter, requireTeacherAuth, async (r
     const qCount = Math.max(3, Math.min(Number(numQuestions) || 6, 15));
     const schoolLevel = gradeLevel || "Scuola Secondaria di II Grado (Scuola Superiore)";
     const diffLevel = difficulty || "intermedio";
+    const strictRule = strictSourceOnly
+      ? "\n\nVINCOLO DI ANCORAGGIO RIGOROSO ALLE FONTI DEL DOCENTE: Formula TUTTE le domande, le risposte corrette, i distrattori e le sintesi basandoti ESCLUSIVAMENTE sui concetti e sui dati effettivamente presenti nel testo/documento fornito dal docente. NON introdurre fatti o nozioni esterne non trattate nella fonte."
+      : "";
 
     let promptSystem = "";
     if (isWorkbook) {
       promptSystem = `Sei un docente esperto e autore di testi scolastici per la scuola italiana (${schoolLevel}).
-Il tuo compito è creare un **Workbook didattico interattivo** sull'argomento fornito dal docente.
+Il tuo compito è creare un **Workbook didattico interattivo** sull'argomento o sul documento fornito dal docente.
 Difficoltà richiesta: ${diffLevel}.
-Numero di sezioni: 2 o 3 sezioni tematiche ben articolate.
+Numero di sezioni: 2 o 3 sezioni tematiche ben articolate.${strictRule}
 
 STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
 {
@@ -2254,10 +2373,10 @@ Per le 1-2 frasi più importanti di tutto il workbook aggiungi il campo "weight"
 Genera solo JSON valido conforme allo schema.`;
     } else {
       promptSystem = `Sei un docente esperto e autore di verifiche scolastiche per la scuola italiana (${schoolLevel}).
-Il tuo compito è creare un **Quiz didattico a scelta multipla** sull'argomento fornito dal docente.
+Il tuo compito è creare un **Quiz didattico a scelta multipla** sull'argomento o sul documento fornito dal docente.
 Difficoltà richiesta: ${diffLevel}.
 Numero di domande a risposta multipla da generare: ${qCount}.
-${includeOpenEnded ? "Includi anche 1 o 2 domande a risposta aperta (openEnded) per valutare l'argomentazione critica personale." : "Non includere domande aperte (array openEnded vuoto: [])."}
+${includeOpenEnded ? "Includi anche 1 o 2 domande a risposta aperta (openEnded) per valutare l'argomentazione critica personale." : "Non includere domande aperte (array openEnded vuoto: [])."}${strictRule}
 
 STRUTTURA RIGOROSA DEL JSON DI OUTPUT:
 {
@@ -2289,13 +2408,30 @@ REGOLE ESSENZIALI:
 4. Genera solo JSON valido conforme.`;
     }
 
-    const safeTopic = scrubPromptPii(topic).scrubbedText;
+    const effectiveTopicText = topic.trim() || (sourceFileName ? `Documento allegato dal docente: ${sourceFileName}` : "Documento didattico PDF allegato dal docente");
+    const safeTopic = scrubPromptPii(effectiveTopicText).scrubbedText;
+    const textInstruction = `Argomento o indicazioni del docente per la verifica:\n${safeTopic}${safeTopic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione o dispensa lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}${strictSourceOnly ? "\n\nRICHIESTA ESPLICITA: attieniti esclusivamente al documento/testo fornito." : ""}`;
+
+    const requestContents: any = pdfBase64Raw
+      ? {
+          parts: [
+            {
+              inlineData: {
+                mimeType: "application/pdf",
+                data: pdfBase64Raw.replace(/^data:application\/pdf;base64,/, ""),
+              },
+            },
+            { text: textInstruction },
+          ],
+        }
+      : textInstruction;
+
     let modelUsed = TASK_MODEL_PREFERENCE["generate-exam"][0];
     const response = await generateWithRetry({
       model: TASK_MODEL_PREFERENCE["generate-exam"][0],
       models: TASK_MODEL_PREFERENCE["generate-exam"],
       onModelUsed: (m: string) => { modelUsed = m; },
-      contents: `Argomento o testo della verifica didattica:\n${safeTopic}${safeTopic.trim().length > 15000 ? "\n\nNOTA BENE: il testo sopra è una trascrizione lunga e completa. Distribuisci le domande in modo proporzionato su TUTTO l'arco del testo (inizio, parte centrale e finale), senza concentrarle solo sulla prima parte." : ""}`,
+      contents: requestContents,
       config: {
         systemInstruction: promptSystem,
         temperature: 0.2,
@@ -2316,7 +2452,7 @@ REGOLE ESSENZIALI:
     const generatedData = normalizeExamStructure(parsedRaw);
 
     const examObj = {
-      title: generatedData.title || topic.substring(0, 40),
+      title: generatedData.title || (sourceFileName ? sourceFileName.replace(/\.pdf$/i, "") : effectiveTopicText.substring(0, 40)),
       ...(isWorkbook ? { sections: generatedData.sections || [] } : {
         multipleChoice: generatedData.multipleChoice || [],
         openEnded: generatedData.openEnded || []
@@ -2348,11 +2484,12 @@ REGOLE ESSENZIALI:
 app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req, res) => {
   try {
     const rawExam = req.body?.examData;
+    const reduceDistractors = Boolean(req.body?.reduceDistractors);
     if (!rawExam || typeof rawExam !== "object") {
       return res.status(400).json({ error: "Dati della prova non validi o mancanti." });
     }
     const normalized = normalizeExamStructure(JSON.parse(JSON.stringify(rawExam)));
-    const { sanitizedExam, answerKey } = stripExamAnswers(normalized);
+    const { sanitizedExam, answerKey } = stripExamAnswers(normalized, { reduceDistractors });
     const encryptedAnswerKey = encryptAnswerKey(answerKey);
     res.setHeader("Cache-Control", "no-store");
     return res.json({ status: "success", sanitizedExam, encryptedAnswerKey });
