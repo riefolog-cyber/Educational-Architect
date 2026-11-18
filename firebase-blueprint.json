@@ -29,7 +29,9 @@
         "Convalida_Docente_At": { "type": "string" },
         "Convalida_Docente_Email": { "type": "string" },
         "Soluzioni_Differite": { "type": "boolean" },
-        "Assigned_Fila": { "type": "string", "enum": ["A", "B"] }
+        "Assigned_Fila": { "type": "string", "enum": ["A", "B"] },
+        "MC_Order": { "type": "string" },
+        "Oral_Answers_Count": { "type": "integer" }
       },
       "required": ["Timestamp", "Tipo", "Email", "Voto_Suggerito"]
     },
@@ -63,7 +65,9 @@
         "besOptions": { "type": "object" },
         "mixFilaAB": { "type": "boolean" },
         "filaBTitle": { "type": "string" },
-        "allowAudioAnswers": { "type": "boolean" }
+        "allowAudioAnswers": { "type": "boolean" },
+        "archived": { "type": "boolean" },
+        "archivedAt": { "type": "string" }
       },
       "required": ["pin", "expiry"]
     },

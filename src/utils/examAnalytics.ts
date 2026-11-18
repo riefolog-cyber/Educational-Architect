@@ -244,3 +244,28 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     weakTopicsCount,
   };
 }
+
+export interface FilaAwareExamItemAnalysis {
+  hasMixedFila: boolean;
+  filaACount: number;
+  filaBCount: number;
+  overall: ExamItemAnalysis;
+  filaA: ExamItemAnalysis | null;
+  filaB: ExamItemAnalysis | null;
+}
+
+export function computeExamItemAnalysisByFila(submissions: SavedSubmission[]): FilaAwareExamItemAnalysis {
+  const safeList = Array.isArray(submissions) ? submissions : [];
+  const filaASubs = safeList.filter((s) => s.Assigned_Fila === "A");
+  const filaBSubs = safeList.filter((s) => s.Assigned_Fila === "B");
+  const hasMixedFila = filaASubs.length > 0 && filaBSubs.length > 0;
+
+  return {
+    hasMixedFila,
+    filaACount: filaASubs.length,
+    filaBCount: filaBSubs.length,
+    overall: computeExamItemAnalysis(safeList),
+    filaA: filaASubs.length > 0 ? computeExamItemAnalysis(filaASubs) : null,
+    filaB: filaBSubs.length > 0 ? computeExamItemAnalysis(filaBSubs) : null,
+  };
+}

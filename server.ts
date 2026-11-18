@@ -7,7 +7,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
 import firebaseConfig from "./firebase-applet-config.json";
 import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
-import { stripExamAnswers, restoreExamAnswers } from "./src/utils/examSecurity";
+import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
@@ -2536,8 +2536,9 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     const cleanPin = String(req.body?.pin || "").trim().toUpperCase();
     const requestedSessionId = String(req.body?.sessionId || "").trim();
     const encryptedAnswerKey = String(req.body?.encryptedAnswerKey || "").trim();
+    const studentEmail = String(req.body?.studentEmail || "").trim().toLowerCase();
     const examData = req.body?.examData;
-    const mcOptionOrder = req.body?.mcOptionOrder;
+    const rawMcOptionOrder = req.body?.mcOptionOrder;
     const answers = req.body?.answers;
     const tipo = String(req.body?.tipo || "Quiz");
 
@@ -2545,24 +2546,40 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
       return res.status(400).json({ error: "Parametri sessione mancanti." });
     }
 
+    const fetchSessionDocWithTimeout = async () => {
+      const projectId = (firebaseConfig as any).projectId;
+      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
+      if (!projectId) return { ok: false, status: 500, fields: null as any };
+      const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`;
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), 5000);
+      try {
+        const fsResp = await fetch(docUrl, { signal: controller.signal });
+        if (!fsResp.ok) return { ok: false, status: fsResp.status, fields: null as any };
+        const fsDoc: any = await fsResp.json().catch(() => null);
+        return { ok: true, status: 200, fields: fsDoc?.fields || {} };
+      } finally {
+        clearTimeout(timer);
+      }
+    };
+
+    let cachedFields: any = null;
+    let resolvedSessionId = requestedSessionId;
+
     // Verify against Firestore active_sessions/{pin} unless caller is an authenticated teacher
     const teacherCheck = await verifyTeacherFromRequest(req);
     if (!teacherCheck.ok) {
-      const projectId = (firebaseConfig as any).projectId;
-      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
-      if (!projectId) {
-        return res.status(500).json({ error: "Configurazione Firebase del server incompleta." });
-      }
-      const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`;
-      const fsResp = await fetch(docUrl);
-      if (!fsResp.ok) {
+      const fsResult = await fetchSessionDocWithTimeout();
+      if (!fsResult.ok || !fsResult.fields) {
         return res.status(403).json({ error: "Sessione non più attiva o soluzioni non rilasciate pubblicamente." });
       }
-      const fsDoc: any = await fsResp.json().catch(() => null);
-      const fields = fsDoc?.fields || {};
-      const fsSessionId = String(fields?.sessionId?.stringValue || "").trim();
-      const fsDefer = Boolean(fields?.deferSolutions?.booleanValue);
-      const fsReleased = Boolean(fields?.solutionsReleased?.booleanValue);
+      cachedFields = fsResult.fields;
+      const fsSessionId = String(cachedFields?.sessionId?.stringValue || "").trim();
+      const fsDefer = Boolean(cachedFields?.deferSolutions?.booleanValue);
+      const fsReleased = Boolean(cachedFields?.solutionsReleased?.booleanValue);
+      if (!resolvedSessionId && fsSessionId) {
+        resolvedSessionId = fsSessionId;
+      }
 
       if (requestedSessionId && fsSessionId && requestedSessionId !== fsSessionId) {
         return res.status(403).json({ error: "Questo PIN appartiene a una sessione diversa." });
@@ -2576,42 +2593,74 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     let keySource = encryptedAnswerKey;
     const assignedFila = String(req.body?.assignedFila || "").trim().toUpperCase();
     if (!keySource) {
-      // Fallback: fetch key from active_sessions doc if client didn't hold encryptedAnswerKey
-      const projectId = (firebaseConfig as any).projectId;
-      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
-      if (projectId) {
-        const fsResp = await fetch(`https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`);
-        if (fsResp.ok) {
-          const fsDoc: any = await fsResp.json().catch(() => null);
-          const fields = fsDoc?.fields || {};
-          keySource = assignedFila === "B" && fields?.encryptedFilaBAnswerKey?.stringValue
-            ? String(fields.encryptedFilaBAnswerKey.stringValue)
-            : String(fields?.encryptedAnswerKey?.stringValue || "");
+      if (!cachedFields) {
+        const fsResult = await fetchSessionDocWithTimeout();
+        if (fsResult.ok) {
+          cachedFields = fsResult.fields;
+          if (!resolvedSessionId && cachedFields?.sessionId?.stringValue) {
+            resolvedSessionId = String(cachedFields.sessionId.stringValue).trim();
+          }
         }
       }
+      if (cachedFields) {
+        keySource = assignedFila === "B" && cachedFields?.encryptedFilaBAnswerKey?.stringValue
+          ? String(cachedFields.encryptedFilaBAnswerKey.stringValue)
+          : String(cachedFields?.encryptedAnswerKey?.stringValue || "");
+      }
     }
+
+    const effectiveMcOrder =
+      rawMcOptionOrder && typeof rawMcOptionOrder === "object" && Object.keys(rawMcOptionOrder).length > 0
+        ? rawMcOptionOrder
+        : studentEmail
+        ? reconstructExamMcOrder(examData, studentEmail, cleanPin, resolvedSessionId)
+        : undefined;
 
     if (keySource) {
       const answerKey = decryptAnswerKey(keySource);
       if (answerKey) {
-        resolvedDomande = restoreExamAnswers(examData, answerKey, mcOptionOrder);
+        resolvedDomande = restoreExamAnswers(examData, answerKey, effectiveMcOrder);
       }
     }
 
     let mainErrors: string | undefined;
-    if (tipo.toLowerCase() === "quiz" && Array.isArray(resolvedDomande?.multipleChoice)) {
-      const wrongList: string[] = [];
-      resolvedDomande.multipleChoice.forEach((q: any, idx: number) => {
-        const uIdx = answers?.mc?.[q.id];
-        if (uIdx === undefined || uIdx === null || Number(uIdx) !== Number(q.correctIndex)) {
-          const chosenText = uIdx !== undefined && q.options?.[uIdx] ? q.options[uIdx] : "Nessuna";
-          const correctText = q.options?.[q.correctIndex] || "Opzione corretta";
-          wrongList.push(`${idx + 1}) ${q.question} (scelta: ${chosenText} → corretta: ${correctText})`);
-        }
-      });
+    const mcLists: any[] = [];
+    if (Array.isArray(resolvedDomande?.multipleChoice)) {
+      mcLists.push(...resolvedDomande.multipleChoice);
+    }
+    if (Array.isArray(resolvedDomande?.sections)) {
+      for (const sec of resolvedDomande.sections) {
+        if (sec && Array.isArray(sec.multipleChoice)) mcLists.push(...sec.multipleChoice);
+      }
+    }
+    const fibLists: any[] = Array.isArray(resolvedDomande?.sections)
+      ? resolvedDomande.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
+      : [];
+
+    const wrongList: string[] = [];
+    mcLists.forEach((q: any, idx: number) => {
+      if (q.correctIndex === undefined || q.correctIndex === null) return;
+      const uIdx = answers?.mc?.[q.id];
+      if (uIdx === undefined || uIdx === null || Number(uIdx) !== Number(q.correctIndex)) {
+        const chosenText = uIdx !== undefined && q.options?.[uIdx] ? q.options[uIdx] : "Nessuna";
+        const correctText = q.options?.[q.correctIndex] || "Opzione corretta";
+        wrongList.push(`${idx + 1}) ${q.question} (scelta: ${chosenText} → corretta: ${correctText})`);
+      }
+    });
+    fibLists.forEach((fib: any, idx: number) => {
+      const rawVal = answers?.wbFib?.[fib.id] ?? answers?.fib?.[fib.id] ?? "";
+      const val = typeof rawVal === "string" ? rawVal.trim() : String(rawVal?.[0] || "").trim();
+      if (fib.answer && !isFibAnswerCorrect(val, fib.answer, fib.sentence)) {
+        wrongList.push(`Completamento ${idx + 1}) ${fib.sentence} (scritto: ${val || "vuoto"} → attesa: ${fib.answer})`);
+      }
+    });
+
+    if (mcLists.length > 0 || fibLists.length > 0) {
       mainErrors = wrongList.length > 0
-        ? `Domande errate: ${wrongList.join("; ")}.`
-        : "Nessun errore: tutte le risposte a scelta multipla sono corrette.";
+        ? `Errori rilevati: ${wrongList.join("; ")}.`
+        : tipo.toLowerCase() === "quiz"
+        ? "Nessun errore: tutte le risposte a scelta multipla sono corrette."
+        : "Nessun errore rilevato nei quesiti oggettivi del workbook.";
     }
 
     return res.json({ status: "success", unlocked: true, resolvedDomande, mainErrors });
@@ -2621,7 +2670,7 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
   }
 });
 
-// Student oral answer transcription via Gemini Audio (gemini-3.5-transcribe)
+// Student oral answer transcription via Gemini Audio (gemini-3.5-transcribe with multimodal fallback)
 app.post("/api/transcribe-audio", evalRateLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   if (!getApiKey()) {
@@ -2643,33 +2692,42 @@ app.post("/api/transcribe-audio", evalRateLimiter, async (req, res) => {
     return res.status(413).json({ error: "La registrazione audio supera il limite massimo consentito (circa 4 MB)." });
   }
 
-  try {
-    const ai = getAiClient();
-    const response = await withAttemptTimeout(
-      ai.models.generateContent({
-        model: "gemini-3.5-transcribe",
-        contents: {
-          parts: [
-            { inlineData: { mimeType: baseMime === "audio/mp3" ? "audio/mpeg" : baseMime, data: cleanBase64 } },
-            { text: "Trascrivi fedelmente questo audio parlato da uno studente in lingua italiana scolastica con punteggiatura corretta. Restituisci esclusivamente la trascrizione, senza commenti aggiuntivi o prefissi." },
-          ],
-        },
-      }),
-      35000
-    );
-    const rawText = String(extractResponseText(response) || "").trim();
-    if (!rawText) {
-      return res.status(422).json({ error: "Audio non comprensibile o silenzioso: riprova a registrare più vicino al microfono." });
+  const normalizedMime = baseMime === "audio/mp3" ? "audio/mpeg" : baseMime;
+  const transcribeModels = ["gemini-3.5-transcribe", "gemini-4-hydrogen", "gemini-2.5-flash"];
+  const ai = getAiClient();
+  let lastError: any = null;
+
+  for (const modelName of transcribeModels) {
+    try {
+      const response = await withAttemptTimeout(
+        ai.models.generateContent({
+          model: modelName,
+          contents: {
+            parts: [
+              { inlineData: { mimeType: normalizedMime, data: cleanBase64 } },
+              { text: "Trascrivi fedelmente questo audio parlato da uno studente in lingua italiana scolastica con punteggiatura corretta. Restituisci esclusivamente la trascrizione, senza commenti aggiuntivi o prefissi." },
+            ],
+          },
+        }),
+        30000
+      );
+      const rawText = String(extractResponseText(response) || "").trim();
+      if (!rawText) {
+        return res.status(422).json({ error: "Audio non comprensibile o silenzioso: riprova a registrare più vicino al microfono." });
+      }
+      const { scrubbedText } = scrubPromptPii(rawText, {
+        fullName: typeof req.body?.studentName === "string" ? req.body.studentName : undefined,
+        email: typeof req.body?.studentEmail === "string" ? req.body.studentEmail : undefined,
+      });
+      return res.json({ status: "success", transcript: scrubbedText, modelUsed: modelName });
+    } catch (err: any) {
+      lastError = err;
+      console.warn(`[transcribe-audio] Model ${modelName} failed, trying fallback:`, err?.message || err);
     }
-    const { scrubbedText } = scrubPromptPii(rawText, {
-      fullName: typeof req.body?.studentName === "string" ? req.body.studentName : undefined,
-      email: typeof req.body?.studentEmail === "string" ? req.body.studentEmail : undefined,
-    });
-    return res.json({ status: "success", transcript: scrubbedText });
-  } catch (err: any) {
-    console.error("[transcribe-audio] Failed:", err);
-    return res.status(500).json({ error: humanAiError(err?.message || "Errore durante la trascrizione audio.") });
   }
+
+  console.error("[transcribe-audio] All models failed:", lastError);
+  return res.status(500).json({ error: humanAiError(lastError?.message || "Errore durante la trascrizione audio.") });
 });
 
 // Teacher-only: generate parallel Fila B variant from an existing Quiz or Workbook JSON
@@ -2873,6 +2931,111 @@ Rispondi ESCLUSIVAMENTE in JSON valido con questo schema:
     console.error("[class-error-summary] Failed:", error);
     return res.status(500).json({
       error: "Impossibile generare la sintesi errori della classe.",
+      details: humanAiError(error?.message || ""),
+    });
+  }
+});
+
+// Teacher-only: targeted mini review sheet + quick exercises on <50% weak items
+app.post("/api/teacher/generate-review-sheet", teacherAiRateLimiter, requireTeacherAuth, async (req, res) => {
+  const rawTitle = String(req.body?.examTitle || "Verifica di classe").trim();
+  const filaLabel = String(req.body?.filaLabel || "").trim();
+  const rawWeakItems = Array.isArray(req.body?.weakItems) ? req.body.weakItems : [];
+
+  if (rawWeakItems.length === 0) {
+    return res.status(400).json({ error: "Nessun argomento critico (<50%) su cui generare la scheda." });
+  }
+  if (!getApiKey()) {
+    return res.status(500).json({ error: "La chiave API di Gemini non è configurata." });
+  }
+
+  try {
+    const safeTitle = scrubPromptPii(rawTitle).scrubbedText.slice(0, 160);
+    const blocks = rawWeakItems.slice(0, 6).map((it: any, idx: number) => {
+      const kind = String(it?.kind || "Quesito").slice(0, 32);
+      const q = scrubPromptPii(String(it?.question || "")).scrubbedText.slice(0, 280);
+      const metric = scrubPromptPii(String(it?.metricLabel || "")).scrubbedText.slice(0, 100);
+      const wrong = it?.commonWrong ? scrubPromptPii(String(it.commonWrong)).scrubbedText.slice(0, 180) : "";
+      return `${idx + 1}. [${kind}] ${q} (${metric})${wrong ? ` — Errore comune: ${wrong}` : ""}`;
+    }).join("\n");
+
+    const response = await generateWithRetry({
+      model: TASK_MODEL_PREFERENCE["analyze-exam"][0],
+      models: TASK_MODEL_PREFERENCE["analyze-exam"],
+      contents: `Titolo verifica: ${safeTitle}${filaLabel ? ` (${filaLabel})` : ""}\nArgomenti da consolidare:\n${blocks}`,
+      config: {
+        systemInstruction: `Sei un docente esperto della scuola secondaria italiana.
+Prepara una "Mini-Scheda di Ripasso Mirata" stampabile per gli studenti esclusivamente sugli argomenti sotto soglia indicati.
+Rispondi SOLO in JSON valido:
+- title: titolo chiaro della scheda di ripasso
+- intro: breve premessa incoraggiante (1-2 frasi)
+- recapPoints: array di 3-5 schede sintetiche { concept: string, explanation: string } che chiariscono i concetti errati
+- quickExercises: array di 3-4 esercizi rapidi di consolidamento { prompt: string, solution: string }`,
+        temperature: 0.25,
+        maxOutputTokens: 2048,
+        responseMimeType: "application/json",
+        responseSchema: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            intro: { type: Type.STRING },
+            recapPoints: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  concept: { type: Type.STRING },
+                  explanation: { type: Type.STRING },
+                },
+                required: ["concept", "explanation"],
+              },
+            },
+            quickExercises: {
+              type: Type.ARRAY,
+              items: {
+                type: Type.OBJECT,
+                properties: {
+                  prompt: { type: Type.STRING },
+                  solution: { type: Type.STRING },
+                },
+                required: ["prompt", "solution"],
+              },
+            },
+          },
+          required: ["title", "intro", "recapPoints", "quickExercises"],
+        },
+      },
+    });
+
+    const responseText = extractResponseText(response);
+    const parsed = tolerantJsonParse(responseText || "");
+    if (!parsed || typeof parsed !== "object") {
+      throw new Error("Formato non valido dalla generazione della scheda di ripasso.");
+    }
+
+    return res.json({
+      status: "success",
+      sheet: {
+        title: String(parsed.title || `Scheda di ripasso — ${safeTitle}`).trim(),
+        intro: String(parsed.intro || "").trim(),
+        recapPoints: Array.isArray(parsed.recapPoints)
+          ? parsed.recapPoints.slice(0, 6).map((p: any) => ({
+              concept: String(p?.concept || "").trim(),
+              explanation: String(p?.explanation || "").trim(),
+            })).filter((p: any) => p.concept && p.explanation)
+          : [],
+        quickExercises: Array.isArray(parsed.quickExercises)
+          ? parsed.quickExercises.slice(0, 6).map((ex: any) => ({
+              prompt: String(ex?.prompt || "").trim(),
+              solution: String(ex?.solution || "").trim(),
+            })).filter((ex: any) => ex.prompt && ex.solution)
+          : [],
+      },
+    });
+  } catch (error: any) {
+    console.error("[generate-review-sheet] Failed:", error);
+    return res.status(500).json({
+      error: "Impossibile generare la mini-scheda di ripasso.",
       details: humanAiError(error?.message || ""),
     });
   }

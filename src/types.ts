@@ -171,6 +171,10 @@ export interface SavedSubmission {
   Soluzioni_Differite?: boolean;
   /** Which exam variant row (Fila A or Fila B) was assigned to this student. */
   Assigned_Fila?: 'A' | 'B';
+  /** Serialized JSON map of per-question shuffled MC option index permutations (no answer keys). */
+  MC_Order?: string;
+  /** Count of open-ended answers recorded/transcribed orally during this exam. */
+  Oral_Answers_Count?: number;
 }
 
 export interface BesOptions {
@@ -189,6 +193,8 @@ export interface LiveSessionSummary {
   createdAt: string | null;
   sessionId: string;
   active: boolean;
+  archived?: boolean;
+  archivedAt?: string | null;
   teacherEmail: string;
   /** 6-digit code the teacher gives to a student whose exam was locked. */
   unlockCode?: string;

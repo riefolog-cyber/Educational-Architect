@@ -42,6 +42,73 @@ export function assignDeterministicFila(email?: string | null, seed?: string | n
   return h % 2 === 0 ? "A" : "B";
 }
 
+function createSeededRng(seedStr: string): () => number {
+  let state = deterministicHash(seedStr) || 1;
+  return () => {
+    state = (Math.imul(1664525, state) + 1013904223) >>> 0;
+    return state / 4294967296;
+  };
+}
+
+/**
+ * Produces a deterministic permutation of [0..length-1] using Fisher-Yates seeded by string.
+ */
+export function computeDeterministicMcOrder(seedStr: string, length: number): number[] {
+  const indices = Array.from({ length: Math.max(0, length) }, (_, i) => i);
+  if (indices.length < 2) return indices;
+  const nextRand = createSeededRng(seedStr);
+  for (let i = indices.length - 1; i > 0; i--) {
+    const j = Math.floor(nextRand() * (i + 1));
+    const tmp = indices[i];
+    indices[i] = indices[j];
+    indices[j] = tmp;
+  }
+  return indices;
+}
+
+/**
+ * Produces a deterministically shuffled copy of an array using Fisher-Yates seeded by string.
+ */
+export function computeDeterministicItemOrder<T>(items: T[], seedStr: string): T[] {
+  if (!Array.isArray(items) || items.length < 2) return Array.isArray(items) ? [...items] : [];
+  const order = computeDeterministicMcOrder(seedStr, items.length);
+  return order.map((idx) => items[idx]);
+}
+
+/**
+ * Reconstructs the deterministic per-question option order map for a given student/session.
+ */
+export function reconstructExamMcOrder(
+  examData: any,
+  email?: string | null,
+  pin?: string | null,
+  sessionId?: string | null
+): Record<string, number[]> {
+  const order: Record<string, number[]> = {};
+  if (!examData || typeof examData !== "object") return order;
+  const normEmail = String(email || "").trim().toLowerCase();
+  const cleanPin = String(pin || "").trim().toUpperCase();
+  const cleanSessionId = String(sessionId || "default").trim();
+  const baseSeed = `${normEmail}|${cleanPin}|${cleanSessionId}`;
+
+  const collect = (list: any[]) => {
+    for (const q of list) {
+      if (!q || !Array.isArray(q.options) || q.options.length < 2) continue;
+      const qId = String(q.id || "").trim();
+      if (!qId) continue;
+      order[qId] = computeDeterministicMcOrder(`${baseSeed}|mc_opt|${qId}`, q.options.length);
+    }
+  };
+
+  if (Array.isArray(examData.multipleChoice)) collect(examData.multipleChoice);
+  if (Array.isArray(examData.sections)) {
+    for (const sec of examData.sections) {
+      if (sec && Array.isArray(sec.multipleChoice)) collect(sec.multipleChoice);
+    }
+  }
+  return order;
+}
+
 /**
  * Produces a student-safe copy of examData with all solution fields removed
  * (`correctIndex`, `answer`, `explanation`, and inline `[word]` FIB hints)

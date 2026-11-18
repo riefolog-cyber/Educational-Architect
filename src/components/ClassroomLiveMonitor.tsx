@@ -60,6 +60,7 @@ interface ClassroomLiveMonitorProps {
   onTerminateSession?: (pin: string) => void;
   onTerminateAllSessions?: () => void;
   onToggleSolutionsReleased?: (pin: string, nextReleased: boolean) => Promise<void>;
+  onPurgeArchivedSession?: (pin: string) => Promise<void>;
   terminatingPin?: string | null;
   terminatingAll?: boolean;
   togglingSolutionsPin?: string | null;
@@ -79,6 +80,7 @@ export default function ClassroomLiveMonitor({
   onTerminateSession,
   onTerminateAllSessions,
   onToggleSolutionsReleased,
+  onPurgeArchivedSession,
   terminatingPin = null,
   terminatingAll = false,
   togglingSolutionsPin = null
@@ -407,6 +409,10 @@ export default function ClassroomLiveMonitor({
   };
 
   const liveSessions = sessions.filter((s) => (isSessionLive ? isSessionLive(s) : s.active));
+  const archivedDeferredSessions = sessions.filter(
+    (s) => !(isSessionLive ? isSessionLive(s) : s.active) && s.deferSolutions
+  );
+  const [showArchivedDeferred, setShowArchivedDeferred] = useState(false);
 
   return (
     <div className="space-y-5 animate-fadeIn text-left">
@@ -601,6 +607,77 @@ export default function ClassroomLiveMonitor({
                 </div>
               );
             })}
+          </div>
+        )}
+
+        {archivedDeferredSessions.length > 0 && (
+          <div className="pt-2 border-t border-white/10 space-y-2">
+            <button
+              type="button"
+              onClick={() => setShowArchivedDeferred((v) => !v)}
+              className="text-[11px] font-semibold text-amber-200 hover:text-amber-100 flex items-center gap-1.5 cursor-pointer"
+            >
+              <Lock className="w-3.5 h-3.5 text-amber-400" />
+              <span>
+                {showArchivedDeferred ? "Nascondi" : "Gestisci"} sessioni chiuse con soluzioni differite ({archivedDeferredSessions.length})
+              </span>
+            </button>
+
+            {showArchivedDeferred && (
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-2 pt-1">
+                {archivedDeferredSessions.map((s) => {
+                  const released = !!s.solutionsReleased;
+                  const isBusy = togglingSolutionsPin === s.pin || terminatingPin === s.pin;
+                  return (
+                    <div
+                      key={`arch_${s.pin}`}
+                      className="p-2.5 rounded-xl bg-slate-950/70 border border-white/10 flex flex-col gap-2"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <span className="font-mono font-bold text-xs text-slate-200">PIN {s.pin}</span>
+                        <span
+                          className={`text-[9px] px-1.5 py-0.5 rounded font-bold border ${
+                            released
+                              ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                              : "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                          }`}
+                        >
+                          {released ? "🔓 Soluzioni Pubbliche" : "🔒 Soluzioni Nascoste"}
+                        </span>
+                      </div>
+                      <p className="text-[11px] text-slate-400 truncate">{s.title}</p>
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        {onToggleSolutionsReleased && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => onToggleSolutionsReleased(s.pin, !released)}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-bold border cursor-pointer transition-colors disabled:opacity-50 ${
+                              released
+                                ? "bg-slate-800 border-white/10 text-slate-300 hover:text-white"
+                                : "bg-amber-500/20 border-amber-500/40 text-amber-200 hover:bg-amber-500/30"
+                            }`}
+                          >
+                            {released ? "Nascondi soluzioni" : "Pubblica soluzioni"}
+                          </button>
+                        )}
+                        {onPurgeArchivedSession && (
+                          <button
+                            type="button"
+                            disabled={isBusy}
+                            onClick={() => onPurgeArchivedSession(s.pin)}
+                            className="px-2 py-1 rounded-lg text-[10px] font-semibold bg-red-950/60 border border-red-500/30 text-red-300 hover:bg-red-600 hover:text-white cursor-pointer transition-colors disabled:opacity-50"
+                            title="Elimina definitivamente questa sessione archiviata"
+                          >
+                            Elimina archivio
+                          </button>
+                        )}
+                      </div>
+                    </div>
+                  );
+                })}
+              </div>
+            )}
           </div>
         )}
       </div>

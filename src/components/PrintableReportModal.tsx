@@ -26,11 +26,15 @@ interface PrintableReportModalProps {
     AntiCopia_InfractionsLog?: string;
     Full_Evaluation?: string | any;
     Risposte_Studente?: string | any;
+    Assigned_Fila?: "A" | "B";
+    Oral_Answers_Count?: number;
+    Soluzioni_Differite?: boolean;
     [key: string]: any;
   } | null;
   examTitle?: string;
   examImages?: Record<string, string>;
   blindGradingMode?: boolean;
+  deferredSolutionsLocked?: boolean;
 }
 
 export default function PrintableReportModal({
@@ -40,6 +44,7 @@ export default function PrintableReportModal({
   examTitle,
   examImages,
   blindGradingMode = false,
+  deferredSolutionsLocked = false,
 }: PrintableReportModalProps) {
   if (!isOpen || !submission) return null;
 
@@ -150,7 +155,10 @@ export default function PrintableReportModal({
               </div>
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Materia / Titolo</span>
-                <span className="text-xs font-semibold text-slate-800 block truncate">{examTitle || submission.Tipo || "Verifica"}</span>
+                <span className="text-xs font-semibold text-slate-800 block truncate">
+                  {examTitle || submission.Tipo || "Verifica"}
+                  {submission.Assigned_Fila ? ` · Fila ${submission.Assigned_Fila}` : ""}
+                </span>
               </div>
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Data e Ora Consegna</span>
@@ -196,8 +204,19 @@ export default function PrintableReportModal({
               </div>
             </div>
 
-            {/* Detailed Grade Composition & Calculation Breakdown */}
-            <GradeCalculationReport breakdown={extractBreakdownFromSubmission(submission)} isPrintMode={true} />
+            {/* Detailed Grade Composition & Calculation Breakdown (masked when deferred solutions locked) */}
+            {deferredSolutionsLocked ? (
+              <div className="p-4 bg-amber-50 border border-amber-200 rounded-xl text-xs text-amber-900 space-y-1">
+                <p className="font-bold uppercase tracking-wider text-[10px]">
+                  Rilascio Differito delle Soluzioni Attivo
+                </p>
+                <p className="text-[11px]">
+                  Il dettaglio analitico per singolo quesito, gli errori oggettivi e le spiegazioni saranno consultabili dopo la pubblicazione delle soluzioni da parte del docente.
+                </p>
+              </div>
+            ) : (
+              <GradeCalculationReport breakdown={extractBreakdownFromSubmission(submission)} isPrintMode={true} />
+            )}
 
             {/* Qualitative Feedback Sections */}
             <div className="space-y-4">
@@ -213,8 +232,8 @@ export default function PrintableReportModal({
                 </div>
               )}
 
-              {/* Main Errors / Remediation focus */}
-              {(evaluationObj?.mainErrors || submission.Errori_Principali) && (
+              {/* Main Errors / Remediation focus (masked when deferred solutions locked) */}
+              {!deferredSolutionsLocked && (evaluationObj?.mainErrors || submission.Errori_Principali) && (
                 <div className="p-4 bg-red-50/60 border border-red-200 rounded-xl space-y-1">
                   <h3 className="text-xs font-bold uppercase tracking-wider text-red-900 flex items-center gap-1.5">
                     <span>⚠️ Nodi Concettuali da Consolidare</span>
@@ -313,6 +332,9 @@ export default function PrintableReportModal({
               <span>
                 Pseudonimo IA: <b className="font-mono">{blindCode}</b> · PII filtrate dal prompt:{" "}
                 <b>{Number(submission.PII_Oscurate_Count || 0)}</b>
+                {Number(submission.Oral_Answers_Count || 0) > 0 && (
+                  <> · Risposte orali BES: <b>{Number(submission.Oral_Answers_Count)}</b></>
+                )}
               </span>
               <span>
                 {submission.Convalida_Docente_At

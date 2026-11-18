@@ -82,7 +82,11 @@ import {
   type RecoveryProgress
 } from "../utils/recoveryProgress";
 import { deriveStudentPseudonym, scrubAnswersForAi } from "../utils/privacyPseudonym";
-import { assignDeterministicFila } from "../utils/examSecurity";
+import {
+  assignDeterministicFila,
+  computeDeterministicMcOrder,
+  computeDeterministicItemOrder,
+} from "../utils/examSecurity";
 import {
   saveScopedExamLock,
   loadScopedExamLock,
@@ -302,6 +306,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const audioChunksRef = useRef<Blob[]>([]);
   const audioTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const oralQuestionIdsRef = useRef<Set<string>>(new Set());
   const [pastSessionSolutionsReleased, setPastSessionSolutionsReleased] = useState<Record<string, boolean>>({});
   const [unlockedPastSubmissions, setUnlockedPastSubmissions] = useState<Record<string, { examData?: any; mainErrors?: string }>>({});
   const [pastUnlockingId, setPastUnlockingId] = useState<string | null>(null);
@@ -514,7 +519,12 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     isInteractingWithInAppDialogRef.current = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      scheduleDialogInteractionEnd(1500);
+      if (!isAppleMobile() && !isAppFullScreen()) {
+        setIsFullscreenBlocked(false);
+        closeFullscreenExit();
+        await requestAppFullScreen().catch(() => {});
+      }
+      scheduleDialogInteractionEnd(2200);
 
       const mimeCandidates = ["audio/webm;codecs=opus", "audio/webm", "audio/mp4", "audio/ogg"];
       const chosenMime = mimeCandidates.find((m) => {
@@ -588,6 +598,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             throw new Error(data?.error || "Trascrizione audio non riuscita.");
           }
           appendAudioTranscript(targetType, qId, String(data.transcript));
+          oralQuestionIdsRef.current.add(fieldKey);
           setInfractionToastMsg("🎙️ Risposta vocale trascritta nel campo di testo!");
         } catch (err: any) {
           setAppAlert({ msg: `⚠️ ${err?.message || "Impossibile trascrivere la registrazione vocale."}` });
@@ -598,7 +609,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
       recorder.start(250);
     } catch (permErr: any) {
-      scheduleDialogInteractionEnd(1500);
+      scheduleDialogInteractionEnd(2200);
       setRecordingAudioForId(null);
       setAppAlert({
         msg: `⚠️ Accesso al microfono non consentito o non disponibile (${permErr?.message || "permesso negato"}). Puoi comunque scrivere la risposta manualmente.`,
@@ -1217,8 +1228,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       if (rawSaved) savedOrder = JSON.parse(rawSaved);
     } catch {}
 
+    const normStudentEmail = String(user?.email || "").trim().toLowerCase();
+    const baseSeed = `${normStudentEmail}|${currPin.trim().toUpperCase()}|${runIdVal || "default"}`;
     const nextOrder: Record<string, number[]> = {};
-    const processMcList = (list: any[], allowShuffle: boolean) => {
+    const processMcList = (list: any[], allowShuffle: boolean, scopeTag: string) => {
       const mappedList = list.map((q: any) => {
         if (!q || !Array.isArray(q.options) || q.options.length < 2) return q;
         const qId = String(q.id || "");
@@ -1230,8 +1243,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         if (existingOrder) {
           chosenOrder = existingOrder;
         } else if (allowShuffle) {
-          const indexed = q.options.map((_: string, idx: number) => idx);
-          chosenOrder = [...indexed].sort(() => Math.random() - 0.5);
+          chosenOrder = computeDeterministicMcOrder(`${baseSeed}|mc_opt|${qId || q.question}`, q.options.length);
         } else {
           return q;
         }
@@ -1250,19 +1262,21 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           ...(hasCorrectIdx ? { correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex } : {}),
         };
       });
-      return allowShuffle && !savedOrder ? [...mappedList].sort(() => Math.random() - 0.5) : mappedList;
+      return allowShuffle && !savedOrder
+        ? computeDeterministicItemOrder(mappedList, `${baseSeed}|mc_list|${scopeTag}`)
+        : mappedList;
     };
 
     const result = { ...rawExamContent };
     if (Array.isArray(result.multipleChoice) && (shouldRandomize || savedOrder)) {
-      result.multipleChoice = processMcList(result.multipleChoice, shouldRandomize);
+      result.multipleChoice = processMcList(result.multipleChoice, shouldRandomize, "root");
     }
     if (Array.isArray(result.sections) && (shouldRandomize || savedOrder)) {
-      result.sections = result.sections.map((sec: any) => {
+      result.sections = result.sections.map((sec: any, sIdx: number) => {
         if (!sec || !Array.isArray(sec.multipleChoice)) return sec;
         return {
           ...sec,
-          multipleChoice: processMcList(sec.multipleChoice, shouldRandomize),
+          multipleChoice: processMcList(sec.multipleChoice, shouldRandomize, `sec_${sIdx}`),
         };
       });
     }
@@ -1541,13 +1555,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           try {
             const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
             const parsedAnswers = safeParseJson(selectedPastSub.Risposte_Studente) || {};
+            const parsedMcOrder = safeParseJson(selectedPastSub.MC_Order) || undefined;
             const resp = await fetch("/api/session/unlock-solutions", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({
                 pin: cleanPin,
                 sessionId: subSessionId,
+                studentEmail: user?.email || selectedPastSub.Email || "",
                 assignedFila: selectedPastSub.Assigned_Fila || "",
+                mcOptionOrder: parsedMcOrder,
                 examData: parsedExamData,
                 answers: parsedAnswers,
                 tipo: selectedPastSub.Tipo || "Quiz",
@@ -2936,6 +2953,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           );
 
           const resolvedFila = rescue.assignedFila || assignedFilaRef.current || undefined;
+          const mcOrderObj = mcOptionOrderRef.current || {};
+          const oralAnswersCount = oralQuestionIdsRef.current.size;
           const submissionData: any = {
             Timestamp: timestamp,
             Docente_Email: cleanVal(rescue.teacherEmail),
@@ -2958,6 +2977,8 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Domande_Esame: serializeExamForSubmission(rescue.examData),
             Soluzioni_Differite: !!(rescue.deferSolutions && !rescue.solutionsReleased),
             ...(resolvedFila ? { Assigned_Fila: resolvedFila } : {}),
+            ...(Object.keys(mcOrderObj).length > 0 ? { MC_Order: JSON.stringify(mcOrderObj) } : {}),
+            ...(oralAnswersCount > 0 ? { Oral_Answers_Count: oralAnswersCount } : {}),
           };
 
           if (rescue.examType === "quiz") {
@@ -3348,6 +3369,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setRecordingAudioForId(null);
     setTranscribingAudioForId(null);
     setAudioRecordSeconds(0);
+    oralQuestionIdsRef.current.clear();
     persistExamLock(false);
     try {
       sessionStorage.removeItem("active_student_session");
@@ -5677,6 +5699,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       <PrintableReportModal
         isOpen={showPrintModal}
         onClose={() => setShowPrintModal(false)}
+        deferredSolutionsLocked={deferSolutionsSession && !solutionsReleased}
         submission={{
           Nome: user?.displayName || "Studente",
           Email: user?.email || "",
@@ -5688,7 +5711,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           AntiCopia_TabSwitch: behavior.tabSwitches,
           AntiCopia_IncollaBloccato: behavior.pasteAttempts,
           Full_Evaluation: evaluation,
-          Risposte_Studente: answers
+          Risposte_Studente: answers,
+          Domande_Esame: examData,
+          Soluzioni_Differite: deferSolutionsSession && !solutionsReleased,
+          ...(assignedFilaRef.current ? { Assigned_Fila: assignedFilaRef.current } : {}),
+          ...(oralQuestionIdsRef.current.size > 0 ? { Oral_Answers_Count: oralQuestionIdsRef.current.size } : {}),
         }}
         examTitle={examData?.title}
         examImages={examData?.images}

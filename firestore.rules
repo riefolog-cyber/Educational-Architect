@@ -87,12 +87,15 @@ service cloud.firestore {
           'solutionsReleased', 'solutionsReleasedAt', 'besOptions',
           'mixFilaAB', 'filaBData', 'encryptedFilaBAnswerKey', 'filaBTitle',
           'allowAudioAnswers', 'severityPreset', 'unlockCode', 'active',
+          'archived', 'archivedAt',
           'createdAt', 'sessionId', 'backendUrl'
         ]) &&
         data.pin is string && data.pin.size() > 0 && data.pin.size() <= 40 &&
         data.expiry is string && data.expiry.size() > 0 && data.expiry.size() <= 64 &&
         data.teacherEmail is string && data.teacherEmail.size() > 0 && data.teacherEmail.size() <= 200 &&
         data.active is bool &&
+        (!('archived' in data) || data.archived is bool) &&
+        (!('archivedAt' in data) || (data.archivedAt is string && data.archivedAt.size() <= 64)) &&
         (!('title' in data) || (data.title is string && data.title.size() <= 300)) &&
         (!('teacherId' in data) || (data.teacherId is string && data.teacherId.size() <= 128)) &&
         (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128)) &&
@@ -122,7 +125,7 @@ service cloud.firestore {
           'Errori_Principali', 'Feedback_Generale', 'Full_Evaluation',
           'Risposte_Studente', 'Domande_Esame', 'Piano_Recupero',
           'Convalida_Docente_At', 'Convalida_Docente_Email', 'Soluzioni_Differite',
-          'Assigned_Fila'
+          'Assigned_Fila', 'MC_Order', 'Oral_Answers_Count'
         ]) &&
         data.Timestamp is string && data.Timestamp.size() > 0 && data.Timestamp.size() <= 64 &&
         data.Tipo in ['Quiz', 'Workbook'] &&
@@ -139,7 +142,9 @@ service cloud.firestore {
         (!('Domande_Esame' in data) || (data.Domande_Esame is string && data.Domande_Esame.size() <= 600000)) &&
         (!('Piano_Recupero' in data) || (data.Piano_Recupero is string && data.Piano_Recupero.size() <= 40000)) &&
         (!('Soluzioni_Differite' in data) || data.Soluzioni_Differite is bool) &&
-        (!('Assigned_Fila' in data) || data.Assigned_Fila in ['A', 'B']);
+        (!('Assigned_Fila' in data) || data.Assigned_Fila in ['A', 'B']) &&
+        (!('MC_Order' in data) || (data.MC_Order is string && data.MC_Order.size() <= 40000)) &&
+        (!('Oral_Answers_Count' in data) || (data.Oral_Answers_Count is int && data.Oral_Answers_Count >= 0 && data.Oral_Answers_Count <= 100));
     }
 
     function isValidSubmissionCreate(data) {
@@ -216,12 +221,23 @@ service cloud.firestore {
       allow delete: if isPrimaryTeacher() && isValidDocId(docId);
     }
 
+    function isOwnerOrPrimaryTeacher(ownerEmail) {
+      return isPrimaryTeacher() || (
+        isTeacher() && (
+          !(ownerEmail is string) ||
+          ownerEmail.size() == 0 ||
+          ownerEmail.lower() == request.auth.token.email.lower()
+        )
+      );
+    }
+
     // Library of teacher-saved exams, reusable across classes/sessions
     match /exam_library/{docId} {
       allow get: if isTeacher() && isValidId(docId);
       allow list: if isTeacher();
-      allow create, update: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming());
-      allow delete: if isTeacher() && isValidId(docId);
+      allow create: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming());
+      allow update: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
+      allow delete: if isTeacher() && isValidId(docId) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
     }
 
     // Cross-teacher exam sharing templates via short code
@@ -239,18 +255,19 @@ service cloud.firestore {
       allow list: if isTeacher() || (resource.data.Email is string && resource.data.Email.size() > 0);
       allow create: if isValidId(valId) && isValidSubmissionCreate(incoming());
       allow update: if isValidId(valId) && (
-        (isTeacher() && isValidSubmissionPayload(incoming())) ||
+        (isTeacher() && isValidSubmissionPayload(incoming()) && isOwnerOrPrimaryTeacher(existing().get('Docente_Email', ''))) ||
         (isValidSubmissionPayload(incoming()) && isStudentRecoveryPlanUpdate())
       );
-      allow delete: if isTeacher() && isValidId(valId);
+      allow delete: if isTeacher() && isValidId(valId) && isOwnerOrPrimaryTeacher(existing().get('Docente_Email', ''));
     }
 
     // Active exam sessions and live classroom progress
     match /active_sessions/{sessionId} {
       allow get: if isValidId(sessionId);
       allow list: if isTeacher();
-      allow create, update: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming());
-      allow delete: if isTeacher() && isValidId(sessionId);
+      allow create: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming());
+      allow update: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
+      allow delete: if isTeacher() && isValidId(sessionId) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
 
       match /live_students/{studentId} {
         allow get: if isValidId(sessionId) && isValidId(studentId);

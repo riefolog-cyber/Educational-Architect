@@ -17,8 +17,15 @@ import {
   isEvaluationPending,
   sanitizeAiHtml,
 } from "../src/utils";
-import { computeExamItemAnalysis } from "../src/utils/examAnalytics";
-import { stripExamAnswers, restoreExamAnswers, assignDeterministicFila } from "../src/utils/examSecurity";
+import { computeExamItemAnalysis, computeExamItemAnalysisByFila } from "../src/utils/examAnalytics";
+import {
+  stripExamAnswers,
+  restoreExamAnswers,
+  assignDeterministicFila,
+  computeDeterministicMcOrder,
+  computeDeterministicItemOrder,
+  reconstructExamMcOrder,
+} from "../src/utils/examSecurity";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -1109,6 +1116,69 @@ test("assignDeterministicFila: assegnazione stabile A/B e bilanciata su una clas
     else countB++;
   }
   assert.ok(countA > 0 && countB > 0, `attesi sia A che B, ricevuti A=${countA}, B=${countB}`);
+});
+
+test("computeDeterministicMcOrder & reconstructExamMcOrder: permutazione stabile e riallinamento soluzioni", () => {
+  const order1 = computeDeterministicMcOrder("stu@scuola.it|PIN1|run1|mc_opt|mc1", 4);
+  const order2 = computeDeterministicMcOrder("stu@scuola.it|PIN1|run1|mc_opt|mc1", 4);
+  assert.deepEqual(order1, order2);
+  assert.deepEqual([...order1].sort((a, b) => a - b), [0, 1, 2, 3]);
+
+  const items = computeDeterministicItemOrder(["a", "b", "c", "d"], "stu@scuola.it|PIN1|items");
+  const itemsRepeat = computeDeterministicItemOrder(["a", "b", "c", "d"], "stu@scuola.it|PIN1|items");
+  assert.deepEqual(items, itemsRepeat);
+  assert.deepEqual([...items].sort(), ["a", "b", "c", "d"]);
+
+  const examData = {
+    multipleChoice: [
+      { id: "mc1", options: ["Alpha", "Beta", "Gamma", "Delta"] },
+    ],
+    sections: [
+      {
+        multipleChoice: [
+          { id: "wbmc1", options: ["Uno", "Due", "Tre"] },
+        ],
+      },
+    ],
+  };
+  const reconstructed = reconstructExamMcOrder(examData, "  STU@SCUOLA.IT ", "pin1", "run1");
+  assert.equal(reconstructed.mc1.length, 4);
+  assert.equal(reconstructed.wbmc1.length, 3);
+  assert.deepEqual(reconstructed.mc1, order1);
+});
+
+test("computeExamItemAnalysisByFila: separa Fila A e Fila B mantenendo il riepilogo complessivo", () => {
+  const examA = JSON.stringify({
+    multipleChoice: [{ id: "mcA", question: "Domanda Fila A", options: ["Vero", "Falso"], correctIndex: 0 }],
+  });
+  const examB = JSON.stringify({
+    multipleChoice: [{ id: "mcB", question: "Domanda Fila B", options: ["Est", "Ovest"], correctIndex: 1 }],
+  });
+  const subs: any[] = [
+    {
+      id: "sa1",
+      Tipo: "Quiz",
+      Assigned_Fila: "A",
+      Domande_Esame: examA,
+      Risposte_Studente: JSON.stringify({ mc: { mcA: 0 } }),
+      Full_Evaluation: "{}",
+    },
+    {
+      id: "sb1",
+      Tipo: "Quiz",
+      Assigned_Fila: "B",
+      Domande_Esame: examB,
+      Risposte_Studente: JSON.stringify({ mc: { mcB: 0 } }),
+      Full_Evaluation: "{}",
+    },
+  ];
+  const byFila = computeExamItemAnalysisByFila(subs);
+  assert.equal(byFila.hasMixedFila, true);
+  assert.equal(byFila.filaACount, 1);
+  assert.equal(byFila.filaBCount, 1);
+  assert.equal(byFila.filaA?.mcStats[0].accuracyPercent, 100);
+  assert.equal(byFila.filaB?.mcStats[0].accuracyPercent, 0);
+  assert.equal(byFila.filaB?.mcStats[0].needsReview, true);
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

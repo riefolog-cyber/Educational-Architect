@@ -504,6 +504,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           createdAt: d.createdAt || null,
           sessionId: d.sessionId || "",
           active: !!d.active,
+          archived: !!d.archived,
+          archivedAt: d.archivedAt || null,
           teacherEmail: d.teacherEmail || user.email,
           deferSolutions: !!d.deferSolutions,
           solutionsReleased: d.deferSolutions ? !!d.solutionsReleased : true,
@@ -556,22 +558,35 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Terminates (ends) and cancels a single active classroom session:
-  // removes its live students, deletes the active_session document and the
-  // RTDB backup, then refreshes the teacher's session list.
+  // Terminates a single active classroom session:
+  // purges live students and RTDB, and archives deferred-solution sessions with active: false
+  // so students can still unlock solutions in their History ("I Tuoi Esiti") later.
   const handleTerminateSession = async (targetPin: string) => {
     const cleanPin = (targetPin || "").trim().toUpperCase();
     if (!cleanPin || !dbFirestore) return;
 
     setTerminatingPin(cleanPin);
     try {
-      // 1. Purge live students
       await purgeLiveStudents(cleanPin);
 
-      // 2. Delete the active_session document
-      await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+      const existingSession = activeSessions.find((s) => s.pin === cleanPin);
+      if (existingSession?.deferSolutions) {
+        const archivedAt = new Date().toISOString();
+        await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+          active: false,
+          archived: true,
+          archivedAt,
+        });
+        setActiveSessions((prev) =>
+          prev.map((s) =>
+            s.pin === cleanPin ? { ...s, active: false, archived: true, archivedAt } : s
+          )
+        );
+      } else {
+        await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+        setActiveSessions((prev) => prev.filter((s) => s.pin !== cleanPin));
+      }
 
-      // 3. Remove RTDB backup (best effort)
       if (db) {
         try {
           await fbSet(fbRef(db, `sessions/${cleanPin}`), null);
@@ -580,8 +595,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
       }
 
-      // 4. Update local state
-      setActiveSessions((prev) => prev.filter((s) => s.pin !== cleanPin));
       if (monitorPin === cleanPin) {
         setMonitorPin("");
         setPin("");
@@ -595,7 +608,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Terminates and cancels ALL active classroom sessions owned by this teacher.
+  // Permanently deletes an archived deferred session doc once the teacher no longer needs it
+  const handlePurgeArchivedSession = async (targetPin: string) => {
+    const cleanPin = (targetPin || "").trim().toUpperCase();
+    if (!cleanPin || !dbFirestore) return;
+    setTerminatingPin(cleanPin);
+    try {
+      await purgeLiveStudents(cleanPin);
+      await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+      setActiveSessions((prev) => prev.filter((s) => s.pin !== cleanPin));
+    } catch (err: any) {
+      showNotify("error", `Impossibile eliminare definitivamente l'archivio ${cleanPin}: ${err?.message || "errore"}`);
+    } finally {
+      setTerminatingPin(null);
+      await handleLoadActiveSessions();
+    }
+  };
+
+  // Terminates ALL active classroom sessions owned by this teacher.
   const handleTerminateAllSessions = async () => {
     const live = activeSessions.filter((s) => isSessionLive(s));
     if (live.length === 0) return;
@@ -606,9 +636,17 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const cleanPin = s.pin.trim().toUpperCase();
         await purgeLiveStudents(cleanPin);
         try {
-          await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+          if (s.deferSolutions) {
+            await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+              active: false,
+              archived: true,
+              archivedAt: new Date().toISOString(),
+            });
+          } else {
+            await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
+          }
         } catch (delErr) {
-          console.warn("Eliminazione sessione fallita:", delErr);
+          console.warn("Chiusura sessione fallita:", delErr);
         }
         if (db) {
           try {
@@ -618,7 +656,6 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }
         }
       }
-      setActiveSessions([]);
       setMonitorPin("");
       setPin("");
     } catch (err: any) {
@@ -2212,10 +2249,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
       blindGradingMode ? "Modalità Privacy" : "Email",
       "PIN Sessione",
+      "Fila",
       "Titolo Prova",
       "Tipologia",
       "Voto IA Suggerito",
       "Autovalutazione",
+      "Risposte Orali BES",
       "Uscite Pagina (Tab Switch)",
       "Incolla Bloccati",
       "Errori Principali",
@@ -2228,10 +2267,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
       blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
       sub.Pin || exam.pin,
+      sub.Assigned_Fila ? `Fila ${sub.Assigned_Fila}` : "Unica",
       exam.title,
       sub.Tipo || "",
       displaySubmissionGrade(sub),
       sub.Autovalutazione || "",
+      sub.Oral_Answers_Count || 0,
       sub.AntiCopia_TabSwitch || 0,
       sub.AntiCopia_IncollaBloccato || 0,
       sub.Errori_Principali || "",
@@ -3802,6 +3843,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 onTerminateSession={handleTerminateSession}
                 onTerminateAllSessions={handleTerminateAllSessions}
                 onToggleSolutionsReleased={handleToggleSolutionsReleased}
+                onPurgeArchivedSession={handlePurgeArchivedSession}
                 terminatingPin={terminatingPin}
                 terminatingAll={terminatingAll}
                 togglingSolutionsPin={togglingSolutionsPin}

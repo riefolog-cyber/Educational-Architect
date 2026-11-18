@@ -1,7 +1,7 @@
 import React, { useMemo, useState } from "react";
-import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X } from "lucide-react";
+import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X, FileText, Copy, Check } from "lucide-react";
 import { SavedSubmission, AiModalPrefill } from "../types";
-import { computeExamItemAnalysis } from "../utils/examAnalytics";
+import { computeExamItemAnalysisByFila } from "../utils/examAnalytics";
 import { getAuthHeaders } from "../firebase";
 import { safeParseJson, sanitizeAiHtml } from "../utils";
 import { scrubPromptPii } from "../utils/privacyPseudonym";
@@ -18,20 +18,47 @@ interface ClassErrorSummaryResult {
   lessonPlan15Min: string[];
 }
 
+interface MiniReviewSheetResult {
+  title: string;
+  intro: string;
+  recapPoints: Array<{ concept: string; explanation: string }>;
+  quickExercises: Array<{ prompt: string; solution: string }>;
+}
+
 const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo(({
   submissions,
   examTitle,
   onGenerateRecoveryExam,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
+  const [filaFilter, setFilaFilter] = useState<"all" | "A" | "B">("all");
   const [synthesizingErrors, setSynthesizingErrors] = useState(false);
   const [synthesisError, setSynthesisError] = useState<string | null>(null);
   const [errorSynthesis, setErrorSynthesis] = useState<ClassErrorSummaryResult | null>(null);
+  const [generatingSheet, setGeneratingSheet] = useState(false);
+  const [reviewSheet, setReviewSheet] = useState<MiniReviewSheetResult | null>(null);
+  const [copiedSheet, setCopiedSheet] = useState(false);
+
+  const filaBundle = useMemo(() => {
+    if (submissions.length === 0) return null;
+    return computeExamItemAnalysisByFila(submissions);
+  }, [submissions]);
+
+  const effectiveFila: "all" | "A" | "B" =
+    filaBundle?.hasMixedFila ? filaFilter : "all";
 
   const analysis = useMemo(() => {
-    if (submissions.length === 0) return null;
-    return computeExamItemAnalysis(submissions);
-  }, [submissions]);
+    if (!filaBundle) return null;
+    if (effectiveFila === "A" && filaBundle.filaA) return filaBundle.filaA;
+    if (effectiveFila === "B" && filaBundle.filaB) return filaBundle.filaB;
+    return filaBundle.overall;
+  }, [filaBundle, effectiveFila]);
+
+  const activeSubmissions = useMemo(() => {
+    if (effectiveFila === "A") return submissions.filter((s) => s.Assigned_Fila === "A");
+    if (effectiveFila === "B") return submissions.filter((s) => s.Assigned_Fila === "B");
+    return submissions;
+  }, [submissions, effectiveFila]);
 
   const totalItems =
     (analysis?.mcStats.length || 0) +
@@ -115,7 +142,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         .slice(0, 3)
         .forEach((s) => {
           const sampleErrors: string[] = [];
-          for (const sub of submissions) {
+          for (const sub of activeSubmissions) {
             if (sampleErrors.length >= 5) break;
             const ans = safeParseJson(sub.Risposte_Studente) || {};
             const ev = safeParseJson(sub.Full_Evaluation) || {};
@@ -147,8 +174,8 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
 
       const resolvedTitle =
         examTitle ||
-        submissions[0]?.Session_Titolo ||
-        safeParseJson(submissions[0]?.Domande_Esame)?.title ||
+        activeSubmissions[0]?.Session_Titolo ||
+        safeParseJson(activeSubmissions[0]?.Domande_Esame)?.title ||
         "Verifica di classe";
 
       const authHeaders = await getAuthHeaders();
@@ -175,6 +202,86 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     } finally {
       setSynthesizingErrors(false);
     }
+  };
+
+  const handleGenerateReviewSheet = async () => {
+    if (generatingSheet) return;
+    setGeneratingSheet(true);
+    setSynthesisError(null);
+    try {
+      const weakItemsPayload: Array<{ kind: string; question: string; metricLabel: string; commonWrong?: string }> = [];
+      analysis.mcStats.filter((m) => m.needsReview).slice(0, 3).forEach((m) => {
+        weakItemsPayload.push({
+          kind: "Scelta Multipla",
+          question: scrubPromptPii(m.question).scrubbedText,
+          metricLabel: `${m.accuracyPercent}% corrette`,
+          commonWrong: m.topWrongOption ? scrubPromptPii(m.topWrongOption.text).scrubbedText : undefined,
+        });
+      });
+      analysis.fibStats.filter((f) => f.needsReview).slice(0, 2).forEach((f) => {
+        weakItemsPayload.push({
+          kind: "Completamento",
+          question: scrubPromptPii(`${f.sentence} [attesa: ${f.expectedAnswer}]`).scrubbedText,
+          metricLabel: `${f.accuracyPercent}% esatte`,
+          commonWrong: f.topWrongAnswer ? scrubPromptPii(f.topWrongAnswer.text).scrubbedText : undefined,
+        });
+      });
+      analysis.subjectiveStats.filter((s) => s.needsReview).slice(0, 3).forEach((s) => {
+        weakItemsPayload.push({
+          kind: s.kind === "open_ended" ? "Domanda Aperta" : "Riflessione",
+          question: scrubPromptPii(s.question).scrubbedText,
+          metricLabel: s.averageScore !== null ? `media ${s.averageScore.toFixed(1)}/10` : "N.V.",
+        });
+      });
+
+      const resolvedTitle =
+        examTitle ||
+        activeSubmissions[0]?.Session_Titolo ||
+        safeParseJson(activeSubmissions[0]?.Domande_Esame)?.title ||
+        "Verifica di classe";
+
+      const authHeaders = await getAuthHeaders();
+      const resp = await fetch("/api/teacher/generate-review-sheet", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Accept: "application/json",
+          ...authHeaders,
+        },
+        body: JSON.stringify({
+          examTitle: resolvedTitle,
+          filaLabel: effectiveFila !== "all" ? `Fila ${effectiveFila}` : "",
+          weakItems: weakItemsPayload,
+        }),
+      });
+      const data = await resp.json().catch(() => ({}));
+      if (!resp.ok || !data?.sheet) {
+        throw new Error(data?.details || data?.error || "Generazione scheda di ripasso non riuscita.");
+      }
+      setReviewSheet(data.sheet);
+    } catch (err: any) {
+      setSynthesisError(err?.message || "Impossibile generare la mini-scheda di ripasso.");
+    } finally {
+      setGeneratingSheet(false);
+    }
+  };
+
+  const handleCopyReviewSheet = () => {
+    if (!reviewSheet) return;
+    const text = [
+      `=== ${reviewSheet.title} ===`,
+      reviewSheet.intro,
+      "",
+      "CONCETTI DA CONSOLIDARE:",
+      ...reviewSheet.recapPoints.map((p, i) => `${i + 1}. ${p.concept}: ${p.explanation}`),
+      "",
+      "ESERCIZI RAPIDI DI RIPASSO:",
+      ...reviewSheet.quickExercises.map((ex, i) => `${i + 1}. ${ex.prompt}\n   Soluzione: ${ex.solution}`),
+    ].join("\n");
+    navigator.clipboard?.writeText(text).then(() => {
+      setCopiedSheet(true);
+      setTimeout(() => setCopiedSheet(false), 2000);
+    }).catch(() => {});
   };
 
   return (
@@ -218,6 +325,38 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
 
       {isOpen && (
         <div className="p-3.5 border-t border-white/10 space-y-4">
+          {filaBundle?.hasMixedFila && (
+            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/5">
+              <span className="text-[11px] font-semibold text-purple-200">
+                🔀 Prova mista nello stesso PIN: seleziona la traccia da analizzare
+              </span>
+              <div className="flex items-center gap-1.5">
+                {([
+                  { key: "all", label: `Tutte (${submissions.length})` },
+                  { key: "A", label: `Fila A (${filaBundle.filaACount})` },
+                  { key: "B", label: `Fila B (${filaBundle.filaBCount})` },
+                ] as const).map((tab) => (
+                  <button
+                    key={tab.key}
+                    type="button"
+                    onClick={() => {
+                      setFilaFilter(tab.key);
+                      setErrorSynthesis(null);
+                      setReviewSheet(null);
+                    }}
+                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                      effectiveFila === tab.key
+                        ? "bg-purple-500 text-white shadow-sm"
+                        : "bg-slate-900 text-slate-300 border border-white/10 hover:text-white"
+                    }`}
+                  >
+                    {tab.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          )}
+
           {analysis.weakTopicsCount > 0 && (
             <div className="space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2 p-2.5 rounded-xl bg-amber-500/10 border border-amber-500/25">
@@ -239,6 +378,20 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                     )}
                     <span>{synthesizingErrors ? "Sintesi in corso..." : "Sintesi errori classe (15 min)"}</span>
                   </button>
+                  <button
+                    type="button"
+                    onClick={handleGenerateReviewSheet}
+                    disabled={generatingSheet}
+                    className="px-3 py-1.5 rounded-lg bg-teal-500/20 hover:bg-teal-500/30 text-teal-200 border border-teal-400/30 font-bold text-[11px] flex items-center gap-1.5 cursor-pointer transition-colors whitespace-nowrap disabled:opacity-50"
+                    title="Genera una mini-scheda di ripasso con esercizi rapidi per gli alunni sui concetti critici"
+                  >
+                    {generatingSheet ? (
+                      <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                    ) : (
+                      <FileText className="w-3.5 h-3.5" />
+                    )}
+                    <span>{generatingSheet ? "Generazione..." : "Mini-Scheda Ripasso"}</span>
+                  </button>
                   {onGenerateRecoveryExam && (
                     <button
                       type="button"
@@ -255,6 +408,61 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
               {synthesisError && (
                 <div className="p-2.5 rounded-xl bg-red-500/10 border border-red-500/30 text-red-200 text-[11px]">
                   ⚠️ {synthesisError}
+                </div>
+              )}
+
+              {reviewSheet && (
+                <div className="p-3.5 rounded-xl bg-teal-950/35 border border-teal-500/30 space-y-2.5 text-xs">
+                  <div className="flex items-center justify-between gap-2 flex-wrap">
+                    <p className="text-[11px] font-bold uppercase tracking-wider text-teal-300 flex items-center gap-1.5">
+                      <FileText className="w-3.5 h-3.5" />
+                      <span>{reviewSheet.title}</span>
+                    </p>
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={handleCopyReviewSheet}
+                        className="px-2 py-1 rounded-lg bg-teal-500/20 hover:bg-teal-500/30 text-teal-200 text-[10px] font-bold flex items-center gap-1 cursor-pointer"
+                      >
+                        {copiedSheet ? <Check className="w-3 h-3" /> : <Copy className="w-3 h-3" />}
+                        <span>{copiedSheet ? "Copiata!" : "Copia testo"}</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => setReviewSheet(null)}
+                        className="p-1 text-slate-400 hover:text-white rounded-lg hover:bg-white/5 cursor-pointer"
+                        title="Chiudi scheda"
+                      >
+                        <X className="w-3.5 h-3.5" />
+                      </button>
+                    </div>
+                  </div>
+                  {reviewSheet.intro && <p className="text-[11px] text-slate-200 leading-relaxed">{reviewSheet.intro}</p>}
+                  {reviewSheet.recapPoints.length > 0 && (
+                    <div className="space-y-1.5">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-teal-300">Punti Chiave da Consolidare</p>
+                      <ul className="space-y-1 text-[11px] text-slate-200">
+                        {reviewSheet.recapPoints.map((p, idx) => (
+                          <li key={idx} className="p-2 rounded-lg bg-slate-900/60 border border-white/5">
+                            <b className="text-white">{p.concept}:</b> {p.explanation}
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  )}
+                  {reviewSheet.quickExercises.length > 0 && (
+                    <div className="space-y-1.5 pt-1 border-t border-white/10">
+                      <p className="text-[10px] font-bold uppercase tracking-wider text-amber-300">Esercizi Rapidi di Ripasso</p>
+                      <ol className="list-decimal pl-4 space-y-1.5 text-[11px] text-slate-200">
+                        {reviewSheet.quickExercises.map((ex, idx) => (
+                          <li key={idx}>
+                            <span className="font-medium text-white">{ex.prompt}</span>
+                            <p className="text-[10px] text-emerald-300 mt-0.5">Soluzione: {ex.solution}</p>
+                          </li>
+                        ))}
+                      </ol>
+                    </div>
+                  )}
                 </div>
               )}
 

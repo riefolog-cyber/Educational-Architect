@@ -117,6 +117,7 @@ export function buildElectronicRegisterCsv(
       "Data",
       "Tipo",
       "PIN",
+      "Fila",
       "Titolo Verifica",
       "Studente",
       "Email / Codice",
@@ -125,6 +126,7 @@ export function buildElectronicRegisterCsv(
       "Originale IA",
       "Convalidato Docente",
       "Autovalutazione",
+      "Risposte Orali",
       "Uscite Pagina",
       "Tentativi Incolla",
     ];
@@ -136,9 +138,11 @@ export function buildElectronicRegisterCsv(
     const blindCode = getSubmissionBlindCode(sub);
     const displayName = blindMode ? `Studente ${blindCode}` : (sub.Nome || "Studente");
     const displayId = blindMode ? blindCode : (sub.Email || blindCode);
-    const examTitle = sub.Session_Titolo || sub.Tipo || "Verifica";
+    const filaSuffix = sub.Assigned_Fila ? ` [Fila ${sub.Assigned_Fila}]` : "";
+    const examTitle = `${sub.Session_Titolo || sub.Tipo || "Verifica"}${filaSuffix}`;
     const dateStr = formatDateIt(sub.Timestamp);
     const validatedLabel = sub.Convalida_Docente_At ? "Sì" : "No";
+    const oralCount = Number(sub.Oral_Answers_Count) || 0;
     const violationsCount =
       (sub.AntiCopia_TabSwitch || 0) +
       (sub.AntiCopia_IncollaBloccato || 0) +
@@ -159,6 +163,10 @@ export function buildElectronicRegisterCsv(
     }
 
     if (preset === "axios") {
+      const notes: string[] = [];
+      if (sub.Assigned_Fila) notes.push(`Fila ${sub.Assigned_Fila}`);
+      if (oralCount > 0) notes.push(`${oralCount} risp. orali BES`);
+      if (violationsCount > 0) notes.push(`${violationsCount} segnalazioni anti-copia`);
       return [
         displayName,
         displayId,
@@ -168,7 +176,7 @@ export function buildElectronicRegisterCsv(
         formatted.registerDecimal,
         formatted.scholasticLabel,
         sub.Convalida_Docente_At ? "Convalidata" : "Bozza IA",
-        violationsCount > 0 ? `${violationsCount} segnalazioni anti-copia` : "Regolare",
+        notes.length > 0 ? notes.join(" · ") : "Regolare",
       ];
     }
 
@@ -187,7 +195,8 @@ export function buildElectronicRegisterCsv(
       dateStr,
       sub.Tipo || "",
       sub.Pin || "-",
-      examTitle,
+      sub.Assigned_Fila ? `Fila ${sub.Assigned_Fila}` : "Unica",
+      sub.Session_Titolo || sub.Tipo || "Verifica",
       displayName,
       displayId,
       formatted.registerDecimal,
@@ -195,6 +204,7 @@ export function buildElectronicRegisterCsv(
       sub.Voto_Originale_IA || sub.Voto_Suggerito || "",
       validatedLabel,
       sub.Autovalutazione || "",
+      String(oralCount),
       String(sub.AntiCopia_TabSwitch || 0),
       String(sub.AntiCopia_IncollaBloccato || 0),
     ];

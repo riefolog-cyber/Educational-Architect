@@ -150,10 +150,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         {/* Modal Header */}
         <div className="flex justify-between items-center bg-slate-950 p-5 border-b border-white/5">
           <div className="text-left">
-            <div className="flex items-center gap-2">
+            <div className="flex items-center gap-2 flex-wrap">
               <p className="text-[10px] font-bold font-mono uppercase text-teal-400">
                 Verbalizzazione Esame Corretto
               </p>
+              {submission.Assigned_Fila && (
+                <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-purple-500/15 text-purple-200 border border-purple-500/30">
+                  FILA {submission.Assigned_Fila}
+                </span>
+              )}
               {blindGradingMode && (
                 <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
                   BLIND GRADING ATTIVO
@@ -311,6 +316,14 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>
                 PII filtrate al prompt: <b className="text-teal-300">{Number(submission.PII_Oscurate_Count || 0)}</b>
               </span>
+              {Number(submission.Oral_Answers_Count || 0) > 0 && (
+                <>
+                  <span className="text-slate-600">·</span>
+                  <span className="px-1.5 py-0.5 rounded bg-sky-500/15 text-sky-200 border border-sky-500/30 font-semibold">
+                    🎙️ {Number(submission.Oral_Answers_Count)} risp. orali
+                  </span>
+                </>
+              )}
             </div>
             <div className="flex items-center gap-1.5">
               {submission.Convalida_Docente_At ? (
