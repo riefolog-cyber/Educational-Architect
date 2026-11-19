@@ -42,7 +42,10 @@ import {
   Volume2,
   Square,
   Mic,
-  Loader2
+  Loader2,
+  Megaphone,
+  Bell,
+  X
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
@@ -91,9 +94,18 @@ import {
   saveScopedExamLock,
   loadScopedExamLock,
   clearScopedExamLock,
+  saveScopedStudentClass,
+  loadScopedStudentClass,
   wipeSharedPcStudentStorage,
   normalizeIdentityKey
 } from "../utils/clientStorage";
+import {
+  normalizeClassLabel,
+  extractClassFromStudentName,
+  parseAllowedClassList,
+  resolveSubmissionClass,
+  UNSPECIFIED_CLASS_LABEL,
+} from "../utils/classGrouping";
 
 function getLiveStudentDocId(email?: string | null, targetPin?: string | null): string {
   return deriveStudentPseudonym(email || "anonimo", String(targetPin || "").trim().toUpperCase());
@@ -113,6 +125,7 @@ interface StudentViewProps {
   user: any;
   onLogout: () => void;
   onBack?: () => void;
+  initialStudentClass?: string;
 }
 
 // Didactic meta under a question: key-question weight badge + grading criteria.
@@ -264,7 +277,7 @@ async function requestRecoveryPlan(
   throw new Error("L'attesa del piano è troppo lunga: riprova tra un minuto.");
 }
 
-export default function StudentView({ user, onLogout, onBack }: StudentViewProps) {
+export default function StudentView({ user, onLogout, onBack, initialStudentClass }: StudentViewProps) {
   // State
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState("");
@@ -275,6 +288,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Student history & recovery plan states (Optimizations 2 & 3)
   const [activeSubTab, setActiveSubTab] = useState<"enter-pin" | "view-history">("enter-pin");
   const [historyList, setHistoryList] = useState<any[]>([]);
+  const [historyClassFilter, setHistoryClassFilter] = useState<string>("ALL");
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [selectedPastSub, setSelectedPastSub] = useState<any | null>(null);
@@ -373,12 +387,91 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   // Printable Report state
   const [showPrintModal, setShowPrintModal] = useState(false);
 
-  // BES / DSA Text-to-Speech + Teacher Live Notice + Timer Warnings
+  // BES / DSA Text-to-Speech + Teacher Live Notice + Class Broadcast + Timer Warnings
   const [speakingId, setSpeakingId] = useState<string | null>(null);
   const [teacherNoticeBanner, setTeacherNoticeBanner] = useState<{ text: string; at: string } | null>(null);
+  const [classNoticeBanner, setClassNoticeBanner] = useState<{ text: string; at: string; targetClass?: string } | null>(null);
+  const [noticeHistory, setNoticeHistory] = useState<Array<{ id: string; kind: "teacher" | "class"; text: string; at: string; targetClass?: string }>>([]);
+  const [showNoticeHistory, setShowNoticeHistory] = useState<boolean>(false);
   const lastTeacherNoticeAtRef = useRef<string | null>(null);
+  const lastClassNoticeAtRef = useRef<string | null>(null);
+  const dismissedTeacherNoticeAtRef = useRef<string | null>(null);
+  const dismissedClassNoticeAtRef = useRef<string | null>(null);
+  const [sessionTargetClass, setSessionTargetClass] = useState<string>("");
+  const [sessionAllowedClasses, setSessionAllowedClasses] = useState<string[]>([]);
+  const [sessionRestrictClasses, setSessionRestrictClasses] = useState<boolean>(false);
+  const [latestActiveSessionBroadcast, setLatestActiveSessionBroadcast] = useState<{
+    text: string;
+    at: string;
+    targetClass?: string;
+  } | null>(null);
+  const [remoteSolutionsReady, setRemoteSolutionsReady] = useState<boolean>(false);
+  const [studentClassInput, setStudentClassInput] = useState<string>(() => {
+    const fromInitial = normalizeClassLabel(initialStudentClass);
+    if (fromInitial) return fromInitial;
+    const fromUser = normalizeClassLabel(user?.studentClass);
+    if (fromUser) return fromUser;
+    const fromName = extractClassFromStudentName(user?.displayName);
+    if (fromName) return fromName;
+    const fromScoped = normalizeClassLabel(loadScopedStudentClass(user?.email));
+    if (fromScoped) return fromScoped;
+    if (user?.isDirectAccess) {
+      try {
+        return normalizeClassLabel(localStorage.getItem("saved_student_class"));
+      } catch {
+        return "";
+      }
+    }
+    return "";
+  });
+  const resolvedStudentClass =
+    normalizeClassLabel(studentClassInput) ||
+    normalizeClassLabel(initialStudentClass) ||
+    normalizeClassLabel(user?.studentClass) ||
+    extractClassFromStudentName(user?.displayName) ||
+    normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+    normalizeClassLabel(sessionTargetClass);
+  const resolvedStudentClassRef = useRef<string>(resolvedStudentClass);
+  useEffect(() => {
+    resolvedStudentClassRef.current = resolvedStudentClass;
+  }, [resolvedStudentClass]);
+
+  useEffect(() => {
+    const nextClass =
+      normalizeClassLabel(initialStudentClass) ||
+      normalizeClassLabel(user?.studentClass) ||
+      extractClassFromStudentName(user?.displayName) ||
+      normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+      "";
+    setStudentClassInput(nextClass);
+  }, [initialStudentClass, user?.email, user?.studentClass, user?.displayName]);
+
   const warn5MinShownRef = useRef(false);
   const warn1MinShownRef = useRef(false);
+
+  const recordNoticeInHistory = useCallback(
+    (entry: { kind: "teacher" | "class"; text: string; at: string; targetClass?: string }) => {
+      const id = `${entry.kind}_${entry.at}`;
+      setNoticeHistory((prev) => {
+        if (prev.some((n) => n.id === id)) return prev;
+        return [{ id, ...entry }, ...prev].slice(0, 30);
+      });
+    },
+    []
+  );
+
+  useEffect(() => {
+    setTeacherNoticeBanner(null);
+    setClassNoticeBanner(null);
+    setLatestActiveSessionBroadcast(null);
+    setNoticeHistory([]);
+    setShowNoticeHistory(false);
+    lastTeacherNoticeAtRef.current = null;
+    lastClassNoticeAtRef.current = null;
+    dismissedTeacherNoticeAtRef.current = null;
+    dismissedClassNoticeAtRef.current = null;
+    setRemoteSolutionsReady(false);
+  }, [sessionPin]);
 
   const canUseSpeech = typeof window !== "undefined" && "speechSynthesis" in window;
   const stopSpeech = useCallback(() => {
@@ -811,6 +904,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
       await setDoc(docRef, {
         studentName: user.displayName || "Studente",
         studentEmail: user.email,
+        ...(resolvedStudentClass ? { studentClass: resolvedStudentClass } : {}),
         answeredCount,
         totalQuestions,
         mcDoneCount,
@@ -829,7 +923,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     } catch (err) {
       console.warn("Live progress sync skipped:", err);
     }
-  }, [dbFirestore, sessionPin, sessionRunId, user?.email, user?.displayName, examType, examData, answers, behavior.tabSwitches, behavior.pasteAttempts, assignedFila]);
+  }, [dbFirestore, sessionPin, sessionRunId, user?.email, user?.displayName, resolvedStudentClass, examType, examData, answers, behavior.tabSwitches, behavior.pasteAttempts, assignedFila]);
 
   // Keeps the latest progress data available to the periodic heartbeat without
   // restarting the interval on every keystroke.
@@ -1016,12 +1110,13 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
   }, [activeScreen, examLocked]);
 
-  // Remote unlock: the teacher presses "Sblocca" in the live monitor, which
-  // writes a new remoteUnlockId and locked: false on this student's live_students document.
+  // Remote unlock & live notice: listen on the student's live_students document using normalized PIN
   useEffect(() => {
     if (!dbFirestore || !sessionPin || !user?.email) return;
-    const liveDocId = getLiveStudentDocId(user.email, sessionPin);
-    const studentDocRef = doc(dbFirestore, "active_sessions", sessionPin, "live_students", liveDocId);
+    const cleanPin = sessionPin.trim().toUpperCase();
+    if (!cleanPin) return;
+    const liveDocId = getLiveStudentDocId(user.email, cleanPin);
+    const studentDocRef = doc(dbFirestore, "active_sessions", cleanPin, "live_students", liveDocId);
     const unsubscribe = onSnapshot(
       studentDocRef,
       (snap) => {
@@ -1032,18 +1127,18 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         const noticeAt = data?.teacherNoticeAt ? String(data.teacherNoticeAt) : "";
         const noticeText = data?.teacherNotice ? String(data.teacherNotice).trim() : "";
         if (noticeAt && noticeText) {
-          if (lastTeacherNoticeAtRef.current === null) {
+          recordNoticeInHistory({ kind: "teacher", text: noticeText, at: noticeAt });
+          if (noticeAt !== lastTeacherNoticeAtRef.current) {
             lastTeacherNoticeAtRef.current = noticeAt;
-            const parsedNoticeTs = Date.parse(noticeAt);
-            if (!isNaN(parsedNoticeTs) && Date.now() - parsedNoticeTs < 2 * 60 * 1000) {
+            if (dismissedTeacherNoticeAtRef.current !== noticeAt) {
               setTeacherNoticeBanner({ text: noticeText, at: noticeAt });
               setInfractionToastMsg(`📩 Avviso del docente: ${noticeText}`);
             }
-          } else if (noticeAt !== lastTeacherNoticeAtRef.current) {
-            lastTeacherNoticeAtRef.current = noticeAt;
-            setTeacherNoticeBanner({ text: noticeText, at: noticeAt });
-            setInfractionToastMsg(`📩 Avviso del docente: ${noticeText}`);
           }
+        } else if (!noticeText && lastTeacherNoticeAtRef.current !== null) {
+          lastTeacherNoticeAtRef.current = null;
+          dismissedTeacherNoticeAtRef.current = null;
+          setTeacherNoticeBanner(null);
         }
 
         const remoteId = data?.remoteUnlockId;
@@ -1346,6 +1441,17 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
         setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
         setSessionRunId(restoredRunId);
+        const restoredTargetCls = normalizeClassLabel(sessionData.targetClass);
+        const restoredAllowedList = Array.isArray(sessionData.allowedClasses)
+          ? parseAllowedClassList(sessionData.allowedClasses.join(","))
+          : parseAllowedClassList(restoredTargetCls);
+        setSessionTargetClass(restoredTargetCls);
+        setSessionAllowedClasses(restoredAllowedList);
+        setSessionRestrictClasses(!!sessionData.restrictToAllowedClasses);
+        if (!normalizeClassLabel(studentClassInput) && cloudStudentData?.studentClass) {
+          const cloudCls = normalizeClassLabel(cloudStudentData.studentClass);
+          if (cloudCls) setStudentClassInput(cloudCls);
+        }
 
         restoreDraftWithCloudFallback(savedPin, restoredRunId, cloudStudentData);
         if (cloudStudentData?.locked === false && cloudStudentData?.lockState === "unlocked") {
@@ -1479,60 +1585,138 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     }
   }, [activeSubTab]);
 
-  // Real-time listener: unlock & decrypt deferred solutions as soon as teacher releases them
+  // Real-time session listener: class-wide broadcast notices, targetClass, allowedClasses, and deferred solutions release
   useEffect(() => {
-    if (activeScreen !== "results" || !deferSolutionsSession || solutionsReleased || !dbFirestore || !sessionPin) {
+    if (!dbFirestore || !sessionPin) return;
+    const cleanPin = sessionPin.trim().toUpperCase();
+    if (!cleanPin) return;
+    const unsub = onSnapshot(
+      doc(dbFirestore, "active_sessions", cleanPin),
+      (snap) => {
+        if (!snap.exists()) return;
+        const d = snap.data();
+
+        const targetCls = normalizeClassLabel(d?.targetClass);
+        setSessionTargetClass((prev) => (prev === targetCls ? prev : targetCls));
+
+        const allowedArr = Array.isArray(d?.allowedClasses)
+          ? parseAllowedClassList(d.allowedClasses.join(","))
+          : targetCls
+          ? [targetCls]
+          : [];
+        setSessionAllowedClasses((prev) =>
+          prev.length === allowedArr.length && prev.every((v, i) => v === allowedArr[i])
+            ? prev
+            : allowedArr
+        );
+        setSessionRestrictClasses(!!d?.restrictToAllowedClasses);
+
+        const cNoticeAt = d?.classNoticeAt ? String(d.classNoticeAt) : "";
+        const cNoticeText = d?.classNotice ? String(d.classNotice).trim() : "";
+        const cTargetCls = normalizeClassLabel(d?.classNoticeTargetClass);
+        if (cNoticeAt && cNoticeText) {
+          setLatestActiveSessionBroadcast((prev) =>
+            prev && prev.at === cNoticeAt && prev.text === cNoticeText && (prev.targetClass || "") === cTargetCls
+              ? prev
+              : { text: cNoticeText, at: cNoticeAt, targetClass: cTargetCls || undefined }
+          );
+        } else {
+          setLatestActiveSessionBroadcast(null);
+        }
+
+        if (d?.solutionsReleased === true || d?.deferSolutions === false) {
+          setRemoteSolutionsReady(true);
+        }
+      },
+      (err) => console.warn("Ascolto sessione live:", err)
+    );
+    return () => unsub();
+  }, [dbFirestore, sessionPin]);
+
+  // Re-evaluate incoming class broadcast reactively when either the broadcast or resolvedStudentClass updates
+  useEffect(() => {
+    if (!latestActiveSessionBroadcast) {
+      if (lastClassNoticeAtRef.current !== null || classNoticeBanner !== null) {
+        lastClassNoticeAtRef.current = null;
+        dismissedClassNoticeAtRef.current = null;
+        setClassNoticeBanner(null);
+      }
+      return;
+    }
+
+    const { text: cNoticeText, at: cNoticeAt, targetClass: cTargetClsRaw } = latestActiveSessionBroadcast;
+    const cTargetCls = normalizeClassLabel(cTargetClsRaw);
+    const myCls = normalizeClassLabel(resolvedStudentClass);
+    const noticeMatchesMyClass = !cTargetCls || !myCls || cTargetCls === myCls;
+
+    if (noticeMatchesMyClass) {
+      recordNoticeInHistory({
+        kind: "class",
+        text: cNoticeText,
+        at: cNoticeAt,
+        targetClass: cTargetCls || undefined,
+      });
+      if (cNoticeAt !== lastClassNoticeAtRef.current) {
+        lastClassNoticeAtRef.current = cNoticeAt;
+        if (dismissedClassNoticeAtRef.current !== cNoticeAt) {
+          setClassNoticeBanner({ text: cNoticeText, at: cNoticeAt, targetClass: cTargetCls || undefined });
+          setInfractionToastMsg(`📢 Avviso ${cTargetCls ? `alla classe ${cTargetCls}` : "alla classe"}: ${cNoticeText}`);
+        }
+      }
+    } else if (lastClassNoticeAtRef.current !== null || classNoticeBanner !== null) {
+      lastClassNoticeAtRef.current = null;
+      dismissedClassNoticeAtRef.current = null;
+      setClassNoticeBanner(null);
+    }
+  }, [latestActiveSessionBroadcast, resolvedStudentClass, recordNoticeInHistory]);
+
+  // Decrypt deferred solutions on results screen once session signals release
+  useEffect(() => {
+    if (activeScreen !== "results" || !deferSolutionsSession || solutionsReleased || !remoteSolutionsReady || !sessionPin) {
       return;
     }
     const cleanPin = sessionPin.trim().toUpperCase();
-    let unlockedTriggered = false;
-    const unsub = onSnapshot(
-      doc(dbFirestore, "active_sessions", cleanPin),
-      async (snap) => {
-        if (!snap.exists() || unlockedTriggered) return;
-        const d = snap.data();
-        if (d?.solutionsReleased === true || d?.deferSolutions === false) {
-          unlockedTriggered = true;
-          try {
-            const resp = await fetch("/api/session/unlock-solutions", {
-              method: "POST",
-              headers: { "Content-Type": "application/json" },
-              body: JSON.stringify({
-                pin: cleanPin,
-                sessionId: sessionRunId || "",
-                assignedFila: assignedFilaRef.current || "",
-                encryptedAnswerKey: encryptedAnswerKey || "",
-                examData,
-                mcOptionOrder: mcOptionOrderRef.current || {},
-                answers,
-                tipo: examType === "quiz" ? "Quiz" : "Workbook",
-              }),
-            });
-            const data = await resp.json().catch(() => null);
-            if (resp.ok && data?.unlocked) {
-              if (data.resolvedDomande) setExamData(data.resolvedDomande);
-              setEvaluation((prev) =>
-                prev
-                  ? {
-                      ...prev,
-                      ...(data.mainErrors ? { mainErrors: data.mainErrors } : {}),
-                      deferredSolutionsLocked: false,
-                    }
-                  : prev
-              );
-            }
-          } catch (unlockErr) {
-            console.warn("Errore sblocco soluzioni differite:", unlockErr);
-          } finally {
-            setSolutionsReleased(true);
-          }
+    let cancelled = false;
+    (async () => {
+      try {
+        const resp = await fetch("/api/session/unlock-solutions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            pin: cleanPin,
+            sessionId: sessionRunId || "",
+            assignedFila: assignedFilaRef.current || "",
+            encryptedAnswerKey: encryptedAnswerKey || "",
+            examData,
+            mcOptionOrder: mcOptionOrderRef.current || {},
+            answers,
+            tipo: examType === "quiz" ? "Quiz" : "Workbook",
+          }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (!cancelled && resp.ok && data?.unlocked) {
+          if (data.resolvedDomande) setExamData(data.resolvedDomande);
+          setEvaluation((prev) =>
+            prev
+              ? {
+                  ...prev,
+                  ...(data.mainErrors ? { mainErrors: data.mainErrors } : {}),
+                  deferredSolutionsLocked: false,
+                }
+              : prev
+          );
         }
-      },
-      (err) => console.warn("Ascolto rilascio soluzioni:", err)
-    );
-    return () => unsub();
+      } catch (unlockErr) {
+        console.warn("Errore sblocco soluzioni differite:", unlockErr);
+      } finally {
+        if (!cancelled) setSolutionsReleased(true);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScreen, deferSolutionsSession, solutionsReleased, sessionPin, sessionRunId, encryptedAnswerKey, examType]);
+  }, [activeScreen, deferSolutionsSession, solutionsReleased, remoteSolutionsReady, sessionPin, sessionRunId, encryptedAnswerKey, examType]);
 
   // History view: if a past submission had deferred solutions, verify Session_Id match and unlock via server vault
   useEffect(() => {
@@ -1594,6 +1778,14 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
 
   // Check custom pins (Firebase or Local Templates)
   const handleCheckPin = async () => {
+    const declaredClass = normalizeClassLabel(studentClassInput);
+    if (!declaredClass || declaredClass.length < 2) {
+      setPinError("Indica e dichiara obbligatoriamente la tua Classe / Sezione di appartenenza (es. 3A, 4B INF) prima di accedere alla prova.");
+      return;
+    }
+    setStudentClassInput(declaredClass);
+    saveScopedStudentClass(user?.email, declaredClass);
+
     if (!pin.trim()) {
       setPinError("Inserisci un PIN valido.");
       return;
@@ -1784,6 +1976,28 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
           setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
+          const sessionCls = normalizeClassLabel(sessionData.targetClass);
+          const allowedClsList = Array.isArray(sessionData.allowedClasses)
+            ? parseAllowedClassList(sessionData.allowedClasses.join(","))
+            : parseAllowedClassList(sessionCls);
+          const restrictAllowed = !!sessionData.restrictToAllowedClasses;
+
+          if (restrictAllowed && allowedClsList.length > 0 && !allowedClsList.includes(declaredClass)) {
+            setPinError(
+              `Accesso limitato: questa sessione è riservata alle classi ${allowedClsList.join(", ")}. Hai dichiarato "${declaredClass}".`
+            );
+            setPinLoading(false);
+            return;
+          }
+
+          setSessionTargetClass(sessionCls);
+          setSessionAllowedClasses(allowedClsList);
+          setSessionRestrictClasses(restrictAllowed);
+          if (allowedClsList.length === 1 && !normalizeClassLabel(studentClassInput)) {
+            setStudentClassInput(allowedClsList[0]);
+          } else if (sessionCls && !normalizeClassLabel(studentClassInput)) {
+            setStudentClassInput(sessionCls);
+          }
 
           // Restore a lock applied before a page reload scoped strictly to this student + PIN
           let isLockedNow = false;
@@ -2485,6 +2699,25 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
   };
 
   const handleStartExam = async () => {
+    const declaredClass =
+      normalizeClassLabel(studentClassInput) ||
+      normalizeClassLabel(initialStudentClass) ||
+      normalizeClassLabel(user?.studentClass) ||
+      extractClassFromStudentName(user?.displayName);
+    if (!declaredClass || declaredClass.length < 2) {
+      setAppAlert({
+        msg: "⚠️ Devi indicare e dichiarare obbligatoriamente la tua Classe / Sezione di appartenenza (es. 3A, 4B INF) prima di avviare la prova.",
+      });
+      return;
+    }
+    if (sessionRestrictClasses && sessionAllowedClasses.length > 0 && !sessionAllowedClasses.includes(declaredClass)) {
+      setAppAlert({
+        msg: `⛔ Accesso non consentito alla classe "${declaredClass}".\n\nIl docente ha ristretto questa prova alle sole classi: ${sessionAllowedClasses.join(", ")}.\n\nSeleziona o correggi la tua classe di appartenenza prima di iniziare.`,
+      });
+      return;
+    }
+    saveScopedStudentClass(user?.email, declaredClass);
+
     // 1. Check if screen is split before starting
     const currentStatus = detectSplitScreenStatus();
     setSplitScreenInfo(currentStatus);
@@ -2953,6 +3186,11 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           );
 
           const resolvedFila = rescue.assignedFila || assignedFilaRef.current || undefined;
+          const effectiveClass =
+            normalizeClassLabel(rescue.studentClass) ||
+            resolvedStudentClass ||
+            normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+            "NON SPEC.";
           const mcOrderObj = mcOptionOrderRef.current || {};
           const oralAnswersCount = oralQuestionIdsRef.current.size;
           const submissionData: any = {
@@ -2960,6 +3198,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             Docente_Email: cleanVal(rescue.teacherEmail),
             Tipo: rescue.examType === "quiz" ? "Quiz" : "Workbook",
             Pin: cleanVal(rescue.sessionPin),
+            Classe: effectiveClass,
             Session_Id: cleanVal(rescue.sessionRunId),
             Session_Titolo: cleanVal(rescue.examTitle),
             Nome: user?.displayName || "Studente",
@@ -3082,6 +3321,10 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           setAnswers(data.answers || { mc: {}, oe: {}, wbFib: {}, wbRq: {} });
           setBehavior(data.behavior || { tabSwitches: 0, pasteAttempts: 0, rightClicks: 0, infractionsLog: [] });
           setStudentSelfGrade(data.studentSelfGrade || "");
+          if (data.studentClass) {
+            const rescuedCls = normalizeClassLabel(data.studentClass);
+            if (rescuedCls) setStudentClassInput(rescuedCls);
+          }
           setActiveScreen("evaluating");
 
           pollJobStatusAndSave(data.jobId, data, true);
@@ -3341,6 +3584,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
         calculatedFIBScore,
         totalFIB,
         studentPseudoId,
+        studentClass: resolvedStudentClass,
         piiRedactionsCount: piiScrubResult.redactionsCount
       };
       localStorage.setItem("active_eval_rescue", JSON.stringify(rescuePayload));
@@ -3379,7 +3623,16 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
     setExamLocked(false);
     setLockReason("");
     setTeacherNoticeBanner(null);
+    setClassNoticeBanner(null);
     lastTeacherNoticeAtRef.current = null;
+    lastClassNoticeAtRef.current = null;
+    dismissedTeacherNoticeAtRef.current = null;
+    dismissedClassNoticeAtRef.current = null;
+    setSessionTargetClass("");
+    setSessionAllowedClasses([]);
+    setSessionRestrictClasses(false);
+    setLatestActiveSessionBroadcast(null);
+    setRemoteSolutionsReady(false);
     warn5MinShownRef.current = false;
     warn1MinShownRef.current = false;
     assignedFilaRef.current = undefined;
@@ -3438,6 +3691,20 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               {isOnline ? "Online" : "Offline (salvato locale)"}
             </span>
           </div>
+          {noticeHistory.length > 0 && (
+            <>
+              <span className="text-slate-600" aria-hidden="true">·</span>
+              <button
+                type="button"
+                onClick={() => setShowNoticeHistory(true)}
+                className="flex items-center gap-1 px-2 py-0.5 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/35 border border-indigo-400/40 text-indigo-200 text-[11px] font-bold cursor-pointer transition-colors"
+                title="Rileggi gli avvisi ricevuti dal docente durante la prova"
+              >
+                <Bell className="w-3 h-3" />
+                <span>Avvisi ({noticeHistory.length})</span>
+              </button>
+            </>
+          )}
         </div>
       )}
 
@@ -3516,14 +3783,58 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                 <h2 className="text-2xl sm:text-3xl font-display font-bold tracking-tight text-white mb-2">
                   Inserisci PIN Sessione
                 </h2>
-                <p className="text-sm text-slate-400 mb-8">
-                  Inserisci il codice d'esame fornito dal docente per avviare la tua prova di valutazione.
+                <p className="text-sm text-slate-400 mb-6">
+                  Dichiara la tua classe di appartenenza e inserisci il codice d'esame fornito dal docente.
                 </p>
 
                 <div className="space-y-4">
+                  <div className="text-left p-4 rounded-2xl bg-slate-950/60 border border-white/10 space-y-2">
+                    <div className="flex items-center justify-between gap-2 flex-wrap">
+                      <label htmlFor="pin-entry-class" className="text-xs font-bold text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
+                        <GraduationCap className="w-4 h-4 text-teal-400 shrink-0" />
+                        <span>La tua Classe / Sezione *</span>
+                      </label>
+                      <span className="text-[10px] font-bold uppercase tracking-wider px-2 py-0.5 rounded-md bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                        Obbligatoria
+                      </span>
+                    </div>
+                    <input
+                      id="pin-entry-class"
+                      type="text"
+                      required
+                      maxLength={40}
+                      placeholder="ES. 3A, 4B INF"
+                      value={studentClassInput}
+                      onChange={(e) => {
+                        const raw = e.target.value.slice(0, 40);
+                        setStudentClassInput(raw);
+                        const norm = normalizeClassLabel(raw);
+                        saveScopedStudentClass(user?.email, norm);
+                        if (user?.isDirectAccess) {
+                          try {
+                            if (norm) localStorage.setItem("saved_student_class", norm);
+                            else localStorage.removeItem("saved_student_class");
+                          } catch {}
+                        }
+                      }}
+                      onBlur={() => {
+                        const norm = normalizeClassLabel(studentClassInput);
+                        if (norm) setStudentClassInput(norm);
+                      }}
+                      className={`w-full text-center py-3 px-4 text-base font-display font-bold tracking-widest uppercase bg-slate-900/90 border rounded-xl text-white placeholder-slate-600 focus:outline-none transition-colors ${
+                        normalizeClassLabel(studentClassInput)
+                          ? "border-teal-500/40 focus:border-teal-400"
+                          : "border-amber-500/50 focus:border-amber-400"
+                      }`}
+                    />
+                    <p className="text-[11px] text-slate-400">
+                      Dichiaro di appartenere alla classe indicata sopra ai fini del raggruppamento nel registro docente.
+                    </p>
+                  </div>
+
                   <input
                     type="text"
-                    placeholder="ES. COMPITO123"
+                    placeholder="PIN SESSIONE (ES. COMPITO123)"
                     value={pin}
                     onChange={(e) => setPin(e.target.value)}
                     onKeyDown={(e) => e.key === "Enter" && handleCheckPin()}
@@ -3999,86 +4310,139 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
                   })()
                 ) : (
                   // List past exams history entries
-                  <div className="space-y-4">
-                    <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider border-b border-white/5 pb-2">
-                      Storico Personale Valutazioni
-                    </h3>
+                  (() => {
+                    const historyClasses = Array.from(
+                      new Set(
+                        historyList
+                          .map((s) => resolveSubmissionClass(s))
+                          .filter((c) => c && c !== UNSPECIFIED_CLASS_LABEL)
+                      )
+                    ).sort();
+                    const visibleHistory =
+                      historyClassFilter === "ALL"
+                        ? historyList
+                        : historyList.filter((s) => resolveSubmissionClass(s) === historyClassFilter);
 
-                    {historyLoading ? (
-                      <div className="py-10 text-center text-slate-500 text-xs flex flex-col items-center justify-center gap-3">
-                        <RefreshCw className="w-5 h-5 animate-spin text-teal-400" />
-                        <span>Recupero dei compiti d'istituto in corso...</span>
-                      </div>
-                    ) : historyError ? (
-                      <p className="text-xs text-red-400 bg-red-500/5 p-3 rounded-xl border border-red-500/10">
-                        {historyError}
-                      </p>
-                    ) : historyList.length === 0 ? (
-                      <div className="py-10 text-center text-slate-500 text-xs space-y-3">
-                        <p>Non risultano ancora compiti registrati nel database con la tua email.</p>
-                        <p className="text-slate-600 text-[11px]">Usa la scheda "Svolgi Esame" per avviare il tuo primo test d'esame.</p>
-                      </div>
-                    ) : (
-                      <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
-                        {historyList.map((sub) => {
-                          const dateObj = sub.Timestamp ? new Date(sub.Timestamp) : null;
-                          const dateStr = dateObj ? dateObj.toLocaleDateString("it-IT", {
-                            day: "2-digit",
-                            month: "short",
-                            hour: "2-digit",
-                            minute: "2-digit"
-                          }) : "N/D";
-                          const listIsPending =
-                            isEvaluationPending(sub.Full_Evaluation) ||
-                            getPendingSubjectiveCount(sub) > 0;
-                          return (
-                            <div
-                              key={sub.id}
-                              onClick={() => setSelectedPastSub(sub)}
-                              className="p-3.5 bg-slate-950/45 hover:bg-slate-950 border border-white/5 hover:border-white/10 rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-all active:scale-[0.99] group"
-                            >
-                              <div className="space-y-1">
-                                <div className="flex items-center gap-2 flex-wrap">
-                                  <span className={`text-[9px] uppercase font-semibold px-2 py-0.5 rounded-full border ${
-                                    sub.Tipo === "Quiz"
-                                      ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
-                                      : "bg-teal-500/10 text-teal-400 border-teal-500/20"
-                                  }`}>
-                                    {sub.Tipo}
-                                  </span>
-                                  <span className="text-xs text-slate-400 font-semibold font-mono">PIN: {sub.Pin}</span>
-                                  {sub.Assigned_Fila && (
-                                    <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
-                                      Fila {sub.Assigned_Fila}
-                                    </span>
-                                  )}
-                                </div>
-                                <p className="text-[10px] text-slate-500">Svolto il: {dateStr}</p>
-                                {sub.Piano_Recupero && (
-                                  <span className="inline-flex items-center gap-1 text-[9px] text-emerald-400 font-bold">
-                                    <Sparkles className="w-2.5 h-2.5 fill-current" />
-                                    Piano di recupero attivo ✓
-                                  </span>
-                                )}
-                              </div>
-
-                              <div className="flex items-center gap-2 text-right shrink-0">
-                                <div>
-                                  <p className="text-[9px] text-slate-500 uppercase font-mono">
-                                    {listIsPending ? "In attesa" : "Voto IA"}
-                                  </p>
-                                  <p className={`text-sm font-display font-semibold leading-tight ${listIsPending ? "text-rose-400" : "text-teal-400"}`}>
-                                    {listIsPending ? "N.V." : sub.Voto_Suggerito || "N/A"}
-                                  </p>
-                                </div>
-                                <ChevronRight className="w-4 h-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
-                              </div>
+                    return (
+                      <div className="space-y-4">
+                        <div className="flex flex-wrap items-center justify-between gap-2 border-b border-white/5 pb-2">
+                          <h3 className="text-sm font-bold text-slate-300 uppercase tracking-wider">
+                            Storico Personale Valutazioni
+                          </h3>
+                          {historyClasses.length > 1 && (
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              <button
+                                type="button"
+                                onClick={() => setHistoryClassFilter("ALL")}
+                                className={`px-2 py-0.5 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
+                                  historyClassFilter === "ALL"
+                                    ? "bg-teal-500/20 text-teal-200 border-teal-500/40"
+                                    : "bg-slate-900/70 text-slate-400 border-white/10 hover:text-white"
+                                }`}
+                              >
+                                Tutte ({historyList.length})
+                              </button>
+                              {historyClasses.map((cls) => (
+                                <button
+                                  key={cls}
+                                  type="button"
+                                  onClick={() => setHistoryClassFilter(cls)}
+                                  className={`px-2 py-0.5 rounded-lg text-[10px] font-bold uppercase border transition-all cursor-pointer ${
+                                    historyClassFilter === cls
+                                      ? "bg-teal-500/20 text-teal-200 border-teal-500/40"
+                                      : "bg-slate-900/70 text-slate-400 border-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  {cls}
+                                </button>
+                              ))}
                             </div>
-                          );
-                        })}
+                          )}
+                        </div>
+
+                        {historyLoading ? (
+                          <div className="py-10 text-center text-slate-500 text-xs flex flex-col items-center justify-center gap-3">
+                            <RefreshCw className="w-5 h-5 animate-spin text-teal-400" />
+                            <span>Recupero dei compiti d'istituto in corso...</span>
+                          </div>
+                        ) : historyError ? (
+                          <p className="text-xs text-red-400 bg-red-500/5 p-3 rounded-xl border border-red-500/10">
+                            {historyError}
+                          </p>
+                        ) : historyList.length === 0 ? (
+                          <div className="py-10 text-center text-slate-500 text-xs space-y-3">
+                            <p>Non risultano ancora compiti registrati nel database con la tua email.</p>
+                            <p className="text-slate-600 text-[11px]">Usa la scheda "Svolgi Esame" per avviare il tuo primo test d'esame.</p>
+                          </div>
+                        ) : (
+                          <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
+                            {visibleHistory.map((sub) => {
+                              const dateObj = sub.Timestamp ? new Date(sub.Timestamp) : null;
+                              const dateStr = dateObj ? dateObj.toLocaleDateString("it-IT", {
+                                day: "2-digit",
+                                month: "short",
+                                hour: "2-digit",
+                                minute: "2-digit"
+                              }) : "N/D";
+                              const listIsPending =
+                                isEvaluationPending(sub.Full_Evaluation) ||
+                                getPendingSubjectiveCount(sub) > 0;
+                              const subClass = resolveSubmissionClass(sub);
+                              return (
+                                <div
+                                  key={sub.id}
+                                  onClick={() => setSelectedPastSub(sub)}
+                                  className="p-3.5 bg-slate-950/45 hover:bg-slate-950 border border-white/5 hover:border-white/10 rounded-2xl flex items-center justify-between gap-4 cursor-pointer transition-all active:scale-[0.99] group"
+                                >
+                                  <div className="space-y-1">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <span className={`text-[9px] uppercase font-semibold px-2 py-0.5 rounded-full border ${
+                                        sub.Tipo === "Quiz"
+                                          ? "bg-purple-500/10 text-purple-400 border-purple-500/20"
+                                          : "bg-teal-500/10 text-teal-400 border-teal-500/20"
+                                      }`}>
+                                        {sub.Tipo}
+                                      </span>
+                                      <span className="text-xs text-slate-400 font-semibold font-mono">PIN: {sub.Pin}</span>
+                                      {subClass !== UNSPECIFIED_CLASS_LABEL && (
+                                        <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                                          Classe {subClass}
+                                        </span>
+                                      )}
+                                      {sub.Assigned_Fila && (
+                                        <span className="text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-300 border border-indigo-500/30">
+                                          Fila {sub.Assigned_Fila}
+                                        </span>
+                                      )}
+                                    </div>
+                                    <p className="text-[10px] text-slate-500">Svolto il: {dateStr}</p>
+                                    {sub.Piano_Recupero && (
+                                      <span className="inline-flex items-center gap-1 text-[9px] text-emerald-400 font-bold">
+                                        <Sparkles className="w-2.5 h-2.5 fill-current" />
+                                        Piano di recupero attivo ✓
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  <div className="flex items-center gap-2 text-right shrink-0">
+                                    <div>
+                                      <p className="text-[9px] text-slate-500 uppercase font-mono">
+                                        {listIsPending ? "In attesa" : "Voto IA"}
+                                      </p>
+                                      <p className={`text-sm font-display font-semibold leading-tight ${listIsPending ? "text-rose-400" : "text-teal-400"}`}>
+                                        {listIsPending ? "N.V." : sub.Voto_Suggerito || "N/A"}
+                                      </p>
+                                    </div>
+                                    <ChevronRight className="w-4 h-4 text-slate-600 group-hover:text-slate-400 transition-colors" />
+                                  </div>
+                                </div>
+                              );
+                            })}
+                          </div>
+                        )}
                       </div>
-                    )}
-                  </div>
+                    );
+                  })()
                 )}
               </div>
             )}
@@ -4196,6 +4560,89 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
             )}
           </div>
 
+          {/* Class / Section mandatory confirmation input before starting */}
+          <div className="mb-6 p-4 bg-slate-950/60 border border-white/10 rounded-2xl space-y-3">
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+              <div className="space-y-0.5 text-left">
+                <label htmlFor="student-class-confirm" className="text-xs font-bold text-slate-200 flex items-center gap-1.5 flex-wrap">
+                  <GraduationCap className="w-4 h-4 text-teal-400 shrink-0" />
+                  <span>Classe / Sezione * (Obbligatoria)</span>
+                  {(sessionTargetClass || sessionAllowedClasses.length > 0) && (
+                    <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30">
+                      {sessionRestrictClasses ? "Vincolata: " : "Sessione: "}
+                      {sessionAllowedClasses.length > 0 ? sessionAllowedClasses.join(", ") : sessionTargetClass}
+                    </span>
+                  )}
+                </label>
+                <p className="text-[11px] text-slate-400">
+                  Dichiarazione obbligatoria: usata dal docente per raggruppare tutte le consegne per classe.
+                </p>
+                {sessionRestrictClasses &&
+                  sessionAllowedClasses.length > 0 &&
+                  normalizeClassLabel(studentClassInput) &&
+                  !sessionAllowedClasses.includes(normalizeClassLabel(studentClassInput)) && (
+                    <p className="text-[11px] text-red-300 font-semibold pt-0.5">
+                      ⛔ Accesso bloccato: il docente ha riservato la prova a {sessionAllowedClasses.join(", ")}.
+                    </p>
+                  )}
+                {!sessionRestrictClasses &&
+                  sessionTargetClass &&
+                  normalizeClassLabel(studentClassInput) &&
+                  normalizeClassLabel(studentClassInput) !== sessionTargetClass && (
+                    <p className="text-[11px] text-amber-300 font-medium pt-0.5">
+                      ⚠️ Nota: hai dichiarato {normalizeClassLabel(studentClassInput)}, mentre il PIN indica {sessionTargetClass}. Verifica che sia corretto.
+                    </p>
+                  )}
+              </div>
+              <input
+                id="student-class-confirm"
+                type="text"
+                required
+                maxLength={40}
+                value={studentClassInput}
+                onChange={(e) => {
+                  const raw = e.target.value.slice(0, 40);
+                  setStudentClassInput(raw);
+                  const norm = normalizeClassLabel(raw);
+                  saveScopedStudentClass(user?.email, norm);
+                }}
+                onBlur={() => {
+                  const norm = normalizeClassLabel(studentClassInput);
+                  if (norm) setStudentClassInput(norm);
+                }}
+                placeholder={sessionAllowedClasses[0] || sessionTargetClass ? `es. ${sessionAllowedClasses[0] || sessionTargetClass}` : "es. 3A, 4B INF"}
+                className="sm:w-44 p-2.5 bg-slate-900 border border-white/15 focus:border-teal-400 rounded-xl text-white text-xs font-bold uppercase tracking-wider outline-none text-center"
+              />
+            </div>
+            {sessionAllowedClasses.length > 0 && (
+              <div className="flex items-center gap-1.5 flex-wrap pt-2 border-t border-white/5 text-left">
+                <span className="text-[10px] text-slate-400 uppercase font-bold tracking-wider mr-1">
+                  Selezione rapida:
+                </span>
+                {sessionAllowedClasses.map((cls) => {
+                  const isSelected = normalizeClassLabel(studentClassInput) === cls;
+                  return (
+                    <button
+                      key={cls}
+                      type="button"
+                      onClick={() => {
+                        setStudentClassInput(cls);
+                        saveScopedStudentClass(user?.email, cls);
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase border transition-all cursor-pointer ${
+                        isSelected
+                          ? "bg-teal-500/25 text-teal-200 border-teal-400 shadow-sm"
+                          : "bg-slate-900 text-slate-300 border-white/10 hover:border-teal-500/40"
+                      }`}
+                    >
+                      {cls}
+                    </button>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           <button
             onClick={handleStartExam}
             className={`w-full py-4 font-bold rounded-2xl flex items-center justify-center gap-2 transition-all cursor-pointer shadow-lg active:scale-[0.98] ${
@@ -4243,30 +4690,6 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
               ? "bg-[#ffffff] text-[#0f172a] border-slate-300"
               : "bg-slate-900/40 backdrop-blur-xl border-white/10 text-white"
           }`}>
-            {/* Dismissible live teacher notice banner */}
-            {teacherNoticeBanner && (
-              <div className="mb-4 p-4 rounded-2xl bg-indigo-950/90 border border-indigo-400/50 text-indigo-100 flex items-start justify-between gap-3 shadow-lg animate-fadeIn">
-                <div className="flex items-start gap-2.5 text-left">
-                  <Info className="w-5 h-5 text-indigo-300 shrink-0 mt-0.5" />
-                  <div>
-                    <p className="text-[11px] font-bold uppercase tracking-wider text-indigo-300">
-                      Avviso del Docente
-                    </p>
-                    <p className="text-sm text-white leading-relaxed mt-0.5">
-                      {teacherNoticeBanner.text}
-                    </p>
-                  </div>
-                </div>
-                <button
-                  type="button"
-                  onClick={() => setTeacherNoticeBanner(null)}
-                  className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/30 text-indigo-200 text-xs font-semibold shrink-0 cursor-pointer"
-                >
-                  Chiudi
-                </button>
-              </div>
-            )}
-
             {/* Accessibility and Inclusive Tools Bar (BES / DSA) */}
             <div className={`mb-6 p-3 rounded-2xl border transition-all ${
               contrastTheme === "sepia"
@@ -5689,9 +6112,148 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           </div>
         </div>
       )}
+      {/* Always-on floating live notices (individual + class broadcast), visible above all overlays */}
+      {(teacherNoticeBanner || classNoticeBanner) && (
+        <div className="fixed top-16 left-1/2 -translate-x-1/2 z-[100010] w-[calc(100%-2rem)] max-w-xl space-y-2 pointer-events-none">
+          {teacherNoticeBanner && (
+            <div className="pointer-events-auto p-3.5 rounded-2xl bg-indigo-950/95 border border-indigo-400/60 text-indigo-100 flex items-start justify-between gap-3 shadow-2xl backdrop-blur-md animate-fadeIn">
+              <div className="flex items-start gap-2.5 text-left">
+                <Info className="w-5 h-5 text-indigo-300 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-indigo-300">
+                    Avviso Personale del Docente
+                  </p>
+                  <p className="text-sm text-white leading-relaxed mt-0.5">
+                    {teacherNoticeBanner.text}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  dismissedTeacherNoticeAtRef.current = teacherNoticeBanner.at;
+                  setTeacherNoticeBanner(null);
+                  const cleanPin = sessionPin.trim().toUpperCase();
+                  if (dbFirestore && cleanPin && user?.email) {
+                    const liveDocId = getLiveStudentDocId(user.email, cleanPin);
+                    void setDoc(
+                      doc(dbFirestore, "active_sessions", cleanPin, "live_students", liveDocId),
+                      { teacherNoticeAckAt: new Date().toISOString() },
+                      { merge: true }
+                    ).catch(() => {});
+                  }
+                }}
+                className="px-2.5 py-1 rounded-lg bg-indigo-500/20 hover:bg-indigo-500/35 text-indigo-100 text-xs font-semibold shrink-0 cursor-pointer flex items-center gap-1"
+                title="Chiudi e conferma lettura avviso"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Ho capito</span>
+              </button>
+            </div>
+          )}
+
+          {classNoticeBanner && (
+            <div className="pointer-events-auto p-3.5 rounded-2xl bg-teal-950/95 border border-teal-400/60 text-teal-100 flex items-start justify-between gap-3 shadow-2xl backdrop-blur-md animate-fadeIn">
+              <div className="flex items-start gap-2.5 text-left">
+                <Megaphone className="w-5 h-5 text-teal-300 shrink-0 mt-0.5" />
+                <div>
+                  <p className="text-[11px] font-bold uppercase tracking-wider text-teal-300">
+                    {classNoticeBanner.targetClass
+                      ? `Avviso alla Classe ${classNoticeBanner.targetClass}`
+                      : "Avviso a Tutta la Classe"}
+                  </p>
+                  <p className="text-sm text-white leading-relaxed mt-0.5">
+                    {classNoticeBanner.text}
+                  </p>
+                </div>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  dismissedClassNoticeAtRef.current = classNoticeBanner.at;
+                  setClassNoticeBanner(null);
+                  const cleanPin = sessionPin.trim().toUpperCase();
+                  if (dbFirestore && cleanPin && user?.email) {
+                    const liveDocId = getLiveStudentDocId(user.email, cleanPin);
+                    void setDoc(
+                      doc(dbFirestore, "active_sessions", cleanPin, "live_students", liveDocId),
+                      { classNoticeAckAt: new Date().toISOString() },
+                      { merge: true }
+                    ).catch(() => {});
+                  }
+                }}
+                className="px-2.5 py-1 rounded-lg bg-teal-500/20 hover:bg-teal-500/35 text-teal-100 text-xs font-semibold shrink-0 cursor-pointer flex items-center gap-1"
+                title="Chiudi e conferma lettura avviso di classe"
+              >
+                <X className="w-3.5 h-3.5" />
+                <span>Ho capito</span>
+              </button>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Persistent Notice History Modal / Drawer during Exam */}
+      {showNoticeHistory && (
+        <div className="fixed inset-0 z-[100012] bg-slate-950/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-indigo-500/30 rounded-3xl max-w-lg w-full p-5 sm:p-6 space-y-4 shadow-2xl text-left">
+            <div className="flex items-center justify-between border-b border-white/10 pb-3">
+              <div className="flex items-center gap-2">
+                <Bell className="w-4 h-4 text-indigo-400" />
+                <h3 className="text-sm font-bold text-white uppercase tracking-wider">
+                  Centro Avvisi del Docente ({noticeHistory.length})
+                </h3>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowNoticeHistory(false)}
+                className="p-1.5 rounded-xl bg-white/5 hover:bg-white/10 text-slate-300 cursor-pointer"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="space-y-2.5 max-h-80 overflow-y-auto pr-1">
+              {noticeHistory.map((item) => (
+                <div
+                  key={item.id}
+                  className={`p-3 rounded-2xl border text-xs space-y-1 ${
+                    item.kind === "teacher"
+                      ? "bg-indigo-950/40 border-indigo-500/30 text-indigo-100"
+                      : "bg-teal-950/40 border-teal-500/30 text-teal-100"
+                  }`}
+                >
+                  <div className="flex items-center justify-between gap-2 text-[10px] font-bold uppercase tracking-wider">
+                    <span className={item.kind === "teacher" ? "text-indigo-300" : "text-teal-300"}>
+                      {item.kind === "teacher"
+                        ? "📩 Avviso Personale"
+                        : item.targetClass
+                        ? `📢 Classe ${item.targetClass}`
+                        : "📢 Avviso alla Classe"}
+                    </span>
+                    <span className="font-mono text-slate-400">
+                      {new Date(item.at).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" })}
+                    </span>
+                  </div>
+                  <p className="text-sm text-white leading-relaxed">{item.text}</p>
+                </div>
+              ))}
+            </div>
+            <div className="flex justify-end pt-1">
+              <button
+                type="button"
+                onClick={() => setShowNoticeHistory(false)}
+                className="px-4 py-2 rounded-xl bg-slate-800 hover:bg-slate-700 text-white text-xs font-bold cursor-pointer"
+              >
+                Torna alla Prova
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+
       {infractionToastMsg && (
-        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[9998] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
-          {/^[🟢🛡️✅⚠️]/.test(infractionToastMsg) ? infractionToastMsg : `⚠️ ${infractionToastMsg}`}
+        <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[100015] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
+          {/^[🟢🛡️✅⚠️🔓📩🎙️⏳📌📢]/u.test(infractionToastMsg) ? infractionToastMsg : `⚠️ ${infractionToastMsg}`}
         </div>
       )}
 
@@ -5705,6 +6267,7 @@ export default function StudentView({ user, onLogout, onBack }: StudentViewProps
           Email: user?.email || "",
           Tipo: examType === "quiz" ? "Quiz" : "Workbook",
           Pin: sessionPin,
+          ...(resolvedStudentClass ? { Classe: resolvedStudentClass } : {}),
           Timestamp: new Date().toISOString(),
           Voto_Suggerito: evaluation?.suggestedGrade || "",
           Autovalutazione: studentSelfGrade,

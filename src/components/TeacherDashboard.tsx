@@ -50,12 +50,21 @@ import {
   Undo2,
   FileUp,
   Archive,
-  Mic
+  Mic,
+  GraduationCap
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType, getAuthHeaders } from "../firebase";
-import { SavedSubmission, LiveSessionSummary, ExamSummary, StudentSummary, AiModalPrefill, BesOptions } from "../types";
-export type { LiveSessionSummary, ExamSummary };
+import { SavedSubmission, LiveSessionSummary, ExamSummary, StudentSummary, ClassSummary, AiModalPrefill, BesOptions } from "../types";
+export type { LiveSessionSummary, ExamSummary, ClassSummary };
+import {
+  normalizeClassLabel,
+  parseAllowedClassList,
+  resolveSubmissionClass,
+  compareClassLabels,
+  buildClassSummaries,
+  UNSPECIFIED_CLASS_LABEL
+} from "../utils/classGrouping";
 import { exportSubmissionPdf, exportSubmissionsZip } from "../utils/pdfExport";
 import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml } from "../utils";
 import {
@@ -262,6 +271,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   // Session config state
   const [materia, setMateria] = useState("");
   const [pin, setPin] = useState("");
+  const [targetClass, setTargetClass] = useState("");
+  const [restrictToAllowedClasses, setRestrictToAllowedClasses] = useState(false);
   const [expiryTime, setExpiryTime] = useState(getCurrentTimeHHMM);
   const [isExpiryCustom, setIsExpiryCustom] = useState(false);
   const timeInputRef = useRef<HTMLInputElement>(null);
@@ -335,15 +346,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [loadingSubmissions, setLoadingSubmissions] = useState(false);
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"All" | "Quiz" | "Workbook">("All");
+  const [filterClass, setFilterClass] = useState<string>("All");
 
-  // View mode: "chronological" (individual submissions), "by_student" (aggregated by student), or "by_exam" (grouped by test/session)
-  const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam">("chronological");
+  // View mode: "chronological", "by_student", "by_exam", or "by_class" (grouped by scholastic class)
+  const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam" | "by_class">("chronological");
   const [studentSortBy, setStudentSortBy] = useState<"highest_avg" | "lowest_avg" | "most_tests" | "name_asc" | "recent">("recent");
   const [examSortBy, setExamSortBy] = useState<"highest_avg" | "recent" | "most_students" | "pin_asc" | "highest_pass_rate">("recent");
+  const [classSortBy, setClassSortBy] = useState<"name_asc" | "highest_avg" | "lowest_avg" | "most_students" | "most_submissions">("name_asc");
   const [chronologicalSortBy, setChronologicalSortBy] = useState<"grade_desc" | "grade_asc" | "recent" | "name_asc" | "violations_desc">("recent");
   const [examRosterSort, setExamRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("recent");
+  const [classRosterSort, setClassRosterSort] = useState<"grade_desc" | "grade_asc" | "name_asc" | "recent">("recent");
   const [expandedStudentKey, setExpandedStudentKey] = useState<string | null>(null);
   const [expandedExamKeys, setExpandedExamKeys] = useState<Set<string>>(new Set());
+  const [expandedClassKeys, setExpandedClassKeys] = useState<Set<string>>(new Set());
+  const [bulkClassEditingKey, setBulkClassEditingKey] = useState<string | null>(null);
+  const [bulkClassInputValue, setBulkClassInputValue] = useState<string>("");
+  const [savingBulkClass, setSavingBulkClass] = useState<boolean>(false);
+  const [showClassCompare, setShowClassCompare] = useState<boolean>(true);
   const [copiedExamPin, setCopiedExamPin] = useState<string | null>(null);
   const [showAccessHelpModal, setShowAccessHelpModal] = useState<boolean>(false);
   const [appAlert, setAppAlert] = useState<{ msg: string } | null>(null);
@@ -387,7 +406,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [showAiModal, setShowAiModal] = useState<boolean>(false);
   const [aiModalPrefill, setAiModalPrefill] = useState<AiModalPrefill | null>(null);
   const [showFormsModal, setShowFormsModal] = useState<boolean>(false);
-  const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "live_monitor">("submissions");
+  const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "grouped_classes" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
 
@@ -406,6 +425,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const next = new Set(prev);
       if (next.has(key)) next.delete(key);
       else next.add(key);
+      return next;
+    });
+  };
+
+  // Helper toggle for class cards
+  const toggleClassExpanded = (className: string) => {
+    setExpandedClassKeys(prev => {
+      const next = new Set(prev);
+      if (next.has(className)) next.delete(className);
+      else next.add(className);
       return next;
     });
   };
@@ -514,6 +543,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           mixFilaAB: !!d.mixFilaAB,
           filaBTitle: d.filaBTitle || undefined,
           allowAudioAnswers: !!d.allowAudioAnswers,
+          targetClass: d.targetClass || undefined,
+          allowedClasses: Array.isArray(d.allowedClasses) ? d.allowedClasses : undefined,
+          restrictToAllowedClasses: !!d.restrictToAllowedClasses,
+          classNotice: d.classNotice || undefined,
+          classNoticeAt: d.classNoticeAt || undefined,
         });
       });
       list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
@@ -1339,6 +1373,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             }
           : { mixFilaAB: false };
 
+        const parsedClasses = parseAllowedClassList(targetClass);
+        const cleanTargetClass = parsedClasses.length === 1 ? parsedClasses[0] : (parsedClasses.length === 0 ? normalizeClassLabel(targetClass) : "");
+        const effectiveAllowedClasses = parsedClasses.length > 0 ? parsedClasses : (cleanTargetClass ? [cleanTargetClass] : []);
+        const effectiveRestrictClasses = !!(restrictToAllowedClasses && effectiveAllowedClasses.length > 0);
         const sessionPayload = {
           data: sanitizedExam,
           encryptedAnswerKey,
@@ -1351,6 +1389,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           solutionsReleased: !deferSolutions,
           besOptions: besOptionsPayload,
           allowAudioAnswers,
+          ...(cleanTargetClass ? { targetClass: cleanTargetClass } : {}),
+          ...(effectiveAllowedClasses.length > 0 ? { allowedClasses: effectiveAllowedClasses } : {}),
+          ...(effectiveRestrictClasses ? { restrictToAllowedClasses: true } : {}),
           ...filaBExtra,
           severityPreset: "normale",
           active: true,
@@ -1375,6 +1416,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           solutionsReleased: !deferSolutions,
           besOptions: besOptionsPayload,
           allowAudioAnswers,
+          ...(cleanTargetClass ? { targetClass: cleanTargetClass } : {}),
+          ...(effectiveAllowedClasses.length > 0 ? { allowedClasses: effectiveAllowedClasses } : {}),
+          ...(effectiveRestrictClasses ? { restrictToAllowedClasses: true } : {}),
           ...filaBExtra,
           severityPreset: "normale",
           active: true,
@@ -2033,6 +2077,66 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
+  // Assign or normalize scholastic class on a single submission
+  const handleUpdateSubmissionClass = async (sub: SavedSubmission, newClassRaw: string) => {
+    const normalized = normalizeClassLabel(newClassRaw);
+    if (!normalized) {
+      setAppAlert({ msg: "⚠️ Inserisci una classe valida (es. 3A, 4B INF)." });
+      return;
+    }
+    if (!dbFirestore) {
+      setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
+      return;
+    }
+    try {
+      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), { Classe: normalized });
+      const updated = { ...sub, Classe: normalized };
+      setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
+      if (selectedSub?.id === sub.id) {
+        setSelectedSub(updated);
+      }
+      showNotify("success", `✅ Classe aggiornata a ${normalized}.`, 3500);
+    } catch (err: any) {
+      setAppAlert({ msg: `Errore aggiornamento classe: ${err?.message || "errore"}` });
+    }
+  };
+
+  // Bulk assign or normalize scholastic class across multiple submissions (e.g. legacy unspecified rows)
+  const handleBulkAssignClass = async (subsToUpdate: SavedSubmission[], nextClassRaw: string) => {
+    const normalized = normalizeClassLabel(nextClassRaw);
+    if (!normalized) {
+      setAppAlert({ msg: "⚠️ Inserisci una classe valida (es. 3A, 4B INF)." });
+      return;
+    }
+    if (!dbFirestore || subsToUpdate.length === 0) return;
+    setSavingBulkClass(true);
+    try {
+      const CHUNK = 400;
+      for (let i = 0; i < subsToUpdate.length; i += CHUNK) {
+        const slice = subsToUpdate.slice(i, i + CHUNK);
+        const batch = writeBatch(dbFirestore);
+        slice.forEach((s) => {
+          batch.update(doc(dbFirestore, "valutazioni", s.id), { Classe: normalized });
+        });
+        await batch.commit();
+      }
+      const updatedIds = new Set(subsToUpdate.map((s) => s.id));
+      setSubmissions((prev) =>
+        prev.map((item) => (updatedIds.has(item.id) ? { ...item, Classe: normalized } : item))
+      );
+      if (selectedSub && updatedIds.has(selectedSub.id)) {
+        setSelectedSub({ ...selectedSub, Classe: normalized });
+      }
+      setBulkClassEditingKey(null);
+      setBulkClassInputValue("");
+      showNotify("success", `✅ Assegnate ${subsToUpdate.length} consegne alla classe ${normalized}.`, 4500);
+    } catch (err: any) {
+      setAppAlert({ msg: `Errore assegnazione multipla classe: ${err?.message || "errore"}` });
+    } finally {
+      setSavingBulkClass(false);
+    }
+  };
+
   // Manual teacher retouch of a single open-ended or reflection question score & feedback
   const handleRetouchSubjectiveItem = async (
     sub: SavedSubmission,
@@ -2248,6 +2352,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const headers = [
       blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
       blindGradingMode ? "Modalità Privacy" : "Email",
+      "Classe",
       "PIN Sessione",
       "Fila",
       "Titolo Prova",
@@ -2266,6 +2371,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const rows = exam.submissions.map(sub => [
       blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
       blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
+      submissionMetaMap.get(sub.id)?.resolvedClass || resolveSubmissionClass(sub),
       sub.Pin || exam.pin,
       sub.Assigned_Fila ? `Fila ${sub.Assigned_Fila}` : "Unica",
       exam.title,
@@ -2294,9 +2400,93 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     );
   };
 
+  // Export single class roster directly to CSV
+  const handleExportSingleClassCSV = (cls: ClassSummary) => {
+    const headers = [
+      "Classe",
+      blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
+      blindGradingMode ? "Modalità Privacy" : "Email",
+      "Titolo Prova",
+      "PIN Sessione",
+      "Tipologia",
+      "Voto IA Suggerito",
+      "Autovalutazione",
+      "Uscite Pagina (Tab Switch)",
+      "Incolla Bloccati",
+      "Data e Ora Consegna",
+      "Convalida Docente"
+    ];
+
+    const rows = cls.submissions.map(sub => [
+      cls.className,
+      blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
+      blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
+      submissionMetaMap.get(sub.id)?.examTitle || getSubmissionExamTitle(sub),
+      sub.Pin || "",
+      sub.Tipo || "",
+      displaySubmissionGrade(sub),
+      sub.Autovalutazione || "",
+      sub.AntiCopia_TabSwitch || 0,
+      sub.AntiCopia_IncollaBloccato || 0,
+      sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "",
+      sub.Convalida_Docente_At ? new Date(sub.Convalida_Docente_At).toLocaleString("it-IT") : "In attesa"
+    ]);
+
+    const cleanCls = cls.className.toLowerCase().replace(/[^a-z0-9]/g, "_");
+    downloadCsvFile(
+      blindGradingMode ? `tabellone_classe_cieco_${cleanCls}.csv` : `tabellone_classe_${cleanCls}.csv`,
+      headers,
+      rows
+    );
+    showNotify(
+      "success",
+      `✅ CSV classe "${cls.className}" esportato (${blindGradingMode ? "Modalità Cieca GDPR: nomi nascosti" : "con nomi reali"}).`,
+      4000
+    );
+  };
+
   // Export current list to CSV for Excel / Google Sheets
   const handleExportCSV = () => {
     const dateFormatted = new Date().toISOString().split("T")[0];
+
+    // Branch A0: Aggregated Classes Export
+    if (submissionViewMode === "by_class") {
+      if (filteredClassSummaries.length === 0) {
+        setAppAlert({ msg: "⚠️ Nessuna classe da esportare con i filtri attuali." });
+        return;
+      }
+      const headers = [
+        "Classe",
+        "Studenti Unici",
+        "Consegne Totali",
+        "Quiz",
+        "Workbook",
+        "Media Voti Classe",
+        "Voto Più Alto",
+        "Voto Più Basso",
+        "% Sufficienza",
+        "Convalidati",
+        "Segnalazioni AntiCopia Totali",
+        "PIN Sessioni"
+      ];
+      const rows = filteredClassSummaries.map(cls => [
+        cls.className,
+        cls.uniqueStudents,
+        cls.totalSubmissions,
+        cls.quizCount,
+        cls.workbookCount,
+        cls.averageGradeFormatted,
+        cls.highestGrade,
+        cls.lowestGrade,
+        `${cls.passRate}%`,
+        cls.validatedCount,
+        cls.totalViolations,
+        cls.uniquePins.join("; ")
+      ]);
+      downloadCsvFile(`riepilogo_classi_${dateFormatted}.csv`, headers, rows);
+      showNotify("success", "✅ Riepilogo classi esportato in CSV.", 4000);
+      return;
+    }
 
     // Branch A: Aggregated Students Export
     if (submissionViewMode === "by_student") {
@@ -2307,6 +2497,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const headers = [
         blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
         blindGradingMode ? "Modalità Privacy" : "Email",
+        "Classe / Classi",
         "Totale Prove Svolte",
         "Quiz Svolti",
         "Workbook Svolti",
@@ -2320,6 +2511,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const rows = filteredStudentSummaries.map(stu => [
         blindGradingMode ? `Studente ${getStudentRosterBlindCode(stu.email || stu.key)}` : stu.name,
         blindGradingMode ? "Identità anonimizzata (GDPR)" : stu.email,
+        stu.classes.join(", ") || UNSPECIFIED_CLASS_LABEL,
         stu.totalTests,
         stu.quizCount,
         stu.workbookCount,
@@ -2396,6 +2588,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const headers = [
       blindGradingMode ? "Codice Anonimo Studente" : "Nome Studente",
       blindGradingMode ? "Modalità Privacy" : "Email",
+      "Classe",
       "Tipologia",
       "PIN Sessione",
       "Data e Ora Consegna",
@@ -2411,6 +2604,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const rows = filteredSubmissions.map(sub => [
       blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Anonimo"),
       blindGradingMode ? "Identità anonimizzata (GDPR)" : (sub.Email || ""),
+      resolveSubmissionClass(sub),
       sub.Tipo || "",
       sub.Pin || "",
       sub.Timestamp || "",
@@ -2449,6 +2643,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         totalViolations: number;
         examTitle: string;
         timestampMs: number;
+        resolvedClass: string;
       }
     >();
     submissions.forEach((sub) => {
@@ -2466,6 +2661,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const examTitle = getSubmissionExamTitle(sub);
       const parsedTs = Date.parse(sub.Timestamp);
       const timestampMs = Number.isNaN(parsedTs) ? 0 : parsedTs;
+      const resolvedClass = resolveSubmissionClass(sub);
       map.set(sub.id, {
         displayGrade,
         numericGrade,
@@ -2474,25 +2670,58 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         totalViolations,
         examTitle,
         timestampMs,
+        resolvedClass,
       });
     });
     return map;
   }, [submissions]);
+
+  const availableClasses = React.useMemo(() => {
+    const clsSet = new Set<string>();
+    submissions.forEach((sub) => {
+      clsSet.add(submissionMetaMap.get(sub.id)?.resolvedClass || resolveSubmissionClass(sub));
+    });
+    return Array.from(clsSet).sort(compareClassLabels);
+  }, [submissions, submissionMetaMap]);
+
+  const normalizedClassSuggestions = React.useMemo(() => {
+    const clsSet = new Set<string>();
+    availableClasses.forEach((c) => {
+      if (c !== UNSPECIFIED_CLASS_LABEL) clsSet.add(c);
+    });
+    activeSessions.forEach((s) => {
+      const c = normalizeClassLabel(s.targetClass);
+      if (c) clsSet.add(c);
+    });
+    return Array.from(clsSet).sort(compareClassLabels);
+  }, [availableClasses, activeSessions]);
+
+  const classScopedSubmissions = React.useMemo(() => {
+    if (filterClass === "All") return submissions;
+    return submissions.filter((sub) => {
+      const subClass = submissionMetaMap.get(sub.id)?.resolvedClass || resolveSubmissionClass(sub);
+      return subClass === filterClass;
+    });
+  }, [submissions, submissionMetaMap, filterClass]);
 
   // Submissions filtered list logic (chronological) with multi-sorting
   const filteredSubmissions = React.useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     const result = submissions.filter(sub => {
       const blindCode = getSubmissionBlindCode(sub).toLowerCase();
-      const examTitle = (submissionMetaMap.get(sub.id)?.examTitle || "").toLowerCase();
+      const meta = submissionMetaMap.get(sub.id);
+      const examTitle = (meta?.examTitle || "").toLowerCase();
+      const subClass = meta?.resolvedClass || resolveSubmissionClass(sub);
+      if (filterClass !== "All" && subClass !== filterClass) return false;
       const matchesSearch =
         !q ||
         (blindGradingMode
-          ? blindCode.includes(q) || (sub.Pin || "").toLowerCase().includes(q) || examTitle.includes(q)
+          ? blindCode.includes(q) || (sub.Pin || "").toLowerCase().includes(q) || examTitle.includes(q) || subClass.toLowerCase().includes(q)
           : (sub.Nome || "").toLowerCase().includes(q) ||
             (sub.Email || "").toLowerCase().includes(q) ||
             (sub.Pin || "").toLowerCase().includes(q) ||
             examTitle.includes(q) ||
+            subClass.toLowerCase().includes(q) ||
             blindCode.includes(q));
 
       if (filterType === "All") return matchesSearch;
@@ -2533,13 +2762,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [submissions, submissionMetaMap, searchQuery, filterType, chronologicalSortBy, blindGradingMode]);
+  }, [submissions, submissionMetaMap, searchQuery, filterType, filterClass, chronologicalSortBy, blindGradingMode]);
 
-  // Aggregated submissions grouped by student
+  // Aggregated submissions grouped by student (strictly scoped to selected class)
   const studentSummaries: StudentSummary[] = React.useMemo(() => {
     const map = new Map<string, SavedSubmission[]>();
 
-    submissions.forEach(sub => {
+    classScopedSubmissions.forEach(sub => {
       const cleanEmail = (sub.Email || "").trim().toLowerCase();
       const cleanName = (sub.Nome || "Anonimo").trim();
       const key = cleanEmail || cleanName;
@@ -2564,6 +2793,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       let numericGradesSum = 0;
       let numericGradesCount = 0;
       const pinsSet = new Set<string>();
+      const classesSet = new Set<string>();
       let totalTabSwitches = 0;
       let totalPasteAttempts = 0;
 
@@ -2572,6 +2802,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         else if (s.Tipo === "Workbook") workbookCount++;
 
         if (s.Pin) pinsSet.add(s.Pin);
+        const cls = submissionMetaMap.get(s.id)?.resolvedClass || resolveSubmissionClass(s);
+        if (cls) classesSet.add(cls);
 
         totalTabSwitches += s.AntiCopia_TabSwitch || 0;
         totalPasteAttempts += s.AntiCopia_IncollaBloccato || 0;
@@ -2582,6 +2814,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           numericGradesCount++;
         }
       });
+
+      const resolvedStudentClasses = Array.from(classesSet).sort(compareClassLabels);
+      const cleanStudentClasses = resolvedStudentClasses.filter((c) => c !== UNSPECIFIED_CLASS_LABEL);
+      const finalStudentClasses = cleanStudentClasses.length > 0 ? cleanStudentClasses : resolvedStudentClasses;
 
       const averageGradeNumber = numericGradesCount > 0 ? numericGradesSum / numericGradesCount : null;
       const averageGradeFormatted = averageGradeNumber !== null ? formatItalianScholasticGrade(averageGradeNumber) : "N/D";
@@ -2618,13 +2854,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         averageGradeFormatted,
         trend,
         uniquePins: Array.from(pinsSet),
+        classes: finalStudentClasses,
         totalTabSwitches,
         totalPasteAttempts
       });
     });
 
     return list;
-  }, [submissions, submissionMetaMap]);
+  }, [classScopedSubmissions, submissionMetaMap]);
 
   // Filtered and sorted students list
   const filteredStudentSummaries = React.useMemo(() => {
@@ -2643,6 +2880,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           stu.uniquePins.some(p => p.toLowerCase().includes(q)));
 
       if (!matchesSearch) return false;
+      if (filterClass !== "All") {
+        const hasClassSub = stu.submissions.some(
+          (s) => (submissionMetaMap.get(s.id)?.resolvedClass || resolveSubmissionClass(s)) === filterClass
+        );
+        if (!hasClassSub) return false;
+      }
       if (filterType === "Quiz") return stu.quizCount > 0;
       if (filterType === "Workbook") return stu.workbookCount > 0;
       return true;
@@ -2679,13 +2922,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [studentSummaries, searchQuery, filterType, studentSortBy, blindGradingMode]);
+  }, [studentSummaries, submissionMetaMap, searchQuery, filterType, filterClass, studentSortBy, blindGradingMode]);
 
-  // Group submissions by exam / test session
+  // Group submissions by exam / test session (strictly scoped to selected class)
   const examSummaries: ExamSummary[] = React.useMemo(() => {
     const map = new Map<string, SavedSubmission[]>();
 
-    submissions.forEach(sub => {
+    classScopedSubmissions.forEach(sub => {
       const pinClean = (sub.Pin || "").trim();
       const examTitle = submissionMetaMap.get(sub.id)?.examTitle || getSubmissionExamTitle(sub);
       // Group by PIN + session run id. Reusing the same PIN for a second class
@@ -2802,7 +3045,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return list;
-  }, [submissions, submissionMetaMap]);
+  }, [classScopedSubmissions, submissionMetaMap]);
 
   // Filtered and sorted exams list
   const filteredExamSummaries = React.useMemo(() => {
@@ -2821,6 +3064,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       );
 
       if (!matchesSearch) return false;
+      if (filterClass !== "All") {
+        const hasClassSub = ex.submissions.some(
+          (s) => (submissionMetaMap.get(s.id)?.resolvedClass || resolveSubmissionClass(s)) === filterClass
+        );
+        if (!hasClassSub) return false;
+      }
       if (filterType === "Quiz") return ex.tipo === "Quiz" || ex.tipo === "Misto";
       if (filterType === "Workbook") return ex.tipo === "Workbook" || ex.tipo === "Misto";
       return true;
@@ -2851,7 +3100,68 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [examSummaries, searchQuery, filterType, examSortBy, blindGradingMode]);
+  }, [examSummaries, submissionMetaMap, searchQuery, filterType, filterClass, examSortBy, blindGradingMode]);
+
+  // Group submissions by scholastic class (respecting type and class filters for accurate class KPIs)
+  const classSummaries: ClassSummary[] = React.useMemo(() => {
+    const scoped = submissions.filter((sub) => {
+      if (filterType !== "All" && sub.Tipo !== filterType) return false;
+      if (filterClass !== "All") {
+        const subCls = submissionMetaMap.get(sub.id)?.resolvedClass || resolveSubmissionClass(sub);
+        if (subCls !== filterClass) return false;
+      }
+      return true;
+    });
+    return buildClassSummaries(scoped, {
+      getNumericGrade: (sub) => submissionMetaMap.get(sub.id)?.numericGrade ?? -1,
+      getExamTitle: (sub) => submissionMetaMap.get(sub.id)?.examTitle || getSubmissionExamTitle(sub),
+    });
+  }, [submissions, submissionMetaMap, filterType, filterClass]);
+
+  const filteredClassSummaries = React.useMemo(() => {
+    const q = searchQuery.toLowerCase().trim();
+    let result = classSummaries.filter((cls) => {
+      if (!q) return true;
+      return (
+        cls.className.toLowerCase().includes(q) ||
+        cls.uniquePins.some((p) => p.toLowerCase().includes(q)) ||
+        cls.uniqueExamTitles.some((t) => t.toLowerCase().includes(q)) ||
+        cls.submissions.some((s) =>
+          blindGradingMode
+            ? getSubmissionBlindCode(s).toLowerCase().includes(q)
+            : (s.Nome || "").toLowerCase().includes(q) ||
+              (s.Email || "").toLowerCase().includes(q) ||
+              getSubmissionBlindCode(s).toLowerCase().includes(q)
+        )
+      );
+    });
+
+    result.sort((a, b) => {
+      if (classSortBy === "highest_avg") {
+        const avgA = a.averageGradeNumber ?? -1;
+        const avgB = b.averageGradeNumber ?? -1;
+        if (avgB !== avgA) return avgB - avgA;
+        return compareClassLabels(a.className, b.className);
+      }
+      if (classSortBy === "lowest_avg") {
+        const avgA = a.averageGradeNumber ?? 99;
+        const avgB = b.averageGradeNumber ?? 99;
+        if (avgA !== avgB) return avgA - avgB;
+        return compareClassLabels(a.className, b.className);
+      }
+      if (classSortBy === "most_students") {
+        if (b.uniqueStudents !== a.uniqueStudents) return b.uniqueStudents - a.uniqueStudents;
+        return compareClassLabels(a.className, b.className);
+      }
+      if (classSortBy === "most_submissions") {
+        if (b.totalSubmissions !== a.totalSubmissions) return b.totalSubmissions - a.totalSubmissions;
+        return compareClassLabels(a.className, b.className);
+      }
+      return compareClassLabels(a.className, b.className);
+    });
+
+    return result;
+  }, [classSummaries, searchQuery, classSortBy, blindGradingMode]);
 
   const expandAllExams = () => {
     setExpandedExamKeys(new Set(filteredExamSummaries.map(e => e.key)));
@@ -2859,6 +3169,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   const collapseAllExams = () => {
     setExpandedExamKeys(new Set());
+  };
+
+  const expandAllClasses = () => {
+    setExpandedClassKeys(new Set(filteredClassSummaries.map(c => c.className)));
+  };
+
+  const collapseAllClasses = () => {
+    setExpandedClassKeys(new Set());
   };
 
   return (
@@ -2904,15 +3222,48 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 />
               </div>
 
-              <div className="space-y-1">
-                <label className="uppercase font-bold text-slate-500 text-[10px]">PIN Identificativo</label>
-                <input
-                  type="text"
-                  placeholder="es. 12"
-                  value={pin}
-                  onChange={(e) => setPin(e.target.value)}
-                  className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none uppercase tracking-wider font-bold"
-                />
+              <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+                <div className="space-y-1">
+                  <label className="uppercase font-bold text-slate-500 text-[10px]">PIN Identificativo</label>
+                  <input
+                    type="text"
+                    placeholder="es. 12"
+                    value={pin}
+                    onChange={(e) => setPin(e.target.value)}
+                    className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none uppercase tracking-wider font-bold"
+                  />
+                </div>
+                <div className="space-y-1">
+                  <label className="uppercase font-bold text-slate-500 text-[10px]">Classi Ammesse / Sezione (opzionale)</label>
+                  <input
+                    type="text"
+                    list="ea-class-suggestions"
+                    placeholder="es. 3A oppure 3A, 3B"
+                    value={targetClass}
+                    onChange={(e) => setTargetClass(e.target.value)}
+                    maxLength={120}
+                    className="w-full p-2.5 bg-slate-950/60 border border-white/10 rounded-xl text-white outline-none uppercase tracking-wider font-bold"
+                  />
+                  <datalist id="ea-class-suggestions">
+                    {normalizedClassSuggestions.map((cls) => (
+                      <option key={cls} value={cls} />
+                    ))}
+                  </datalist>
+                  {parseAllowedClassList(targetClass).length > 0 && (
+                    <label className="flex items-center gap-1.5 text-[10px] text-teal-200 cursor-pointer pt-1 select-none">
+                      <input
+                        type="checkbox"
+                        checked={restrictToAllowedClasses}
+                        onChange={(e) => setRestrictToAllowedClasses(e.target.checked)}
+                        className="rounded accent-teal-400 cursor-pointer"
+                      />
+                      <span>
+                        Vincola accesso solo a:{" "}
+                        <b className="font-mono">{parseAllowedClassList(targetClass).join(", ")}</b>
+                      </span>
+                    </label>
+                  )}
+                </div>
               </div>
 
               <div className="p-3 bg-slate-950/60 border border-teal-500/20 rounded-xl flex items-center justify-between gap-3">
@@ -3779,7 +4130,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 type="button"
                 onClick={() => {
                   setDashboardTab("submissions");
-                  if (submissionViewMode === "by_exam") {
+                  if (submissionViewMode === "by_exam" || submissionViewMode === "by_class") {
                     setSubmissionViewMode("chronological");
                   }
                 }}
@@ -3807,6 +4158,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               >
                 <Layers className="w-4 h-4 text-purple-300" />
                 <span>Gruppo per Prove ({examSummaries.length})</span>
+              </button>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setDashboardTab("grouped_classes");
+                  setSubmissionViewMode("by_class");
+                }}
+                className={`px-4 py-2 rounded-xl text-xs font-bold flex items-center gap-2 transition-all cursor-pointer shrink-0 ${
+                  dashboardTab === "grouped_classes"
+                    ? "bg-teal-600 text-white shadow-md shadow-teal-600/20"
+                    : "bg-slate-950/60 text-slate-400 hover:text-white border border-white/5"
+                }`}
+              >
+                <GraduationCap className="w-4 h-4 text-teal-300" />
+                <span>Gruppo per Classi ({classSummaries.length})</span>
               </button>
 
               <button
@@ -3861,6 +4228,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                             ({filteredExamSummaries.length} {filteredExamSummaries.length === 1 ? "prova" : "prove"})
                           </span>
                         </>
+                      ) : dashboardTab === "grouped_classes" || submissionViewMode === "by_class" ? (
+                        <>
+                          <GraduationCap className="w-5 h-5 text-teal-400" />
+                          <span>Gruppo per Classi</span>
+                          <span className="text-xs font-mono text-slate-400 font-normal">
+                            ({filteredClassSummaries.length} {filteredClassSummaries.length === 1 ? "classe" : "classi"})
+                          </span>
+                        </>
                       ) : (
                         <>
                           <FileCode className="w-5 h-5 text-indigo-400" />
@@ -3871,7 +4246,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     <p className="text-xs text-slate-400 mt-0.5">
                       {dashboardTab === "grouped_exams" || submissionViewMode === "by_exam"
                         ? "Visualizzazione aggregata per singola prova o sessione PIN: statistiche complessive, medie voti e tabellone alunni."
-                        : "Elenco storico degli elaborati e riepilogo prove per studente."}
+                        : dashboardTab === "grouped_classes" || submissionViewMode === "by_class"
+                        ? "Riepilogo per classe e sezione scolastica: studenti partecipanti, media voti, sufficienze, export CSV e ZIP PDF di classe."
+                        : "Elenco storico degli elaborati, filtro per classe e riepilogo prove per studente."}
                     </p>
                   </div>
                   <div className="flex items-center gap-2 w-full sm:w-auto flex-wrap">
@@ -3889,6 +4266,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         title={expandedExamKeys.size === filteredExamSummaries.length && filteredExamSummaries.length > 0 ? "Comprimi tutte le prove" : "Espandi tutte le prove per vedere gli studenti partecipanti"}
                       >
                         {expandedExamKeys.size === filteredExamSummaries.length && filteredExamSummaries.length > 0 ? (
+                          <>
+                            <ChevronUp className="w-3.5 h-3.5" />
+                            <span>Comprimi Tutte</span>
+                          </>
+                        ) : (
+                          <>
+                            <ChevronDown className="w-3.5 h-3.5" />
+                            <span>Espandi Tutte</span>
+                          </>
+                        )}
+                      </button>
+                    )}
+                    {(dashboardTab === "grouped_classes" || submissionViewMode === "by_class") && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          if (expandedClassKeys.size === filteredClassSummaries.length && filteredClassSummaries.length > 0) {
+                            collapseAllClasses();
+                          } else {
+                            expandAllClasses();
+                          }
+                        }}
+                        className="flex items-center gap-1.5 py-1.5 px-3 bg-teal-500/15 hover:bg-teal-500/25 text-teal-300 font-semibold rounded-xl text-xs transition-colors cursor-pointer border border-teal-500/30"
+                        title={expandedClassKeys.size === filteredClassSummaries.length && filteredClassSummaries.length > 0 ? "Comprimi tutte le classi" : "Espandi tutte le classi per vedere gli elaborati"}
+                      >
+                        {expandedClassKeys.size === filteredClassSummaries.length && filteredClassSummaries.length > 0 ? (
                           <>
                             <ChevronUp className="w-3.5 h-3.5" />
                             <span>Comprimi Tutte</span>
@@ -3924,19 +4327,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       onClick={handleExportCSV}
                       className="flex items-center gap-1 py-1.5 px-3 bg-teal-600 hover:bg-teal-500 text-white font-semibold rounded-xl text-xs transition-colors cursor-pointer shadow-md"
                       title={
-                        submissionViewMode === "by_student" 
-                          ? "Esporta elenco studenti aggregato per prove fatte" 
+                        submissionViewMode === "by_student"
+                          ? "Esporta elenco studenti aggregato per prove fatte"
                           : submissionViewMode === "by_exam" || dashboardTab === "grouped_exams"
-                          ? "Esporta riepilogo prove didattiche aggregate" 
+                          ? "Esporta riepilogo prove didattiche aggregate"
+                          : submissionViewMode === "by_class" || dashboardTab === "grouped_classes"
+                          ? "Esporta riepilogo statistico per classe"
                           : "Esporta tutte le singole verifiche"
                       }
                     >
                       <Download className="w-3.5 h-3.5" />
                       <span>
-                        {submissionViewMode === "by_student" 
-                          ? "Esporta Studenti CSV" 
+                        {submissionViewMode === "by_student"
+                          ? "Esporta Studenti CSV"
                           : submissionViewMode === "by_exam" || dashboardTab === "grouped_exams"
-                          ? "Esporta Prove CSV" 
+                          ? "Esporta Prove CSV"
+                          : submissionViewMode === "by_class" || dashboardTab === "grouped_classes"
+                          ? "Esporta Classi CSV"
                           : "Esporta in CSV"}
                       </span>
                     </button>
@@ -4026,6 +4433,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         ({filteredExamSummaries.length})
                       </span>
                     </button>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setDashboardTab("grouped_classes");
+                        setSubmissionViewMode("by_class");
+                      }}
+                      className={`px-3 py-2 rounded-xl text-xs font-bold flex items-center justify-center gap-1.5 transition-all cursor-pointer ${
+                        submissionViewMode === "by_class" || dashboardTab === "grouped_classes"
+                          ? "bg-teal-600 text-white shadow-md shadow-teal-600/20"
+                          : "text-slate-400 hover:text-white"
+                      }`}
+                    >
+                      <GraduationCap className="w-3.5 h-3.5" />
+                      <span>Gruppo per Classi</span>
+                      <span className="text-[11px] font-mono opacity-80">
+                        ({filteredClassSummaries.length})
+                      </span>
+                    </button>
                   </div>
 
                   {submissionViewMode === "chronological" && (
@@ -4087,6 +4512,26 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       </select>
                     </div>
                   )}
+
+                  {submissionViewMode === "by_class" && (
+                    <div className="flex items-center gap-2 justify-end px-2">
+                      <span className="text-[11px] text-slate-400 shrink-0 flex items-center gap-1">
+                        <ListOrdered className="w-3 h-3 text-teal-400" />
+                        <span>Ordina Classi:</span>
+                      </span>
+                      <select
+                        value={classSortBy}
+                        onChange={(e) => setClassSortBy(e.target.value as any)}
+                        className="bg-slate-900 border border-white/10 text-white text-xs rounded-xl px-2.5 py-1.5 outline-none font-medium cursor-pointer"
+                      >
+                        <option value="name_asc">🎓 Ordine naturale classe (1A ➔ 5Z)</option>
+                        <option value="highest_avg">🏆 Media Voti decrescente</option>
+                        <option value="lowest_avg">📉 Media Voti crescente</option>
+                        <option value="most_students">👥 Più studenti</option>
+                        <option value="most_submissions">📝 Più consegne</option>
+                      </select>
+                    </div>
+                  )}
                 </div>
 
                 {/* Filter bar */}
@@ -4099,12 +4544,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         blindGradingMode
                           ? submissionViewMode === "by_exam"
                             ? "Cerca prova per titolo, PIN sessione o codice anonimo (es. STU-...)..."
+                            : submissionViewMode === "by_class"
+                            ? "Cerca classe (es. 3A), PIN prova o codice anonimo (es. STU-...)..."
                             : "Cerca per codice anonimo (es. STU-7K4M9P) o PIN prova..."
                           : submissionViewMode === "by_exam"
                           ? "Cerca prova per titolo, PIN sessione o studente..."
+                          : submissionViewMode === "by_class"
+                          ? "Cerca classe (es. 3A), studente, prova o PIN..."
                           : submissionViewMode === "by_student"
                           ? "Cerca studente per nome, e-mail o PIN prova..."
-                          : "Cerca studente per nome o e-mail..."
+                          : "Cerca studente per nome, classe o e-mail..."
                       }
                       value={searchQuery}
                       onChange={(e) => setSearchQuery(e.target.value)}
@@ -4112,18 +4561,35 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     />
                   </div>
 
-                  <div className="flex gap-2 shrink-0 flex-wrap">
+                  <div className="flex gap-2 shrink-0 flex-wrap items-center">
+                    {availableClasses.length > 0 && (
+                      <select
+                        value={filterClass}
+                        onChange={(e) => setFilterClass(e.target.value)}
+                        className="px-3 py-2 text-xs font-semibold rounded-xl bg-slate-950/80 border border-teal-500/30 text-teal-200 outline-none cursor-pointer"
+                        title="Filtra le consegne per classe / sezione"
+                      >
+                        <option value="All">🎓 Tutte le classi ({submissions.length})</option>
+                        {availableClasses.map((clsName) => (
+                          <option key={clsName} value={clsName}>
+                            {clsName}
+                          </option>
+                        ))}
+                      </select>
+                    )}
                     <button
                       onClick={() => {
                         setChronologicalSortBy("recent");
                         setStudentSortBy("recent");
                         setExamRosterSort("recent");
                         setExamSortBy("recent");
+                        setClassRosterSort("recent");
                       }}
                       className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
                         (submissionViewMode === "chronological" && chronologicalSortBy === "recent") ||
                         (submissionViewMode === "by_student" && studentSortBy === "recent") ||
-                        (submissionViewMode === "by_exam" && examRosterSort === "recent")
+                        (submissionViewMode === "by_exam" && examRosterSort === "recent") ||
+                        (submissionViewMode === "by_class" && classRosterSort === "recent")
                           ? "bg-indigo-600/30 border-indigo-500/50 text-indigo-200 shadow-sm font-bold"
                           : "bg-slate-950/50 border-white/10 text-slate-400 hover:text-white"
                       }`}
@@ -4138,11 +4604,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         setStudentSortBy("highest_avg");
                         setExamRosterSort("grade_desc");
                         setExamSortBy("highest_avg");
+                        setClassRosterSort("grade_desc");
+                        setClassSortBy("highest_avg");
                       }}
                       className={`flex items-center gap-1.5 px-3 py-2 text-xs font-semibold rounded-xl border transition-all cursor-pointer ${
                         (submissionViewMode === "chronological" && chronologicalSortBy === "grade_desc") ||
                         (submissionViewMode === "by_student" && studentSortBy === "highest_avg") ||
-                        (submissionViewMode === "by_exam" && examRosterSort === "grade_desc")
+                        (submissionViewMode === "by_exam" && examRosterSort === "grade_desc") ||
+                        (submissionViewMode === "by_class" && classRosterSort === "grade_desc")
                           ? "bg-teal-500/20 border-teal-500/40 text-teal-300 shadow-sm font-bold"
                           : "bg-slate-950/50 border-white/10 text-slate-400 hover:text-white"
                       }`}
@@ -4228,7 +4697,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           <span>Prove Svolte Totali</span>
                         </div>
                         <p className="text-xl font-display font-extrabold text-indigo-300 mt-1">
-                          {submissions.length}
+                          {filteredStudentSummaries.reduce((acc, s) => acc + s.totalTests, 0)}
                         </p>
                       </div>
 
@@ -4238,7 +4707,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           <span>Media Prove / Alunno</span>
                         </div>
                         <p className="text-xl font-display font-extrabold text-amber-300 mt-1">
-                          {(submissions.length / Math.max(1, studentSummaries.length)).toFixed(1)}
+                          {(
+                            filteredStudentSummaries.reduce((acc, s) => acc + s.totalTests, 0) /
+                            Math.max(1, filteredStudentSummaries.length)
+                          ).toFixed(1)}
                         </p>
                       </div>
 
@@ -4312,6 +4784,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                       <span className="text-slate-400 text-xs">
                                         {stu.totalTests} {stu.totalTests === 1 ? "prova svolta" : "prove svolte"}
                                       </span>
+                                      {stu.classes && stu.classes.length > 0 && (
+                                        <div className="flex items-center gap-1 flex-wrap">
+                                          {stu.classes.map((cls) => (
+                                            <span
+                                              key={cls}
+                                              className="px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-300 border border-teal-500/30 text-[10px] font-bold uppercase"
+                                            >
+                                              {cls}
+                                            </span>
+                                          ))}
+                                        </div>
+                                      )}
                                     </div>
                                     <p className="text-[11px] text-slate-400 mt-0.5">
                                       {blindGradingMode ? "• Identità anonimizzata (GDPR) •" : stu.email}
@@ -4480,6 +4964,496 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </div>
                 )}
 
+                {/* VIEW D: BY CLASS (Grouped by scholastic class / section) */}
+                {submissionViewMode === "by_class" && (
+                  <div className="space-y-4 animate-fadeIn">
+                    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2.5">
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <GraduationCap className="w-3.5 h-3.5 text-teal-400" />
+                          <span>Classi Rilevate</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-white mt-1">
+                          {filteredClassSummaries.length}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Users className="w-3.5 h-3.5 text-indigo-400" />
+                          <span>Consegne Nei Gruppi</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-indigo-300 mt-1">
+                          {filteredClassSummaries.reduce((acc, c) => acc + c.totalSubmissions, 0)}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <Award className="w-3.5 h-3.5 text-emerald-400" />
+                          <span>Media Sufficienze</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-emerald-300 mt-1">
+                          {(() => {
+                            const totalPass = filteredClassSummaries.reduce((acc, c) => acc + c.passedCount, 0);
+                            const totalGraded = filteredClassSummaries.reduce((acc, c) => acc + c.passedCount + c.failedCount, 0);
+                            return totalGraded > 0 ? `${Math.round((totalPass / totalGraded) * 100)}%` : "100%";
+                          })()}
+                        </p>
+                      </div>
+
+                      <div className="bg-slate-950/60 border border-white/5 p-3 rounded-2xl">
+                        <div className="flex items-center gap-1.5 text-slate-400 text-[11px]">
+                          <ShieldCheck className="w-3.5 h-3.5 text-teal-400" />
+                          <span>Voti Convalidati</span>
+                        </div>
+                        <p className="text-xl font-display font-extrabold text-teal-300 mt-1">
+                          {filteredClassSummaries.reduce((acc, c) => acc + c.validatedCount, 0)}
+                        </p>
+                      </div>
+                    </div>
+
+                    {/* Cross-class comparative analytics card when >= 2 declared classes exist */}
+                    {(() => {
+                      const realClasses = filteredClassSummaries.filter((c) => c.className !== UNSPECIFIED_CLASS_LABEL);
+                      if (realClasses.length < 2) return null;
+                      return (
+                        <div className="p-4 rounded-2xl bg-slate-950/55 border border-teal-500/20 space-y-3">
+                          <div className="flex items-center justify-between gap-2">
+                            <div className="flex items-center gap-2 text-xs font-bold text-teal-200">
+                              <BarChart2 className="w-4 h-4 text-teal-400" />
+                              <span>Confronto tra Classi ({realClasses.length} sezioni)</span>
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setShowClassCompare((v) => !v)}
+                              className="text-[11px] font-semibold text-slate-400 hover:text-white cursor-pointer"
+                            >
+                              {showClassCompare ? "Nascondi confronto ▲" : "Mostra confronto ▼"}
+                            </button>
+                          </div>
+                          {showClassCompare && (
+                            <div className="space-y-2.5">
+                              {realClasses.map((c) => {
+                                const avgPct = c.averageGradeNumber !== null ? Math.min(100, Math.round((c.averageGradeNumber / 10) * 100)) : 0;
+                                const validatedPct = c.totalSubmissions > 0 ? Math.round((c.validatedCount / c.totalSubmissions) * 100) : 0;
+                                return (
+                                  <div key={`cmp_${c.className}`} className="grid grid-cols-12 items-center gap-2 text-xs">
+                                    <button
+                                      type="button"
+                                      onClick={() => setFilterClass(filterClass === c.className ? "All" : c.className)}
+                                      className="col-span-3 sm:col-span-2 text-left font-mono font-bold text-teal-200 hover:text-white truncate cursor-pointer"
+                                      title={`Filtra registro su ${c.className}`}
+                                    >
+                                      {c.className}
+                                    </button>
+                                    <div className="col-span-6 sm:col-span-7 h-2.5 bg-slate-900 rounded-full overflow-hidden border border-white/5">
+                                      <div
+                                        className={`h-full rounded-full transition-all duration-500 ${
+                                          (c.averageGradeNumber ?? 0) >= 7.5
+                                            ? "bg-gradient-to-r from-emerald-500 to-teal-400"
+                                            : (c.averageGradeNumber ?? 0) >= 6
+                                            ? "bg-gradient-to-r from-indigo-500 to-teal-400"
+                                            : "bg-gradient-to-r from-rose-500 to-amber-400"
+                                        }`}
+                                        style={{ width: `${avgPct}%` }}
+                                      />
+                                    </div>
+                                    <div className="col-span-3 text-right font-mono text-[11px] flex items-center justify-end gap-2">
+                                      <span className="font-bold text-white">{c.averageGradeFormatted}</span>
+                                      <span className={`hidden sm:inline ${c.passRate >= 70 ? "text-emerald-400" : "text-amber-300"}`}>
+                                        {c.passRate}% suff.
+                                      </span>
+                                      <span className="hidden md:inline text-slate-500">
+                                        · {validatedPct}% conv.
+                                      </span>
+                                    </div>
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          )}
+                        </div>
+                      );
+                    })()}
+
+                    {loadingSubmissions ? (
+                      <div className="p-12 text-center text-slate-400 text-xs bg-slate-950/20 border border-white/5 rounded-2xl">
+                        <div className="flex items-center justify-center gap-2">
+                          <RefreshCw className="w-4 h-4 animate-spin text-teal-400" />
+                          <span>Raggruppamento per classe in corso...</span>
+                        </div>
+                      </div>
+                    ) : filteredClassSummaries.length === 0 ? (
+                      <div className="p-12 text-center text-slate-400 text-xs italic bg-slate-950/20 border border-white/5 rounded-2xl">
+                        Nessuna classe corrisponde ai filtri di ricerca impostati.
+                      </div>
+                    ) : (
+                      <div className="space-y-3.5">
+                        {filteredClassSummaries.map((cls) => {
+                          const isExpanded = expandedClassKeys.has(cls.className);
+                          const isUnspecified = cls.className === UNSPECIFIED_CLASS_LABEL;
+                          return (
+                            <div
+                              key={cls.className}
+                              className="bg-slate-950/40 border border-white/10 hover:border-teal-500/35 rounded-2xl transition-all overflow-hidden"
+                            >
+                              <div
+                                onClick={() => toggleClassExpanded(cls.className)}
+                                className="p-4 flex flex-col lg:flex-row items-start lg:items-center justify-between gap-3.5 cursor-pointer hover:bg-white/[0.02]"
+                              >
+                                <div className="space-y-1.5 flex-1">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <span className={`px-3 py-1 rounded-xl text-xs font-mono font-bold border flex items-center gap-1.5 ${
+                                      isUnspecified
+                                        ? "bg-slate-800/80 text-slate-300 border-white/10"
+                                        : "bg-teal-500/15 text-teal-200 border-teal-500/35"
+                                    }`}>
+                                      <GraduationCap className="w-3.5 h-3.5" />
+                                      <span>{cls.className}</span>
+                                    </span>
+
+                                    {cls.quizCount > 0 && (
+                                      <span className="px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold bg-teal-500/10 text-teal-400 border border-teal-500/20">
+                                        Quiz: {cls.quizCount}
+                                      </span>
+                                    )}
+                                    {cls.workbookCount > 0 && (
+                                      <span className="px-2 py-0.5 rounded text-[10px] uppercase font-mono font-bold bg-purple-500/10 text-purple-400 border border-purple-500/20">
+                                        Workbook: {cls.workbookCount}
+                                      </span>
+                                    )}
+
+                                    {cls.uniquePins.slice(0, 4).map((p) => (
+                                      <span key={p} className="px-1.5 py-0.5 rounded text-[10px] bg-slate-800 text-indigo-300 font-mono border border-white/5">
+                                        PIN {p}
+                                      </span>
+                                    ))}
+                                    {cls.uniquePins.length > 4 && (
+                                      <span className="text-[10px] text-slate-400 font-mono">
+                                        +{cls.uniquePins.length - 4} PIN
+                                      </span>
+                                    )}
+                                  </div>
+
+                                  {cls.uniqueExamTitles.length > 0 && (
+                                    <p className="text-xs text-slate-300 truncate max-w-2xl">
+                                      Prove svolte: <span className="text-white font-medium">{cls.uniqueExamTitles.slice(0, 3).join(" • ")}</span>
+                                      {cls.uniqueExamTitles.length > 3 ? ` (+${cls.uniqueExamTitles.length - 3})` : ""}
+                                    </p>
+                                  )}
+
+                                  {cls.latestDate && (
+                                    <p className="text-[11px] text-slate-400">
+                                      Ultima consegna: {new Date(cls.latestDate).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric" })} alle {new Date(cls.latestDate).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+                                    </p>
+                                  )}
+                                </div>
+
+                                <div className="flex items-center gap-3 sm:gap-4 w-full lg:w-auto justify-between lg:justify-end border-t lg:border-t-0 border-white/5 pt-2 lg:pt-0">
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Alunni / Consegne</span>
+                                    <span className="font-bold text-white text-xs sm:text-sm">
+                                      {cls.uniqueStudents} / {cls.totalSubmissions}
+                                    </span>
+                                  </div>
+
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Media Classe</span>
+                                    <span className="font-extrabold text-teal-400 text-xs sm:text-sm font-display">
+                                      {cls.averageGradeFormatted}
+                                    </span>
+                                  </div>
+
+                                  <div className="text-left sm:text-center">
+                                    <span className="text-[10px] text-slate-400 block">Sufficienze</span>
+                                    <span className={`font-bold text-xs ${cls.passRate >= 70 ? "text-emerald-400" : "text-amber-400"}`}>
+                                      {cls.passedCount}/{cls.passedCount + cls.failedCount} ({cls.passRate}%)
+                                    </span>
+                                  </div>
+
+                                  <div className="flex items-center gap-2">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExportSingleClassCSV(cls);
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-teal-600/20 hover:bg-teal-600 text-teal-300 hover:text-white border border-teal-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                                      title={`Esporta il tabellone CSV completo della classe ${cls.className}`}
+                                    >
+                                      <Download className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">CSV Classe</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
+                                      disabled={isExportingZip}
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        handleExportZip(cls.submissions, `verifiche_classe_${cls.className}`);
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-indigo-600/20 hover:bg-indigo-600 text-indigo-300 hover:text-white border border-indigo-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer disabled:opacity-40"
+                                      title={`Scarica tutti i ${cls.submissions.length} PDF di questa classe in un unico archivio ZIP`}
+                                    >
+                                      <Archive className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">ZIP ({cls.submissions.length})</span>
+                                    </button>
+
+                                    <div className="p-1.5 rounded-lg bg-white/5 text-slate-400 hover:text-white shrink-0">
+                                      {isExpanded ? <ChevronUp className="w-4 h-4" /> : <ChevronDown className="w-4 h-4" />}
+                                    </div>
+                                  </div>
+                                </div>
+                              </div>
+
+                              {isExpanded && (
+                                <div className="p-4 bg-slate-900/70 border-t border-white/5 space-y-3 animate-fadeIn">
+                                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 border-b border-white/5 pb-2">
+                                    <div className="flex items-center gap-2 flex-wrap">
+                                      <p className="text-[11px] font-bold text-slate-300 uppercase tracking-wider flex items-center gap-1.5">
+                                        <Users className="w-3.5 h-3.5 text-teal-400" />
+                                        <span>Elenco Consegne — {cls.className} ({cls.submissions.length})</span>
+                                      </p>
+                                      {bulkClassEditingKey === cls.className ? (
+                                        <div className="flex items-center gap-1.5 flex-wrap">
+                                          <input
+                                            type="text"
+                                            list="ea-class-suggestions"
+                                            value={bulkClassInputValue}
+                                            onChange={(e) => setBulkClassInputValue(e.target.value.slice(0, 40))}
+                                            placeholder="Nuova classe (es. 3A)"
+                                            className="w-32 px-2 py-0.5 bg-slate-950 border border-teal-400/50 rounded-lg text-white text-[11px] font-mono uppercase outline-none"
+                                            autoFocus
+                                          />
+                                          <button
+                                            type="button"
+                                            disabled={savingBulkClass || !normalizeClassLabel(bulkClassInputValue)}
+                                            onClick={() => handleBulkAssignClass(cls.submissions, bulkClassInputValue)}
+                                            className="px-2 py-0.5 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white text-[10px] font-bold cursor-pointer"
+                                          >
+                                            {savingBulkClass ? "Salvo..." : "Applica a tutti"}
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => {
+                                              setBulkClassEditingKey(null);
+                                              setBulkClassInputValue("");
+                                            }}
+                                            className="px-2 py-0.5 rounded-lg bg-slate-800 text-slate-300 text-[10px] cursor-pointer"
+                                          >
+                                            Annulla
+                                          </button>
+                                        </div>
+                                      ) : (
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setBulkClassEditingKey(cls.className);
+                                            setBulkClassInputValue(isUnspecified ? "" : cls.className);
+                                          }}
+                                          className="px-2 py-0.5 rounded-lg bg-teal-500/15 hover:bg-teal-500/25 border border-teal-500/30 text-teal-200 text-[10px] font-semibold cursor-pointer"
+                                          title="Assegna o unifica in blocco la classe per tutte le consegne di questo gruppo"
+                                        >
+                                          {isUnspecified ? "Assegna Classe in blocco" : "Unifica / Rinomina Classe"}
+                                        </button>
+                                      )}
+                                    </div>
+                                    <div className="flex items-center gap-3 text-[10px] flex-wrap justify-between sm:justify-end">
+                                      <div className="flex items-center gap-1.5">
+                                        <span className="text-slate-400">Ordina:</span>
+                                        <select
+                                          value={classRosterSort}
+                                          onChange={(e) => setClassRosterSort(e.target.value as any)}
+                                          className="bg-slate-950 border border-white/10 text-white text-[10px] rounded-lg px-2 py-0.5 outline-none font-medium cursor-pointer"
+                                        >
+                                          <option value="recent">🕒 Consegna recente</option>
+                                          <option value="grade_desc">🏆 Voto IA decrescente (10 ➔ 1)</option>
+                                          <option value="grade_asc">📉 Voto IA crescente (1 ➔ 10)</option>
+                                          <option value="name_asc">🔤 Nome Studente (A-Z)</option>
+                                        </select>
+                                      </div>
+                                      <div className="flex items-center gap-2 text-slate-400 border-l border-white/10 pl-3">
+                                        <span>Max: <b className="text-teal-300">{cls.highestGrade}</b></span>
+                                        <span>•</span>
+                                        <span>Min: <b className="text-amber-300">{cls.lowestGrade}</b></span>
+                                        <span>•</span>
+                                        <span>Convalidati: <b className="text-emerald-300">{cls.validatedCount}/{cls.totalSubmissions}</b></span>
+                                      </div>
+                                    </div>
+                                  </div>
+
+                                  <div className="overflow-x-auto border border-white/5 rounded-xl">
+                                    <table className="w-full text-left border-collapse text-xs">
+                                      <thead>
+                                        <tr className="bg-slate-950 text-slate-400 uppercase tracking-wider font-bold text-[9px] border-b border-white/5 select-none">
+                                          <th className="p-2 text-center w-10">#</th>
+                                          <th className="p-2">Studente</th>
+                                          <th className="p-2">Prova / PIN</th>
+                                          <th className="p-2 text-center">Voto IA</th>
+                                          <th className="p-2 text-center">Autoval.</th>
+                                          <th className="p-2 text-center">Integrità</th>
+                                          <th className="p-2">Orario Consegna</th>
+                                          <th className="p-2 text-right">Azioni</th>
+                                        </tr>
+                                      </thead>
+                                      <tbody className="divide-y divide-white/5 bg-slate-950/40">
+                                        {(() => {
+                                          const sortedClassSubs = [...cls.submissions].sort((a, b) => {
+                                            if (classRosterSort === "grade_desc") {
+                                              const gradeA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                              const gradeB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+                                              if (gradeB !== gradeA) return gradeB - gradeA;
+                                              return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                            }
+                                            if (classRosterSort === "grade_asc") {
+                                              const rawA = submissionMetaMap.get(a.id)?.numericGrade ?? -1;
+                                              const rawB = submissionMetaMap.get(b.id)?.numericGrade ?? -1;
+                                              const gradeA = rawA < 0 ? 99 : rawA;
+                                              const gradeB = rawB < 0 ? 99 : rawB;
+                                              if (gradeA !== gradeB) return gradeA - gradeB;
+                                              return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                            }
+                                            if (classRosterSort === "name_asc") {
+                                              if (blindGradingMode) {
+                                                return getSubmissionBlindCode(a).localeCompare(getSubmissionBlindCode(b));
+                                              }
+                                              return (a.Nome || "").localeCompare(b.Nome || "");
+                                            }
+                                            return new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime();
+                                          });
+                                          const orderedIds = sortedClassSubs.map((s) => s.id);
+                                          return sortedClassSubs.map((sub, sIdx) => {
+                                            const meta = submissionMetaMap.get(sub.id);
+                                            const violations = meta?.totalViolations ?? ((sub.AntiCopia_TabSwitch || 0) + (sub.AntiCopia_IncollaBloccato || 0) + (sub.AntiCopia_SchermoDiviso || 0));
+                                            const subGradeLabel = meta?.displayGrade ?? displaySubmissionGrade(sub);
+                                            return (
+                                              <tr key={sub.id} className="hover:bg-white/5 transition-colors">
+                                                <td className="p-2 text-center font-mono font-bold text-xs text-slate-500">
+                                                  {sIdx + 1}
+                                                </td>
+                                                <td className="p-2">
+                                                  {blindGradingMode ? (
+                                                    <span className="font-mono font-bold text-amber-300">
+                                                      Studente {getSubmissionBlindCode(sub)}
+                                                    </span>
+                                                  ) : (
+                                                    <div>
+                                                      <p className="font-semibold text-white">{sub.Nome || "Anonimo"}</p>
+                                                      <p className="text-[10px] text-slate-400 truncate">{sub.Email}</p>
+                                                    </div>
+                                                  )}
+                                                </td>
+                                                <td className="p-2">
+                                                  <div className="flex items-center gap-1.5 flex-wrap">
+                                                    <span className={`px-1.5 py-0.5 rounded text-[9px] uppercase font-mono font-bold ${
+                                                      sub.Tipo === "Quiz"
+                                                        ? "bg-teal-500/10 text-teal-400 border border-teal-500/20"
+                                                        : "bg-purple-500/10 text-purple-400 border border-purple-500/20"
+                                                    }`}>
+                                                      {sub.Tipo}
+                                                    </span>
+                                                    {sub.Pin && (
+                                                      <span className="px-1.5 py-0.5 rounded text-[9px] bg-slate-800 text-slate-300 font-mono border border-white/5">
+                                                        PIN: {sub.Pin}
+                                                      </span>
+                                                    )}
+                                                  </div>
+                                                  <p className="text-[10px] text-slate-400 truncate max-w-[180px] mt-0.5">
+                                                    {meta?.examTitle || getSubmissionExamTitle(sub)}
+                                                  </p>
+                                                </td>
+                                                <td className={`p-2 text-center font-extrabold font-mono text-xs sm:text-sm ${subGradeLabel === "N.V." ? "text-rose-400" : "text-teal-400"}`}>
+                                                  {subGradeLabel}
+                                                </td>
+                                                <td className="p-2 text-center text-indigo-300 font-mono text-xs">
+                                                  {sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—"}
+                                                </td>
+                                                <td className="p-2 text-center">
+                                                  {violations > 0 ? (
+                                                    <span className="px-1.5 py-0.5 rounded text-[10px] font-mono bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                                      {violations} segn.
+                                                    </span>
+                                                  ) : (
+                                                    <span className="text-emerald-400 font-bold font-mono">✓</span>
+                                                  )}
+                                                </td>
+                                                <td className="p-2 text-slate-400 text-[10px]">
+                                                  {new Date(sub.Timestamp).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit" })} {new Date(sub.Timestamp).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
+                                                </td>
+                                                <td className="p-2 text-right">
+                                                  <div className="flex items-center justify-end gap-1.5">
+                                                    <button
+                                                      onClick={() => {
+                                                        setPrintableSub(sub);
+                                                        setShowPrintModal(true);
+                                                      }}
+                                                      className="p-1.5 bg-indigo-500/10 hover:bg-indigo-500/20 text-indigo-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-indigo-500/20"
+                                                      title="Stampa Scheda Valutazione A4 / PDF"
+                                                    >
+                                                      <Printer className="w-3.5 h-3.5" />
+                                                    </button>
+                                                    <button
+                                                      onClick={() => {
+                                                        setSpeedGraderScopeIds(orderedIds);
+                                                        setSelectedSub(sub);
+                                                      }}
+                                                      className="px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-[10px] rounded-lg transition-colors cursor-pointer"
+                                                    >
+                                                      Esamina
+                                                    </button>
+                                                    <button
+                                                      onClick={() => handleExportPDF(sub)}
+                                                      className="p-1.5 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 hover:text-white rounded-lg transition-colors cursor-pointer border border-teal-500/20"
+                                                      title="Scarica PDF Esito"
+                                                    >
+                                                      <Download className="w-3.5 h-3.5" />
+                                                    </button>
+                                                    {confirmDeleteId === sub.id ? (
+                                                      <div className="flex items-center gap-1 bg-red-950/60 border border-red-500/40 p-0.5 rounded-lg animate-fadeIn">
+                                                        <button
+                                                          onClick={() => handleDeleteSubmissionDirectly(sub.id)}
+                                                          className="px-1.5 py-0.5 bg-red-500 hover:bg-red-400 text-slate-950 font-bold text-[9px] rounded transition-colors cursor-pointer select-none"
+                                                          title="Conferma eliminazione"
+                                                        >
+                                                          Sì
+                                                        </button>
+                                                        <button
+                                                          onClick={() => setConfirmDeleteId(null)}
+                                                          className="px-1.5 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-300 text-[9px] rounded transition-colors cursor-pointer select-none"
+                                                          title="Annulla"
+                                                        >
+                                                          No
+                                                        </button>
+                                                      </div>
+                                                    ) : (
+                                                      <button
+                                                        onClick={() => setConfirmDeleteId(sub.id)}
+                                                        className="p-1.5 bg-red-500/10 hover:bg-red-500/20 text-red-400 hover:text-white rounded-lg transition-colors cursor-pointer border border-red-500/20"
+                                                        title="Elimina questa singola consegna"
+                                                      >
+                                                        <Trash2 className="w-3.5 h-3.5" />
+                                                      </button>
+                                                    )}
+                                                  </div>
+                                                </td>
+                                              </tr>
+                                            );
+                                          });
+                                        })()}
+                                      </tbody>
+                                    </table>
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+                          );
+                        })}
+                      </div>
+                    )}
+                  </div>
+                )}
+
                 {/* VIEW C: BY EXAM (Grouped by test / exam session) */}
                 {submissionViewMode === "by_exam" && (
                   <div className="space-y-4 animate-fadeIn">
@@ -4501,7 +5475,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           <span>Consegne Totali</span>
                         </div>
                         <p className="text-xl font-display font-extrabold text-teal-300 mt-1">
-                          {submissions.length}
+                          {filteredExamSummaries.reduce((acc, e) => acc + e.totalStudents, 0)}
                         </p>
                       </div>
 
@@ -4511,7 +5485,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           <span>Media Alunni / Prova</span>
                         </div>
                         <p className="text-xl font-display font-extrabold text-indigo-300 mt-1">
-                          {(submissions.length / Math.max(1, examSummaries.length)).toFixed(1)}
+                          {(
+                            filteredExamSummaries.reduce((acc, e) => acc + e.totalStudents, 0) /
+                            Math.max(1, filteredExamSummaries.length)
+                          ).toFixed(1)}
                         </p>
                       </div>
 
@@ -4522,8 +5499,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                         </div>
                         <p className="text-xl font-display font-extrabold text-emerald-300 mt-1">
                           {(() => {
-                            const totalPass = examSummaries.reduce((acc, e) => acc + e.passedCount, 0);
-                            const totalGraded = examSummaries.reduce((acc, e) => acc + e.passedCount + e.failedCount, 0);
+                            const totalPass = filteredExamSummaries.reduce((acc, e) => acc + e.passedCount, 0);
+                            const totalGraded = filteredExamSummaries.reduce((acc, e) => acc + e.passedCount + e.failedCount, 0);
                             return totalGraded > 0 ? `${Math.round((totalPass / totalGraded) * 100)}%` : "100%";
                           })()}
                         </p>
@@ -5117,6 +6094,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         PIN: {sub.Pin}
                                       </span>
                                     )}
+                                    {meta?.resolvedClass && meta.resolvedClass !== UNSPECIFIED_CLASS_LABEL && (
+                                      <span className="px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-teal-500/15 text-teal-200 font-mono border border-teal-500/30 font-semibold">
+                                        {meta.resolvedClass}
+                                      </span>
+                                    )}
                                   </div>
                                   <p className="text-[9px] sm:text-[10px] text-slate-400 mt-1 whitespace-nowrap">
                                     {new Date(sub.Timestamp).toLocaleDateString("it-IT", { month: "2-digit", day: "2-digit" })} 
@@ -5257,6 +6239,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
               setShowPrintModal(true);
             }}
             onManualGradeSave={handleManualGrade}
+            onUpdateClass={handleUpdateSubmissionClass}
+            availableClassSuggestions={normalizedClassSuggestions}
             onValidateSubmission={handleValidateSubmission}
             validatingId={validatingId}
             onRetouchSubjectiveItem={handleRetouchSubjectiveItem}

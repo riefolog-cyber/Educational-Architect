@@ -82,11 +82,13 @@ service cloud.firestore {
       return data is map &&
         data.keys().hasAll(['pin', 'expiry', 'teacherEmail', 'active']) &&
         data.keys().hasOnly([
-          'pin', 'title', 'expiry', 'teacherEmail', 'teacherId', 'data',
+          'pin', 'title', 'targetClass', 'allowedClasses', 'restrictToAllowedClasses',
+          'expiry', 'teacherEmail', 'teacherId', 'data',
           'encryptedAnswerKey', 'randomizeQuestions', 'deferSolutions',
           'solutionsReleased', 'solutionsReleasedAt', 'besOptions',
           'mixFilaAB', 'filaBData', 'encryptedFilaBAnswerKey', 'filaBTitle',
           'allowAudioAnswers', 'severityPreset', 'unlockCode', 'active',
+          'classNotice', 'classNoticeAt', 'classNoticeTargetClass',
           'archived', 'archivedAt',
           'createdAt', 'sessionId', 'backendUrl'
         ]) &&
@@ -97,6 +99,12 @@ service cloud.firestore {
         (!('archived' in data) || data.archived is bool) &&
         (!('archivedAt' in data) || (data.archivedAt is string && data.archivedAt.size() <= 64)) &&
         (!('title' in data) || (data.title is string && data.title.size() <= 300)) &&
+        (!('targetClass' in data) || (data.targetClass is string && data.targetClass.size() <= 40)) &&
+        (!('allowedClasses' in data) || (data.allowedClasses is list && data.allowedClasses.size() <= 30 && (data.allowedClasses.size() == 0 || (data.allowedClasses[0] is string && data.allowedClasses[0].size() <= 40)))) &&
+        (!('restrictToAllowedClasses' in data) || data.restrictToAllowedClasses is bool) &&
+        (!('classNotice' in data) || (data.classNotice is string && data.classNotice.size() <= 300)) &&
+        (!('classNoticeAt' in data) || (data.classNoticeAt is string && data.classNoticeAt.size() <= 64)) &&
+        (!('classNoticeTargetClass' in data) || (data.classNoticeTargetClass is string && data.classNoticeTargetClass.size() <= 40)) &&
         (!('teacherId' in data) || (data.teacherId is string && data.teacherId.size() <= 128)) &&
         (!('sessionId' in data) || (data.sessionId is string && data.sessionId.size() <= 128)) &&
         (!('backendUrl' in data) || (data.backendUrl is string && data.backendUrl.size() <= 200)) &&
@@ -118,7 +126,7 @@ service cloud.firestore {
         data.keys().hasAll(['Timestamp', 'Tipo', 'Email', 'Voto_Suggerito']) &&
         data.keys().hasOnly([
           'Timestamp', 'Docente_Email', 'Tipo', 'Pin', 'Session_Id', 'Session_Titolo',
-          'Nome', 'Email', 'Pseudo_Id', 'PII_Oscurate_Count',
+          'Nome', 'Email', 'Classe', 'Pseudo_Id', 'PII_Oscurate_Count',
           'Voto_Suggerito', 'Voto_Originale_IA', 'Autovalutazione',
           'Punteggio_MC', 'Punteggio_FIB',
           'AntiCopia_TabSwitch', 'AntiCopia_IncollaBloccato', 'AntiCopia_SchermoDiviso', 'AntiCopia_InfractionsLog',
@@ -136,6 +144,7 @@ service cloud.firestore {
         (!('Session_Id' in data) || (data.Session_Id is string && data.Session_Id.size() <= 128)) &&
         (!('Session_Titolo' in data) || (data.Session_Titolo is string && data.Session_Titolo.size() <= 300)) &&
         (!('Nome' in data) || (data.Nome is string && data.Nome.size() <= 200)) &&
+        (!('Classe' in data) || (data.Classe is string && data.Classe.size() <= 40)) &&
         (!('Pseudo_Id' in data) || (data.Pseudo_Id is string && data.Pseudo_Id.size() <= 64)) &&
         (!('Full_Evaluation' in data) || (data.Full_Evaluation is string && data.Full_Evaluation.size() <= 300000)) &&
         (!('Risposte_Studente' in data) || (data.Risposte_Studente is string && data.Risposte_Studente.size() <= 250000)) &&
@@ -149,6 +158,7 @@ service cloud.firestore {
 
     function isValidSubmissionCreate(data) {
       return isValidSubmissionPayload(data) &&
+        'Classe' in data && data.Classe is string && data.Classe.size() >= 2 && data.Classe.size() <= 40 &&
         !('Convalida_Docente_At' in data) &&
         !('Convalida_Docente_Email' in data) &&
         !('Voto_Originale_IA' in data);
@@ -163,30 +173,49 @@ service cloud.firestore {
     function isValidLiveStudentWrite(data) {
       return data is map &&
         data.keys().hasOnly([
-          'studentName', 'studentEmail', 'answeredCount', 'totalQuestions',
+          'studentName', 'studentEmail', 'studentClass', 'answeredCount', 'totalQuestions',
           'mcDoneCount', 'openDoneCount', 'currentProgressPercent',
           'tabSwitches', 'pasteAttempts', 'lastHeartbeat', 'status',
           'joinedAt', 'sessionRunId', 'locked', 'lockState', 'lockReason',
           'lockedAt', 'draftAnswersJson', 'draftUpdatedAt',
           'besExpiryIso', 'assignedFila',
           'remoteUnlockId', 'unlockedAt', 'unlockedBy',
-          'teacherNotice', 'teacherNoticeAt'
+          'teacherNotice', 'teacherNoticeAt', 'teacherNoticeAckAt', 'classNoticeAckAt'
         ]) &&
         (!('studentName' in data) || (data.studentName is string && data.studentName.size() <= 200)) &&
-        (!('studentEmail' in data) || (data.studentEmail is string && data.studentEmail.size() > 0 && data.studentEmail.size() <= 200)) &&
+        (!('studentEmail' in data) || (data.studentEmail is string && data.studentEmail.size() <= 200)) &&
+        (!('studentClass' in data) || (data.studentClass is string && data.studentClass.size() <= 40)) &&
         (!('draftAnswersJson' in data) || (data.draftAnswersJson is string && data.draftAnswersJson.size() <= 220000)) &&
         (!('draftUpdatedAt' in data) || (data.draftUpdatedAt is string && data.draftUpdatedAt.size() <= 64)) &&
         (!('lastHeartbeat' in data) || (data.lastHeartbeat is string && data.lastHeartbeat.size() <= 64)) &&
+        (!('joinedAt' in data) || (data.joinedAt is string && data.joinedAt.size() <= 64)) &&
+        (!('sessionRunId' in data) || (data.sessionRunId is string && data.sessionRunId.size() <= 128)) &&
         (!('besExpiryIso' in data) || (data.besExpiryIso is string && data.besExpiryIso.size() <= 64)) &&
         (!('assignedFila' in data) || data.assignedFila in ['A', 'B']) &&
+        (!('locked' in data) || data.locked is bool) &&
+        (!('lockState' in data) || data.lockState in ['locked', 'unlocked']) &&
         (!('lockReason' in data) || (data.lockReason is string && data.lockReason.size() <= 400)) &&
+        (!('lockedAt' in data) || (data.lockedAt is string && data.lockedAt.size() <= 64)) &&
         (!('answeredCount' in data) || data.answeredCount is int) &&
         (!('totalQuestions' in data) || data.totalQuestions is int) &&
+        (!('mcDoneCount' in data) || data.mcDoneCount is int) &&
+        (!('openDoneCount' in data) || data.openDoneCount is int) &&
+        (!('currentProgressPercent' in data) || data.currentProgressPercent is int) &&
+        (!('tabSwitches' in data) || data.tabSwitches is int) &&
+        (!('pasteAttempts' in data) || data.pasteAttempts is int) &&
+        (!('remoteUnlockId' in data) || (data.remoteUnlockId is string && data.remoteUnlockId.size() <= 128)) &&
+        (!('unlockedAt' in data) || (data.unlockedAt is string && data.unlockedAt.size() <= 64)) &&
+        (!('unlockedBy' in data) || (data.unlockedBy is string && data.unlockedBy.size() <= 200)) &&
+        (!('teacherNotice' in data) || (data.teacherNotice is string && data.teacherNotice.size() <= 300)) &&
+        (!('teacherNoticeAt' in data) || (data.teacherNoticeAt is string && data.teacherNoticeAt.size() <= 64)) &&
+        (!('teacherNoticeAckAt' in data) || (data.teacherNoticeAckAt is string && data.teacherNoticeAckAt.size() <= 64)) &&
+        (!('classNoticeAckAt' in data) || (data.classNoticeAckAt is string && data.classNoticeAckAt.size() <= 64)) &&
         (!('status' in data) || data.status in ['waiting', 'in_progress', 'self_evaluating', 'submitted', 'offline']);
     }
 
     function isStudentLiveCreate(data, sessionId) {
       return isValidLiveStudentWrite(data) &&
+        'studentEmail' in data && data.studentEmail is string && data.studentEmail.size() > 0 &&
         exists(/databases/$(database)/documents/active_sessions/$(sessionId)) &&
         !('remoteUnlockId' in data) &&
         !('unlockedAt' in data) &&

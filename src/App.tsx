@@ -4,6 +4,7 @@ import {
   signInWithPopup, 
   signInWithRedirect,
   getRedirectResult,
+  signInAnonymously,
   signOut
 } from "firebase/auth";
 import { 
@@ -31,6 +32,8 @@ import {
 
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
+import { normalizeClassLabel } from "./utils/classGrouping";
+import { saveScopedStudentClass, loadScopedStudentClass } from "./utils/clientStorage";
 // Helper to retry failed dynamic module imports (e.g. transient dev-proxy / stale Vite dep cache)
 function isChunkOrModuleFetchError(err: unknown): boolean {
   const msg = String((err as any)?.message || err || "").toLowerCase();
@@ -196,7 +199,9 @@ export default function App() {
   const [directSurname, setDirectSurname] = useState("");
   const [directClass, setDirectClass] = useState("");
   const [directEmail, setDirectEmail] = useState("");
+  const [sharedPcMode, setSharedPcMode] = useState(false);
   const [directError, setDirectError] = useState("");
+  const [googleStudentClass, setGoogleStudentClass] = useState("");
   const [showWorkspaceHelp, setShowWorkspaceHelp] = useState(false);
 
   const [activePane, setActivePane] = useState<"home" | "student" | "teacher">("home");
@@ -300,12 +305,14 @@ export default function App() {
     // 2. Handle redirect auth result (e.g. for mobile browsers)
     getRedirectResult(auth)
       .then((result) => {
-        if (result?.user) {
+        if (result?.user && !result.user.isAnonymous) {
           try {
             sessionStorage.removeItem("direct_student_user");
             localStorage.removeItem("direct_student_user");
+            localStorage.removeItem("saved_student_class");
           } catch {}
           setUser(result.user);
+          setGoogleStudentClass(normalizeClassLabel(loadScopedStudentClass(result.user.email)));
           checkUserRoleAndBootstrap(result.user);
         }
       })
@@ -317,12 +324,15 @@ export default function App() {
     // 3. Main onAuthStateChanged listener (always registered so Google login works after direct student sign-out)
     const unsubscribe = onAuthStateChanged(auth, async (currentUser) => {
       clearTimeout(safetyTimer);
-      if (currentUser) {
+      if (currentUser && !currentUser.isAnonymous) {
         setAuthLoading(true);
         try {
           sessionStorage.removeItem("direct_student_user");
           localStorage.removeItem("direct_student_user");
+          localStorage.removeItem("saved_student_class");
         } catch {}
+        const scopedClass = normalizeClassLabel(loadScopedStudentClass(currentUser.email));
+        setGoogleStudentClass(scopedClass);
         setUser(currentUser);
         await checkUserRoleAndBootstrap(currentUser);
       } else {
@@ -333,15 +343,18 @@ export default function App() {
             const parsedDirect = JSON.parse(currentDirect);
             if (!hasSavedDirect && parsedDirect?.email) {
               setUser(parsedDirect);
+              setGoogleStudentClass(normalizeClassLabel(parsedDirect.studentClass));
               setRole("student");
             }
           } else {
             setUser(null);
+            setGoogleStudentClass("");
             setRole("student");
             setRoleError("");
           }
         } catch {
           setUser(null);
+          setGoogleStudentClass("");
           setRole("student");
         }
       }
@@ -431,11 +444,16 @@ export default function App() {
 
     const nome = directName.trim();
     const cognome = directSurname.trim();
-    const classe = directClass.trim().toUpperCase();
+    const classe = normalizeClassLabel(directClass);
     let email = directEmail.trim().toLowerCase().replace(/\s+/g, "");
 
     if (!nome || !cognome) {
       setDirectError("Inserisci sia il nome che il cognome per identificare la prova.");
+      return;
+    }
+
+    if (!classe || classe.length < 2) {
+      setDirectError("Indica e dichiara obbligatoriamente la tua Classe / Sezione di appartenenza (es. 3A, 4B INF) per accedere.");
       return;
     }
 
@@ -463,22 +481,40 @@ export default function App() {
     }
 
     const studentUser = {
-      displayName: classe ? `${nome} ${cognome} (${classe})` : `${nome} ${cognome}`,
+      displayName: `${nome} ${cognome} (${classe})`,
       email: email,
+      studentClass: classe,
       isDirectAccess: true
     };
 
     try {
       sessionStorage.setItem("direct_student_user", JSON.stringify(studentUser));
-      localStorage.setItem("direct_student_user", JSON.stringify(studentUser));
-      localStorage.setItem("saved_student_name", nome);
-      localStorage.setItem("saved_student_surname", cognome);
-      if (classe) localStorage.setItem("saved_student_class", classe);
-      localStorage.setItem("saved_student_email", email);
+      if (sharedPcMode) {
+        localStorage.removeItem("direct_student_user");
+        localStorage.removeItem("saved_student_name");
+        localStorage.removeItem("saved_student_surname");
+        localStorage.removeItem("saved_student_class");
+        localStorage.removeItem("saved_student_email");
+        saveScopedStudentClass(email, classe, sessionStorage);
+      } else {
+        localStorage.setItem("direct_student_user", JSON.stringify(studentUser));
+        localStorage.setItem("saved_student_name", nome);
+        localStorage.setItem("saved_student_surname", cognome);
+        localStorage.setItem("saved_student_class", classe);
+        saveScopedStudentClass(email, classe);
+        localStorage.setItem("saved_student_email", email);
+      }
     } catch (e) {
       // Storage access blocked or restricted
     }
 
+    // Opportunistic silent anonymous sign-in (never blocks direct student login if disabled in Firebase Console)
+    if (auth && !auth.currentUser) {
+      void signInAnonymously(auth).catch(() => {});
+    }
+
+    setDirectClass(classe);
+    setGoogleStudentClass(classe);
     setUser(studentUser);
     setRole("student");
     setActivePane("student");
@@ -495,6 +531,7 @@ export default function App() {
       }
     }
     setUser(null);
+    setGoogleStudentClass("");
     setRole("student");
     setActivePane("home");
   };
@@ -716,12 +753,18 @@ export default function App() {
                             </div>
                             <div className="col-span-2 sm:col-span-1">
                               <label className="block text-[11px] font-bold text-slate-300 uppercase tracking-wider mb-1">
-                                Classe / Sez.
+                                Classe / Sez. *
                               </label>
                               <input
                                 type="text"
+                                required
+                                maxLength={40}
                                 value={directClass}
                                 onChange={(e) => setDirectClass(e.target.value)}
+                                onBlur={() => {
+                                  const norm = normalizeClassLabel(directClass);
+                                  if (norm) setDirectClass(norm);
+                                }}
                                 placeholder="es. 3B"
                                 className="w-full px-3 py-2 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-xl text-white text-xs font-mono uppercase outline-none transition-all placeholder:text-slate-600"
                               />
@@ -756,6 +799,30 @@ export default function App() {
                               </button>
                             </div>
                           </div>
+
+                          <label className="flex items-start gap-2.5 p-2.5 rounded-xl bg-slate-950/60 border border-white/10 text-[11px] text-slate-300 cursor-pointer select-none hover:border-teal-500/30 transition-colors">
+                            <input
+                              type="checkbox"
+                              checked={sharedPcMode}
+                              onChange={(e) => {
+                                const checked = e.target.checked;
+                                setSharedPcMode(checked);
+                                if (checked) {
+                                  try {
+                                    localStorage.removeItem("direct_student_user");
+                                    localStorage.removeItem("saved_student_name");
+                                    localStorage.removeItem("saved_student_surname");
+                                    localStorage.removeItem("saved_student_class");
+                                    localStorage.removeItem("saved_student_email");
+                                  } catch {}
+                                }
+                              }}
+                              className="mt-0.5 rounded accent-teal-400 cursor-pointer"
+                            />
+                            <span>
+                              <b className="text-teal-300">Computer condiviso / aula informatica:</b> non memorizzare nome, classe o sessione dopo la chiusura della scheda.
+                            </span>
+                          </label>
 
                           <button
                             type="submit"
@@ -998,6 +1065,7 @@ export default function App() {
                     <Suspense fallback={<LoadingScreen />}>
                       <StudentView
                         user={user}
+                        initialStudentClass={googleStudentClass || user?.studentClass}
                         onLogout={handleSignOut}
                         onBack={() => setActivePane("home")}
                       />

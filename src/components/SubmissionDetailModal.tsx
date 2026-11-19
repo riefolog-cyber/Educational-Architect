@@ -11,9 +11,11 @@ import {
   ChevronLeft,
   ChevronRight,
   ShieldCheck,
+  GraduationCap,
 } from "lucide-react";
 import { SavedSubmission } from "../types";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
+import { resolveSubmissionClass, normalizeClassLabel, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
 import {
   formatMarkdown,
   isFibAnswerCorrect,
@@ -38,6 +40,8 @@ interface SubmissionDetailModalProps {
   onExportPDF: (sub: SavedSubmission) => void;
   onOpenPrintModal: (sub: SavedSubmission) => void;
   onManualGradeSave: (sub: SavedSubmission, newGradeValue: string) => Promise<void>;
+  onUpdateClass?: (sub: SavedSubmission, newClass: string) => Promise<void>;
+  availableClassSuggestions?: string[];
   onValidateSubmission?: (sub: SavedSubmission) => Promise<void>;
   validatingId?: string | null;
   onRetouchSubjectiveItem: (
@@ -65,6 +69,8 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   onExportPDF,
   onOpenPrintModal,
   onManualGradeSave,
+  onUpdateClass,
+  availableClassSuggestions = [],
   onValidateSubmission,
   validatingId,
   onRetouchSubjectiveItem,
@@ -74,6 +80,9 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 }) => {
   const [gradeEditOpen, setGradeEditOpen] = useState(false);
   const [gradeEditValue, setGradeEditValue] = useState("");
+  const [classEditOpen, setClassEditOpen] = useState(false);
+  const [classEditValue, setClassEditValue] = useState("");
+  const [savingClass, setSavingClass] = useState(false);
   const [editingItemKey, setEditingItemKey] = useState<string | null>(null);
   const [itemScoreInput, setItemScoreInput] = useState("");
   const [itemFeedbackInput, setItemFeedbackInput] = useState("");
@@ -82,6 +91,9 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   useEffect(() => {
     setGradeEditOpen(false);
     setGradeEditValue("");
+    setClassEditOpen(false);
+    setClassEditValue("");
+    setSavingClass(false);
     setEditingItemKey(null);
     setItemScoreInput("");
     setItemFeedbackInput("");
@@ -143,6 +155,21 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
   const evalObj = safeParseJson(submission.Full_Evaluation);
   const blindCode = getSubmissionBlindCode(submission);
+  const resolvedClass = resolveSubmissionClass(submission);
+  const isClassUnspecified = resolvedClass === UNSPECIFIED_CLASS_LABEL;
+
+  const handleSaveClassEdit = async () => {
+    if (!onUpdateClass) return;
+    const norm = normalizeClassLabel(classEditValue);
+    if (!norm) return;
+    setSavingClass(true);
+    try {
+      await onUpdateClass(submission, norm);
+      setClassEditOpen(false);
+    } finally {
+      setSavingClass(false);
+    }
+  };
 
   return (
     <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
@@ -154,6 +181,30 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <p className="text-[10px] font-bold font-mono uppercase text-teal-400">
                 Verbalizzazione Esame Corretto
               </p>
+              <span
+                className={`px-1.5 py-0.5 rounded text-[9px] font-mono font-bold border inline-flex items-center gap-1 ${
+                  isClassUnspecified
+                    ? "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                    : "bg-teal-500/15 text-teal-200 border-teal-500/30"
+                }`}
+              >
+                <GraduationCap className="w-3 h-3" />
+                <span>{isClassUnspecified ? "Classe non spec." : resolvedClass}</span>
+              </span>
+              {onUpdateClass && !classEditOpen && (
+                <button
+                  type="button"
+                  onClick={() => {
+                    setClassEditValue(isClassUnspecified ? "" : resolvedClass);
+                    setClassEditOpen(true);
+                  }}
+                  className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border border-white/10 cursor-pointer flex items-center gap-1"
+                  title="Assegna o correggi la classe di appartenenza"
+                >
+                  <Pencil className="w-2.5 h-2.5" />
+                  <span>{isClassUnspecified ? "Assegna Classe" : "Modifica"}</span>
+                </button>
+              )}
               {submission.Assigned_Fila && (
                 <span className="px-1.5 py-0.5 rounded text-[9px] font-mono font-bold bg-purple-500/15 text-purple-200 border border-purple-500/30">
                   FILA {submission.Assigned_Fila}
@@ -165,6 +216,41 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 </span>
               )}
             </div>
+            {classEditOpen && onUpdateClass && (
+              <div className="mt-2 flex items-center gap-1.5 flex-wrap">
+                <input
+                  type="text"
+                  list="sub-detail-class-suggestions"
+                  value={classEditValue}
+                  onChange={(e) => setClassEditValue(e.target.value.slice(0, 40))}
+                  onKeyDown={(e) => e.key === "Enter" && handleSaveClassEdit()}
+                  placeholder="es. 3A, 4B INF"
+                  className="w-32 px-2 py-1 bg-slate-900 border border-teal-400/50 rounded-lg text-white text-xs font-mono uppercase outline-none"
+                  autoFocus
+                />
+                <datalist id="sub-detail-class-suggestions">
+                  {availableClassSuggestions.map((cls) => (
+                    <option key={cls} value={cls} />
+                  ))}
+                </datalist>
+                <button
+                  type="button"
+                  disabled={savingClass || !normalizeClassLabel(classEditValue)}
+                  onClick={handleSaveClassEdit}
+                  className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white text-[10px] font-bold cursor-pointer flex items-center gap-1"
+                >
+                  <Check className="w-3 h-3" />
+                  <span>{savingClass ? "Salvo..." : "Salva"}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setClassEditOpen(false)}
+                  className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] cursor-pointer"
+                >
+                  Annulla
+                </button>
+              </div>
+            )}
             <h3 className="text-base font-semibold text-white mt-0.5">
               {blindGradingMode ? `Studente ${blindCode}` : submission.Nome}
             </h3>

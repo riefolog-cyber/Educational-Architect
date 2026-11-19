@@ -183,6 +183,51 @@ export function clearScopedExamLock(
   }
 }
 
+export function getScopedStudentClassKey(email: string | null | undefined): string {
+  return `ea_student_class_${normalizeIdentityKey(email)}`;
+}
+
+export function saveScopedStudentClass(
+  email: string | null | undefined,
+  classLabel: string,
+  localStore: StorageLike | null = getDefaultLocalStorage()
+): void {
+  if (!localStore || !email) return;
+  const key = getScopedStudentClassKey(email);
+  const clean = String(classLabel || "").trim().slice(0, 40);
+  try {
+    if (clean) localStore.setItem(key, clean);
+    else localStore.removeItem(key);
+  } catch {}
+}
+
+export function loadScopedStudentClass(
+  email: string | null | undefined,
+  localStore: StorageLike | null = getDefaultLocalStorage(),
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): string {
+  if (!email) return "";
+  const key = getScopedStudentClassKey(email);
+  for (const store of [localStore, sessionStore]) {
+    if (!store) continue;
+    try {
+      const val = String(store.getItem(key) || "").trim();
+      if (val) return val;
+    } catch {}
+  }
+  return "";
+}
+
+export function clearScopedStudentClass(
+  email: string | null | undefined,
+  localStore: StorageLike | null = getDefaultLocalStorage()
+): void {
+  if (!localStore || !email) return;
+  try {
+    localStore.removeItem(getScopedStudentClassKey(email));
+  } catch {}
+}
+
 const SHARED_PC_EXACT_KEYS = [
   "direct_student_user",
   "saved_student_name",
@@ -203,6 +248,7 @@ const SHARED_PC_PREFIXES = [
   "ea_exam_lock_",
   "ea_active_exam_lock_",
   "ea_bes_expiry_",
+  "ea_student_class_",
 ];
 
 /**

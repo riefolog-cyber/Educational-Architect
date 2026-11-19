@@ -18,6 +18,7 @@ import {
   type RoundingMode,
 } from "../utils/gradebookExport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
+import { resolveSubmissionClass, compareClassLabels, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
 import { downloadTextFile } from "../utils/examLibrary";
 import {
   detectGradeDiscrepancy,
@@ -62,6 +63,7 @@ export default function TeacherBulkGradingModal({
   onSaveBulkValidation,
 }: TeacherBulkGradingModalProps) {
   const [selectedPin, setSelectedPin] = useState<string>("ALL");
+  const [selectedClass, setSelectedClass] = useState<string>("ALL");
   const [roundingMode, setRoundingMode] = useState<RoundingMode>("quarters");
   const [preset, setPreset] = useState<GradebookExportPreset>("argo_didup");
   const [onlyValidatedExport, setOnlyValidatedExport] = useState(false);
@@ -88,6 +90,21 @@ export default function TeacherBulkGradingModal({
     });
   }, [submissions, selectedPin]);
 
+  const uniqueClasses = useMemo(() => {
+    const classes = new Set<string>();
+    for (const s of pinFiltered) {
+      classes.add(resolveSubmissionClass(s));
+    }
+    return Array.from(classes).sort(compareClassLabels);
+  }, [pinFiltered]);
+
+  const classFiltered = useMemo(() => {
+    return pinFiltered.filter((s) => {
+      if (selectedClass === "ALL") return true;
+      return resolveSubmissionClass(s) === selectedClass;
+    });
+  }, [pinFiltered, selectedClass]);
+
   const getViolationsCount = (s: SavedSubmission) =>
     Number(s.AntiCopia_TabSwitch || 0) +
     Number(s.AntiCopia_IncollaBloccato || 0) +
@@ -103,18 +120,18 @@ export default function TeacherBulkGradingModal({
     let violations = 0;
     let attention = 0;
     let pending = 0;
-    for (const s of pinFiltered) {
+    for (const s of classFiltered) {
       if (!s.Convalida_Docente_At) unvalidated++;
       if (getViolationsCount(s) > 0) violations++;
       const g = parseItalianGrade(s.Voto_Suggerito);
       if (detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6)) attention++;
       if (isSubPending(s)) pending++;
     }
-    return { all: pinFiltered.length, unvalidated, violations, attention, pending };
-  }, [pinFiltered]);
+    return { all: classFiltered.length, unvalidated, violations, attention, pending };
+  }, [classFiltered]);
 
   const rows = useMemo(() => {
-    return pinFiltered.filter((s) => {
+    return classFiltered.filter((s) => {
       if (quickFilter === "unvalidated") return !s.Convalida_Docente_At;
       if (quickFilter === "violations") return getViolationsCount(s) > 0;
       if (quickFilter === "attention") {
@@ -124,7 +141,7 @@ export default function TeacherBulkGradingModal({
       if (quickFilter === "pending") return isSubPending(s);
       return true;
     });
-  }, [pinFiltered, quickFilter]);
+  }, [classFiltered, quickFilter]);
 
   if (!isOpen) return null;
 
@@ -213,8 +230,12 @@ export default function TeacherBulkGradingModal({
       onlyValidated: onlyValidatedExport,
       gradeOverrides: overrides,
     });
-    const suffix = selectedPin === "ALL" ? "tutte" : selectedPin;
-    downloadTextFile(`registro_${preset}_${suffix}_${new Date().toISOString().slice(0, 10)}.csv`, csv, "text/csv;charset=utf-8");
+    const pinSuffix = selectedPin === "ALL" ? "tutte" : selectedPin;
+    const classSuffix =
+      selectedClass === "ALL"
+        ? ""
+        : `_${selectedClass.replace(/[^a-zA-Z0-9_-]+/g, "_")}`;
+    downloadTextFile(`registro_${preset}_${pinSuffix}${classSuffix}_${new Date().toISOString().slice(0, 10)}.csv`, csv, "text/csv;charset=utf-8");
     setStatusMsg(`📥 Esportato file CSV compatibile ${REGISTER_PRESETS.find((p) => p.id === preset)?.label}.`);
   };
 
@@ -254,7 +275,7 @@ export default function TeacherBulkGradingModal({
         </div>
 
         {/* Controls Bar */}
-        <div className="p-4 sm:p-5 border-b border-white/10 bg-slate-950/40 grid grid-cols-1 lg:grid-cols-3 gap-4 text-xs">
+        <div className="p-4 sm:p-5 border-b border-white/10 bg-slate-950/40 grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-4 gap-3 text-xs">
           {/* Session / PIN filter */}
           <div className="space-y-1.5">
             <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
@@ -264,6 +285,7 @@ export default function TeacherBulkGradingModal({
               value={selectedPin}
               onChange={(e) => {
                 setSelectedPin(e.target.value);
+                setSelectedClass("ALL");
                 setSelectedIds(new Set());
               }}
               className="w-full p-2 bg-slate-950 border border-white/15 rounded-xl text-white outline-none"
@@ -272,6 +294,28 @@ export default function TeacherBulkGradingModal({
               {uniquePins.map((p) => (
                 <option key={p} value={p}>
                   PIN {p} ({submissions.filter((s) => String(s.Pin || "").trim().toUpperCase() === p).length})
+                </option>
+              ))}
+            </select>
+          </div>
+
+          {/* Class filter */}
+          <div className="space-y-1.5">
+            <label className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
+              Filtra per Classe
+            </label>
+            <select
+              value={selectedClass}
+              onChange={(e) => {
+                setSelectedClass(e.target.value);
+                setSelectedIds(new Set());
+              }}
+              className="w-full p-2 bg-slate-950 border border-white/15 rounded-xl text-white outline-none"
+            >
+              <option value="ALL">Tutte le classi ({pinFiltered.length})</option>
+              {uniqueClasses.map((cls) => (
+                <option key={cls} value={cls}>
+                  {cls} ({pinFiltered.filter((s) => resolveSubmissionClass(s) === cls).length})
                 </option>
               ))}
             </select>
@@ -450,6 +494,15 @@ export default function TeacherBulkGradingModal({
                             <p className="font-bold text-white">
                               {blindGradingMode ? `Studente ${code}` : (sub.Nome || "Studente")}
                             </p>
+                            {(() => {
+                              const clsLabel = resolveSubmissionClass(sub);
+                              if (clsLabel === UNSPECIFIED_CLASS_LABEL) return null;
+                              return (
+                                <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-200 border border-teal-500/30">
+                                  {clsLabel}
+                                </span>
+                              );
+                            })()}
                             {sub.Assigned_Fila && (
                               <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ${
                                 sub.Assigned_Fila === "B"

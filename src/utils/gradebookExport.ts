@@ -1,6 +1,7 @@
 import type { SavedSubmission } from "../types";
 import { parseItalianGrade, formatItalianScholasticGrade } from "../utils";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
+import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping";
 
 export type RoundingMode = "exact" | "quarters" | "halves" | "integers";
 export type GradebookExportPreset = "argo_didup" | "axios" | "classeviva" | "standard";
@@ -117,6 +118,7 @@ export function buildElectronicRegisterCsv(
       "Data",
       "Tipo",
       "PIN",
+      "Classe",
       "Fila",
       "Titolo Verifica",
       "Studente",
@@ -138,6 +140,7 @@ export function buildElectronicRegisterCsv(
     const blindCode = getSubmissionBlindCode(sub);
     const displayName = blindMode ? `Studente ${blindCode}` : (sub.Nome || "Studente");
     const displayId = blindMode ? blindCode : (sub.Email || blindCode);
+    const classLabel = resolveSubmissionClass(sub);
     const filaSuffix = sub.Assigned_Fila ? ` [Fila ${sub.Assigned_Fila}]` : "";
     const examTitle = `${sub.Session_Titolo || sub.Tipo || "Verifica"}${filaSuffix}`;
     const dateStr = formatDateIt(sub.Timestamp);
@@ -164,6 +167,7 @@ export function buildElectronicRegisterCsv(
 
     if (preset === "axios") {
       const notes: string[] = [];
+      if (classLabel && classLabel !== UNSPECIFIED_CLASS_LABEL) notes.push(classLabel);
       if (sub.Assigned_Fila) notes.push(`Fila ${sub.Assigned_Fila}`);
       if (oralCount > 0) notes.push(`${oralCount} risp. orali BES`);
       if (violationsCount > 0) notes.push(`${violationsCount} segnalazioni anti-copia`);
@@ -195,6 +199,7 @@ export function buildElectronicRegisterCsv(
       dateStr,
       sub.Tipo || "",
       sub.Pin || "-",
+      classLabel,
       sub.Assigned_Fila ? `Fila ${sub.Assigned_Fila}` : "Unica",
       sub.Session_Titolo || sub.Tipo || "Verifica",
       displayName,

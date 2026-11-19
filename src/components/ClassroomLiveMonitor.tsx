@@ -25,11 +25,13 @@ import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch 
 import { dbFirestore } from "../firebase";
 import type { LiveSessionSummary } from "../types";
 import { deriveStudentPseudonym } from "../utils/privacyPseudonym";
+import { compareClassLabels, normalizeClassLabel } from "../utils/classGrouping";
 
 export interface LiveStudentData {
   id: string;
   studentName: string;
   studentEmail: string;
+  studentClass?: string;
   answeredCount: number;
   totalQuestions: number;
   mcDoneCount?: number;
@@ -46,6 +48,8 @@ export interface LiveStudentData {
   lockedAt?: string;
   teacherNotice?: string;
   teacherNoticeAt?: string;
+  teacherNoticeAckAt?: string;
+  classNoticeAckAt?: string;
   assignedFila?: "A" | "B";
 }
 
@@ -85,6 +89,7 @@ export default function ClassroomLiveMonitor({
   terminatingAll = false,
   togglingSolutionsPin = null
 }: ClassroomLiveMonitorProps) {
+  const cleanPin = (pin || "").trim().toUpperCase();
   const [students, setStudents] = useState<LiveStudentData[]>([]);
   const [loading, setLoading] = useState(true);
   const [snapshotError, setSnapshotError] = useState("");
@@ -104,12 +109,33 @@ export default function ClassroomLiveMonitor({
   const [noticeTargetId, setNoticeTargetId] = useState<string | null>(null);
   const [noticeText, setNoticeText] = useState("");
   const [sendingNotice, setSendingNotice] = useState(false);
+  const [clearingNoticeId, setClearingNoticeId] = useState<string | null>(null);
   const [noticeSentId, setNoticeSentId] = useState<string | null>(null);
+  const [noticeError, setNoticeError] = useState<string | null>(null);
+  const [activeClassNotice, setActiveClassNotice] = useState<{ text: string; at: string; targetClass?: string } | null>(null);
+  const [classNoticeInput, setClassNoticeInput] = useState("");
+  const [classNoticeTargetClass, setClassNoticeTargetClass] = useState<string>("ALL");
+  const [classFilter, setClassFilter] = useState<string>("ALL");
+  const [sendingClassNotice, setSendingClassNotice] = useState(false);
+  const [classNoticeFeedback, setClassNoticeFeedback] = useState<{ type: "success" | "error"; msg: string } | null>(null);
   const [blindLimMode, setBlindLimMode] = useState(false);
   const progressChangedAtRef = useRef<Record<string, { answered: number; changedAt: number }>>({});
 
+  const CLASS_NOTICE_PRESETS = [
+    "Ultimi 5 minuti prima della chiusura!",
+    "Ricontrollate le risposte aperte prima di consegnare.",
+    "Consegna anticipata consentita se avete terminato.",
+    "Silenzio e massima concentrazione.",
+  ];
+  const INDIVIDUAL_NOTICE_PRESETS = [
+    "Controlla le risposte rimaste vuote.",
+    "Mancano 5 minuti al termine della prova.",
+    "Torna subito a schermo intero.",
+    "Approfondisci meglio la risposta aperta.",
+  ];
+
   const getMonitorCode = (s: Pick<LiveStudentData, "id" | "studentEmail">) =>
-    deriveStudentPseudonym(s.studentEmail || s.id || "anonimo", pin || "");
+    deriveStudentPseudonym(s.studentEmail || s.id || "anonimo", cleanPin || "");
   const getMonitorName = (s: Pick<LiveStudentData, "id" | "studentName" | "studentEmail">) =>
     blindLimMode ? `Studente ${getMonitorCode(s)}` : s.studentName;
 
@@ -138,9 +164,46 @@ export default function ClassroomLiveMonitor({
     return () => clearInterval(timer);
   }, []);
 
+  // Listen to active session document (for live classNotice broadcast state)
+  useEffect(() => {
+    setNoticeTargetId(null);
+    setNoticeText("");
+    setNoticeError(null);
+    setClassNoticeFeedback(null);
+    setClassNoticeTargetClass("ALL");
+    setClassFilter("ALL");
+    if (!dbFirestore || !cleanPin) {
+      setActiveClassNotice(null);
+      setClassNoticeInput("");
+      return;
+    }
+    const unsubSession = onSnapshot(
+      doc(dbFirestore, "active_sessions", cleanPin),
+      (snap) => {
+        if (!snap.exists()) {
+          setActiveClassNotice(null);
+          return;
+        }
+        const d = snap.data();
+        const text = typeof d?.classNotice === "string" ? d.classNotice.trim() : "";
+        const at = typeof d?.classNoticeAt === "string" ? d.classNoticeAt : "";
+        const targetClass = normalizeClassLabel(d?.classNoticeTargetClass) || undefined;
+        if (text && at) {
+          setActiveClassNotice({ text, at, targetClass });
+        } else {
+          setActiveClassNotice(null);
+        }
+      },
+      (err) => {
+        console.warn("Session broadcast snapshot error:", err);
+      }
+    );
+    return () => unsubSession();
+  }, [cleanPin]);
+
   // Listen to Firestore real-time collection of live students in this session
   useEffect(() => {
-    if (!dbFirestore || !pin) {
+    if (!dbFirestore || !cleanPin) {
       setStudents([]);
       setLoading(false);
       return;
@@ -148,7 +211,7 @@ export default function ClassroomLiveMonitor({
 
     setLoading(true);
     setSnapshotError("");
-    const liveColRef = collection(dbFirestore, "active_sessions", pin, "live_students");
+    const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
     const unsubscribe = onSnapshot(
       liveColRef,
       (snapshot) => {
@@ -165,6 +228,7 @@ export default function ClassroomLiveMonitor({
             id: docSnap.id,
             studentName: data.studentName || "Studente",
             studentEmail: data.studentEmail || "",
+            studentClass: typeof data.studentClass === "string" ? data.studentClass : undefined,
             answeredCount: ansCount,
             totalQuestions: Number(data.totalQuestions) || 1,
             mcDoneCount: typeof data.mcDoneCount === "number" ? data.mcDoneCount : undefined,
@@ -180,6 +244,8 @@ export default function ClassroomLiveMonitor({
             lockedAt: data.lockedAt || "",
             teacherNotice: typeof data.teacherNotice === "string" ? data.teacherNotice : undefined,
             teacherNoticeAt: typeof data.teacherNoticeAt === "string" ? data.teacherNoticeAt : undefined,
+            teacherNoticeAckAt: typeof data.teacherNoticeAckAt === "string" ? data.teacherNoticeAckAt : undefined,
+            classNoticeAckAt: typeof data.classNoticeAckAt === "string" ? data.classNoticeAckAt : undefined,
             assignedFila: data.assignedFila === "A" || data.assignedFila === "B" ? data.assignedFila : undefined,
           });
         });
@@ -207,7 +273,7 @@ export default function ClassroomLiveMonitor({
     );
 
     return () => unsubscribe();
-  }, [pin]);
+  }, [cleanPin]);
 
   const secondsSince = (isoString: string) => {
     const ts = Date.parse(isoString);
@@ -258,14 +324,66 @@ export default function ClassroomLiveMonitor({
     return `${Math.floor(diffSec / 60)}m fa`;
   };
 
+  const distinctClasses = useMemo(() => {
+    const clsSet = new Set<string>();
+    for (const s of students) {
+      const c = normalizeClassLabel(s.studentClass);
+      if (c) clsSet.add(c);
+    }
+    return Array.from(clsSet).sort(compareClassLabels);
+  }, [students]);
+
+  // Ensure stale class targets/filters never remain stuck when switching sessions or after room changes
+  useEffect(() => {
+    if (distinctClasses.length <= 1 || (classNoticeTargetClass !== "ALL" && !distinctClasses.includes(classNoticeTargetClass))) {
+      setClassNoticeTargetClass("ALL");
+    }
+    if (classFilter !== "ALL" && !distinctClasses.includes(classFilter)) {
+      setClassFilter("ALL");
+    }
+  }, [distinctClasses, classNoticeTargetClass, classFilter]);
+
+  const classBreakdown = useMemo(() => {
+    return distinctClasses.map((cls) => {
+      const members = resolvedStudents.filter((s) => normalizeClassLabel(s.studentClass) === cls);
+      const activeOrSubmitted = members.filter((s) => s.status !== "offline" || s.locked);
+      const submitted = members.filter((s) => s.status === "submitted").length;
+      const locked = members.filter((s) => s.locked).length;
+      return {
+        className: cls,
+        connected: activeOrSubmitted.length,
+        submitted,
+        locked,
+      };
+    });
+  }, [distinctClasses, resolvedStudents]);
+
+  const classNoticeAckStats = useMemo(() => {
+    if (!activeClassNotice) return null;
+    const targetCls = normalizeClassLabel(activeClassNotice.targetClass);
+    const recipients = resolvedStudents.filter((s) => {
+      if (s.status === "offline" && !s.locked) return false;
+      if (!targetCls) return true;
+      return normalizeClassLabel(s.studentClass) === targetCls;
+    });
+    const acked = recipients.filter(
+      (s) => s.classNoticeAckAt && s.classNoticeAckAt >= activeClassNotice.at
+    ).length;
+    return { acked, total: recipients.length };
+  }, [activeClassNotice, resolvedStudents]);
+
   // Filter and prioritize students (locked students first so teacher sees them immediately)
   const filteredStudents = resolvedStudents
     .filter((s) => {
+      if (classFilter !== "ALL" && normalizeClassLabel(s.studentClass) !== classFilter) {
+        return false;
+      }
       const q = search.toLowerCase().trim();
       const matchesSearch = !q || (blindLimMode
         ? getMonitorCode(s).toLowerCase().includes(q)
         : s.studentName.toLowerCase().includes(q) ||
           s.studentEmail.toLowerCase().includes(q) ||
+          (s.studentClass || "").toLowerCase().includes(q) ||
           getMonitorCode(s).toLowerCase().includes(q));
 
       if (!matchesSearch) return false;
@@ -274,7 +392,7 @@ export default function ClassroomLiveMonitor({
       if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
       if (filter === "submitted") return s.status === "submitted";
       if (filter === "alerts") return s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0;
-      return s.status !== "offline" || s.locked;
+      return s.status !== "offline" || s.locked || s.id === noticeTargetId;
     })
     .sort((a, b) => {
       // 1. Locked students always float to the top
@@ -327,10 +445,10 @@ export default function ClassroomLiveMonitor({
   // Remote unlock: the student app listens for a new remoteUnlockId on its own
   // live_students document and drops the blocking overlay as soon as it changes.
   const handleRemoteUnlock = async (studentId: string) => {
-    if (!dbFirestore || !pin || unlockingId) return;
+    if (!dbFirestore || !cleanPin || unlockingId) return;
     setUnlockingId(studentId);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId), {
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
         remoteUnlockId: `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         lockState: "unlocked",
         locked: false,
@@ -347,7 +465,7 @@ export default function ClassroomLiveMonitor({
 
   // Batch remote unlock: unlocks all locked students in the classroom at once with 1 click
   const handleUnlockAll = async () => {
-    if (!dbFirestore || !pin || unlockingAll) return;
+    if (!dbFirestore || !cleanPin || unlockingAll) return;
     const lockedStudents = students.filter(s => s.locked);
     if (lockedStudents.length === 0) return;
 
@@ -357,7 +475,7 @@ export default function ClassroomLiveMonitor({
       const baseUnlockId = `u_all_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       await Promise.all(
         lockedStudents.map((s) =>
-          updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", s.id), {
+          updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", s.id), {
             remoteUnlockId: `${baseUnlockId}_${s.id}`,
             lockState: "unlocked",
             locked: false,
@@ -377,10 +495,10 @@ export default function ClassroomLiveMonitor({
   const [removingId, setRemovingId] = useState<string | null>(null);
 
   const handleRemoveStudent = async (studentId: string) => {
-    if (!dbFirestore || !pin || removingId) return;
+    if (!dbFirestore || !cleanPin || removingId) return;
     setRemovingId(studentId);
     try {
-      await deleteDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId));
+      await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId));
     } catch (err) {
       console.warn("Rimozione studente non riuscita:", err);
     } finally {
@@ -389,22 +507,117 @@ export default function ClassroomLiveMonitor({
   };
 
   const handleSendNotice = async (studentId: string) => {
-    const clean = noticeText.trim();
-    if (!dbFirestore || !pin || !clean || sendingNotice) return;
+    const clean = noticeText.trim().slice(0, 280);
+    if (!dbFirestore || !cleanPin || !clean || sendingNotice) return;
     setSendingNotice(true);
+    setNoticeError(null);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", pin, "live_students", studentId), {
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
         teacherNotice: clean,
         teacherNoticeAt: new Date().toISOString(),
       });
       setNoticeTargetId(null);
       setNoticeText("");
       setNoticeSentId(studentId);
-      scheduleTimer(() => setNoticeSentId((prev) => (prev === studentId ? null : prev)), 3500);
-    } catch (err) {
+      scheduleTimer(() => setNoticeSentId((prev) => (prev === studentId ? null : prev)), 4000);
+    } catch (err: any) {
       console.warn("Invio avviso studente non riuscito:", err);
+      const errMsg = err?.code === "permission-denied"
+        ? "Invio messaggio bloccato dalle regole Firestore (permessi insufficienti o campo non consentito)."
+        : `Impossibile inviare l'avviso allo studente: ${err?.message || "errore di rete"}`;
+      setNoticeError(errMsg);
+      scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 6000);
     } finally {
       setSendingNotice(false);
+    }
+  };
+
+  const handleClearNotice = async (studentId: string) => {
+    if (!dbFirestore || !cleanPin || clearingNoticeId) return;
+    setClearingNoticeId(studentId);
+    setNoticeError(null);
+    try {
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
+        teacherNotice: "",
+        teacherNoticeAt: "",
+      });
+      if (noticeTargetId === studentId) {
+        setNoticeTargetId(null);
+        setNoticeText("");
+      }
+    } catch (err: any) {
+      console.warn("Rimozione avviso studente non riuscita:", err);
+      const errMsg = `Impossibile rimuovere l'avviso: ${err?.message || "errore"}`;
+      setNoticeError(errMsg);
+      scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 5000);
+    } finally {
+      setClearingNoticeId(null);
+    }
+  };
+
+  const handleSendClassNotice = async (e?: React.FormEvent) => {
+    e?.preventDefault();
+    const clean = classNoticeInput.trim().slice(0, 280);
+    if (!dbFirestore || !cleanPin || !clean || sendingClassNotice) return;
+    setSendingClassNotice(true);
+    setClassNoticeFeedback(null);
+    const effectiveTarget = distinctClasses.length > 1 ? classNoticeTargetClass : "ALL";
+    const targetCls = effectiveTarget === "ALL" ? "" : normalizeClassLabel(effectiveTarget);
+    try {
+      const nowIso = new Date().toISOString();
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+        classNotice: clean,
+        classNoticeAt: nowIso,
+        classNoticeTargetClass: targetCls,
+      });
+      setActiveClassNotice({ text: clean, at: nowIso, targetClass: targetCls || undefined });
+      setClassNoticeInput("");
+      setClassNoticeFeedback({
+        type: "success",
+        msg: targetCls
+          ? `Avviso trasmesso in tempo reale alla classe ${targetCls} ✓`
+          : "Avviso trasmesso in tempo reale a tutta la classe ✓",
+      });
+      scheduleTimer(() => setClassNoticeFeedback(null), 4000);
+    } catch (err: any) {
+      console.warn("Invio avviso alla classe non riuscito:", err);
+      setClassNoticeFeedback({
+        type: "error",
+        msg:
+          err?.code === "permission-denied"
+            ? "Invio bloccato dalle regole Firestore (verifica permessi sessione)."
+            : `Impossibile inviare l'avviso alla classe: ${err?.message || "errore"}`,
+      });
+      scheduleTimer(() => setClassNoticeFeedback(null), 6000);
+    } finally {
+      setSendingClassNotice(false);
+    }
+  };
+
+  const handleClearClassNotice = async () => {
+    if (!dbFirestore || !cleanPin || sendingClassNotice) return;
+    setSendingClassNotice(true);
+    setClassNoticeFeedback(null);
+    try {
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+        classNotice: "",
+        classNoticeAt: "",
+        classNoticeTargetClass: "",
+      });
+      setActiveClassNotice(null);
+      setClassNoticeFeedback({
+        type: "success",
+        msg: "Avviso di classe rimosso ✓",
+      });
+      scheduleTimer(() => setClassNoticeFeedback(null), 3500);
+    } catch (err: any) {
+      console.warn("Rimozione avviso classe non riuscita:", err);
+      setClassNoticeFeedback({
+        type: "error",
+        msg: `Impossibile rimuovere l'avviso: ${err?.message || "errore"}`,
+      });
+    } finally {
+      setSendingClassNotice(false);
     }
   };
 
@@ -510,11 +723,18 @@ export default function ClassroomLiveMonitor({
                   >
                     <div className="flex items-center justify-between gap-2 pr-7">
                       <span className="font-mono font-bold text-sm text-white">PIN {s.pin}</span>
-                      {selected && (
-                        <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/25 text-indigo-200 font-bold uppercase">
-                          In monitoraggio
-                        </span>
-                      )}
+                      <div className="flex items-center gap-1">
+                        {s.targetClass && (
+                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-teal-500/20 text-teal-200 border border-teal-500/30 font-bold uppercase">
+                            {s.targetClass}
+                          </span>
+                        )}
+                        {(s.pin || "").trim().toUpperCase() === cleanPin && (
+                          <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/25 text-indigo-200 font-bold uppercase">
+                            In monitoraggio
+                          </span>
+                        )}
+                      </div>
                     </div>
                     <p className="text-[11px] text-slate-300 truncate">{s.title}</p>
                     {s.expiry && (
@@ -696,6 +916,22 @@ export default function ClassroomLiveMonitor({
         </div>
       )}
 
+      {noticeError && (
+        <div className="p-3 rounded-2xl bg-red-500/15 border border-red-500/40 text-red-200 text-xs flex items-center justify-between gap-2 animate-fadeIn">
+          <div className="flex items-start gap-2">
+            <AlertTriangle className="w-4 h-4 shrink-0 text-red-400 mt-0.5" />
+            <span>{noticeError}</span>
+          </div>
+          <button
+            type="button"
+            onClick={() => setNoticeError(null)}
+            className="p-1 text-red-300 hover:text-white cursor-pointer"
+          >
+            <X className="w-3.5 h-3.5" />
+          </button>
+        </div>
+      )}
+
       {/* Top Banner with PIN & Status */}
       <div className="p-4 sm:p-5 rounded-2xl bg-slate-900/80 border border-indigo-500/20 shadow-xl flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
@@ -704,10 +940,10 @@ export default function ClassroomLiveMonitor({
               <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
               <span className="relative inline-flex rounded-full h-3 w-3 bg-emerald-500"></span>
             </span>
-            <h3 className="text-base font-bold text-white flex items-center gap-2">
+            <h3 className="text-base font-bold text-white flex items-center gap-2 flex-wrap">
               <span>Monitoraggio Live dell'Aula</span>
               <span className="text-xs px-2.5 py-0.5 rounded-lg bg-indigo-500/20 text-indigo-300 font-mono font-bold border border-indigo-500/30">
-                PIN: {pin || "—"}
+                PIN: {cleanPin || "—"}
               </span>
             </h3>
           </div>
@@ -718,7 +954,7 @@ export default function ClassroomLiveMonitor({
 
         <div className="flex items-center gap-2 flex-wrap">
           {(() => {
-            const activeMonitoredSession = sessions.find((s) => s.pin === pin);
+            const activeMonitoredSession = sessions.find((s) => (s.pin || "").trim().toUpperCase() === cleanPin);
             if (!activeMonitoredSession?.deferSolutions || !onToggleSolutionsReleased) return null;
             const released = !!activeMonitoredSession.solutionsReleased;
             const isBusy = togglingSolutionsPin === activeMonitoredSession.pin;
@@ -870,6 +1106,116 @@ export default function ClassroomLiveMonitor({
           )}
         </div>
       </div>
+
+      {/* Broadcast Live Message to Whole Class */}
+      {cleanPin && (
+        <div className="p-4 rounded-2xl bg-indigo-950/35 border border-indigo-500/25 space-y-2.5">
+          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+            <div className="flex items-center gap-2">
+              <MessageSquare className="w-4 h-4 text-indigo-400 shrink-0" />
+              <div>
+                <p className="text-xs font-bold text-white">Avviso in Tempo Reale a Tutta la Classe</p>
+                <p className="text-[11px] text-slate-400">
+                  Il messaggio appare istantaneamente in sovrimpressione sui dispositivi di tutti gli alunni connessi al PIN {cleanPin}.
+                </p>
+              </div>
+            </div>
+            {activeClassNotice && (
+              <button
+                type="button"
+                onClick={handleClearClassNotice}
+                disabled={sendingClassNotice}
+                className="px-2.5 py-1 rounded-lg bg-white/5 hover:bg-red-500/20 border border-white/10 hover:border-red-500/40 text-[11px] font-semibold text-slate-300 hover:text-red-200 cursor-pointer transition-colors shrink-0 self-start sm:self-auto"
+              >
+                Rimuovi avviso classe
+              </button>
+            )}
+          </div>
+
+          {activeClassNotice && (
+            <div className="p-2.5 rounded-xl bg-indigo-500/15 border border-indigo-400/35 text-xs text-indigo-100 flex items-center justify-between gap-2 flex-wrap">
+              <span className="truncate flex-1 min-w-[200px]">
+                <b className="text-indigo-300">
+                  {activeClassNotice.targetClass ? `Attivo (${activeClassNotice.targetClass}):` : "Attivo ora:"}
+                </b>{" "}
+                {blindLimMode ? "Avviso alla classe attivo (nascosto in LIM Cieca)" : activeClassNotice.text}
+              </span>
+              <div className="flex items-center gap-2 shrink-0">
+                {classNoticeAckStats && classNoticeAckStats.total > 0 && (
+                  <span
+                    className="px-2 py-0.5 rounded-md bg-emerald-500/20 border border-emerald-500/35 text-emerald-200 font-mono text-[10px] font-bold"
+                    title="Studenti che hanno confermato la lettura dell'avviso collettivo"
+                  >
+                    ✓ Letto da {classNoticeAckStats.acked}/{classNoticeAckStats.total}
+                  </span>
+                )}
+                <span className="text-[10px] text-indigo-300 font-mono">
+                  {getRelativeTime(activeClassNotice.at)}
+                </span>
+              </div>
+            </div>
+          )}
+
+          {/* 1-click quick notice presets */}
+          <div className="flex items-center gap-1.5 flex-wrap">
+            <span className="text-[10px] uppercase font-bold text-indigo-300/80 mr-1">Rapidi:</span>
+            {CLASS_NOTICE_PRESETS.map((presetText) => (
+              <button
+                key={presetText}
+                type="button"
+                onClick={() => setClassNoticeInput(presetText)}
+                className="px-2 py-1 rounded-lg bg-slate-950/70 hover:bg-indigo-600/25 border border-indigo-400/20 hover:border-indigo-400/50 text-[10px] text-slate-300 hover:text-white transition-colors cursor-pointer"
+              >
+                {presetText}
+              </button>
+            ))}
+          </div>
+
+          <form onSubmit={handleSendClassNotice} className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2">
+            {distinctClasses.length > 1 && (
+              <select
+                value={classNoticeTargetClass}
+                onChange={(e) => setClassNoticeTargetClass(e.target.value)}
+                className="px-2.5 py-2 text-xs bg-slate-950/90 border border-indigo-400/30 rounded-xl text-teal-200 font-mono font-bold outline-none shrink-0 cursor-pointer"
+                title="Invia a tutti o solo a una classe specifica"
+              >
+                <option value="ALL">Tutte le classi</option>
+                {distinctClasses.map((cls) => (
+                  <option key={cls} value={cls}>
+                    Solo {cls}
+                  </option>
+                ))}
+              </select>
+            )}
+            <input
+              type="text"
+              value={classNoticeInput}
+              onChange={(e) => setClassNoticeInput(e.target.value)}
+              placeholder="Es. 'Ultimi 10 minuti prima della consegna automatica!' oppure 'Attenzione al quesito 4...'"
+              maxLength={280}
+              className="flex-1 px-3 py-2 text-xs bg-slate-950/90 border border-indigo-400/30 focus:border-indigo-400 rounded-xl text-white outline-none"
+            />
+            <button
+              type="submit"
+              disabled={sendingClassNotice || !classNoticeInput.trim()}
+              className="px-4 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-500 text-white text-xs font-bold flex items-center justify-center gap-1.5 cursor-pointer disabled:opacity-50 shrink-0 transition-colors"
+            >
+              {sendingClassNotice ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <Send className="w-3.5 h-3.5" />}
+              <span>{sendingClassNotice ? "Invio..." : classNoticeTargetClass !== "ALL" && distinctClasses.length > 1 ? `Invia a ${classNoticeTargetClass}` : "Invia a tutta la classe"}</span>
+            </button>
+          </form>
+
+          {classNoticeFeedback && (
+            <p
+              className={`text-[11px] font-semibold ${
+                classNoticeFeedback.type === "success" ? "text-emerald-300" : "text-red-300"
+              }`}
+            >
+              {classNoticeFeedback.msg}
+            </p>
+          )}
+        </div>
+      )}
 
       {/* Banner if any student is currently locked */}
       {students.some((s) => s.locked) && (() => {
@@ -1092,7 +1438,7 @@ export default function ClassroomLiveMonitor({
             placeholder={
               blindLimMode
                 ? "Cerca codice anonimo (es. STU-7K4M9P)..."
-                : "Cerca alunno per nome o cognome..."
+                : "Cerca alunno per nome, cognome o classe..."
             }
             value={search}
             onChange={(e) => setSearch(e.target.value)}
@@ -1140,6 +1486,51 @@ export default function ClassroomLiveMonitor({
           ))}
         </div>
       </div>
+
+      {/* Multi-class quick filter & per-class delivery progress bar */}
+      {distinctClasses.length > 1 && (
+        <div className="p-3 rounded-2xl bg-slate-950/60 border border-teal-500/20 flex items-center gap-2 flex-wrap">
+          <span className="text-[10px] uppercase font-bold text-teal-300 tracking-wider mr-1">
+            Classi in aula ({distinctClasses.length}):
+          </span>
+          <button
+            type="button"
+            onClick={() => setClassFilter("ALL")}
+            className={`px-2.5 py-1 rounded-xl text-[11px] font-bold cursor-pointer transition-all ${
+              classFilter === "ALL"
+                ? "bg-teal-500 text-slate-950 shadow-sm"
+                : "bg-slate-900 text-slate-300 hover:text-white border border-white/10"
+            }`}
+          >
+            Tutte ({connectedCount})
+          </button>
+          {classBreakdown.map((cb) => (
+            <button
+              key={cb.className}
+              type="button"
+              onClick={() => setClassFilter(classFilter === cb.className ? "ALL" : cb.className)}
+              className={`px-2.5 py-1 rounded-xl text-[11px] font-mono font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+                classFilter === cb.className
+                  ? "bg-teal-500 text-slate-950 shadow-sm"
+                  : "bg-slate-900 text-teal-200 hover:text-white border border-teal-500/25"
+              }`}
+              title={`Filtra monitor su ${cb.className} • Consegnati: ${cb.submitted}/${cb.connected}`}
+            >
+              <span>{cb.className}</span>
+              <span className={`text-[10px] px-1.5 py-0.2 rounded ${
+                classFilter === cb.className ? "bg-slate-950/20 text-slate-950" : "bg-white/5 text-slate-300"
+              }`}>
+                {cb.submitted}/{cb.connected} cons.
+              </span>
+              {cb.locked > 0 && (
+                <span className="text-[9px] px-1 rounded bg-red-500 text-white font-bold">
+                  {cb.locked} 🔒
+                </span>
+              )}
+            </button>
+          ))}
+        </div>
+      )}
 
       {/* Students Live List */}
       <div className="bg-slate-900/50 border border-white/10 rounded-2xl overflow-hidden">
@@ -1227,6 +1618,11 @@ export default function ClassroomLiveMonitor({
                             <span className={blindLimMode ? "font-mono text-amber-300" : ""}>
                               {getMonitorName(student)}
                             </span>
+                            {student.studentClass && (
+                              <span className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-teal-500/15 text-teal-200 border border-teal-500/30">
+                                {student.studentClass}
+                              </span>
+                            )}
                             {student.assignedFila && (
                               <span className={`text-[9px] font-mono font-bold px-1.5 py-0.5 rounded border ${
                                 student.assignedFila === "B"
@@ -1278,6 +1674,37 @@ export default function ClassroomLiveMonitor({
                           <p className="text-[10px] text-slate-400 font-mono mt-0.5">
                             {blindLimMode ? "• Identità nascosta (Modalità LIM) •" : student.studentEmail}
                           </p>
+                          {student.teacherNotice && (
+                            <p
+                              className="text-[10px] text-indigo-300 mt-1 flex items-center gap-1.5 truncate max-w-xs"
+                              title={blindLimMode ? "Avviso personale inviato" : student.teacherNotice}
+                            >
+                              <MessageSquare className="w-3 h-3 shrink-0" />
+                              <span className="truncate">
+                                {blindLimMode
+                                  ? "Avviso docente attivo (LIM Cieca)"
+                                  : `Avviso inviato: “${student.teacherNotice}”`}
+                              </span>
+                              {student.teacherNoticeAckAt &&
+                                student.teacherNoticeAt &&
+                                student.teacherNoticeAckAt >= student.teacherNoticeAt && (
+                                  <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 border border-emerald-500/35 text-emerald-300 font-mono text-[9px] font-bold shrink-0">
+                                    ✓ Letto
+                                  </span>
+                                )}
+                            </p>
+                          )}
+                          {activeClassNotice &&
+                            student.classNoticeAckAt &&
+                            student.classNoticeAckAt >= activeClassNotice.at &&
+                            (!activeClassNotice.targetClass ||
+                              normalizeClassLabel(student.studentClass) === activeClassNotice.targetClass) && (
+                              <p className="text-[10px] text-teal-300 mt-0.5 flex items-center gap-1">
+                                <span className="px-1.5 py-0.2 rounded bg-teal-500/20 border border-teal-500/35 text-teal-200 font-mono text-[9px] font-bold">
+                                  ✓ Letto avviso classe
+                                </span>
+                              </p>
+                            )}
                         </div>
                       </div>
 
@@ -1287,7 +1714,11 @@ export default function ClassroomLiveMonitor({
                           <AlertCircle className="w-3.5 h-3.5 text-red-400 shrink-0 mt-0.5" />
                           <div>
                             <span className="font-bold text-red-300">Motivo del blocco: </span>
-                            <span className="text-red-100">{student.lockReason || "Perdita di focus dalla finestra o uscita schermo intero"}</span>
+                            <span className="text-red-100">
+                              {blindLimMode
+                                ? "Dettaglio nascosto (Modalità LIM Cieca attiva)"
+                                : (student.lockReason || "Perdita di focus dalla finestra o uscita schermo intero")}
+                            </span>
                             {student.lockedAt && (
                               <span className="text-[10px] text-red-300/80 font-mono ml-2">
                                 (bloccato da {getRelativeTime(student.lockedAt)})
@@ -1436,43 +1867,69 @@ export default function ClassroomLiveMonitor({
                   </div>
 
                   {noticeTargetId === student.id && (
-                    <form
-                      onSubmit={(e) => {
-                        e.preventDefault();
-                        handleSendNotice(student.id);
-                      }}
-                      className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2 pt-2 border-t border-white/10"
-                    >
-                      <input
-                        type="text"
-                        value={noticeText}
-                        onChange={(e) => setNoticeText(e.target.value)}
-                        placeholder={`Scrivi un avviso rapido a ${getMonitorName(student)} (es. 'Mancano 5 minuti, procedi alla consegna')...`}
-                        maxLength={240}
-                        autoFocus
-                        className="flex-1 px-3 py-1.5 text-xs bg-slate-950 border border-indigo-400/40 focus:border-indigo-400 rounded-lg text-white outline-none"
-                      />
-                      <div className="flex items-center gap-1.5 shrink-0">
-                        <button
-                          type="submit"
-                          disabled={sendingNotice || !noticeText.trim()}
-                          className="px-3 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
-                        >
-                          <Send className="w-3 h-3" />
-                          <span>{sendingNotice ? "Invio..." : "Invia"}</span>
-                        </button>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setNoticeTargetId(null);
-                            setNoticeText("");
-                          }}
-                          className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 cursor-pointer"
-                        >
-                          <X className="w-3.5 h-3.5" />
-                        </button>
+                    <div className="space-y-2 pt-2 border-t border-white/10">
+                      <div className="flex items-center gap-1.5 flex-wrap">
+                        <span className="text-[9px] uppercase font-bold text-indigo-300/80">Rapidi:</span>
+                        {INDIVIDUAL_NOTICE_PRESETS.map((p) => (
+                          <button
+                            key={p}
+                            type="button"
+                            onClick={() => setNoticeText(p)}
+                            className="px-2 py-0.5 rounded-md bg-slate-950 hover:bg-indigo-600/25 border border-indigo-400/20 text-[10px] text-slate-300 hover:text-white cursor-pointer"
+                          >
+                            {p}
+                          </button>
+                        ))}
                       </div>
-                    </form>
+                      <form
+                        onSubmit={(e) => {
+                          e.preventDefault();
+                          handleSendNotice(student.id);
+                        }}
+                        className="flex flex-col sm:flex-row items-stretch sm:items-center gap-2"
+                      >
+                        <input
+                          type="text"
+                          value={noticeText}
+                          onChange={(e) => setNoticeText(e.target.value)}
+                          placeholder={`Scrivi un avviso rapido a ${getMonitorName(student)} (es. 'Mancano 5 minuti, procedi alla consegna')...`}
+                          maxLength={280}
+                          autoFocus
+                          className="flex-1 px-3 py-1.5 text-xs bg-slate-950 border border-indigo-400/40 focus:border-indigo-400 rounded-lg text-white outline-none"
+                        />
+                        <div className="flex items-center gap-1.5 shrink-0">
+                          <button
+                            type="submit"
+                            disabled={sendingNotice || !noticeText.trim()}
+                            className="px-3 py-1.5 rounded-lg bg-indigo-500 hover:bg-indigo-400 text-white text-[11px] font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-50"
+                          >
+                            <Send className="w-3 h-3" />
+                            <span>{sendingNotice ? "Invio..." : "Invia"}</span>
+                          </button>
+                          {student.teacherNotice && (
+                            <button
+                              type="button"
+                              onClick={() => handleClearNotice(student.id)}
+                              disabled={clearingNoticeId === student.id || sendingNotice}
+                              title="Rimuovi l'avviso dallo schermo dello studente"
+                              className="px-2.5 py-1.5 rounded-lg bg-red-500/15 hover:bg-red-500/25 text-red-300 text-[11px] font-semibold cursor-pointer disabled:opacity-50"
+                            >
+                              {clearingNoticeId === student.id ? "..." : "Rimuovi"}
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setNoticeTargetId(null);
+                              setNoticeText("");
+                            }}
+                            className="p-1.5 rounded-lg text-slate-400 hover:text-white hover:bg-white/5 cursor-pointer"
+                          >
+                            <X className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      </form>
+                    </div>
                   )}
                 </div>
               );

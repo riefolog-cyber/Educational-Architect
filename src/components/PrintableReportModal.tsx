@@ -3,6 +3,7 @@ import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
 import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
+import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
 
 interface PrintableReportModalProps {
   isOpen: boolean;
@@ -49,6 +50,8 @@ export default function PrintableReportModal({
   if (!isOpen || !submission) return null;
 
   const blindCode = getSubmissionBlindCode(submission);
+  const resolvedClass = resolveSubmissionClass(submission);
+  const classDisplay = resolvedClass === UNSPECIFIED_CLASS_LABEL ? "Non specificata" : resolvedClass;
   const displayStudentName = blindGradingMode
     ? `Studente ${blindCode}`
     : (submission.Nome || "Studente");
@@ -142,10 +145,14 @@ export default function PrintableReportModal({
             </div>
 
             {/* General Info Grid */}
-            <div className="grid grid-cols-2 sm:grid-cols-4 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
+            <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 p-4 bg-slate-50 rounded-xl border border-slate-200">
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Studente / Candidato</span>
                 <span className="text-xs font-bold text-slate-900 block">{displayStudentName}</span>
+              </div>
+              <div>
+                <span className="text-[9px] uppercase font-bold text-slate-500 block">Classe / Sezione</span>
+                <span className="text-xs font-mono font-bold text-slate-900 block">{classDisplay}</span>
               </div>
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">

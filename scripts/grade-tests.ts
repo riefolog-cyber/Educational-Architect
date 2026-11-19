@@ -37,6 +37,9 @@ import {
   saveScopedExamLock,
   loadScopedExamLock,
   clearScopedExamLock,
+  saveScopedStudentClass,
+  loadScopedStudentClass,
+  clearScopedStudentClass,
   wipeSharedPcStudentStorage,
   type StorageLike,
 } from "../src/utils/clientStorage";
@@ -46,6 +49,14 @@ import {
   sanitizeCsvCell,
   buildElectronicRegisterCsv,
 } from "../src/utils/gradebookExport";
+import {
+  normalizeClassLabel,
+  extractClassFromStudentName,
+  resolveSubmissionClass,
+  buildClassSummaries,
+  parseAllowedClassList,
+  UNSPECIFIED_CLASS_LABEL,
+} from "../src/utils/classGrouping";
 import { SavedSubmission } from "../src/types";
 
 let passed = 0;
@@ -1064,6 +1075,18 @@ test("gradebookExport: arrotondamenti italiani, protezione CSV formula injection
   });
   assert.ok(classeVivaCsv.includes("Cognome e Nome / Codice"));
   assert.ok(classeVivaCsv.includes("Mario Rossi"));
+
+  const standardCsv = buildElectronicRegisterCsv(
+    [{ ...sampleSub, Classe: "3A", Email: "mario.rossi@scuola.it" }],
+    {
+      preset: "standard",
+      roundingMode: "exact",
+      blindMode: false,
+      onlyValidated: false,
+    }
+  );
+  assert.ok(standardCsv.includes("Classe"));
+  assert.ok(standardCsv.includes("3A"));
 });
 
 test("BES reduceDistractors (4 -> 3 opzioni) preserva il grading esatto dopo restoreExamAnswers", () => {
@@ -1181,5 +1204,216 @@ test("computeExamItemAnalysisByFila: separa Fila A e Fila B mantenendo il riepil
   assert.equal(byFila.filaB?.mcStats[0].needsReview, true);
 });
 
+test("classGrouping: normalizeClassLabel, extractClassFromStudentName, resolveSubmissionClass", () => {
+  assert.equal(normalizeClassLabel(" 3ª a "), "3A");
+  assert.equal(normalizeClassLabel("4 b inf"), "4B INF");
+  assert.equal(normalizeClassLabel("  (5° c) "), "5C");
+  assert.equal(normalizeClassLabel("N/D"), "");
+  assert.equal(normalizeClassLabel(UNSPECIFIED_CLASS_LABEL), "");
+
+  assert.equal(extractClassFromStudentName("Mario Rossi (3a)"), "3A");
+  assert.equal(extractClassFromStudentName("Giulia Bianchi (4 B INF)"), "4B INF");
+  assert.equal(extractClassFromStudentName("Luigi Verdi (BES)"), "");
+  assert.equal(extractClassFromStudentName("Anna Neri (Fila A)"), "");
+  assert.equal(extractClassFromStudentName("Paolo Rossi"), "");
+
+  assert.equal(resolveSubmissionClass({ Classe: "2c", Nome: "Luca (1A)" }), "2C");
+  assert.equal(resolveSubmissionClass({ Nome: "Luca (1a)" }), "1A");
+  assert.equal(resolveSubmissionClass({ Nome: "Luca" }, "3B"), "3B");
+  assert.equal(resolveSubmissionClass({ Nome: "Luca" }), UNSPECIFIED_CLASS_LABEL);
+});
+
+test("buildClassSummaries: raggruppa per classe, ordina naturalmente e calcola medie/sufficienze", () => {
+  const subs: any[] = [
+    {
+      id: "c1",
+      Timestamp: "2026-11-10T10:00:00Z",
+      Tipo: "Quiz",
+      Pin: "STO3A",
+      Nome: "Mario Rossi",
+      Email: "mario@scuola.it",
+      Classe: "3a",
+      Voto_Suggerito: "8",
+      Full_Evaluation: "{}",
+      Convalida_Docente_At: "2026-11-10T12:00:00Z",
+    },
+    {
+      id: "c2",
+      Timestamp: "2026-11-10T10:05:00Z",
+      Tipo: "Workbook",
+      Pin: "STO3A",
+      Nome: "Lucia Verdi (3 A)",
+      Email: "lucia@scuola.it",
+      Voto_Suggerito: "5+",
+      Full_Evaluation: "{}",
+    },
+    {
+      id: "c3",
+      Timestamp: "2026-11-11T09:00:00Z",
+      Tipo: "Quiz",
+      Pin: "INF4B",
+      Nome: "Paolo Neri",
+      Email: "paolo@scuola.it",
+      Classe: "4B INF",
+      Voto_Suggerito: "9",
+      Full_Evaluation: "{}",
+    },
+    {
+      id: "c4",
+      Timestamp: "2026-11-11T11:00:00Z",
+      Tipo: "Quiz",
+      Pin: "GEN01",
+      Nome: "Studente Esterno",
+      Email: "est@scuola.it",
+      Voto_Suggerito: "6",
+      Full_Evaluation: "{}",
+    },
+  ];
+
+  const summaries = buildClassSummaries(subs);
+  assert.equal(summaries.length, 3);
+  assert.equal(summaries[0].className, "3A");
+  assert.equal(summaries[1].className, "4B INF");
+  assert.equal(summaries[2].className, UNSPECIFIED_CLASS_LABEL);
+
+  const c3a = summaries[0];
+  assert.equal(c3a.totalSubmissions, 2);
+  assert.equal(c3a.uniqueStudents, 2);
+  assert.equal(c3a.quizCount, 1);
+  assert.equal(c3a.workbookCount, 1);
+  assert.equal(c3a.validatedCount, 1);
+  assert.equal(c3a.passedCount, 1);
+  assert.equal(c3a.failedCount, 1);
+  assert.equal(c3a.passRate, 50);
+});
+
+test("buildElectronicRegisterCsv (axios): esclude UNSPECIFIED_CLASS_LABEL dalla colonna Note", () => {
+  const subs: SavedSubmission[] = [
+    {
+      id: "ax1",
+      Timestamp: "2026-11-12T08:00:00Z",
+      Tipo: "Quiz",
+      Pin: "AX001",
+      Nome: "Marco Bianchi",
+      Email: "marco@scuola.it",
+      Docente_Email: "prof@scuola.it",
+      Voto_Suggerito: "7.5",
+      Autovalutazione: "7",
+      AntiCopia_TabSwitch: 0,
+      AntiCopia_IncollaBloccato: 0,
+      AntiCopia_InfractionsLog: "[]",
+      Full_Evaluation: "{}",
+      Risposte_Studente: "{}",
+    },
+    {
+      id: "ax2",
+      Timestamp: "2026-11-12T08:05:00Z",
+      Tipo: "Quiz",
+      Pin: "AX001",
+      Nome: "Elena Neri",
+      Email: "elena@scuola.it",
+      Docente_Email: "prof@scuola.it",
+      Classe: "4A",
+      Voto_Suggerito: "8",
+      Autovalutazione: "8",
+      AntiCopia_TabSwitch: 0,
+      AntiCopia_IncollaBloccato: 0,
+      AntiCopia_InfractionsLog: "[]",
+      Full_Evaluation: "{}",
+      Risposte_Studente: "{}",
+    },
+  ];
+  const csv = buildElectronicRegisterCsv(subs, {
+    preset: "axios",
+    roundingMode: "exact",
+    blindMode: false,
+  });
+  assert.ok(!csv.includes(UNSPECIFIED_CLASS_LABEL), "CSV Axios non deve contenere 'Classe non specificata'");
+  assert.ok(csv.includes("Regolare"), "CSV Axios deve contenere lo stato Regolare");
+  assert.ok(csv.includes("4A"), "CSV Axios deve includere la classe quando specificata");
+});
+
+test("scopedStudentClass: isola la classe per email su PC condiviso e ripulisce al logout", () => {
+  const backing = new Map<string, string>();
+  const mockStorage: StorageLike = {
+    get length() {
+      return backing.size;
+    },
+    key(index: number) {
+      return Array.from(backing.keys())[index] ?? null;
+    },
+    getItem(k: string) {
+      return backing.get(k) ?? null;
+    },
+    setItem(k: string, v: string) {
+      backing.set(k, v);
+    },
+    removeItem(k: string) {
+      backing.delete(k);
+    },
+  };
+
+  saveScopedStudentClass("Luca@Scuola.it", "3A", mockStorage);
+  saveScopedStudentClass("anna@scuola.it", "5B", mockStorage);
+
+  assert.equal(loadScopedStudentClass("luca@scuola.it", mockStorage), "3A");
+  assert.equal(loadScopedStudentClass("anna@scuola.it", mockStorage), "5B");
+  assert.equal(loadScopedStudentClass(undefined, mockStorage), "");
+
+  clearScopedStudentClass("luca@scuola.it", mockStorage);
+  assert.equal(loadScopedStudentClass("luca@scuola.it", mockStorage), "");
+  assert.equal(loadScopedStudentClass("anna@scuola.it", mockStorage), "5B");
+
+  mockStorage.setItem("saved_student_class", "1X");
+  mockStorage.setItem("direct_student_user", "{}");
+  mockStorage.setItem("ea_teacher_pref", "keep");
+
+  wipeSharedPcStudentStorage(mockStorage);
+  assert.equal(loadScopedStudentClass("anna@scuola.it", mockStorage), "");
+  assert.equal(mockStorage.getItem("saved_student_class"), null);
+  assert.equal(mockStorage.getItem("direct_student_user"), null);
+  assert.equal(mockStorage.getItem("ea_teacher_pref"), "keep");
+});
+
+test("parseAllowedClassList: normalizza, deduplica e limita classi separate da virgola o punto e virgola", () => {
+  assert.deepEqual(parseAllowedClassList(" 3a , 3b; 3A ; 4c inf "), ["3A", "3B", "4C INF"]);
+  assert.deepEqual(parseAllowedClassList(""), []);
+  assert.deepEqual(parseAllowedClassList("   ;;;  "), []);
+  const many = Array.from({ length: 40 }, (_, i) => `${i + 1}A`).join(", ");
+  assert.equal(parseAllowedClassList(many).length, 30);
+});
+
+test("loadScopedStudentClass: usa sessionStorage come fallback su PC condiviso", () => {
+  const makeMockStorage = (): StorageLike => {
+    const backing = new Map<string, string>();
+    return {
+      get length() {
+        return backing.size;
+      },
+      key: (index: number) => Array.from(backing.keys())[index] ?? null,
+      getItem: (k: string) => backing.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        backing.set(k, v);
+      },
+      removeItem: (k: string) => {
+        backing.delete(k);
+      },
+    };
+  };
+
+  const localStore = makeMockStorage();
+  const sessionStore = makeMockStorage();
+
+  // Save exclusively in sessionStorage (shared PC lab mode)
+  saveScopedStudentClass("marta@scuola.it", "4D", sessionStore);
+  assert.equal(localStore.length, 0);
+  assert.equal(loadScopedStudentClass("marta@scuola.it", localStore, sessionStore), "4D");
+
+  // LocalStorage takes precedence when present
+  saveScopedStudentClass("marta@scuola.it", "5D", localStore);
+  assert.equal(loadScopedStudentClass("marta@scuola.it", localStore, sessionStore), "5D");
+});
+
 console.log(`\n${passed} test superati, ${failed} falliti.`);
 process.exit(failed > 0 ? 1 : 0);
+

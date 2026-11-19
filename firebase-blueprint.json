@@ -13,6 +13,7 @@
         "Session_Titolo": { "type": "string" },
         "Nome": { "type": "string" },
         "Email": { "type": "string" },
+        "Classe": { "type": "string" },
         "Voto_Suggerito": { "type": "string" },
         "Voto_Originale_IA": { "type": "string" },
         "Autovalutazione": { "type": "string" },
@@ -33,7 +34,7 @@
         "MC_Order": { "type": "string" },
         "Oral_Answers_Count": { "type": "integer" }
       },
-      "required": ["Timestamp", "Tipo", "Email", "Voto_Suggerito"]
+      "required": ["Timestamp", "Tipo", "Email", "Classe", "Voto_Suggerito"]
     },
     "docente": {
       "title": "Docente",
@@ -53,6 +54,9 @@
       "properties": {
         "pin": { "type": "string" },
         "title": { "type": "string" },
+        "targetClass": { "type": "string", "maxLength": 40 },
+        "allowedClasses": { "type": "array" },
+        "restrictToAllowedClasses": { "type": "boolean" },
         "expiry": { "type": "string" },
         "teacherEmail": { "type": "string" },
         "teacherId": { "type": "string" },
@@ -66,6 +70,9 @@
         "mixFilaAB": { "type": "boolean" },
         "filaBTitle": { "type": "string" },
         "allowAudioAnswers": { "type": "boolean" },
+        "classNotice": { "type": "string" },
+        "classNoticeAt": { "type": "string" },
+        "classNoticeTargetClass": { "type": "string" },
         "archived": { "type": "boolean" },
         "archivedAt": { "type": "string" }
       },
@@ -78,6 +85,7 @@
       "properties": {
         "studentName": { "type": "string" },
         "studentEmail": { "type": "string" },
+        "studentClass": { "type": "string" },
         "answeredCount": { "type": "integer" },
         "totalQuestions": { "type": "integer" },
         "currentProgressPercent": { "type": "integer" },
@@ -90,10 +98,18 @@
         "locked": { "type": "boolean" },
         "lockState": { "type": "string" },
         "lockReason": { "type": "string" },
+        "lockedAt": { "type": "string" },
         "draftAnswersJson": { "type": "string" },
         "draftUpdatedAt": { "type": "string" },
         "besExpiryIso": { "type": "string" },
-        "assignedFila": { "type": "string", "enum": ["A", "B"] }
+        "assignedFila": { "type": "string", "enum": ["A", "B"] },
+        "remoteUnlockId": { "type": "string" },
+        "unlockedAt": { "type": "string" },
+        "unlockedBy": { "type": "string" },
+        "teacherNotice": { "type": "string" },
+        "teacherNoticeAt": { "type": "string" },
+        "teacherNoticeAckAt": { "type": "string" },
+        "classNoticeAckAt": { "type": "string" }
       },
       "required": ["studentEmail"]
     },

@@ -13,6 +13,7 @@ import {
   safeParseJson,
 } from "../utils";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
+import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping";
 
 export interface PdfExportOptions {
   blindMode?: boolean;
@@ -182,15 +183,19 @@ export function createSubmissionPdfDoc(
   currentY += 6;
 
   doc.setFillColor(248, 250, 252);
-  doc.rect(15, currentY, 180, 24, "F");
+  doc.rect(15, currentY, 180, 29, "F");
 
   doc.setFontSize(9);
   doc.setFont("Helvetica", "normal");
   doc.setTextColor(71, 85, 105);
 
+  const resolvedClass = resolveSubmissionClass(sub);
+  const classDisplay = resolvedClass === UNSPECIFIED_CLASS_LABEL ? "Non specificata" : resolvedClass;
+
   doc.text(`Studente: ${sanitizePdfText(displayStudentName)}`, 18, currentY + 6);
   doc.text(`Email: ${sanitizePdfText(displayStudentEmail)}`, 18, currentY + 12);
-  doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 18);
+  doc.text(`Classe / Sez.: ${sanitizePdfText(classDisplay)}`, 18, currentY + 18);
+  doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 24);
 
   const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
   doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
@@ -201,7 +206,7 @@ export function createSubmissionPdfDoc(
     currentY + 18
   );
 
-  currentY += 30;
+  currentY += 35;
 
   // 3. DASHBOARD DI PERFORMANCE
   doc.setFont("Helvetica", "bold");

@@ -140,6 +140,8 @@ export interface SavedSubmission {
   Pin?: string;
   Nome: string;
   Email: string;
+  /** Scholastic class / section label (e.g. "3A", "4B INF"). */
+  Classe?: string;
   Voto_Suggerito: string;
   /** Original AI grade before a manual teacher retouch (audit trail). */
   Voto_Originale_IA?: string;
@@ -189,6 +191,12 @@ export interface BesOptions {
 export interface LiveSessionSummary {
   pin: string;
   title: string;
+  /** Optional class/section target specified by the teacher when activating the session. */
+  targetClass?: string;
+  /** Optional list of allowed classes for this session PIN (e.g. ["3A", "3B"]). */
+  allowedClasses?: string[];
+  /** When true, students must belong to one of allowedClasses (or targetClass) to start the exam. */
+  restrictToAllowedClasses?: boolean;
   expiry: string | null;
   createdAt: string | null;
   sessionId: string;
@@ -196,6 +204,12 @@ export interface LiveSessionSummary {
   archived?: boolean;
   archivedAt?: string | null;
   teacherEmail: string;
+  /** Live broadcast message sent by the teacher to the whole classroom. */
+  classNotice?: string;
+  /** ISO timestamp of the latest class-wide broadcast notice. */
+  classNoticeAt?: string;
+  /** Optional class/section target when filtering class-wide broadcasts. */
+  classNoticeTargetClass?: string;
   /** 6-digit code the teacher gives to a student whose exam was locked. */
   unlockCode?: string;
   /** If true, detailed solutions/explanations stay hidden from students until published. */
@@ -247,8 +261,31 @@ export interface StudentSummary {
   averageGradeFormatted: string;
   trend: { dir: 'up' | 'down' | 'same'; delta: number } | null;
   uniquePins: string[];
+  classes: string[];
   totalTabSwitches: number;
   totalPasteAttempts: number;
+}
+
+export interface ClassSummary {
+  className: string;
+  submissions: SavedSubmission[];
+  totalSubmissions: number;
+  uniqueStudents: number;
+  uniquePins: string[];
+  uniqueExamTitles: string[];
+  quizCount: number;
+  workbookCount: number;
+  firstDate: string;
+  latestDate: string;
+  averageGradeNumber: number | null;
+  averageGradeFormatted: string;
+  highestGrade: string;
+  lowestGrade: string;
+  passedCount: number;
+  failedCount: number;
+  passRate: number;
+  validatedCount: number;
+  totalViolations: number;
 }
 
 export interface SharedExamRecord {
