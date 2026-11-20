@@ -51,7 +51,9 @@ import {
   FileUp,
   Archive,
   Mic,
-  GraduationCap
+  GraduationCap,
+  Lock,
+  Unlock
 } from "lucide-react";
 
 import { db, dbFirestore, handleFirestoreError, OperationType, getAuthHeaders } from "../firebase";
@@ -108,6 +110,8 @@ import ExamLibraryPanel from "./ExamLibraryPanel";
 import ExamItemAnalysisPanel from "./ExamItemAnalysisPanel";
 import SubmissionDetailModal from "./SubmissionDetailModal";
 import TeacherBulkGradingModal, { BulkValidationUpdate } from "./TeacherBulkGradingModal";
+import { isDeferredUnlockedForStudent, addMinutesToExpiryIso } from "../utils/deferredSolutions";
+import { stripExamAnswers } from "../utils/examSecurity";
 
 interface TeacherDashboardProps {
   user: any;
@@ -392,7 +396,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
   // New features state
   const [randomizeQuestions, setRandomizeQuestions] = useState<boolean>(true);
-  const [deferSolutions, setDeferSolutions] = useState<boolean>(false);
+  const [deferSolutions, setDeferSolutions] = useState<boolean>(true);
+  const [autoReleaseSolutions, setAutoReleaseSolutions] = useState<boolean>(false);
   const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
   const [besReduceDistractors, setBesReduceDistractors] = useState<boolean>(false);
   const [besAutoOpenBar, setBesAutoOpenBar] = useState<boolean>(false);
@@ -418,6 +423,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [activeSessions, setActiveSessions] = useState<LiveSessionSummary[]>([]);
   const [monitorPin, setMonitorPin] = useState<string>("");
   const [loadingSessions, setLoadingSessions] = useState(false);
+  const [extendingSessionPin, setExtendingSessionPin] = useState<string | null>(null);
+  const [bulkUnlockingDeferred, setBulkUnlockingDeferred] = useState(false);
 
   // Helper toggle for exam cards
   const toggleExamExpanded = (key: string) => {
@@ -530,6 +537,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           pin: docSnap.id,
           title: d.title || "Esame attivato",
           expiry: d.expiry || null,
+          maxExtendedExpiry: d.maxExtendedExpiry || null,
           createdAt: d.createdAt || null,
           sessionId: d.sessionId || "",
           active: !!d.active,
@@ -538,6 +546,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           teacherEmail: d.teacherEmail || user.email,
           deferSolutions: !!d.deferSolutions,
           solutionsReleased: d.deferSolutions ? !!d.solutionsReleased : true,
+          releasedClasses: Array.isArray(d.releasedClasses)
+            ? d.releasedClasses.map((c: any) => normalizeClassLabel(c)).filter(Boolean)
+            : undefined,
+          autoReleaseSolutions: !!d.autoReleaseSolutions,
           solutionsReleasedAt: d.solutionsReleasedAt || null,
           besOptions: d.besOptions || undefined,
           mixFilaAB: !!d.mixFilaAB,
@@ -593,8 +605,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   // Terminates a single active classroom session:
-  // purges live students and RTDB, and archives deferred-solution sessions with active: false
-  // so students can still unlock solutions in their History ("I Tuoi Esiti") later.
+  // flushes matured auto-release solutions before archiving, purges live students and RTDB,
+  // and archives deferred-solution sessions with active: false so students can unlock History later.
   const handleTerminateSession = async (targetPin: string) => {
     const cleanPin = (targetPin || "").trim().toUpperCase();
     if (!cleanPin || !dbFirestore) return;
@@ -605,6 +617,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
       const existingSession = activeSessions.find((s) => s.pin === cleanPin);
       if (existingSession?.deferSolutions) {
+        const isMaturedAuto =
+          !existingSession.solutionsReleased &&
+          !!existingSession.autoReleaseSolutions &&
+          isDeferredUnlockedForStudent({
+            deferSolutions: true,
+            solutionsReleased: false,
+            autoReleaseSolutions: true,
+            expiry: existingSession.expiry,
+            createdAt: existingSession.createdAt,
+            maxExtendedExpiry: existingSession.maxExtendedExpiry,
+            besExtraTimePercent: existingSession.besOptions?.extraTimePercent,
+          });
+        if (isMaturedAuto) {
+          await handleToggleSolutionsReleased(cleanPin, true);
+        }
+
         const archivedAt = new Date().toISOString();
         await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
           active: false,
@@ -671,6 +699,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         await purgeLiveStudents(cleanPin);
         try {
           if (s.deferSolutions) {
+            const isMaturedAuto =
+              !s.solutionsReleased &&
+              !!s.autoReleaseSolutions &&
+              isDeferredUnlockedForStudent({
+                deferSolutions: true,
+                solutionsReleased: false,
+                autoReleaseSolutions: true,
+                expiry: s.expiry,
+                createdAt: s.createdAt,
+                maxExtendedExpiry: s.maxExtendedExpiry,
+                besExtraTimePercent: s.besOptions?.extraTimePercent,
+              });
+            if (isMaturedAuto) {
+              await handleToggleSolutionsReleased(cleanPin, true);
+            }
             await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
               active: false,
               archived: true,
@@ -701,29 +744,230 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Deferred Solutions Release: publish or re-hide exact solutions live for the class
-  const handleToggleSolutionsReleased = async (targetPin: string, nextReleased: boolean) => {
+  // Helper that unlocks a single deferred submission doc via /api/session/unlock-solutions
+  // (or force-unlocks Soluzioni_Differite when forced by teacher bulk action)
+  const syncUnlockedSubmissionDoc = async (
+    sub: SavedSubmission,
+    authHeaders: Record<string, string>,
+    fallbackPin = "",
+    fallbackRun = "",
+    forceUnlock = false
+  ): Promise<Partial<SavedSubmission> | null> => {
+    if (!dbFirestore) return null;
+    const cleanPin = (sub.Pin || fallbackPin || "").trim().toUpperCase();
+    const parsedExam = safeParseJson(sub.Domande_Esame) || {};
+    const parsedAns = safeParseJson(sub.Risposte_Studente) || {};
+    const parsedMcOrder = safeParseJson(sub.MC_Order) || undefined;
+    let resolvedDomandeJson: string | undefined;
+    let mainErrorsVal: string | undefined;
+    let serverUnlocked = false;
+
+    if (cleanPin && parsedExam && typeof parsedExam === "object") {
+      try {
+        const resp = await fetch("/api/session/unlock-solutions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...authHeaders,
+          },
+          body: JSON.stringify({
+            pin: cleanPin,
+            sessionId: sub.Session_Id || fallbackRun || "",
+            studentEmail: sub.Email || "",
+            studentClass: resolveSubmissionClass(sub),
+            assignedFila: sub.Assigned_Fila || "",
+            mcOptionOrder: parsedMcOrder,
+            examData: parsedExam,
+            answers: parsedAns,
+            tipo: sub.Tipo || "Quiz",
+          }),
+        });
+        const data = await resp.json().catch(() => null);
+        if (resp.ok && data?.unlocked) {
+          serverUnlocked = true;
+          if (data.resolvedDomande) {
+            const serialized = JSON.stringify(data.resolvedDomande);
+            if (serialized.length <= 580000) {
+              resolvedDomandeJson = serialized;
+            }
+          }
+          if (typeof data.mainErrors === "string" && data.mainErrors) {
+            mainErrorsVal = data.mainErrors;
+          }
+        }
+      } catch (fetchErr) {
+        console.warn("unlock-solutions fetch warning (continuo):", sub.id, fetchErr);
+      }
+    }
+
+    if (!serverUnlocked && !forceUnlock) {
+      return null;
+    }
+
+    const patch: Record<string, any> = {
+      Soluzioni_Differite: false,
+      ...(resolvedDomandeJson ? { Domande_Esame: resolvedDomandeJson } : {}),
+      ...(mainErrorsVal ? { Errori_Principali: mainErrorsVal } : {}),
+    };
+    await updateDoc(doc(dbFirestore, "valutazioni", sub.id), patch);
+    return patch;
+  };
+
+  // Deferred Solutions Release: publish or re-hide exact solutions live (globally or per-class),
+  // sync RTDB fallback, and persist unlocked/re-stripped solutions directly on matching submissions.
+  const handleToggleSolutionsReleased = async (
+    targetPin: string,
+    nextReleased: boolean,
+    targetClass?: string
+  ) => {
     const cleanPin = (targetPin || "").trim().toUpperCase();
+    const cleanClass = targetClass ? normalizeClassLabel(targetClass) : "";
     if (!cleanPin || !dbFirestore) return;
     setTogglingSolutionsPin(cleanPin);
     try {
       const nowIso = new Date().toISOString();
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
-        solutionsReleased: nextReleased,
-        solutionsReleasedAt: nextReleased ? nowIso : "",
-      });
-      setActiveSessions((prev) =>
-        prev.map((s) =>
-          s.pin === cleanPin
-            ? { ...s, solutionsReleased: nextReleased, solutionsReleasedAt: nextReleased ? nowIso : null }
-            : s
-        )
-      );
+      const existingSession = activeSessions.find((s) => s.pin === cleanPin);
+      const sessionRun = existingSession?.sessionId || "";
+
+      let nextGlobalReleased = existingSession ? !!existingSession.solutionsReleased : nextReleased;
+      let nextReleasedClasses: string[] = Array.isArray(existingSession?.releasedClasses)
+        ? existingSession.releasedClasses.map((c) => normalizeClassLabel(c)).filter(Boolean)
+        : [];
+
+      if (cleanClass) {
+        if (nextReleased) {
+          nextReleasedClasses = Array.from(new Set([...nextReleasedClasses, cleanClass]));
+        } else {
+          nextReleasedClasses = nextReleasedClasses.filter((c) => c !== cleanClass);
+          nextGlobalReleased = false;
+        }
+        await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+          releasedClasses: nextReleasedClasses,
+          ...(nextReleased ? {} : { solutionsReleased: false }),
+        });
+        setActiveSessions((prev) =>
+          prev.map((s) =>
+            s.pin === cleanPin
+              ? {
+                  ...s,
+                  releasedClasses: nextReleasedClasses,
+                  ...(nextReleased ? {} : { solutionsReleased: false }),
+                }
+              : s
+          )
+        );
+        if (db) {
+          try {
+            await fbSet(fbRef(db, `sessions/${cleanPin}/releasedClasses`), nextReleasedClasses);
+            if (!nextReleased) {
+              await fbSet(fbRef(db, `sessions/${cleanPin}/solutionsReleased`), false);
+            }
+          } catch (rtdbErr) {
+            console.warn("RTDB per-class release sync failed (non-blocking):", rtdbErr);
+          }
+        }
+      } else {
+        nextGlobalReleased = nextReleased;
+        const resetClasses = !nextReleased ? [] : nextReleasedClasses;
+        if (!nextReleased) {
+          autoReleasedPinsRef.current.delete(`${cleanPin}_${sessionRun}`);
+        }
+        await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+          solutionsReleased: nextReleased,
+          solutionsReleasedAt: nextReleased ? nowIso : "",
+          ...(!nextReleased ? { releasedClasses: [], autoReleaseSolutions: false } : {}),
+        });
+        setActiveSessions((prev) =>
+          prev.map((s) =>
+            s.pin === cleanPin
+              ? {
+                  ...s,
+                  solutionsReleased: nextReleased,
+                  solutionsReleasedAt: nextReleased ? nowIso : null,
+                  releasedClasses: resetClasses,
+                  ...(!nextReleased ? { autoReleaseSolutions: false } : {}),
+                }
+              : s
+          )
+        );
+        if (db) {
+          try {
+            await fbSet(fbRef(db, `sessions/${cleanPin}/solutionsReleased`), nextReleased);
+            if (!nextReleased) {
+              await fbSet(fbRef(db, `sessions/${cleanPin}/autoReleaseSolutions`), false);
+            }
+          } catch (rtdbErr) {
+            console.warn("RTDB release sync failed (non-blocking):", rtdbErr);
+          }
+        }
+      }
+
+      // Sync unlock / re-strip state onto matching saved submissions in `valutazioni`
+      try {
+        const matchingSubs = submissions.filter((s) => {
+          if ((s.Pin || "").trim().toUpperCase() !== cleanPin) return false;
+          if (sessionRun && s.Session_Id && s.Session_Id !== sessionRun) return false;
+          if (cleanClass && resolveSubmissionClass(s) !== cleanClass) return false;
+          return nextReleased ? !!s.Soluzioni_Differite : !s.Soluzioni_Differite;
+        });
+
+        if (matchingSubs.length > 0) {
+          const authHeaders = await getAuthHeaders();
+          const updatedMap = new Map<string, Partial<SavedSubmission>>();
+          const chunkSize = 8;
+
+          for (let i = 0; i < matchingSubs.length; i += chunkSize) {
+            const chunk = matchingSubs.slice(i, i + chunkSize);
+            await Promise.all(
+              chunk.map(async (sub) => {
+                try {
+                  if (nextReleased) {
+                    const patch = await syncUnlockedSubmissionDoc(sub, authHeaders, cleanPin, sessionRun, true);
+                    if (patch) {
+                      updatedMap.set(sub.id, patch);
+                    }
+                  } else {
+                    const parsedExam = safeParseJson(sub.Domande_Esame);
+                    let strippedJson: string | undefined;
+                    if (parsedExam && typeof parsedExam === "object") {
+                      const { sanitizedExam } = stripExamAnswers(parsedExam);
+                      const serialized = JSON.stringify(sanitizedExam);
+                      if (serialized.length <= 580000) {
+                        strippedJson = serialized;
+                      }
+                    }
+                    const patch: Record<string, any> = {
+                      Soluzioni_Differite: true,
+                      Errori_Principali: "",
+                      ...(strippedJson ? { Domande_Esame: strippedJson } : {}),
+                    };
+                    await updateDoc(doc(dbFirestore!, "valutazioni", sub.id), patch);
+                    reconciledDeferredIdsRef.current.delete(sub.id);
+                    updatedMap.set(sub.id, patch);
+                  }
+                } catch (subErr) {
+                  console.warn("Sincronizzazione consegna posticipata fallita (continuo):", sub.id, subErr);
+                }
+              })
+            );
+          }
+
+          if (updatedMap.size > 0) {
+            setSubmissions((prev) =>
+              prev.map((s) => (updatedMap.has(s.id) ? { ...s, ...updatedMap.get(s.id)! } : s))
+            );
+          }
+        }
+      } catch (syncErr) {
+        console.warn("Aggiornamento archivio valutazioni differite:", syncErr);
+      }
+
+      const scopeLabel = cleanClass ? `classe ${cleanClass} (PIN ${cleanPin})` : `sessione ${cleanPin}`;
       showNotify(
         "success",
         nextReleased
-          ? `Soluzioni sbloccate in tempo reale per la sessione ${cleanPin}.`
-          : `Soluzioni nuovamente nascoste per la sessione ${cleanPin}.`
+          ? `Soluzioni sbloccate in tempo reale per ${scopeLabel}.`
+          : `Soluzioni nuovamente nascoste per ${scopeLabel}.`
       );
     } catch (err: any) {
       showNotify("error", `Impossibile aggiornare il rilascio soluzioni: ${err?.message || "errore"}`);
@@ -731,6 +975,217 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setTogglingSolutionsPin(null);
     }
   };
+
+  // Collective classroom time extension (+5m / +10m): advances session `expiry` & `maxExtendedExpiry`
+  // in Firestore/RTDB and local state, clearing auto-release lock guard so delayed auto-release waits cleanly.
+  const handleExtendSessionTime = async (targetPin: string, minutesToAdd: number) => {
+    const cleanPin = (targetPin || "").trim().toUpperCase();
+    if (!cleanPin || !dbFirestore || minutesToAdd <= 0) return;
+    setExtendingSessionPin(cleanPin);
+    try {
+      const existing = activeSessions.find((s) => s.pin === cleanPin);
+      const nextExpiry = addMinutesToExpiryIso(existing?.expiry, minutesToAdd);
+      const maxAnchorIso =
+        existing?.maxExtendedExpiry &&
+        (!existing?.expiry || Date.parse(existing.maxExtendedExpiry) > Date.parse(existing.expiry))
+          ? existing.maxExtendedExpiry
+          : existing?.expiry;
+      const nextMaxExtendedExpiry = addMinutesToExpiryIso(maxAnchorIso, minutesToAdd);
+
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+        expiry: nextExpiry,
+        maxExtendedExpiry: nextMaxExtendedExpiry,
+      });
+
+      autoReleasedPinsRef.current.delete(`${cleanPin}_${existing?.sessionId || ""}`);
+
+      setActiveSessions((prev) =>
+        prev.map((s) =>
+          s.pin === cleanPin
+            ? { ...s, expiry: nextExpiry, maxExtendedExpiry: nextMaxExtendedExpiry }
+            : s
+        )
+      );
+
+      if (db) {
+        try {
+          await fbSet(fbRef(db, `sessions/${cleanPin}/expiry`), nextExpiry);
+          await fbSet(fbRef(db, `sessions/${cleanPin}/maxExtendedExpiry`), nextMaxExtendedExpiry);
+        } catch (rtdbErr) {
+          console.warn("RTDB expiry extension sync warning (non-blocking):", rtdbErr);
+        }
+      }
+
+      const clockStr = new Date(nextExpiry).toLocaleTimeString("it-IT", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      showNotify(
+        "success",
+        `+${minutesToAdd} minuti assegnati all'intera aula (PIN ${cleanPin}). Nuova scadenza: ${clockStr}.`
+      );
+    } catch (err: any) {
+      showNotify("error", `Impossibile prorogare la sessione ${cleanPin}: ${err?.message || "errore"}`);
+    } finally {
+      setExtendingSessionPin(null);
+    }
+  };
+
+  // Bulk-unlock all visible deferred submissions directly from the Submissions Registry
+  const handleBulkUnlockDeferredSubmissions = async (targetSubs: SavedSubmission[]) => {
+    const deferredList = targetSubs.filter((s) => !!s.Soluzioni_Differite);
+    if (!dbFirestore || deferredList.length === 0) return;
+    setBulkUnlockingDeferred(true);
+    try {
+      const authHeaders = await getAuthHeaders();
+      const updatedMap = new Map<string, Partial<SavedSubmission>>();
+      const chunkSize = 8;
+
+      for (let i = 0; i < deferredList.length; i += chunkSize) {
+        const chunk = deferredList.slice(i, i + chunkSize);
+        await Promise.all(
+          chunk.map(async (sub) => {
+            try {
+              const patch = await syncUnlockedSubmissionDoc(sub, authHeaders, sub.Pin || "", sub.Session_Id || "", true);
+              if (patch) {
+                updatedMap.set(sub.id, patch);
+              }
+            } catch (err) {
+              console.warn("Sblocco massivo differita fallito:", sub.id, err);
+            }
+          })
+        );
+      }
+
+      if (updatedMap.size > 0) {
+        setSubmissions((prev) =>
+          prev.map((s) => (updatedMap.has(s.id) ? { ...s, ...updatedMap.get(s.id)! } : s))
+        );
+      }
+      showNotify(
+        "success",
+        `Sbloccate ${updatedMap.size} consegne con soluzioni differite nel registro.`
+      );
+    } catch (err: any) {
+      showNotify("error", `Errore durante lo sblocco massivo: ${err?.message || "errore"}`);
+    } finally {
+      setBulkUnlockingDeferred(false);
+    }
+  };
+
+  // Automatic deferred solutions release when expiry (+ any BES tolerance + individual/class extensions) elapses
+  const autoReleasedPinsRef = useRef<Set<string>>(new Set());
+  const reconciledDeferredIdsRef = useRef<Set<string>>(new Set());
+  useEffect(() => {
+    const checkAutoRelease = () => {
+      const nowMs = Date.now();
+      for (const s of activeSessions) {
+        if (!s.deferSolutions || !s.autoReleaseSolutions || s.solutionsReleased || !s.expiry) continue;
+        const guardKey = `${s.pin}_${s.sessionId || ""}`;
+        if (autoReleasedPinsRef.current.has(guardKey)) continue;
+        const shouldRelease = isDeferredUnlockedForStudent({
+          deferSolutions: true,
+          solutionsReleased: false,
+          autoReleaseSolutions: true,
+          expiry: s.expiry,
+          createdAt: s.createdAt,
+          maxExtendedExpiry: s.maxExtendedExpiry,
+          besExtraTimePercent: s.besOptions?.extraTimePercent,
+          nowMs,
+        });
+        if (shouldRelease) {
+          autoReleasedPinsRef.current.add(guardKey);
+          void handleToggleSolutionsReleased(s.pin, true);
+        }
+      }
+    };
+    checkAutoRelease();
+    const hasPendingAuto = activeSessions.some(
+      (s) => s.deferSolutions && s.autoReleaseSolutions && !s.solutionsReleased && !!s.expiry
+    );
+    if (!hasPendingAuto) return;
+    const interval = setInterval(checkAutoRelease, 20000);
+    return () => clearInterval(interval);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessions]);
+
+  // Background reconciliation: if any archived/unlocked session has stale `Soluzioni_Differite: true`
+  // submissions in `valutazioni`, unlock them seamlessly once so students never stay blocked in History.
+  useEffect(() => {
+    if (!dbFirestore || togglingSolutionsPin || submissions.length === 0 || activeSessions.length === 0) {
+      return;
+    }
+    const nowMs = Date.now();
+    const pendingToReconcile: Array<{ sub: SavedSubmission; sess: LiveSessionSummary }> = [];
+
+    for (const sub of submissions) {
+      if (!sub.Soluzioni_Differite || !sub.Pin) continue;
+      if (reconciledDeferredIdsRef.current.has(sub.id)) continue;
+      const cleanPin = sub.Pin.trim().toUpperCase();
+      const matchedSess = activeSessions.find(
+        (s) => s.pin === cleanPin && (!s.sessionId || !sub.Session_Id || s.sessionId === sub.Session_Id)
+      );
+      if (!matchedSess) continue;
+
+      const unlocked = isDeferredUnlockedForStudent({
+        deferSolutions: matchedSess.deferSolutions,
+        solutionsReleased: matchedSess.solutionsReleased,
+        releasedClasses: matchedSess.releasedClasses,
+        studentClass: resolveSubmissionClass(sub),
+        autoReleaseSolutions: matchedSess.autoReleaseSolutions,
+        expiry: matchedSess.expiry,
+        createdAt: matchedSess.createdAt,
+        maxExtendedExpiry: matchedSess.maxExtendedExpiry,
+        besExtraTimePercent: matchedSess.besOptions?.extraTimePercent,
+        nowMs,
+      });
+
+      if (unlocked) {
+        reconciledDeferredIdsRef.current.add(sub.id);
+        pendingToReconcile.push({ sub, sess: matchedSess });
+      }
+    }
+
+    if (pendingToReconcile.length === 0) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const authHeaders = await getAuthHeaders();
+        const updatedMap = new Map<string, Partial<SavedSubmission>>();
+        const chunkSize = 6;
+        for (let i = 0; i < pendingToReconcile.length; i += chunkSize) {
+          if (cancelled) return;
+          const chunk = pendingToReconcile.slice(i, i + chunkSize);
+          await Promise.all(
+            chunk.map(async ({ sub, sess }) => {
+              try {
+                const patch = await syncUnlockedSubmissionDoc(
+                  sub,
+                  authHeaders,
+                  sess.pin,
+                  sess.sessionId || "",
+                  false
+                );
+                if (patch) updatedMap.set(sub.id, patch);
+              } catch (err) {
+                console.warn("Riconciliazione differita fallita:", sub.id, err);
+              }
+            })
+          );
+        }
+        if (!cancelled && updatedMap.size > 0) {
+          setSubmissions((prev) =>
+            prev.map((s) => (updatedMap.has(s.id) ? { ...s, ...updatedMap.get(s.id)! } : s))
+          );
+        }
+      } catch {}
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [submissions, activeSessions, togglingSolutionsPin]);
 
   // Bulk grade override + validation from TeacherBulkGradingModal
   const handleBulkValidationSave = async (updates: BulkValidationUpdate[]) => {
@@ -1387,6 +1842,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           randomizeQuestions,
           deferSolutions,
           solutionsReleased: !deferSolutions,
+          autoReleaseSolutions: !!(deferSolutions && autoReleaseSolutions),
           besOptions: besOptionsPayload,
           allowAudioAnswers,
           ...(cleanTargetClass ? { targetClass: cleanTargetClass } : {}),
@@ -1414,6 +1870,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           randomizeQuestions,
           deferSolutions,
           solutionsReleased: !deferSolutions,
+          autoReleaseSolutions: !!(deferSolutions && autoReleaseSolutions),
           besOptions: besOptionsPayload,
           allowAudioAnswers,
           ...(cleanTargetClass ? { targetClass: cleanTargetClass } : {}),
@@ -1422,6 +1879,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           ...filaBExtra,
           severityPreset: "normale",
           active: true,
+          maxExtendedExpiry: "",
           createdAt: new Date().toISOString(),
           sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
           backendUrl: "AI_STUDIO_GENAI_INTEGRATA"
@@ -3479,23 +3937,38 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 </label>
 
                 {/* Deferred Solutions Release Toggle */}
-                <label className="flex items-center gap-2.5 p-2.5 bg-amber-950/20 border border-amber-500/20 rounded-xl cursor-pointer hover:bg-amber-950/35 transition-colors">
-                  <input
-                    type="checkbox"
-                    checked={deferSolutions}
-                    onChange={(e) => setDeferSolutions(e.target.checked)}
-                    className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
-                  />
-                  <div className="text-left">
-                    <span className="text-[11px] font-bold text-amber-200 flex items-center gap-1.5">
-                      <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
-                      <span>Rilascio Differito delle Soluzioni</span>
-                    </span>
-                    <p className="text-[10px] text-slate-300/80 leading-normal">
-                      Chi consegna in anticipo vede il riepilogo ma NON le risposte esatte/spiegazioni finché non le sblocchi con 1 click dal Monitor d'Aula.
-                    </p>
-                  </div>
-                </label>
+                <div className="p-2.5 bg-amber-950/20 border border-amber-500/20 rounded-xl space-y-2 text-left">
+                  <label className="flex items-center gap-2.5 cursor-pointer hover:opacity-95 transition-opacity">
+                    <input
+                      type="checkbox"
+                      checked={deferSolutions}
+                      onChange={(e) => setDeferSolutions(e.target.checked)}
+                      className="w-4 h-4 accent-amber-500 rounded cursor-pointer"
+                    />
+                    <div className="text-left">
+                      <span className="text-[11px] font-bold text-amber-200 flex items-center gap-1.5">
+                        <ShieldCheck className="w-3.5 h-3.5 text-amber-400" />
+                        <span>Rilascio Differito delle Soluzioni</span>
+                      </span>
+                      <p className="text-[10px] text-slate-300/80 leading-normal">
+                        Chi consegna in anticipo vede il riepilogo ma NON le risposte esatte/spiegazioni finché non le sblocchi con 1 click dal Monitor d'Aula.
+                      </p>
+                    </div>
+                  </label>
+                  {deferSolutions && (
+                    <label className="flex items-center gap-2 pl-6 pt-1.5 border-t border-amber-500/15 cursor-pointer text-[10px] text-amber-100/90">
+                      <input
+                        type="checkbox"
+                        checked={autoReleaseSolutions}
+                        onChange={(e) => setAutoReleaseSolutions(e.target.checked)}
+                        className="w-3.5 h-3.5 accent-amber-400 rounded cursor-pointer"
+                      />
+                      <span>
+                        ⏰ Pubblica automaticamente allo scadere dell&apos;ora (attende eventuale tempo extra BES)
+                      </span>
+                    </label>
+                  )}
+                </div>
 
                 {/* BES / DSA Session Inclusivity Controls */}
                 <div className="p-3 bg-teal-950/20 border border-teal-500/20 rounded-xl space-y-2.5 text-left">
@@ -4210,10 +4683,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 onTerminateSession={handleTerminateSession}
                 onTerminateAllSessions={handleTerminateAllSessions}
                 onToggleSolutionsReleased={handleToggleSolutionsReleased}
+                onExtendSessionTime={handleExtendSessionTime}
                 onPurgeArchivedSession={handlePurgeArchivedSession}
                 terminatingPin={terminatingPin}
                 terminatingAll={terminatingAll}
                 togglingSolutionsPin={togglingSolutionsPin}
+                extendingSessionPin={extendingSessionPin}
               />
             ) : (
               <>
@@ -4313,6 +4788,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
                       <span>Info Accesso Account</span>
                     </button>
+                    {filteredSubmissions.some((s) => !!s.Soluzioni_Differite) && (
+                      <button
+                        type="button"
+                        disabled={bulkUnlockingDeferred}
+                        onClick={() => handleBulkUnlockDeferredSubmissions(filteredSubmissions)}
+                        className="flex items-center gap-1.5 py-1.5 px-3 bg-amber-500/20 hover:bg-amber-500/35 text-amber-200 font-bold rounded-xl text-xs transition-colors cursor-pointer border border-amber-500/40 disabled:opacity-40"
+                        title="Sblocca permanentemente le soluzioni differite per tutte le consegne filtrate"
+                      >
+                        {bulkUnlockingDeferred ? (
+                          <RefreshCw className="w-3.5 h-3.5 animate-spin text-amber-300" />
+                        ) : (
+                          <Unlock className="w-3.5 h-3.5 text-amber-300" />
+                        )}
+                        <span>
+                          Sblocca Differite ({filteredSubmissions.filter((s) => !!s.Soluzioni_Differite).length})
+                        </span>
+                      </button>
+                    )}
                     <button
                       type="button"
                       onClick={() => setShowBulkGradingModal(true)}
@@ -6099,6 +6592,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                         {meta.resolvedClass}
                                       </span>
                                     )}
+                                    {sub.Soluzioni_Differite ? (
+                                      <span
+                                        className="inline-flex items-center gap-0.5 px-1.5 py-0.5 rounded text-[9px] sm:text-[10px] bg-amber-500/15 text-amber-300 font-mono border border-amber-500/30 font-semibold"
+                                        title="Soluzioni ancora bloccate per lo studente (Rilascio Differito)"
+                                      >
+                                        <Lock className="w-2.5 h-2.5" />
+                                        Differite
+                                      </span>
+                                    ) : null}
                                   </div>
                                   <p className="text-[9px] sm:text-[10px] text-slate-400 mt-1 whitespace-nowrap">
                                     {new Date(sub.Timestamp).toLocaleDateString("it-IT", { month: "2-digit", day: "2-digit" })} 

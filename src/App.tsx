@@ -33,7 +33,7 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
 import { normalizeClassLabel } from "./utils/classGrouping";
-import { saveScopedStudentClass, loadScopedStudentClass } from "./utils/clientStorage";
+import { saveScopedStudentClass, loadScopedStudentClass, isSharedPcSessionActive, setSharedPcSessionActive } from "./utils/clientStorage";
 // Helper to retry failed dynamic module imports (e.g. transient dev-proxy / stale Vite dep cache)
 function isChunkOrModuleFetchError(err: unknown): boolean {
   const msg = String((err as any)?.message || err || "").toLowerCase();
@@ -199,7 +199,7 @@ export default function App() {
   const [directSurname, setDirectSurname] = useState("");
   const [directClass, setDirectClass] = useState("");
   const [directEmail, setDirectEmail] = useState("");
-  const [sharedPcMode, setSharedPcMode] = useState(false);
+  const [sharedPcMode, setSharedPcMode] = useState(() => isSharedPcSessionActive());
   const [directError, setDirectError] = useState("");
   const [googleStudentClass, setGoogleStudentClass] = useState("");
   const [showWorkspaceHelp, setShowWorkspaceHelp] = useState(false);
@@ -213,18 +213,20 @@ export default function App() {
     setInAppBrowserDetected(checkIsInAppBrowser());
     setAppleMobileDetected(isAppleMobile());
 
-    // Pre-fill student fields from previous session if present
-    try {
-      const savedName = localStorage.getItem("saved_student_name");
-      const savedSurname = localStorage.getItem("saved_student_surname");
-      const savedClass = localStorage.getItem("saved_student_class");
-      const savedEmail = localStorage.getItem("saved_student_email");
-      if (savedName) setDirectName(savedName);
-      if (savedSurname) setDirectSurname(savedSurname);
-      if (savedClass) setDirectClass(savedClass);
-      if (savedEmail) setDirectEmail(savedEmail);
-    } catch (e) {
-      // Storage access blocked or restricted
+    // Pre-fill student fields from previous session ONLY if not in shared PC mode
+    if (!isSharedPcSessionActive()) {
+      try {
+        const savedName = localStorage.getItem("saved_student_name");
+        const savedSurname = localStorage.getItem("saved_student_surname");
+        const savedClass = localStorage.getItem("saved_student_class");
+        const savedEmail = localStorage.getItem("saved_student_email");
+        if (savedName) setDirectName(savedName);
+        if (savedSurname) setDirectSurname(savedSurname);
+        if (savedClass) setDirectClass(savedClass);
+        if (savedEmail) setDirectEmail(savedEmail);
+      } catch (e) {
+        // Storage access blocked or restricted
+      }
     }
   }, []);
 
@@ -307,6 +309,8 @@ export default function App() {
       .then((result) => {
         if (result?.user && !result.user.isAnonymous) {
           try {
+            setSharedPcSessionActive(false);
+            setSharedPcMode(false);
             sessionStorage.removeItem("direct_student_user");
             localStorage.removeItem("direct_student_user");
             localStorage.removeItem("saved_student_class");
@@ -327,6 +331,8 @@ export default function App() {
       if (currentUser && !currentUser.isAnonymous) {
         setAuthLoading(true);
         try {
+          setSharedPcSessionActive(false);
+          setSharedPcMode(false);
           sessionStorage.removeItem("direct_student_user");
           localStorage.removeItem("direct_student_user");
           localStorage.removeItem("saved_student_class");
@@ -484,10 +490,12 @@ export default function App() {
       displayName: `${nome} ${cognome} (${classe})`,
       email: email,
       studentClass: classe,
-      isDirectAccess: true
+      isDirectAccess: true,
+      isSharedPc: sharedPcMode,
     };
 
     try {
+      setSharedPcSessionActive(sharedPcMode);
       sessionStorage.setItem("direct_student_user", JSON.stringify(studentUser));
       if (sharedPcMode) {
         localStorage.removeItem("direct_student_user");
@@ -495,7 +503,7 @@ export default function App() {
         localStorage.removeItem("saved_student_surname");
         localStorage.removeItem("saved_student_class");
         localStorage.removeItem("saved_student_email");
-        saveScopedStudentClass(email, classe, sessionStorage);
+        saveScopedStudentClass(email, classe, null, sessionStorage, true);
       } else {
         localStorage.setItem("direct_student_user", JSON.stringify(studentUser));
         localStorage.setItem("saved_student_name", nome);
@@ -807,6 +815,7 @@ export default function App() {
                               onChange={(e) => {
                                 const checked = e.target.checked;
                                 setSharedPcMode(checked);
+                                setSharedPcSessionActive(checked);
                                 if (checked) {
                                   try {
                                     localStorage.removeItem("direct_student_user");
@@ -1066,6 +1075,7 @@ export default function App() {
                       <StudentView
                         user={user}
                         initialStudentClass={googleStudentClass || user?.studentClass}
+                        isSharedPc={Boolean(user?.isSharedPc || sharedPcMode)}
                         onLogout={handleSignOut}
                         onBack={() => setActivePane("home")}
                       />

@@ -97,7 +97,11 @@ import {
   saveScopedStudentClass,
   loadScopedStudentClass,
   wipeSharedPcStudentStorage,
-  normalizeIdentityKey
+  normalizeIdentityKey,
+  isSharedPcSessionActive,
+  saveStudentScopedStorageItem,
+  loadStudentScopedStorageItem,
+  removeStudentScopedStorageItem
 } from "../utils/clientStorage";
 import {
   normalizeClassLabel,
@@ -106,6 +110,7 @@ import {
   resolveSubmissionClass,
   UNSPECIFIED_CLASS_LABEL,
 } from "../utils/classGrouping";
+import { isDeferredUnlockedForStudent } from "../utils/deferredSolutions";
 
 function getLiveStudentDocId(email?: string | null, targetPin?: string | null): string {
   return deriveStudentPseudonym(email || "anonimo", String(targetPin || "").trim().toUpperCase());
@@ -126,6 +131,7 @@ interface StudentViewProps {
   onLogout: () => void;
   onBack?: () => void;
   initialStudentClass?: string;
+  isSharedPc?: boolean;
 }
 
 // Didactic meta under a question: key-question weight badge + grading criteria.
@@ -277,7 +283,8 @@ async function requestRecoveryPlan(
   throw new Error("L'attesa del piano è troppo lunga: riprova tra un minuto.");
 }
 
-export default function StudentView({ user, onLogout, onBack, initialStudentClass }: StudentViewProps) {
+export default function StudentView({ user, onLogout, onBack, initialStudentClass, isSharedPc }: StudentViewProps) {
+  const sharedPcActive = Boolean(isSharedPc || user?.isSharedPc || isSharedPcSessionActive());
   // State
   const [pin, setPin] = useState("");
   const [pinError, setPinError] = useState("");
@@ -309,6 +316,13 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [teacherEmail, setTeacherEmail] = useState<string>("sconosciuto");
   const [deferSolutionsSession, setDeferSolutionsSession] = useState<boolean>(false);
   const [solutionsReleased, setSolutionsReleased] = useState<boolean>(true);
+  const [sessionCreatedAt, setSessionCreatedAt] = useState<string | null>(null);
+  const [sessionAutoRelease, setSessionAutoRelease] = useState<boolean>(false);
+  const [sessionReleasedClasses, setSessionReleasedClasses] = useState<string[]>([]);
+  const [sessionMaxExtendedExpiry, setSessionMaxExtendedExpiry] = useState<string | null>(null);
+  const [unlockSolutionsError, setUnlockSolutionsError] = useState<string>("");
+  const [unlockRetryNonce, setUnlockRetryNonce] = useState<number>(0);
+  const lastExtendedExpiryIsoRef = useRef<string | null>(null);
   const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
   const [assignedFila, setAssignedFila] = useState<"A" | "B" | undefined>(undefined);
   const assignedFilaRef = useRef<"A" | "B" | undefined>(undefined);
@@ -413,9 +427,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     if (fromUser) return fromUser;
     const fromName = extractClassFromStudentName(user?.displayName);
     if (fromName) return fromName;
-    const fromScoped = normalizeClassLabel(loadScopedStudentClass(user?.email));
+    const fromScoped = normalizeClassLabel(loadScopedStudentClass(user?.email, undefined, undefined, sharedPcActive));
     if (fromScoped) return fromScoped;
-    if (user?.isDirectAccess) {
+    if (user?.isDirectAccess && !sharedPcActive) {
       try {
         return normalizeClassLabel(localStorage.getItem("saved_student_class"));
       } catch {
@@ -429,7 +443,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     normalizeClassLabel(initialStudentClass) ||
     normalizeClassLabel(user?.studentClass) ||
     extractClassFromStudentName(user?.displayName) ||
-    normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+    normalizeClassLabel(loadScopedStudentClass(user?.email, undefined, undefined, sharedPcActive)) ||
     normalizeClassLabel(sessionTargetClass);
   const resolvedStudentClassRef = useRef<string>(resolvedStudentClass);
   useEffect(() => {
@@ -1028,9 +1042,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const persistExamLock = (locked: boolean, reason?: string) => {
     const pinToUse = (sessionPin || pin || "").trim().toUpperCase();
     if (locked) {
-      saveScopedExamLock(user?.email, pinToUse, true, reason || "");
+      saveScopedExamLock(user?.email, pinToUse, true, reason || "", undefined, undefined, sharedPcActive);
     } else {
-      clearScopedExamLock(user?.email, pinToUse);
+      clearScopedExamLock(user?.email, pinToUse, undefined, undefined, sharedPcActive);
     }
   };
 
@@ -1141,6 +1155,22 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setTeacherNoticeBanner(null);
         }
 
+        // Individual extra time granted live by teacher from ClassroomLiveMonitor
+        const extIso = data?.extendedExpiryIso ? String(data.extendedExpiryIso) : "";
+        if (extIso && !isNaN(new Date(extIso).getTime()) && extIso !== lastExtendedExpiryIsoRef.current) {
+          const prevExt = lastExtendedExpiryIsoRef.current;
+          lastExtendedExpiryIsoRef.current = extIso;
+          setExpiryTime((prevExpiry) => {
+            const prevMs = prevExpiry ? new Date(prevExpiry).getTime() : 0;
+            const nextMs = new Date(extIso).getTime();
+            return nextMs > prevMs ? extIso : prevExpiry;
+          });
+          if (prevExt !== null || besExpiryIsoRef.current || expiryTime) {
+            const endLabel = new Date(extIso).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+            setInfractionToastMsg(`⏱️ Il docente ti ha concesso tempo extra: nuova scadenza alle ${endLabel}.`);
+          }
+        }
+
         const remoteId = data?.remoteUnlockId;
         const currentId = remoteId ? String(remoteId) : "";
         const isDocLocked = data?.locked === true;
@@ -1196,18 +1226,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   const saveDraft = (currPin: string, currAnswers: Answers, runId = sessionRunId) => {
     try {
-      localStorage.setItem(
+      saveStudentScopedStorageItem(
         getDraftKey(currPin),
-        JSON.stringify({ sessionRunId: runId || "", updatedAt: Date.now(), answers: currAnswers })
+        JSON.stringify({ sessionRunId: runId || "", updatedAt: Date.now(), answers: currAnswers }),
+        sharedPcActive
       );
     } catch (e) {
-      console.warn("Impossibile salvare la bozza in localStorage:", e);
+      console.warn("Impossibile salvare la bozza:", e);
     }
   };
 
   const getLocalDraftUpdatedAt = (currPin: string, expectedRunId?: string): { found: boolean; updatedAt: number } => {
     try {
-      const raw = localStorage.getItem(getDraftKey(currPin)) || localStorage.getItem(`draft_${currPin}`);
+      const raw =
+        loadStudentScopedStorageItem(getDraftKey(currPin), sharedPcActive) ||
+        (!sharedPcActive ? loadStudentScopedStorageItem(`draft_${currPin}`, false) : null);
       if (!raw) return { found: false, updatedAt: 0 };
       const parsed = JSON.parse(raw);
       if (!parsed || typeof parsed !== "object") return { found: false, updatedAt: 0 };
@@ -1232,10 +1265,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const loadDraft = (currPin: string, expectedRunId?: string): boolean => {
     try {
       // 1. Try student-specific isolated draft
-      let draft = localStorage.getItem(getDraftKey(currPin));
-      // 2. Fallback to shared draft if not found
-      if (!draft) {
-        draft = localStorage.getItem(`draft_${currPin}`);
+      let draft = loadStudentScopedStorageItem(getDraftKey(currPin), sharedPcActive);
+      // 2. Fallback to shared draft only on personal devices (never in Shared-PC lab mode)
+      if (!draft && !sharedPcActive) {
+        draft = loadStudentScopedStorageItem(`draft_${currPin}`, false);
       }
       if (draft) {
         const parsed = JSON.parse(draft);
@@ -1302,8 +1335,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   const clearDraft = (currPin: string) => {
     try {
-      localStorage.removeItem(getDraftKey(currPin));
-      localStorage.removeItem(`draft_${currPin}`);
+      removeStudentScopedStorageItem(getDraftKey(currPin), sharedPcActive);
+      if (!sharedPcActive) {
+        removeStudentScopedStorageItem(`draft_${currPin}`, false);
+      }
     } catch {}
   };
 
@@ -1319,7 +1354,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     if (!rawExamContent) return rawExamContent;
     let savedOrder: Record<string, number[]> | null = null;
     try {
-      const rawSaved = localStorage.getItem(getMcOrderStorageKey(currPin, runIdVal));
+      const rawSaved = loadStudentScopedStorageItem(getMcOrderStorageKey(currPin, runIdVal), sharedPcActive);
       if (rawSaved) savedOrder = JSON.parse(rawSaved);
     } catch {}
 
@@ -1379,7 +1414,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     mcOptionOrderRef.current = nextOrder;
     if (Object.keys(nextOrder).length > 0) {
       try {
-        localStorage.setItem(getMcOrderStorageKey(currPin, runIdVal), JSON.stringify(nextOrder));
+        saveStudentScopedStorageItem(getMcOrderStorageKey(currPin, runIdVal), JSON.stringify(nextOrder), sharedPcActive);
       } catch {}
     }
     return result;
@@ -1427,16 +1462,42 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setExamType(examContent.sections ? "workbook" : "quiz");
         }
         setEncryptedAnswerKey(String(selectedKey || ""));
-        setDeferSolutionsSession(!!sessionData.deferSolutions);
-        setSolutionsReleased(sessionData.deferSolutions ? !!sessionData.solutionsReleased : true);
-        setAllowAudioAnswersSession(!!sessionData.allowAudioAnswers);
-
         const besOpts: BesOptions = sessionData.besOptions || {};
         const extraPct: 0 | 25 | 50 = besOpts.extraTimePercent === 50 ? 50 : besOpts.extraTimePercent === 25 ? 25 : 0;
         setBesExtraTimePercent(extraPct);
         const restoredBesExpiry = cloudStudentData?.besExpiryIso || null;
+        const restoredExtExpiry = cloudStudentData?.extendedExpiryIso || null;
+        if (restoredExtExpiry) {
+          lastExtendedExpiryIsoRef.current = String(restoredExtExpiry);
+        }
+        const candidateExpiries = [sessionData.expiry, restoredBesExpiry, restoredExtExpiry]
+          .filter((v): v is string => typeof v === "string" && !isNaN(new Date(v).getTime()));
+        const bestExpiry = candidateExpiries.sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || null;
         besExpiryIsoRef.current = extraPct > 0 ? (restoredBesExpiry || sessionData.expiry || null) : null;
-        setExpiryTime(restoredBesExpiry || sessionData.expiry || null);
+        setExpiryTime(bestExpiry);
+        setSessionCreatedAt(sessionData.createdAt || null);
+        setSessionAutoRelease(!!sessionData.autoReleaseSolutions);
+        setSessionMaxExtendedExpiry(sessionData.maxExtendedExpiry || null);
+        const restoredReleasedClasses = Array.isArray(sessionData.releasedClasses)
+          ? parseAllowedClassList(sessionData.releasedClasses.join(","))
+          : [];
+        setSessionReleasedClasses(restoredReleasedClasses);
+        setDeferSolutionsSession(!!sessionData.deferSolutions);
+        const restoredClsForCheck = normalizeClassLabel(cloudStudentData?.studentClass) || resolvedStudentClassRef.current;
+        const restoredUnlocked = isDeferredUnlockedForStudent({
+          deferSolutions: sessionData.deferSolutions,
+          solutionsReleased: sessionData.solutionsReleased,
+          releasedClasses: restoredReleasedClasses,
+          autoReleaseSolutions: !!sessionData.autoReleaseSolutions,
+          expiry: sessionData.expiry || bestExpiry,
+          createdAt: sessionData.createdAt || null,
+          maxExtendedExpiry: sessionData.maxExtendedExpiry || null,
+          studentClass: restoredClsForCheck,
+          besExtraTimePercent: extraPct,
+        });
+        setSolutionsReleased(restoredUnlocked);
+        setRemoteSolutionsReady(restoredUnlocked);
+        setAllowAudioAnswersSession(!!sessionData.allowAudioAnswers);
         setBackendUrl(sessionData.backendUrl || null);
         setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
         setSeverityPreset(normalizeSeverityPreset(sessionData.severityPreset));
@@ -1466,7 +1527,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   // Restore locked session on mount using strictly student-scoped storage
   useEffect(() => {
-    const scopedLock = loadScopedExamLock(user?.email);
+    const scopedLock = loadScopedExamLock(user?.email, undefined, undefined, undefined, sharedPcActive);
     const savedPin = String(scopedLock?.pin || "").trim().toUpperCase();
     const savedReason = String(scopedLock?.reason || "Prova precedentemente bloccata dal docente o dal sistema");
 
@@ -1481,7 +1542,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       void restoreLockedSession(savedPin);
     } else {
       try {
-        const rawActive = localStorage.getItem("active_student_session");
+        const rawActive = loadStudentScopedStorageItem("active_student_session", sharedPcActive);
         if (rawActive) {
           const parsed = JSON.parse(rawActive);
           if (parsed?.pin) {
@@ -1624,14 +1685,50 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setLatestActiveSessionBroadcast(null);
         }
 
-        if (d?.solutionsReleased === true || d?.deferSolutions === false) {
-          setRemoteSolutionsReady(true);
+        if (d?.createdAt) setSessionCreatedAt(String(d.createdAt));
+        setSessionAutoRelease(!!d?.autoReleaseSolutions);
+        const nextMaxExt = d?.maxExtendedExpiry ? String(d.maxExtendedExpiry) : null;
+        setSessionMaxExtendedExpiry(nextMaxExt);
+        if (d?.expiry && !isNaN(new Date(String(d.expiry)).getTime())) {
+          const nextClassExpiry = String(d.expiry);
+          const nextClassMs = new Date(nextClassExpiry).getTime();
+          setExpiryTime((prevExpiry) => {
+            const prevMs = prevExpiry ? new Date(prevExpiry).getTime() : 0;
+            if (prevMs > 0 && nextClassMs > prevMs + 30_000 && activeScreen === "exam-space") {
+              const endStr = new Date(nextClassExpiry).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+              setInfractionToastMsg(`⏱️ Il docente ha prorogato la scadenza della prova alle ${endStr}.`);
+            }
+            return nextClassMs > prevMs ? nextClassExpiry : prevExpiry;
+          });
+        }
+        const relCls = Array.isArray(d?.releasedClasses)
+          ? parseAllowedClassList(d.releasedClasses.join(","))
+          : [];
+        setSessionReleasedClasses((prev) =>
+          prev.length === relCls.length && prev.every((v, i) => v === relCls[i]) ? prev : relCls
+        );
+
+        const readyForStudent = isDeferredUnlockedForStudent({
+          deferSolutions: d?.deferSolutions,
+          solutionsReleased: d?.solutionsReleased,
+          releasedClasses: relCls,
+          autoReleaseSolutions: !!d?.autoReleaseSolutions,
+          expiry: d?.expiry || expiryTime,
+          createdAt: d?.createdAt || sessionCreatedAt,
+          maxExtendedExpiry: nextMaxExt,
+          studentClass: resolvedStudentClassRef.current,
+          besExtraTimePercent: besExtraTimePercent,
+        });
+        setRemoteSolutionsReady(readyForStudent);
+        if (!readyForStudent && d?.deferSolutions === true) {
+          setSolutionsReleased(false);
+          setUnlockSolutionsError("");
         }
       },
       (err) => console.warn("Ascolto sessione live:", err)
     );
     return () => unsub();
-  }, [dbFirestore, sessionPin]);
+  }, [dbFirestore, sessionPin, besExtraTimePercent]);
 
   // Re-evaluate incoming class broadcast reactively when either the broadcast or resolvedStudentClass updates
   useEffect(() => {
@@ -1670,6 +1767,51 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     }
   }, [latestActiveSessionBroadcast, resolvedStudentClass, recordNoticeInHistory]);
 
+  // Auto-release timer: when scheduled autoReleaseSolutions is enabled, check every 15s on results screen
+  useEffect(() => {
+    if (
+      activeScreen !== "results" ||
+      !deferSolutionsSession ||
+      solutionsReleased ||
+      remoteSolutionsReady ||
+      !sessionAutoRelease ||
+      !expiryTime
+    ) {
+      return;
+    }
+    const checkDeadline = () => {
+      const ready = isDeferredUnlockedForStudent({
+        deferSolutions: deferSolutionsSession,
+        solutionsReleased: false,
+        releasedClasses: sessionReleasedClasses,
+        autoReleaseSolutions: sessionAutoRelease,
+        expiry: expiryTime,
+        createdAt: sessionCreatedAt,
+        maxExtendedExpiry: sessionMaxExtendedExpiry,
+        studentClass: resolvedStudentClass,
+        besExtraTimePercent: besExtraTimePercent,
+      });
+      if (ready) {
+        setRemoteSolutionsReady(true);
+      }
+    };
+    checkDeadline();
+    const timer = setInterval(checkDeadline, 15000);
+    return () => clearInterval(timer);
+  }, [
+    activeScreen,
+    deferSolutionsSession,
+    solutionsReleased,
+    remoteSolutionsReady,
+    sessionAutoRelease,
+    expiryTime,
+    sessionCreatedAt,
+    sessionMaxExtendedExpiry,
+    sessionReleasedClasses,
+    resolvedStudentClass,
+    besExtraTimePercent,
+  ]);
+
   // Decrypt deferred solutions on results screen once session signals release
   useEffect(() => {
     if (activeScreen !== "results" || !deferSolutionsSession || solutionsReleased || !remoteSolutionsReady || !sessionPin) {
@@ -1679,12 +1821,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     let cancelled = false;
     (async () => {
       try {
+        setUnlockSolutionsError("");
         const resp = await fetch("/api/session/unlock-solutions", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify({
             pin: cleanPin,
             sessionId: sessionRunId || "",
+            studentEmail: user?.email || "",
+            studentClass: resolvedStudentClass || "",
             assignedFila: assignedFilaRef.current || "",
             encryptedAnswerKey: encryptedAnswerKey || "",
             examData,
@@ -1694,7 +1839,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           }),
         });
         const data = await resp.json().catch(() => null);
-        if (!cancelled && resp.ok && data?.unlocked) {
+        if (cancelled) return;
+        if (resp.ok && data?.unlocked) {
           if (data.resolvedDomande) setExamData(data.resolvedDomande);
           setEvaluation((prev) =>
             prev
@@ -1705,18 +1851,25 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 }
               : prev
           );
+          setUnlockSolutionsError("");
+          setSolutionsReleased(true);
+        } else {
+          setUnlockSolutionsError(
+            data?.error || "Impossibile recuperare le soluzioni sbloccate in questo momento. Riprova tra poco."
+          );
         }
       } catch (unlockErr) {
         console.warn("Errore sblocco soluzioni differite:", unlockErr);
-      } finally {
-        if (!cancelled) setSolutionsReleased(true);
+        if (!cancelled) {
+          setUnlockSolutionsError("Connessione assente o instabile durante lo sblocco delle soluzioni. Premi Riprova.");
+        }
       }
     })();
     return () => {
       cancelled = true;
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeScreen, deferSolutionsSession, solutionsReleased, remoteSolutionsReady, sessionPin, sessionRunId, encryptedAnswerKey, examType]);
+  }, [activeScreen, deferSolutionsSession, solutionsReleased, remoteSolutionsReady, sessionPin, sessionRunId, encryptedAnswerKey, examType, unlockRetryNonce]);
 
   // History view: if a past submission had deferred solutions, verify Session_Id match and unlock via server vault
   useEffect(() => {
@@ -1734,7 +1887,25 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         if (snapSessionId && subSessionId && snapSessionId !== subSessionId) {
           return;
         }
-        if (sData?.solutionsReleased === true || sData?.deferSolutions === false) {
+        const pastStudentCls = resolveSubmissionClass(selectedPastSub);
+        const sBesExtra =
+          sData?.besOptions?.extraTimePercent === 50
+            ? 50
+            : sData?.besOptions?.extraTimePercent === 25
+            ? 25
+            : 0;
+        const isPastUnlocked = isDeferredUnlockedForStudent({
+          deferSolutions: sData?.deferSolutions,
+          solutionsReleased: sData?.solutionsReleased,
+          releasedClasses: sData?.releasedClasses,
+          autoReleaseSolutions: !!sData?.autoReleaseSolutions,
+          expiry: sData?.expiry,
+          createdAt: sData?.createdAt,
+          maxExtendedExpiry: sData?.maxExtendedExpiry || null,
+          studentClass: pastStudentCls === UNSPECIFIED_CLASS_LABEL ? "" : pastStudentCls,
+          besExtraTimePercent: sBesExtra,
+        });
+        if (isPastUnlocked) {
           setPastUnlockingId(selectedPastSub.id);
           try {
             const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
@@ -1747,6 +1918,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 pin: cleanPin,
                 sessionId: subSessionId,
                 studentEmail: user?.email || selectedPastSub.Email || "",
+                studentClass: pastStudentCls === UNSPECIFIED_CLASS_LABEL ? "" : pastStudentCls,
                 assignedFila: selectedPastSub.Assigned_Fila || "",
                 mcOptionOrder: parsedMcOrder,
                 examData: parsedExamData,
@@ -1784,7 +1956,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       return;
     }
     setStudentClassInput(declaredClass);
-    saveScopedStudentClass(user?.email, declaredClass);
+    saveScopedStudentClass(user?.email, declaredClass, undefined, undefined, sharedPcActive);
 
     if (!pin.trim()) {
       setPinError("Inserisci un PIN valido.");
@@ -1864,10 +2036,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             if (cloudBesIso) {
               anchoredBesIso = cloudBesIso;
               effectiveExpiry = cloudBesIso;
-              try { localStorage.setItem(besAnchorKey, cloudBesIso); } catch {}
+              saveStudentScopedStorageItem(besAnchorKey, cloudBesIso, sharedPcActive);
             } else {
-              let savedBesExpiry: string | null = null;
-              try { savedBesExpiry = localStorage.getItem(besAnchorKey); } catch {}
+              const savedBesExpiry = loadStudentScopedStorageItem(besAnchorKey, sharedPcActive);
               if (savedBesExpiry && !isNaN(new Date(savedBesExpiry).getTime())) {
                 anchoredBesIso = savedBesExpiry;
                 effectiveExpiry = savedBesExpiry;
@@ -1882,9 +2053,19 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   const extendedIso = new Date(baseMs + extraMs).toISOString();
                   anchoredBesIso = extendedIso;
                   effectiveExpiry = extendedIso;
-                  try { localStorage.setItem(besAnchorKey, extendedIso); } catch {}
+                  saveStudentScopedStorageItem(besAnchorKey, extendedIso, sharedPcActive);
                 }
               }
+            }
+          }
+
+          if (cloudStudentData?.extendedExpiryIso) {
+            const extIso = String(cloudStudentData.extendedExpiryIso);
+            const extMs = new Date(extIso).getTime();
+            const curMs = effectiveExpiry ? new Date(effectiveExpiry).getTime() : 0;
+            if (!isNaN(extMs) && extMs > curMs) {
+              effectiveExpiry = extIso;
+              lastExtendedExpiryIsoRef.current = extIso;
             }
           }
 
@@ -1969,9 +2150,27 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setExamType(examContent?.sections ? "workbook" : "quiz");
 
           const isDeferred = !!sessionData.deferSolutions;
-          const isReleasedNow = isDeferred ? !!sessionData.solutionsReleased : true;
+          const initReleasedClasses = Array.isArray(sessionData.releasedClasses)
+            ? parseAllowedClassList(sessionData.releasedClasses.join(","))
+            : [];
+          setSessionCreatedAt(sessionData.createdAt || null);
+          setSessionAutoRelease(!!sessionData.autoReleaseSolutions);
+          setSessionMaxExtendedExpiry(sessionData.maxExtendedExpiry || null);
+          setSessionReleasedClasses(initReleasedClasses);
+          const isReleasedNow = isDeferredUnlockedForStudent({
+            deferSolutions: isDeferred,
+            solutionsReleased: !!sessionData.solutionsReleased,
+            releasedClasses: initReleasedClasses,
+            autoReleaseSolutions: !!sessionData.autoReleaseSolutions,
+            expiry: sessionData.expiry || null,
+            createdAt: sessionData.createdAt || null,
+            maxExtendedExpiry: sessionData.maxExtendedExpiry || null,
+            studentClass: declaredClass,
+            besExtraTimePercent: extraPct,
+          });
           setDeferSolutionsSession(isDeferred);
           setSolutionsReleased(isReleasedNow);
+          setRemoteSolutionsReady(isReleasedNow);
 
           setBackendUrl(sessionData.backendUrl || null);
           setTeacherEmail(sessionData.teacherEmail || "sconosciuto");
@@ -2002,7 +2201,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           // Restore a lock applied before a page reload scoped strictly to this student + PIN
           let isLockedNow = false;
           let currentLockReason = "";
-          const restoredLock = loadScopedExamLock(user?.email, formattedPin);
+          const restoredLock = loadScopedExamLock(user?.email, formattedPin, undefined, undefined, sharedPcActive);
           if (restoredLock) {
             isLockedNow = true;
             currentLockReason = restoredLock.reason || "Prova precedentemente bloccata per allontanamento";
@@ -2753,13 +2952,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     setIsExamActive(true);
     setActiveScreen("exam-space");
     syncLiveProgress("in_progress");
-    try {
-      localStorage.setItem("active_student_session", JSON.stringify({
+    saveStudentScopedStorageItem(
+      "active_student_session",
+      JSON.stringify({
         pin: sessionPin,
         sessionRunId,
         startedAt: new Date().toISOString()
-      }));
-    } catch {}
+      }),
+      sharedPcActive
+    );
   };
 
   // MCQ handler
@@ -3039,9 +3240,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   currentJobToken = String(reEnqueueData.jobToken || "");
                   rescue.jobId = currentJobId;
                   rescue.jobToken = currentJobToken;
-                  try {
-                    localStorage.setItem("active_eval_rescue", JSON.stringify(rescue));
-                  } catch {}
+                  saveStudentScopedStorageItem("active_eval_rescue", JSON.stringify(rescue), sharedPcActive);
                   pollAttempts = 0;
                   pollingStartedAt = Date.now();
                   isFirstPoll = true;
@@ -3057,7 +3256,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             // the job is gone for good — drop the stale token so refreshes
             // stop re-polling it. Answers remain safe in the per-PIN draft.
             if (!rescue.payload && rescue.jobId === currentJobId) {
-              try { localStorage.removeItem("active_eval_rescue"); } catch {}
+              removeStudentScopedStorageItem("active_eval_rescue", sharedPcActive);
             }
             throw new Error("La sessione di correzione sul server è scaduta o il server è stato riavviato. Riprova a consegnare.");
           }
@@ -3151,12 +3350,11 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
       setEvaluation(finalEval);
       clearDraft(rescue.sessionPin);
-      localStorage.removeItem("active_eval_rescue"); // Clean the rescue token on successful completion!
+      removeStudentScopedStorageItem("active_eval_rescue", sharedPcActive); // Clean the rescue token on successful completion!
       try {
-        localStorage.removeItem("active_student_session");
-        sessionStorage.removeItem("active_student_session");
+        removeStudentScopedStorageItem("active_student_session", sharedPcActive);
         if (rescue.sessionPin) {
-          localStorage.removeItem(getMcOrderStorageKey(rescue.sessionPin, rescue.sessionRunId || ""));
+          removeStudentScopedStorageItem(getMcOrderStorageKey(rescue.sessionPin, rescue.sessionRunId || ""), sharedPcActive);
         }
       } catch {}
       setActiveScreen("results");
@@ -3189,7 +3387,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           const effectiveClass =
             normalizeClassLabel(rescue.studentClass) ||
             resolvedStudentClass ||
-            normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+            normalizeClassLabel(loadScopedStudentClass(user?.email, undefined, undefined, sharedPcActive)) ||
             "NON SPEC.";
           const mcOrderObj = mcOptionOrderRef.current || {};
           const oralAnswersCount = oralQuestionIdsRef.current.size;
@@ -3291,7 +3489,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   // Auto recovery for interrupted/crashed evaluations on mount
   useEffect(() => {
-    const rescued = localStorage.getItem("active_eval_rescue");
+    const rescued = loadStudentScopedStorageItem("active_eval_rescue", sharedPcActive);
     if (rescued) {
       try {
         const data = JSON.parse(rescued);
@@ -3300,11 +3498,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           // (each Render restart wipes the in-memory queue).
           const ageMs = Date.now() - (data.savedAt || 0);
           if (!data.savedAt || ageMs > 30 * 60 * 1000) {
-            // console.log removed
-            localStorage.removeItem("active_eval_rescue");
+            removeStudentScopedStorageItem("active_eval_rescue", sharedPcActive);
             return;
           }
-          // console.log removed
           setSessionPin(data.sessionPin || "");
           setSessionRunId(data.sessionRunId || "");
           setExamType(data.examType || "quiz");
@@ -3331,7 +3527,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         }
       } catch (err) {
         console.error("[Rescue Engine] Failed to restore rescue session:", err);
-        localStorage.removeItem("active_eval_rescue");
+        removeStudentScopedStorageItem("active_eval_rescue", sharedPcActive);
       }
     }
   }, []);
@@ -3587,7 +3783,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         studentClass: resolvedStudentClass,
         piiRedactionsCount: piiScrubResult.redactionsCount
       };
-      localStorage.setItem("active_eval_rescue", JSON.stringify(rescuePayload));
+      saveStudentScopedStorageItem("active_eval_rescue", JSON.stringify(rescuePayload), sharedPcActive);
 
       // 2. Start polling
       await pollJobStatusAndSave(jobId, rescuePayload);
@@ -3616,8 +3812,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     oralQuestionIdsRef.current.clear();
     persistExamLock(false);
     try {
-      sessionStorage.removeItem("active_student_session");
-      localStorage.removeItem("active_student_session");
+      removeStudentScopedStorageItem("active_student_session", sharedPcActive);
     } catch {}
     lockedRef.current = false;
     setExamLocked(false);
@@ -3633,6 +3828,12 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     setSessionRestrictClasses(false);
     setLatestActiveSessionBroadcast(null);
     setRemoteSolutionsReady(false);
+    setSessionCreatedAt(null);
+    setSessionAutoRelease(false);
+    setSessionMaxExtendedExpiry(null);
+    setSessionReleasedClasses([]);
+    setUnlockSolutionsError("");
+    lastExtendedExpiryIsoRef.current = null;
     warn5MinShownRef.current = false;
     warn1MinShownRef.current = false;
     assignedFilaRef.current = undefined;
@@ -3809,8 +4010,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         const raw = e.target.value.slice(0, 40);
                         setStudentClassInput(raw);
                         const norm = normalizeClassLabel(raw);
-                        saveScopedStudentClass(user?.email, norm);
-                        if (user?.isDirectAccess) {
+                        saveScopedStudentClass(user?.email, norm, undefined, undefined, sharedPcActive);
+                        if (user?.isDirectAccess && !sharedPcActive) {
                           try {
                             if (norm) localStorage.setItem("saved_student_class", norm);
                             else localStorage.removeItem("saved_student_class");
@@ -4050,12 +4251,20 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                             {selectedPastSub.Tipo === "Quiz" ? (
                               <div>
                                 <p className="text-slate-500">Crocette Esatte</p>
-                                <p className="text-xs font-bold text-slate-200 mt-0.5">{selectedPastSub.Punteggio_MC || 0} risposta/e</p>
+                                <p className="text-xs font-bold text-slate-200 mt-0.5">
+                                  {pastSolutionsMasked ? "🔒 Differito" : `${selectedPastSub.Punteggio_MC || 0} risposta/e`}
+                                </p>
                               </div>
                             ) : (
                               <div>
-                                <p className="text-slate-500">Punti Fill-in-Blank</p>
-                                <p className="text-xs font-bold text-slate-200 mt-0.5">{selectedPastSub.Punteggio_FIB || 0} esatti</p>
+                                <p className="text-slate-500">Punti Oggettivi</p>
+                                <p className="text-xs font-bold text-slate-200 mt-0.5">
+                                  {pastSolutionsMasked
+                                    ? "🔒 Differito"
+                                    : selectedPastSub.Punteggio_MC !== undefined && Number(selectedPastSub.Punteggio_MC) > 0
+                                    ? `${selectedPastSub.Punteggio_FIB || 0} FIB · ${selectedPastSub.Punteggio_MC} MC`
+                                    : `${selectedPastSub.Punteggio_FIB || 0} esatti`}
+                                </p>
                               </div>
                             )}
                             <div>
@@ -5384,17 +5593,23 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 <p className="text-2xl font-display font-bold text-white mt-2">
                   {deferSolutionsSession && !solutionsReleased ? (
                     <span className="text-base text-amber-300 font-bold">🔒 Differito</span>
-                  ) : examType === "quiz" ? (
-                    <>
-                      {Object.keys(answers.mc).reduce((acc, qId) => {
-                        const question = examData?.multipleChoice?.find((q: any) => q.id === qId);
-                        return acc + (question && answers.mc[qId] === question.correctIndex ? 1 : 0);
-                      }, 0)}
-                      <span className="text-xs text-slate-500 font-mono ml-1">
-                        / {(examData?.multipleChoice || []).length}
-                      </span>
-                    </>
-                  ) : (
+                  ) : examType === "quiz" ? (() => {
+                    const allMcQs = [
+                      ...(Array.isArray(examData?.multipleChoice) ? examData.multipleChoice : []),
+                      ...((Array.isArray(examData?.sections) ? examData.sections : []).flatMap((s: any) =>
+                        Array.isArray(s?.multipleChoice) ? s.multipleChoice : []
+                      )),
+                    ];
+                    const mcHits = allMcQs.reduce((acc, q: any) => (answers.mc[q.id] === q.correctIndex ? acc + 1 : acc), 0);
+                    return (
+                      <>
+                        {mcHits}
+                        <span className="text-xs text-slate-500 font-mono ml-1">
+                          / {allMcQs.length}
+                        </span>
+                      </>
+                    );
+                  })() : (
                     <>
                       {evaluation?.fibScore || 0}
                       <span className="text-xs text-slate-500 font-mono ml-1">
@@ -5469,7 +5684,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
             {/* Deferred Solutions Live Lock Notice */}
             {deferSolutionsSession && !solutionsReleased && (
-              <div className="bg-amber-950/40 border border-amber-500/35 rounded-2xl p-4 sm:p-5 space-y-1.5">
+              <div className="bg-amber-950/40 border border-amber-500/35 rounded-2xl p-4 sm:p-5 space-y-2.5">
                 <div className="flex items-center gap-2 text-amber-300">
                   <Lock className="w-4 h-4 shrink-0" />
                   <h4 className="text-xs font-bold uppercase tracking-wider">
@@ -5477,8 +5692,24 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   </h4>
                 </div>
                 <p className="text-xs text-amber-100/90 leading-relaxed">
-                  Per tutelare chi sta ancora svolgendo la verifica in classe, le risposte corrette e le spiegazioni restano nascoste fino allo sblocco da parte del docente. Questa pagina si aggiornerà automaticamente appena verranno pubblicate.
+                  Per tutelare chi sta ancora svolgendo la verifica in classe, le risposte corrette e le spiegazioni restano nascoste fino allo sblocco da parte del docente{sessionAutoRelease ? " o alla scadenza automatica della prova" : ""}. Questa pagina si aggiornerà automaticamente appena verranno pubblicate.
                 </p>
+                {unlockSolutionsError && (
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 pt-2 border-t border-amber-500/20">
+                    <span className="text-xs text-rose-300">{unlockSolutionsError}</span>
+                    <button
+                      type="button"
+                      onClick={() => {
+                        setUnlockSolutionsError("");
+                        setRemoteSolutionsReady(true);
+                        setUnlockRetryNonce((n) => n + 1);
+                      }}
+                      className="px-3 py-1.5 rounded-lg bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 text-xs font-semibold cursor-pointer shrink-0 transition-colors"
+                    >
+                      Riprova sblocco soluzioni
+                    </button>
+                  </div>
+                )}
               </div>
             )}
 
@@ -6253,7 +6484,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
       {infractionToastMsg && (
         <div className="fixed bottom-4 left-1/2 -translate-x-1/2 z-[100015] max-w-md w-[calc(100%-2rem)] px-4 py-2.5 bg-amber-950/95 border border-amber-500/40 rounded-xl text-amber-100 text-xs text-center shadow-2xl animate-fadeIn">
-          {/^[🟢🛡️✅⚠️🔓📩🎙️⏳📌📢]/u.test(infractionToastMsg) ? infractionToastMsg : `⚠️ ${infractionToastMsg}`}
+          {/^[🟢🛡️✅⚠️🔓📩🎙️⏳📌📢⏱]/u.test(infractionToastMsg) ? infractionToastMsg : `⚠️ ${infractionToastMsg}`}
         </div>
       )}
 

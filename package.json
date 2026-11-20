@@ -14,6 +14,7 @@
     "lint": "tsc --noEmit && tsx scripts/check-secrets.ts",
     "check:secrets": "tsx scripts/check-secrets.ts",
     "test:grades": "tsx scripts/grade-tests.ts",
+    "test:server": "tsx scripts/server-tests.ts",
     "audit:grades": "tsx scripts/audit-grades.ts"
   },
   "dependencies": {

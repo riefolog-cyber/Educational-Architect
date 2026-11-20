@@ -26,6 +26,7 @@ import { dbFirestore } from "../firebase";
 import type { LiveSessionSummary } from "../types";
 import { deriveStudentPseudonym } from "../utils/privacyPseudonym";
 import { compareClassLabels, normalizeClassLabel } from "../utils/classGrouping";
+import { addMinutesToExpiryIso } from "../utils/deferredSolutions";
 
 export interface LiveStudentData {
   id: string;
@@ -51,6 +52,8 @@ export interface LiveStudentData {
   teacherNoticeAckAt?: string;
   classNoticeAckAt?: string;
   assignedFila?: "A" | "B";
+  besExpiryIso?: string;
+  extendedExpiryIso?: string;
 }
 
 interface ClassroomLiveMonitorProps {
@@ -63,11 +66,13 @@ interface ClassroomLiveMonitorProps {
   onRefreshSessions?: () => void;
   onTerminateSession?: (pin: string) => void;
   onTerminateAllSessions?: () => void;
-  onToggleSolutionsReleased?: (pin: string, nextReleased: boolean) => Promise<void>;
+  onToggleSolutionsReleased?: (pin: string, nextReleased: boolean, targetClass?: string) => Promise<void>;
+  onExtendSessionTime?: (pin: string, minutesToAdd: number) => Promise<void>;
   onPurgeArchivedSession?: (pin: string) => Promise<void>;
   terminatingPin?: string | null;
   terminatingAll?: boolean;
   togglingSolutionsPin?: string | null;
+  extendingSessionPin?: string | null;
 }
 
 // A student is considered truly "in exam" only while the heartbeat keeps flowing
@@ -84,10 +89,12 @@ export default function ClassroomLiveMonitor({
   onTerminateSession,
   onTerminateAllSessions,
   onToggleSolutionsReleased,
+  onExtendSessionTime,
   onPurgeArchivedSession,
   terminatingPin = null,
   terminatingAll = false,
-  togglingSolutionsPin = null
+  togglingSolutionsPin = null,
+  extendingSessionPin = null
 }: ClassroomLiveMonitorProps) {
   const cleanPin = (pin || "").trim().toUpperCase();
   const [students, setStudents] = useState<LiveStudentData[]>([]);
@@ -119,6 +126,8 @@ export default function ClassroomLiveMonitor({
   const [sendingClassNotice, setSendingClassNotice] = useState(false);
   const [classNoticeFeedback, setClassNoticeFeedback] = useState<{ type: "success" | "error"; msg: string } | null>(null);
   const [blindLimMode, setBlindLimMode] = useState(false);
+  const [extendingId, setExtendingId] = useState<string | null>(null);
+  const [extendedOkId, setExtendedOkId] = useState<string | null>(null);
   const progressChangedAtRef = useRef<Record<string, { answered: number; changedAt: number }>>({});
 
   const CLASS_NOTICE_PRESETS = [
@@ -247,6 +256,8 @@ export default function ClassroomLiveMonitor({
             teacherNoticeAckAt: typeof data.teacherNoticeAckAt === "string" ? data.teacherNoticeAckAt : undefined,
             classNoticeAckAt: typeof data.classNoticeAckAt === "string" ? data.classNoticeAckAt : undefined,
             assignedFila: data.assignedFila === "A" || data.assignedFila === "B" ? data.assignedFila : undefined,
+            besExpiryIso: typeof data.besExpiryIso === "string" ? data.besExpiryIso : undefined,
+            extendedExpiryIso: typeof data.extendedExpiryIso === "string" ? data.extendedExpiryIso : undefined,
           });
         });
 
@@ -506,6 +517,44 @@ export default function ClassroomLiveMonitor({
     }
   };
 
+  const activeMonitoredSession = sessions.find((s) => (s.pin || "").trim().toUpperCase() === cleanPin);
+
+  const handleExtendStudentTime = async (student: LiveStudentData, minutesToAdd: number) => {
+    if (!dbFirestore || !cleanPin || extendingId) return;
+    setExtendingId(student.id);
+    setNoticeError(null);
+    try {
+      const currentAnchor = student.extendedExpiryIso || student.besExpiryIso || activeMonitoredSession?.expiry || null;
+      const nextIso = addMinutesToExpiryIso(currentAnchor, minutesToAdd);
+      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", student.id), {
+        extendedExpiryIso: nextIso,
+      });
+      // Keep session-level maxExtendedExpiry up to date so autoReleaseSolutions waits for this extension
+      const currentMaxMs = activeMonitoredSession?.maxExtendedExpiry
+        ? Date.parse(String(activeMonitoredSession.maxExtendedExpiry))
+        : 0;
+      const nextMs = Date.parse(nextIso);
+      if (Number.isFinite(nextMs) && (!Number.isFinite(currentMaxMs) || nextMs > currentMaxMs)) {
+        try {
+          await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+            maxExtendedExpiry: nextIso,
+          });
+        } catch (syncMaxErr) {
+          console.warn("Aggiornamento maxExtendedExpiry sessione non riuscito (non bloccante):", syncMaxErr);
+        }
+      }
+      setExtendedOkId(student.id);
+      scheduleTimer(() => setExtendedOkId((prev) => (prev === student.id ? null : prev)), 3500);
+    } catch (err: any) {
+      console.warn("Estensione tempo studente non riuscita:", err);
+      const errMsg = `Impossibile concedere +${minutesToAdd} min: ${err?.message || "errore"}`;
+      setNoticeError(errMsg);
+      scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 5000);
+    } finally {
+      setExtendingId(null);
+    }
+  };
+
   const handleSendNotice = async (studentId: string) => {
     const clean = noticeText.trim().slice(0, 280);
     if (!dbFirestore || !cleanPin || !clean || sendingNotice) return;
@@ -748,10 +797,21 @@ export default function ClassroomLiveMonitor({
                           className={`text-[9px] px-1.5 py-0.5 rounded font-bold border ${
                             s.solutionsReleased
                               ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                              : Array.isArray(s.releasedClasses) && s.releasedClasses.length > 0
+                              ? "bg-teal-500/15 text-teal-200 border-teal-500/30"
                               : "bg-amber-500/15 text-amber-300 border-amber-500/30"
                           }`}
                         >
-                          {s.solutionsReleased ? "🔓 Soluzioni Pubblicate" : "🔒 Soluzioni Differite"}
+                          {s.solutionsReleased
+                            ? "🔓 Soluzioni Pubblicate"
+                            : Array.isArray(s.releasedClasses) && s.releasedClasses.length > 0
+                            ? `🔓 Pubbliche: ${s.releasedClasses.join(", ")}`
+                            : "🔒 Soluzioni Differite"}
+                        </span>
+                      )}
+                      {s.deferSolutions && s.autoReleaseSolutions && !s.solutionsReleased && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded bg-indigo-500/15 text-indigo-200 border border-indigo-500/30 font-bold">
+                          ⏰ Auto-rilascio
                         </span>
                       )}
                       {!!s.besOptions?.extraTimePercent && (
@@ -954,37 +1014,101 @@ export default function ClassroomLiveMonitor({
 
         <div className="flex items-center gap-2 flex-wrap">
           {(() => {
-            const activeMonitoredSession = sessions.find((s) => (s.pin || "").trim().toUpperCase() === cleanPin);
             if (!activeMonitoredSession?.deferSolutions || !onToggleSolutionsReleased) return null;
             const released = !!activeMonitoredSession.solutionsReleased;
             const isBusy = togglingSolutionsPin === activeMonitoredSession.pin;
+            const sessionClasses = Array.from(
+              new Set(
+                [
+                  ...(Array.isArray(activeMonitoredSession.allowedClasses) ? activeMonitoredSession.allowedClasses : []),
+                  ...(activeMonitoredSession.targetClass ? [activeMonitoredSession.targetClass] : []),
+                  ...distinctClasses,
+                ]
+                  .map((c) => normalizeClassLabel(c))
+                  .filter(Boolean)
+              )
+            ).sort(compareClassLabels);
+            const releasedClsList = Array.isArray(activeMonitoredSession.releasedClasses)
+              ? activeMonitoredSession.releasedClasses.map((c) => normalizeClassLabel(c))
+              : [];
+
             return (
-              <button
-                type="button"
-                disabled={isBusy}
-                onClick={() => onToggleSolutionsReleased(activeMonitoredSession.pin, !released)}
-                className={`px-3 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50 ${
-                  released
-                    ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30"
-                    : "bg-amber-500/20 border-amber-500/40 text-amber-200 hover:bg-amber-500/30"
-                }`}
-                title={
-                  released
-                    ? "Nascondi nuovamente le risposte esatte e le spiegazioni agli studenti"
-                    : "Sblocca in tempo reale risposte esatte e spiegazioni per tutta la classe"
-                }
-              >
-                {isBusy ? (
-                  <RefreshCw className="w-3.5 h-3.5 animate-spin" />
-                ) : released ? (
-                  <Eye className="w-3.5 h-3.5 text-emerald-300" />
-                ) : (
-                  <Lock className="w-3.5 h-3.5 text-amber-300" />
-                )}
-                <span>{released ? "Soluzioni Pubbliche (Nascondi)" : "Pubblica Soluzioni alla Classe"}</span>
-              </button>
+              <div className="flex items-center gap-1.5 flex-wrap">
+                <button
+                  type="button"
+                  disabled={isBusy}
+                  onClick={() => onToggleSolutionsReleased(activeMonitoredSession.pin, !released)}
+                  className={`px-3 py-1.5 rounded-xl border text-xs font-bold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50 ${
+                    released
+                      ? "bg-emerald-500/20 border-emerald-500/40 text-emerald-200 hover:bg-emerald-500/30"
+                      : "bg-amber-500/20 border-amber-500/40 text-amber-200 hover:bg-amber-500/30"
+                  }`}
+                  title={
+                    released
+                      ? "Nascondi nuovamente le risposte esatte e le spiegazioni agli studenti"
+                      : "Sblocca in tempo reale risposte esatte e spiegazioni per tutta la sessione"
+                  }
+                >
+                  {isBusy ? (
+                    <RefreshCw className="w-3.5 h-3.5 animate-spin" />
+                  ) : released ? (
+                    <Eye className="w-3.5 h-3.5 text-emerald-300" />
+                  ) : (
+                    <Lock className="w-3.5 h-3.5 text-amber-300" />
+                  )}
+                  <span>{released ? "Soluzioni Pubbliche (Nascondi)" : "Pubblica Soluzioni alla Classe"}</span>
+                </button>
+                {sessionClasses.length > 1 && !released && sessionClasses.map((cls) => {
+                  const clsReleased = releasedClsList.includes(cls);
+                  return (
+                    <button
+                      key={`rel_${cls}`}
+                      type="button"
+                      disabled={isBusy}
+                      onClick={() => onToggleSolutionsReleased(activeMonitoredSession.pin, !clsReleased, cls)}
+                      className={`px-2 py-1.5 rounded-xl border text-[11px] font-mono font-bold flex items-center gap-1 cursor-pointer transition-colors disabled:opacity-50 ${
+                        clsReleased
+                          ? "bg-teal-500/20 border-teal-400/50 text-teal-200 hover:bg-teal-500/30"
+                          : "bg-slate-950/70 border-white/10 text-slate-300 hover:text-amber-200 hover:border-amber-500/40"
+                      }`}
+                      title={
+                        clsReleased
+                          ? `Nascondi soluzioni solo per la classe ${cls}`
+                          : `Pubblica le soluzioni solo per la classe ${cls}`
+                      }
+                    >
+                      <span>{clsReleased ? `🔓 ${cls}` : `🔒 Solo ${cls}`}</span>
+                    </button>
+                  );
+                })}
+              </div>
             );
           })()}
+          {activeMonitoredSession && onExtendSessionTime && (isSessionLive ? isSessionLive(activeMonitoredSession) : activeMonitoredSession.active) && (
+            <div className="flex items-center gap-1 bg-slate-950/70 border border-sky-500/30 rounded-xl px-1.5 py-1">
+              <span className="text-[10px] font-bold text-sky-300 px-1 uppercase tracking-wider hidden md:inline">
+                Proroga Classe:
+              </span>
+              <button
+                type="button"
+                disabled={extendingSessionPin === activeMonitoredSession.pin}
+                onClick={() => onExtendSessionTime(activeMonitoredSession.pin, 5)}
+                className="px-2 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/30 border border-sky-500/30 text-sky-200 text-[11px] font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors"
+                title="Aggiungi 5 minuti alla scadenza di tutta la classe e all'eventuale auto-rilascio"
+              >
+                +5m
+              </button>
+              <button
+                type="button"
+                disabled={extendingSessionPin === activeMonitoredSession.pin}
+                onClick={() => onExtendSessionTime(activeMonitoredSession.pin, 10)}
+                className="px-2 py-1 rounded-lg bg-sky-500/15 hover:bg-sky-500/30 border border-sky-500/30 text-sky-200 text-[11px] font-mono font-bold cursor-pointer disabled:opacity-50 transition-colors"
+                title="Aggiungi 10 minuti alla scadenza di tutta la classe e all'eventuale auto-rilascio"
+              >
+                +10m
+              </button>
+            </div>
+          )}
           <button
             type="button"
             onClick={() => setBlindLimMode((prev) => !prev)}
@@ -1632,6 +1756,22 @@ export default function ClassroomLiveMonitor({
                                 Fila {student.assignedFila}
                               </span>
                             )}
+                            {student.extendedExpiryIso && (() => {
+                              const baseRef = student.besExpiryIso || activeMonitoredSession?.expiry || "";
+                              const baseMs = baseRef ? Date.parse(baseRef) : NaN;
+                              const extMs = Date.parse(student.extendedExpiryIso);
+                              const extraMins = Number.isFinite(extMs) && Number.isFinite(baseMs) && extMs > baseMs
+                                ? Math.max(1, Math.round((extMs - baseMs) / 60000))
+                                : null;
+                              return (
+                                <span
+                                  className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-400/35"
+                                  title={`Scadenza individuale estesa alle ${new Date(student.extendedExpiryIso).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}`}
+                                >
+                                  {extraMins ? `+${extraMins}m extra` : "Tempo extra"}
+                                </span>
+                              );
+                            })()}
                             {student.status === "submitted" && (
                               <span className="text-[10px] font-bold px-2 py-0.5 rounded-lg bg-emerald-500/25 text-emerald-200 border border-emerald-500/40 flex items-center gap-1 shadow-xs">
                                 <CheckCircle2 className="w-3 h-3 text-emerald-400" />
@@ -1821,29 +1961,53 @@ export default function ClassroomLiveMonitor({
                       )}
 
                       {student.status !== "submitted" && (
-                        <button
-                          type="button"
-                          onClick={() => {
-                            if (noticeTargetId === student.id) {
-                              setNoticeTargetId(null);
-                              setNoticeText("");
-                            } else {
-                              setNoticeTargetId(student.id);
-                              setNoticeText(student.teacherNotice || "");
-                            }
-                          }}
-                          title={`Invia un messaggio mirato a ${getMonitorName(student)}`}
-                          className={`px-2 py-1 rounded-lg text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-colors shrink-0 ${
-                            noticeSentId === student.id
-                              ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
-                              : noticeTargetId === student.id
-                              ? "bg-indigo-500/25 text-indigo-200 border border-indigo-400/40"
-                              : "bg-white/5 hover:bg-indigo-500/15 text-slate-300 hover:text-indigo-200 border border-white/10"
-                          }`}
-                        >
-                          {noticeSentId === student.id ? <Check className="w-3 h-3" /> : <MessageSquare className="w-3 h-3" />}
-                          <span>{noticeSentId === student.id ? "Inviato" : "Avviso"}</span>
-                        </button>
+                        <div className="flex items-center gap-1 shrink-0">
+                          <button
+                            type="button"
+                            onClick={() => handleExtendStudentTime(student, 5)}
+                            disabled={extendingId === student.id}
+                            title={`Concedi +5 minuti extra individuali a ${getMonitorName(student)}`}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition-colors border disabled:opacity-50 ${
+                              extendedOkId === student.id
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                : "bg-white/5 hover:bg-teal-500/20 text-slate-300 hover:text-teal-200 border-white/10 hover:border-teal-500/40"
+                            }`}
+                          >
+                            {extendedOkId === student.id ? "+5m ✓" : "+5m"}
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleExtendStudentTime(student, 10)}
+                            disabled={extendingId === student.id}
+                            title={`Concedi +10 minuti extra individuali a ${getMonitorName(student)}`}
+                            className="px-2 py-1 rounded-lg text-[10px] font-mono font-bold bg-white/5 hover:bg-teal-500/20 text-slate-300 hover:text-teal-200 border border-white/10 hover:border-teal-500/40 cursor-pointer transition-colors disabled:opacity-50"
+                          >
+                            +10m
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              if (noticeTargetId === student.id) {
+                                setNoticeTargetId(null);
+                                setNoticeText("");
+                              } else {
+                                setNoticeTargetId(student.id);
+                                setNoticeText(student.teacherNotice || "");
+                              }
+                            }}
+                            title={`Invia un messaggio mirato a ${getMonitorName(student)}`}
+                            className={`px-2 py-1 rounded-lg text-[10px] font-semibold flex items-center gap-1 cursor-pointer transition-colors shrink-0 ${
+                              noticeSentId === student.id
+                                ? "bg-emerald-500/20 text-emerald-300 border border-emerald-500/30"
+                                : noticeTargetId === student.id
+                                ? "bg-indigo-500/25 text-indigo-200 border border-indigo-400/40"
+                                : "bg-white/5 hover:bg-indigo-500/15 text-slate-300 hover:text-indigo-200 border border-white/10"
+                            }`}
+                          >
+                            {noticeSentId === student.id ? <Check className="w-3 h-3" /> : <MessageSquare className="w-3 h-3" />}
+                            <span>{noticeSentId === student.id ? "Inviato" : "Avviso"}</span>
+                          </button>
+                        </div>
                       )}
 
                       {/* Relative heartbeat */}

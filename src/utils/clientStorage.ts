@@ -27,6 +27,109 @@ function getDefaultSessionStorage(): StorageLike | null {
   }
 }
 
+export const SHARED_PC_MODE_KEY = "ea_shared_pc_mode";
+
+export function isSharedPcSessionActive(
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): boolean {
+  if (!sessionStore) return false;
+  try {
+    return sessionStore.getItem(SHARED_PC_MODE_KEY) === "1";
+  } catch {
+    return false;
+  }
+}
+
+export function setSharedPcSessionActive(
+  active: boolean,
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): void {
+  if (!sessionStore) return;
+  try {
+    if (active) sessionStore.setItem(SHARED_PC_MODE_KEY, "1");
+    else sessionStore.removeItem(SHARED_PC_MODE_KEY);
+  } catch {}
+}
+
+function getEffectiveLocalStore(
+  localStore: StorageLike | null | undefined,
+  sessionStore: StorageLike | null,
+  sharedPcOverride?: boolean
+): StorageLike | null {
+  const isShared = sharedPcOverride ?? isSharedPcSessionActive(sessionStore);
+  if (localStore !== undefined) {
+    return isShared ? null : localStore;
+  }
+  return isShared ? null : getDefaultLocalStorage();
+}
+
+export function saveStudentScopedStorageItem(
+  key: string,
+  value: string,
+  sharedPc?: boolean,
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): void {
+  const isShared = sharedPc ?? isSharedPcSessionActive(sessionStore);
+  if (isShared) {
+    if (sessionStore) {
+      try {
+        sessionStore.setItem(key, value);
+      } catch {}
+    }
+    return;
+  }
+  const rawLocal = localStore !== undefined ? localStore : getDefaultLocalStorage();
+  if (rawLocal) {
+    try {
+      rawLocal.setItem(key, value);
+    } catch {}
+  }
+  if (sessionStore) {
+    try {
+      sessionStore.setItem(key, value);
+    } catch {}
+  }
+}
+
+export function loadStudentScopedStorageItem(
+  key: string,
+  sharedPc?: boolean,
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): string | null {
+  const isShared = sharedPc ?? isSharedPcSessionActive(sessionStore);
+  if (sessionStore) {
+    try {
+      const val = sessionStore.getItem(key);
+      if (val !== null) return val;
+    } catch {}
+  }
+  if (isShared) return null;
+  const rawLocal = localStore !== undefined ? localStore : getDefaultLocalStorage();
+  if (rawLocal) {
+    try {
+      return rawLocal.getItem(key);
+    } catch {}
+  }
+  return null;
+}
+
+export function removeStudentScopedStorageItem(
+  key: string,
+  sharedPc?: boolean,
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
+): void {
+  const effectiveLocal = getEffectiveLocalStore(localStore, sessionStore, sharedPc);
+  for (const store of [effectiveLocal, sessionStore]) {
+    if (!store) continue;
+    try {
+      store.removeItem(key);
+    } catch {}
+  }
+}
+
 export function normalizeIdentityKey(email?: string | null): string {
   const raw = String(email || "").trim().toLowerCase();
   if (!raw) return "anon";
@@ -55,15 +158,17 @@ export function saveScopedExamLock(
   pin: string,
   locked: boolean,
   reason = "",
-  localStore: StorageLike | null = getDefaultLocalStorage(),
-  sessionStore: StorageLike | null = getDefaultSessionStorage()
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage(),
+  sharedPc?: boolean
 ): void {
   const cleanPin = String(pin || "").trim().toUpperCase();
   const emailKey = normalizeIdentityKey(email);
   const scopedKey = getScopedExamLockKey(email, cleanPin);
   const activeKey = getScopedActiveExamLockKey(email);
 
-  const stores = [localStore, sessionStore].filter((s): s is StorageLike => !!s);
+  const effectiveLocal = getEffectiveLocalStore(localStore, sessionStore, sharedPc);
+  const stores = [effectiveLocal, sessionStore].filter((s): s is StorageLike => !!s);
   for (const store of stores) {
     try {
       if (locked) {
@@ -93,12 +198,14 @@ export function saveScopedExamLock(
 export function loadScopedExamLock(
   email: string | null | undefined,
   pin?: string,
-  localStore: StorageLike | null = getDefaultLocalStorage(),
-  sessionStore: StorageLike | null = getDefaultSessionStorage()
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage(),
+  sharedPc?: boolean
 ): StoredExamLock | null {
   const emailKey = normalizeIdentityKey(email);
   const cleanPin = String(pin || "").trim().toUpperCase();
-  const stores = [localStore, sessionStore].filter((s): s is StorageLike => !!s);
+  const effectiveLocal = getEffectiveLocalStore(localStore, sessionStore, sharedPc);
+  const stores = [effectiveLocal, sessionStore].filter((s): s is StorageLike => !!s);
 
   const candidateKeys: string[] = [];
   if (cleanPin) {
@@ -159,12 +266,14 @@ export function loadScopedExamLock(
 export function clearScopedExamLock(
   email: string | null | undefined,
   pin?: string,
-  localStore: StorageLike | null = getDefaultLocalStorage(),
-  sessionStore: StorageLike | null = getDefaultSessionStorage()
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage(),
+  sharedPc?: boolean
 ): void {
-  saveScopedExamLock(email, pin || "", false, "", localStore, sessionStore);
+  saveScopedExamLock(email, pin || "", false, "", localStore, sessionStore, sharedPc);
   const emailKey = normalizeIdentityKey(email);
-  const stores = [localStore, sessionStore].filter((s): s is StorageLike => !!s);
+  const effectiveLocal = getEffectiveLocalStore(localStore, sessionStore, sharedPc);
+  const stores = [effectiveLocal, sessionStore].filter((s): s is StorageLike => !!s);
   for (const store of stores) {
     if (typeof store.length === "number" && typeof store.key === "function") {
       const keysToDelete: string[] = [];
@@ -190,25 +299,41 @@ export function getScopedStudentClassKey(email: string | null | undefined): stri
 export function saveScopedStudentClass(
   email: string | null | undefined,
   classLabel: string,
-  localStore: StorageLike | null = getDefaultLocalStorage()
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage(),
+  sharedPc?: boolean
 ): void {
-  if (!localStore || !email) return;
+  if (!email) return;
   const key = getScopedStudentClassKey(email);
   const clean = String(classLabel || "").trim().slice(0, 40);
+  const isShared = sharedPc ?? isSharedPcSessionActive(sessionStore);
+  if (isShared) {
+    if (sessionStore) {
+      try {
+        if (clean) sessionStore.setItem(key, clean);
+        else sessionStore.removeItem(key);
+      } catch {}
+    }
+    return;
+  }
+  const targetStore = localStore !== undefined ? localStore : getDefaultLocalStorage();
+  if (!targetStore) return;
   try {
-    if (clean) localStore.setItem(key, clean);
-    else localStore.removeItem(key);
+    if (clean) targetStore.setItem(key, clean);
+    else targetStore.removeItem(key);
   } catch {}
 }
 
 export function loadScopedStudentClass(
   email: string | null | undefined,
-  localStore: StorageLike | null = getDefaultLocalStorage(),
-  sessionStore: StorageLike | null = getDefaultSessionStorage()
+  localStore?: StorageLike | null,
+  sessionStore: StorageLike | null = getDefaultSessionStorage(),
+  sharedPc?: boolean
 ): string {
   if (!email) return "";
   const key = getScopedStudentClassKey(email);
-  for (const store of [localStore, sessionStore]) {
+  const effectiveLocal = getEffectiveLocalStore(localStore, sessionStore, sharedPc);
+  for (const store of [effectiveLocal, sessionStore]) {
     if (!store) continue;
     try {
       const val = String(store.getItem(key) || "").trim();
@@ -220,15 +345,21 @@ export function loadScopedStudentClass(
 
 export function clearScopedStudentClass(
   email: string | null | undefined,
-  localStore: StorageLike | null = getDefaultLocalStorage()
+  localStore: StorageLike | null = getDefaultLocalStorage(),
+  sessionStore: StorageLike | null = getDefaultSessionStorage()
 ): void {
-  if (!localStore || !email) return;
-  try {
-    localStore.removeItem(getScopedStudentClassKey(email));
-  } catch {}
+  if (!email) return;
+  const key = getScopedStudentClassKey(email);
+  for (const store of [localStore, sessionStore]) {
+    if (!store) continue;
+    try {
+      store.removeItem(key);
+    } catch {}
+  }
 }
 
 const SHARED_PC_EXACT_KEYS = [
+  SHARED_PC_MODE_KEY,
   "direct_student_user",
   "saved_student_name",
   "saved_student_surname",

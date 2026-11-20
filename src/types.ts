@@ -216,6 +216,12 @@ export interface LiveSessionSummary {
   deferSolutions?: boolean;
   /** True once the teacher publishes deferred solutions to the class. */
   solutionsReleased?: boolean;
+  /** Optional list of specific classes whose deferred solutions were released in multi-class sessions. */
+  releasedClasses?: string[];
+  /** Highest individual/collective expiry ISO timestamp active for this session (guards autoReleaseSolutions). */
+  maxExtendedExpiry?: string | null;
+  /** When true, deferred solutions auto-publish after expiry (+ any BES extra time). */
+  autoReleaseSolutions?: boolean;
   /** ISO timestamp when deferred solutions were published. */
   solutionsReleasedAt?: string;
   /** Teacher-configured inclusive accommodations (BES/DSA) for this session. */

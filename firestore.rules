@@ -78,14 +78,53 @@ service cloud.firestore {
         (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64));
     }
 
+    function isValidClassItem(val) {
+      return val is string && val.size() > 0 && val.size() <= 40;
+    }
+
+    function isValidClassArray(arr) {
+      return arr is list &&
+        arr.size() <= 30 &&
+        (arr.size() < 1 || isValidClassItem(arr[0])) &&
+        (arr.size() < 2 || isValidClassItem(arr[1])) &&
+        (arr.size() < 3 || isValidClassItem(arr[2])) &&
+        (arr.size() < 4 || isValidClassItem(arr[3])) &&
+        (arr.size() < 5 || isValidClassItem(arr[4])) &&
+        (arr.size() < 6 || isValidClassItem(arr[5])) &&
+        (arr.size() < 7 || isValidClassItem(arr[6])) &&
+        (arr.size() < 8 || isValidClassItem(arr[7])) &&
+        (arr.size() < 9 || isValidClassItem(arr[8])) &&
+        (arr.size() < 10 || isValidClassItem(arr[9])) &&
+        (arr.size() < 11 || isValidClassItem(arr[10])) &&
+        (arr.size() < 12 || isValidClassItem(arr[11])) &&
+        (arr.size() < 13 || isValidClassItem(arr[12])) &&
+        (arr.size() < 14 || isValidClassItem(arr[13])) &&
+        (arr.size() < 15 || isValidClassItem(arr[14])) &&
+        (arr.size() < 16 || isValidClassItem(arr[15])) &&
+        (arr.size() < 17 || isValidClassItem(arr[16])) &&
+        (arr.size() < 18 || isValidClassItem(arr[17])) &&
+        (arr.size() < 19 || isValidClassItem(arr[18])) &&
+        (arr.size() < 20 || isValidClassItem(arr[19])) &&
+        (arr.size() < 21 || isValidClassItem(arr[20])) &&
+        (arr.size() < 22 || isValidClassItem(arr[21])) &&
+        (arr.size() < 23 || isValidClassItem(arr[22])) &&
+        (arr.size() < 24 || isValidClassItem(arr[23])) &&
+        (arr.size() < 25 || isValidClassItem(arr[24])) &&
+        (arr.size() < 26 || isValidClassItem(arr[25])) &&
+        (arr.size() < 27 || isValidClassItem(arr[26])) &&
+        (arr.size() < 28 || isValidClassItem(arr[27])) &&
+        (arr.size() < 29 || isValidClassItem(arr[28])) &&
+        (arr.size() < 30 || isValidClassItem(arr[29]));
+    }
+
     function isValidActiveSession(data) {
       return data is map &&
         data.keys().hasAll(['pin', 'expiry', 'teacherEmail', 'active']) &&
         data.keys().hasOnly([
           'pin', 'title', 'targetClass', 'allowedClasses', 'restrictToAllowedClasses',
-          'expiry', 'teacherEmail', 'teacherId', 'data',
+          'expiry', 'maxExtendedExpiry', 'teacherEmail', 'teacherId', 'data',
           'encryptedAnswerKey', 'randomizeQuestions', 'deferSolutions',
-          'solutionsReleased', 'solutionsReleasedAt', 'besOptions',
+          'solutionsReleased', 'releasedClasses', 'autoReleaseSolutions', 'solutionsReleasedAt', 'besOptions',
           'mixFilaAB', 'filaBData', 'encryptedFilaBAnswerKey', 'filaBTitle',
           'allowAudioAnswers', 'severityPreset', 'unlockCode', 'active',
           'classNotice', 'classNoticeAt', 'classNoticeTargetClass',
@@ -94,14 +133,17 @@ service cloud.firestore {
         ]) &&
         data.pin is string && data.pin.size() > 0 && data.pin.size() <= 40 &&
         data.expiry is string && data.expiry.size() > 0 && data.expiry.size() <= 64 &&
+        (!('maxExtendedExpiry' in data) || (data.maxExtendedExpiry is string && data.maxExtendedExpiry.size() <= 64)) &&
         data.teacherEmail is string && data.teacherEmail.size() > 0 && data.teacherEmail.size() <= 200 &&
         data.active is bool &&
         (!('archived' in data) || data.archived is bool) &&
         (!('archivedAt' in data) || (data.archivedAt is string && data.archivedAt.size() <= 64)) &&
         (!('title' in data) || (data.title is string && data.title.size() <= 300)) &&
         (!('targetClass' in data) || (data.targetClass is string && data.targetClass.size() <= 40)) &&
-        (!('allowedClasses' in data) || (data.allowedClasses is list && data.allowedClasses.size() <= 30 && (data.allowedClasses.size() == 0 || (data.allowedClasses[0] is string && data.allowedClasses[0].size() <= 40)))) &&
+        (!('allowedClasses' in data) || isValidClassArray(data.allowedClasses)) &&
+        (!('releasedClasses' in data) || isValidClassArray(data.releasedClasses)) &&
         (!('restrictToAllowedClasses' in data) || data.restrictToAllowedClasses is bool) &&
+        (!('autoReleaseSolutions' in data) || data.autoReleaseSolutions is bool) &&
         (!('classNotice' in data) || (data.classNotice is string && data.classNotice.size() <= 300)) &&
         (!('classNoticeAt' in data) || (data.classNoticeAt is string && data.classNoticeAt.size() <= 64)) &&
         (!('classNoticeTargetClass' in data) || (data.classNoticeTargetClass is string && data.classNoticeTargetClass.size() <= 40)) &&
@@ -178,7 +220,7 @@ service cloud.firestore {
           'tabSwitches', 'pasteAttempts', 'lastHeartbeat', 'status',
           'joinedAt', 'sessionRunId', 'locked', 'lockState', 'lockReason',
           'lockedAt', 'draftAnswersJson', 'draftUpdatedAt',
-          'besExpiryIso', 'assignedFila',
+          'besExpiryIso', 'extendedExpiryIso', 'assignedFila',
           'remoteUnlockId', 'unlockedAt', 'unlockedBy',
           'teacherNotice', 'teacherNoticeAt', 'teacherNoticeAckAt', 'classNoticeAckAt'
         ]) &&
@@ -191,6 +233,7 @@ service cloud.firestore {
         (!('joinedAt' in data) || (data.joinedAt is string && data.joinedAt.size() <= 64)) &&
         (!('sessionRunId' in data) || (data.sessionRunId is string && data.sessionRunId.size() <= 128)) &&
         (!('besExpiryIso' in data) || (data.besExpiryIso is string && data.besExpiryIso.size() <= 64)) &&
+        (!('extendedExpiryIso' in data) || (data.extendedExpiryIso is string && data.extendedExpiryIso.size() <= 64)) &&
         (!('assignedFila' in data) || data.assignedFila in ['A', 'B']) &&
         (!('locked' in data) || data.locked is bool) &&
         (!('lockState' in data) || data.lockState in ['locked', 'unlocked']) &&
@@ -221,14 +264,15 @@ service cloud.firestore {
         !('unlockedAt' in data) &&
         !('unlockedBy' in data) &&
         !('teacherNotice' in data) &&
-        !('teacherNoticeAt' in data);
+        !('teacherNoticeAt' in data) &&
+        !('extendedExpiryIso' in data);
     }
 
     function isStudentLiveUpdate(sessionId) {
       return isValidLiveStudentWrite(incoming()) &&
         exists(/databases/$(database)/documents/active_sessions/$(sessionId)) &&
         !incoming().diff(existing()).affectedKeys().hasAny([
-          'remoteUnlockId', 'unlockedAt', 'unlockedBy', 'teacherNotice', 'teacherNoticeAt'
+          'remoteUnlockId', 'unlockedAt', 'unlockedBy', 'teacherNotice', 'teacherNoticeAt', 'extendedExpiryIso'
         ]) &&
         (
           incoming().get('locked', false) == true ||

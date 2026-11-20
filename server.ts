@@ -12,10 +12,11 @@ import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStruc
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
 import { deriveStudentPseudonym, scrubPromptPii, scrubAnswersForAi } from "./src/utils/privacyPseudonym";
+import { isDeferredUnlockedForStudent } from "./src/utils/deferredSolutions";
 
 dotenv.config();
 
-const app = express();
+export const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
 // Helper for lazy loading Gemini: standard GEMINI_API_KEY takes precedence over any legacy alias
@@ -786,7 +787,7 @@ function getLegacyGeminiVaultKey(): Buffer | null {
   return crypto.createHash("sha256").update(`ea_vault:${apiSecret}`).digest();
 }
 
-function encryptAnswerKey(answerKey: any): string {
+export function encryptAnswerKey(answerKey: any): string {
   const key = getSessionVaultKey();
   const iv = crypto.randomBytes(12);
   const cipher = crypto.createCipheriv("aes-256-gcm", key, iv);
@@ -891,6 +892,7 @@ async function runEvaluationCore(reqBody: any) {
     }
     if (deferSolutions) {
       resObj.deferredSolutionsLocked = true;
+      delete resObj.gradeBreakdown;
     }
     resObj.calculatedMCScore = Number(report.punteggioMC || 0);
     if (report.punteggioFIB !== undefined) {
@@ -2537,6 +2539,7 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     const requestedSessionId = String(req.body?.sessionId || "").trim();
     const encryptedAnswerKey = String(req.body?.encryptedAnswerKey || "").trim();
     const studentEmail = String(req.body?.studentEmail || "").trim().toLowerCase();
+    const studentClass = String(req.body?.studentClass || "").trim();
     const examData = req.body?.examData;
     const rawMcOptionOrder = req.body?.mcOptionOrder;
     const answers = req.body?.answers;
@@ -2577,6 +2580,18 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
       const fsSessionId = String(cachedFields?.sessionId?.stringValue || "").trim();
       const fsDefer = Boolean(cachedFields?.deferSolutions?.booleanValue);
       const fsReleased = Boolean(cachedFields?.solutionsReleased?.booleanValue);
+      const fsReleasedClasses: string[] = Array.isArray(cachedFields?.releasedClasses?.arrayValue?.values)
+        ? cachedFields.releasedClasses.arrayValue.values
+            .map((v: any) => String(v?.stringValue || "").trim())
+            .filter(Boolean)
+        : [];
+      const fsAutoRelease = Boolean(cachedFields?.autoReleaseSolutions?.booleanValue);
+      const fsExpiry = String(cachedFields?.expiry?.stringValue || "").trim() || null;
+      const fsCreatedAt = String(cachedFields?.createdAt?.stringValue || "").trim() || null;
+      const fsMaxExtendedExpiry = String(cachedFields?.maxExtendedExpiry?.stringValue || "").trim() || null;
+      const besExtraField = cachedFields?.besOptions?.mapValue?.fields?.extraTimePercent;
+      const fsBesExtraPct = Number(besExtraField?.integerValue ?? besExtraField?.doubleValue ?? 0) || 0;
+
       if (!resolvedSessionId && fsSessionId) {
         resolvedSessionId = fsSessionId;
       }
@@ -2584,7 +2599,18 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
       if (requestedSessionId && fsSessionId && requestedSessionId !== fsSessionId) {
         return res.status(403).json({ error: "Questo PIN appartiene a una sessione diversa." });
       }
-      if (fsDefer && !fsReleased) {
+      const unlockedForStudent = isDeferredUnlockedForStudent({
+        deferSolutions: fsDefer,
+        solutionsReleased: fsReleased,
+        releasedClasses: fsReleasedClasses,
+        studentClass,
+        autoReleaseSolutions: fsAutoRelease,
+        expiry: fsExpiry,
+        createdAt: fsCreatedAt,
+        maxExtendedExpiry: fsMaxExtendedExpiry,
+        besExtraTimePercent: fsBesExtraPct,
+      });
+      if (!unlockedForStudent) {
         return res.status(403).json({ error: "Le soluzioni non sono ancora state pubblicate dal docente." });
       }
     }
@@ -2609,10 +2635,13 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
       }
     }
 
+    const fsRandomize = Boolean(
+      cachedFields?.randomizeQuestions?.booleanValue ?? req.body?.randomizeQuestions
+    );
     const effectiveMcOrder =
       rawMcOptionOrder && typeof rawMcOptionOrder === "object" && Object.keys(rawMcOptionOrder).length > 0
         ? rawMcOptionOrder
-        : studentEmail
+        : fsRandomize && studentEmail
         ? reconstructExamMcOrder(examData, studentEmail, cleanPin, resolvedSessionId)
         : undefined;
 
@@ -3763,4 +3792,8 @@ async function startServer() {
   });
 }
 
-startServer();
+export { startServer };
+
+if (process.env.DISABLE_AUTO_LISTEN !== "1") {
+  startServer();
+}

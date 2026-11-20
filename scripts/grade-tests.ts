@@ -41,6 +41,9 @@ import {
   loadScopedStudentClass,
   clearScopedStudentClass,
   wipeSharedPcStudentStorage,
+  saveStudentScopedStorageItem,
+  loadStudentScopedStorageItem,
+  removeStudentScopedStorageItem,
   type StorageLike,
 } from "../src/utils/clientStorage";
 import {
@@ -57,6 +60,11 @@ import {
   parseAllowedClassList,
   UNSPECIFIED_CLASS_LABEL,
 } from "../src/utils/classGrouping";
+import {
+  isDeferredUnlockedForStudent,
+  computeEffectiveDeferredDeadlineMs,
+  addMinutesToExpiryIso,
+} from "../src/utils/deferredSolutions";
 import { SavedSubmission } from "../src/types";
 
 let passed = 0;
@@ -1412,6 +1420,223 @@ test("loadScopedStudentClass: usa sessionStorage come fallback su PC condiviso",
   // LocalStorage takes precedence when present
   saveScopedStudentClass("marta@scuola.it", "5D", localStore);
   assert.equal(loadScopedStudentClass("marta@scuola.it", localStore, sessionStore), "5D");
+});
+
+test("isDeferredUnlockedForStudent: gestisce rilascio globale, per classe e scadenza automatica con BES +25%/+50%", () => {
+  // 1. Defer disabled -> always unlocked
+  assert.equal(
+    isDeferredUnlockedForStudent({ deferSolutions: false, solutionsReleased: false }),
+    true
+  );
+
+  // 2. Global release
+  assert.equal(
+    isDeferredUnlockedForStudent({ deferSolutions: true, solutionsReleased: true }),
+    true
+  );
+
+  // 3. Per-class selective release
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      releasedClasses: ["3A", "4B"],
+      studentClass: "3a",
+    }),
+    true
+  );
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      releasedClasses: ["3A"],
+      studentClass: "3B",
+    }),
+    false
+  );
+
+  // 4. Auto-release at scheduled expiry with BES extra time tolerance
+  const createdMs = Date.UTC(2026, 10, 20, 9, 0, 0);
+  const expiryMs = Date.UTC(2026, 10, 20, 10, 0, 0); // 60m exam
+  const created = new Date(createdMs).toISOString();
+  const expiry = new Date(expiryMs).toISOString();
+
+  // Before expiry -> locked
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      nowMs: expiryMs - 1000,
+    }),
+    false
+  );
+
+  // Right after base expiry (without BES extra time) -> unlocked
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      besExtraTimePercent: 0,
+      nowMs: expiryMs + 1000,
+    }),
+    true
+  );
+
+  // Student or session with +25% BES time (+15m -> 10:15): still locked at 10:05
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      besExtraTimePercent: 25,
+      nowMs: expiryMs + 5 * 60 * 1000,
+    }),
+    false
+  );
+
+  // After +25% BES grace (+15m + 1s): unlocked
+  const bes25Deadline = computeEffectiveDeferredDeadlineMs({
+    expiryIso: expiry,
+    createdAtIso: created,
+    extraTimePercent: 25,
+  });
+  assert.ok(bes25Deadline !== null);
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      besExtraTimePercent: 25,
+      nowMs: (bes25Deadline || 0) + 1000,
+    }),
+    true
+  );
+
+  // Session with +50% BES time (+30m -> 10:30): still locked at 10:20, unlocked at 10:31
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      besExtraTimePercent: 50,
+      nowMs: expiryMs + 20 * 60 * 1000,
+    }),
+    false
+  );
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      besExtraTimePercent: 50,
+      nowMs: expiryMs + 31 * 60 * 1000,
+    }),
+    true
+  );
+
+  // Individual +10m extra-time guard via maxExtendedExpiry keeps solutions locked even after BES+expiry
+  const individualExtIso = new Date(expiryMs + 45 * 60 * 1000).toISOString();
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      maxExtendedExpiry: individualExtIso,
+      besExtraTimePercent: 50,
+      nowMs: expiryMs + 40 * 60 * 1000,
+    }),
+    false
+  );
+  assert.equal(
+    isDeferredUnlockedForStudent({
+      deferSolutions: true,
+      solutionsReleased: false,
+      autoReleaseSolutions: true,
+      createdAt: created,
+      expiry,
+      maxExtendedExpiry: individualExtIso,
+      besExtraTimePercent: 50,
+      nowMs: expiryMs + 46 * 60 * 1000,
+    }),
+    true
+  );
+});
+
+test("addMinutesToExpiryIso: estende correttamente scadenze future o appena scadute", () => {
+  const nowMs = Date.UTC(2026, 10, 20, 10, 0, 0);
+  const futureIso = new Date(nowMs + 5 * 60 * 1000).toISOString();
+  const extendedFuture = addMinutesToExpiryIso(futureIso, 10, nowMs);
+  assert.equal(new Date(extendedFuture).getTime(), nowMs + 15 * 60 * 1000);
+
+  const pastIso = new Date(nowMs - 20 * 60 * 1000).toISOString();
+  const extendedFromNow = addMinutesToExpiryIso(pastIso, 5, nowMs);
+  assert.equal(new Date(extendedFromNow).getTime(), nowMs + 5 * 60 * 1000);
+});
+
+test("sharedPc storage isolation: in modalità PC condiviso non legge né scrive su localStorage", () => {
+  const makeMockStorage = (): StorageLike => {
+    const backing = new Map<string, string>();
+    return {
+      get length() {
+        return backing.size;
+      },
+      key: (index: number) => Array.from(backing.keys())[index] ?? null,
+      getItem: (k: string) => backing.get(k) ?? null,
+      setItem: (k: string, v: string) => {
+        backing.set(k, v);
+      },
+      removeItem: (k: string) => {
+        backing.delete(k);
+      },
+    };
+  };
+
+  const localStore = makeMockStorage();
+  const sessionStore = makeMockStorage();
+
+  // Pre-seed stale data from a previous student in localStorage (fresh sessionStore on new tab)
+  saveScopedStudentClass("mario@scuola.it", "1A", localStore);
+  saveScopedExamLock("mario@scuola.it", "PIN99", true, "Blocco vecchio", localStore, null);
+  localStore.setItem("draft_PIN99_mario_scuola_it", '{"mc":{"1":0}}');
+
+  // New student in Shared PC lab mode must stay completely isolated in sessionStorage
+  saveScopedStudentClass("mario@scuola.it", "3C", localStore, sessionStore, true);
+  assert.equal(loadScopedStudentClass("mario@scuola.it", localStore, sessionStore, true), "3C");
+  // Previous localStore must remain untouched
+  assert.equal(loadScopedStudentClass("mario@scuola.it", localStore, sessionStore, false), "1A");
+
+  // Pre-seeded local exam lock must NOT leak into a Shared PC session when sharedPc=true
+  assert.equal(loadScopedExamLock("mario@scuola.it", "PIN99", localStore, sessionStore, true), null);
+  saveScopedExamLock("mario@scuola.it", "PIN99", true, "Blocco lab", localStore, sessionStore, true);
+  assert.equal(loadScopedExamLock("mario@scuola.it", "PIN99", localStore, sessionStore, true)?.reason, "Blocco lab");
+  clearScopedExamLock("mario@scuola.it", "PIN99", localStore, sessionStore, true);
+  assert.equal(loadScopedExamLock("mario@scuola.it", "PIN99", localStore, sessionStore, true), null);
+
+  // Draft isolation under sharedPc=true
+  assert.equal(loadStudentScopedStorageItem("draft_PIN99_mario_scuola_it", true, localStore, sessionStore), null);
+  saveStudentScopedStorageItem("draft_PIN99_mario_scuola_it", '{"mc":{"1":2}}', true, localStore, sessionStore);
+  assert.equal(loadStudentScopedStorageItem("draft_PIN99_mario_scuola_it", true, localStore, sessionStore), '{"mc":{"1":2}}');
+  // Original localStore draft untouched
+  assert.equal(localStore.getItem("draft_PIN99_mario_scuola_it"), '{"mc":{"1":0}}');
+  removeStudentScopedStorageItem("draft_PIN99_mario_scuola_it", true, localStore, sessionStore);
+  assert.equal(loadStudentScopedStorageItem("draft_PIN99_mario_scuola_it", true, localStore, sessionStore), null);
+  assert.equal(localStore.getItem("draft_PIN99_mario_scuola_it"), '{"mc":{"1":0}}');
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);
