@@ -660,6 +660,144 @@ async function main() {
       assert.ok(String(unlockRes.data.mainErrors || "").includes("Parigi"));
       assert.ok(!String(unlockRes.data.mainErrors || "").includes("Tevere"));
     });
+
+    await runTest("evaluate/enqueue: esame strippato senza chiave e senza fallback active_sessions sospende in N.V. (MAI 0/N)", async () => {
+      mockSessionDocFields = {
+        sessionId: { stringValue: "run_missing_key_1" },
+        deferSolutions: { booleanValue: false },
+      };
+
+      const enq = await httpJsonRequest(port, "POST", "/api/evaluate/enqueue", {
+        tipo: "Quiz",
+        studentPseudoId: "STU-MISSKEY-1",
+        sessionPin: "MISSKEY1",
+        sessionId: "run_missing_key_1",
+        encryptedAnswerKey: "tampered.invalid.key",
+        deferSolutions: false,
+        report: {
+          domande: sanitizedExam,
+          risposte: { mc: { mc1: 1 }, oe: {}, wbFib: {}, wbRq: {} },
+          autovalutazione: "8",
+        },
+      });
+      assert.equal(enq.status, 200);
+
+      let statusRes: any = null;
+      for (let i = 0; i < 20; i++) {
+        statusRes = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/evaluate/status/${encodeURIComponent(enq.data.jobId)}?token=${encodeURIComponent(enq.data.jobToken || "")}`,
+          undefined,
+          enq.data.jobToken ? { "x-job-token": enq.data.jobToken } : undefined
+        );
+        if (statusRes.data?.status === "completed" || statusRes.data?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      assert.equal(statusRes?.status, 200);
+      assert.equal(statusRes?.data?.status, "completed");
+      const ev = statusRes.data.evaluation;
+      assert.equal(ev.evaluationMode, "pending");
+      assert.equal(ev.requiresManualReview, true);
+      assert.equal(ev.objectiveKeysMissing, true);
+      assert.equal(ev.suggestedGrade, "N.V.");
+    });
+
+    await runTest("evaluate/enqueue e unlock-solutions: recuperano chiave e mcOptionOrder da active_sessions se omessi dal client", async () => {
+      const { reconstructExamMcOrder } = await import("../src/utils/examSecurity");
+      const multiRaw = {
+        title: "Quiz Mescolato",
+        multipleChoice: [
+          {
+            id: "mq_1",
+            question: "2 + 2 = ?",
+            options: ["3", "4", "5", "6"],
+            correctIndex: 1,
+            explanation: "2 + 2 = 4.",
+          },
+          {
+            id: "mq_2",
+            question: "Capitale Francia?",
+            options: ["Lione", "Parigi", "Nizza", "Marsiglia"],
+            correctIndex: 1,
+            explanation: "Parigi.",
+          },
+        ],
+        openEnded: [],
+      };
+      const strippedMulti = stripExamAnswers(multiRaw);
+      const encMultiKey = encryptAnswerKey(strippedMulti.answerKey);
+
+      const stuEmail = "chiara.rossi@scuola.it";
+      const pinCode = "SHUF1";
+      const sessId = "run_shuf_1";
+
+      mockSessionDocFields = {
+        sessionId: { stringValue: sessId },
+        deferSolutions: { booleanValue: false },
+        solutionsReleased: { booleanValue: true },
+        randomizeQuestions: { booleanValue: true },
+        encryptedAnswerKey: { stringValue: encMultiKey },
+      };
+
+      // Simulate student answering according to deterministic shuffled order without sending encryptedAnswerKey or mcOptionOrder
+      const expectedOrder = reconstructExamMcOrder(strippedMulti.sanitizedExam, stuEmail, pinCode, sessId);
+      const chosenMq1 = expectedOrder["mq_1"].findIndex((origIdx) => origIdx === 1);
+      const chosenMq2 = expectedOrder["mq_2"].findIndex((origIdx) => origIdx === 1);
+      assert.ok(chosenMq1 >= 0 && chosenMq2 >= 0);
+
+      const enq = await httpJsonRequest(port, "POST", "/api/evaluate/enqueue", {
+        tipo: "Quiz",
+        studentPseudoId: "STU-SHUF-1",
+        studentEmail: stuEmail,
+        sessionPin: pinCode,
+        sessionId: sessId,
+        randomizeQuestions: true,
+        report: {
+          domande: strippedMulti.sanitizedExam,
+          risposte: { mc: { mq_1: chosenMq1, mq_2: chosenMq2 }, oe: {}, wbFib: {}, wbRq: {} },
+          autovalutazione: "9",
+        },
+      });
+      assert.equal(enq.status, 200);
+
+      let statusRes: any = null;
+      for (let i = 0; i < 20; i++) {
+        statusRes = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/evaluate/status/${encodeURIComponent(enq.data.jobId)}?token=${encodeURIComponent(enq.data.jobToken || "")}`,
+          undefined,
+          enq.data.jobToken ? { "x-job-token": enq.data.jobToken } : undefined
+        );
+        if (statusRes.data?.status === "completed" || statusRes.data?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      assert.equal(statusRes?.status, 200);
+      assert.equal(statusRes?.data?.status, "completed");
+      const ev = statusRes.data.evaluation;
+      assert.equal(ev.calculatedMCScore, 2);
+      assert.equal(ev.gradeBreakdown?.objectivePart?.score, 2);
+      assert.equal(ev.gradeBreakdown?.objectivePart?.total, 2);
+      assert.equal(ev.suggestedGrade, "10 (Eccellente)");
+
+      // unlock-solutions must also fall back to active_sessions when caller key is corrupted and reconstruct mcOptionOrder
+      const unlockFallback = await httpJsonRequest(port, "POST", "/api/session/unlock-solutions", {
+        pin: pinCode,
+        sessionId: sessId,
+        studentEmail: stuEmail,
+        encryptedAnswerKey: "bad.corrupt.token",
+        examData: strippedMulti.sanitizedExam,
+        answers: { mc: { mq_1: chosenMq1, mq_2: chosenMq2 } },
+        tipo: "Quiz",
+      });
+      assert.equal(unlockFallback.status, 200);
+      assert.equal(unlockFallback.data.unlocked, true);
+      assert.equal(unlockFallback.data.resolvedDomande?.multipleChoice?.[0]?.correctIndex, chosenMq1);
+      assert.equal(unlockFallback.data.resolvedDomande?.multipleChoice?.[1]?.correctIndex, chosenMq2);
+    });
   } finally {
     globalThis.fetch = originalFetch;
     await new Promise<void>((resolve) => server.close(() => resolve()));

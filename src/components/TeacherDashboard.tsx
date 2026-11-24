@@ -67,8 +67,8 @@ import {
   buildClassSummaries,
   UNSPECIFIED_CLASS_LABEL
 } from "../utils/classGrouping";
-import { exportSubmissionPdf, exportSubmissionsZip, exportBlankExamPaperPdf } from "../utils/pdfExport";
-import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, applySubjectiveRetouchToDetails, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml, isWorkbookExamData, collectExamMultipleChoice, collectQuizOpenEnded } from "../utils";
+import { exportSubmissionPdf, exportSubmissionsZip, exportBlankExamPaperPdf, exportExamLedgerPdf } from "../utils/pdfExport";
+import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, applySubjectiveRetouchToDetails, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml, isWorkbookExamData, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, evaluateMcSelection } from "../utils";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -147,10 +147,11 @@ function submissionStructuredAccuracy(sub: SavedSubmission): number | null {
       const mcs = mcWeightedScore(mcList, ans?.mc || {});
       return mcs.weightedTotal > 0 ? mcs.weightedCorrect / mcs.weightedTotal : null;
     }
-    const fibList = (domande?.sections || []).flatMap((s: any) => s.fillInTheBlank || []);
+    const fibList = collectWorkbookFillInTheBlank(domande);
     const wbMcList = collectExamMultipleChoice(domande);
     if (fibList.length === 0 && wbMcList.length === 0) return null;
-    const fibs = fibWeightedScore(fibList, ans?.wbFib || {}, isFibAnswerCorrect);
+    const fibAnswers = ans?.wbFib || ans?.fib || {};
+    const fibs = fibWeightedScore(fibList, fibAnswers, isFibAnswerCorrect);
     const mcs = mcWeightedScore(wbMcList, ans?.mc || {});
     const total = fibs.weightedTotal + mcs.weightedTotal;
     return total > 0 ? (fibs.weightedCorrect + mcs.weightedCorrect) / total : null;
@@ -376,6 +377,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [searchQuery, setSearchQuery] = useState("");
   const [filterType, setFilterType] = useState<"All" | "Quiz" | "Workbook">("All");
   const [filterClass, setFilterClass] = useState<string>("All");
+  const [filterStatus, setFilterStatus] = useState<"all" | "unvalidated" | "pending_nv" | "violations" | "attention">("all");
 
   // View mode: "chronological", "by_student", "by_exam", or "by_class" (grouped by scholastic class)
   const [submissionViewMode, setSubmissionViewMode] = useState<"chronological" | "by_student" | "by_exam" | "by_class">("chronological");
@@ -1384,8 +1386,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           if (Array.isArray(data.sections[i].multipleChoice)) {
             for (let m = 0; m < data.sections[i].multipleChoice.length; m++) {
               const q = data.sections[i].multipleChoice[m];
-              if (!q || !q.question || !Array.isArray(q.options) || q.correctIndex === undefined) {
-                setValidationError(`Errore Sezione ${i + 1}, Crocetta ${m + 1}: Domanda a scelta multipla incompleta.`);
+              if (!q || !q.question || !Array.isArray(q.options) || q.options.length < 2 || !evaluateMcSelection(q, 0).hasCorrectKey) {
+                setValidationError(`Errore Sezione ${i + 1}, Crocetta ${m + 1}: Domanda a scelta multipla incompleta o chiave corretta non valida.`);
                 setCanAutoRepair(true);
                 return null;
               }
@@ -1394,17 +1396,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
       }
 
-      if (isQuiz) {
-        if (data.multipleChoice) {
-          for (let i = 0; i < data.multipleChoice.length; i++) {
-            const q = data.multipleChoice[i];
-            if (!q.question || !q.options || !Array.isArray(q.options) || q.correctIndex === undefined) {
-              setValidationError(`Errore Crocetta ${i + 1}: Domanda a scelta multipla incompleta (manca testo, opzioni, o indice corretta).`);
-              setCanAutoRepair(true);
-              return null;
-            }
+      if (Array.isArray(data.multipleChoice)) {
+        for (let i = 0; i < data.multipleChoice.length; i++) {
+          const q = data.multipleChoice[i];
+          if (!q || !q.question || !Array.isArray(q.options) || q.options.length < 2 || !evaluateMcSelection(q, 0).hasCorrectKey) {
+            setValidationError(`Errore Crocetta ${i + 1}: Domanda a scelta multipla incompleta (manca testo, almeno 2 opzioni, o chiave corretta valida).`);
+            setCanAutoRepair(true);
+            return null;
           }
         }
+      }
+
+      if (isQuiz) {
         if (data.openEnded) {
           for (let i = 0; i < data.openEnded.length; i++) {
             if (!data.openEnded[i].question) {
@@ -2269,9 +2272,54 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       throw new Error("Database scolastico non disponibile.");
     }
 
-    const domandeObj = safeParseJson(sub.Domande_Esame);
+    let effectiveDomandeObj = safeParseJson(sub.Domande_Esame);
     const ansObj = safeParseJson(sub.Risposte_Studente) || {};
     let evalObj = safeParseJson(sub.Full_Evaluation) || {};
+
+    // Hydrate objective keys from server vault if deferred solutions were stripped before saving
+    const initialMcList = collectExamMultipleChoice(effectiveDomandeObj);
+    const initialFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
+    const hasMissingMcKey = initialMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey);
+    const hasMissingFibKey = initialFibList.some((f: any) => !String(f?.answer ?? "").trim());
+
+    if ((hasMissingMcKey || hasMissingFibKey) && sub.Pin) {
+      try {
+        const authHeaders = await getAuthHeaders();
+        const unlockResp = await fetch("/api/session/unlock-solutions", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({
+            pin: sub.Pin,
+            sessionId: sub.Session_Id || "",
+            studentEmail: sub.Email || "",
+            studentClass: resolveSubmissionClass(sub),
+            assignedFila: sub.Assigned_Fila || "",
+            examData: effectiveDomandeObj,
+            answers: ansObj,
+            tipo: sub.Tipo || "Quiz",
+          }),
+        });
+        if (unlockResp.ok) {
+          const unlockData = await unlockResp.json();
+          if (unlockData?.resolvedDomande && typeof unlockData.resolvedDomande === "object") {
+            effectiveDomandeObj = unlockData.resolvedDomande;
+          }
+        }
+      } catch {
+        // Guard below will halt recalculation safely if keys remain missing
+      }
+    }
+
+    const verifiedMcList = collectExamMultipleChoice(effectiveDomandeObj);
+    const verifiedFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
+    if (
+      verifiedMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey) ||
+      verifiedFibList.some((f: any) => !String(f?.answer ?? "").trim())
+    ) {
+      throw new Error(
+        "Chiavi di correzione oggettive mancanti o non decifrabili per questa consegna: ricalcolo annullato per evitare di azzerare i punteggi MC/FIB."
+      );
+    }
 
     let newGrade = sub.Voto_Suggerito;
     let newErrors = sub.Errori_Principali;
@@ -2280,23 +2328,22 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     let updatedPunteggioFIB = sub.Punteggio_FIB;
 
     if (sub.Tipo === "Quiz") {
-      const mcList = collectExamMultipleChoice(domandeObj);
-      const oeList = collectQuizOpenEnded(domandeObj);
+      const mcList = collectExamMultipleChoice(effectiveDomandeObj);
+      const oeList = collectQuizOpenEnded(effectiveDomandeObj);
 
       let correctCount = 0;
       const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
 
       mcList.forEach((q: any, idx: number) => {
-        const chosen = ansObj.mc?.[q.id];
-        const hasChosen = chosen !== undefined && chosen !== null && chosen !== "";
-        if (hasChosen && Number(chosen) === Number(q.correctIndex)) {
+        const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+        if (sel.hasCorrectKey && sel.isCorrect) {
           correctCount++;
         } else {
           wrongQuestions.push({
             number: idx + 1,
             question: q.question,
-            studentChoice: (hasChosen && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
-            correctChoice: q.options?.[q.correctIndex] || ""
+            studentChoice: sel.hasSelection && sel.selectedText ? sel.selectedText : "Nessuna opzione selezionata",
+            correctChoice: sel.correctText || ""
           });
         }
       });
@@ -2314,7 +2361,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (oeList.length === 0) {
         const breakdown = computeGradeBreakdown({
           tipo: "Quiz",
-          examData: domandeObj,
+          examData: effectiveDomandeObj,
           answers: hasMcAnswers ? ansObj : undefined,
           punteggioMC: correctCount
         });
@@ -2361,7 +2408,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           sessionId: sub.Session_Id || "",
           studentClass: resolveSubmissionClass(sub),
           report: {
-            domande: domandeObj,
+            domande: effectiveDomandeObj,
             risposte: aiSafeQuizAnswers,
             punteggioMC: correctCount,
             punteggioMCPesato: mcs.weightedCorrect,
@@ -2394,7 +2441,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
         const breakdown = computeGradeBreakdown({
           tipo: "Quiz",
-          examData: domandeObj,
+          examData: effectiveDomandeObj,
           answers: sanitizedAnswers,
           evaluation: evalObj,
           punteggioMC: correctCount
@@ -2406,9 +2453,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
       }
     } else if (sub.Tipo === "Workbook") {
-      const sections = domandeObj?.sections || [];
-      const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-      const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+      const rqList = collectWorkbookReflections(effectiveDomandeObj);
+      const fibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
 
       const fibAnswersMap = ansObj.wbFib || ansObj.fib || {};
       const hasFibAnswers = Object.keys(fibAnswersMap).length > 0;
@@ -2425,13 +2471,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
       const fibs = fibWeightedScore(fibList, fibAnswersMap, isFibAnswerCorrect);
 
-      const wbMcList = collectExamMultipleChoice(domandeObj);
+      const wbMcList = collectExamMultipleChoice(effectiveDomandeObj);
       const hasWbMcAnswers = Object.keys(ansObj.mc || {}).length > 0;
       let correctMc = 0;
       if (wbMcList.length > 0) {
         wbMcList.forEach((q: any) => {
-          const chosen = ansObj.mc?.[q.id];
-          if (chosen !== undefined && chosen !== null && chosen !== "" && Number(chosen) === Number(q.correctIndex)) {
+          const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+          if (sel.hasCorrectKey && sel.isCorrect) {
             correctMc++;
           }
         });
@@ -2448,7 +2494,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (rqList.length === 0) {
         const breakdown = computeGradeBreakdown({
           tipo: "Workbook",
-          examData: domandeObj,
+          examData: effectiveDomandeObj,
           answers: breakdownAnswers,
           punteggioFIB: correctFib,
           punteggioMC: correctMc
@@ -2457,6 +2503,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         evalObj.reflectionDetails = [];
         evalObj.fibScore = correctFib;
         evalObj.fibTotal = fibList.length;
+        evalObj.totalFIB = fibList.length;
         evalObj.suggestedGrade = newGrade;
         evalObj.gradeBreakdown = breakdown;
         evalObj.overallFeedback = wbMcList.length > 0
@@ -2492,7 +2539,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           sessionId: sub.Session_Id || "",
           studentClass: resolveSubmissionClass(sub),
           report: {
-            domande: domandeObj,
+            domande: effectiveDomandeObj,
             risposte: aiSafeWbAnswers,
             punteggioMC: correctMc,
             punteggioFIB: correctFib,
@@ -2527,9 +2574,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
         evalObj.fibScore = correctFib;
         evalObj.fibTotal = fibList.length;
+        evalObj.totalFIB = fibList.length;
         const breakdown = computeGradeBreakdown({
           tipo: "Workbook",
-          examData: domandeObj,
+          examData: effectiveDomandeObj,
           answers: breakdownAnswers,
           evaluation: evalObj,
           punteggioFIB: correctFib,
@@ -2776,9 +2824,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const evalObj = { ...(safeParseJson(sub.Full_Evaluation) || {}) };
 
       const oeQuestions = collectQuizOpenEnded(domandeObj);
-      const rqQuestions = Array.isArray(domandeObj?.sections)
-        ? domandeObj.sections.flatMap((s: any) => s.reflectionQuestions || [])
-        : [];
+      const rqQuestions = collectWorkbookReflections(domandeObj);
 
       if (kind === "open_ended") {
         evalObj.openEndedDetails = applySubjectiveRetouchToDetails({
@@ -3256,6 +3302,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         displayGrade: string;
         numericGrade: number;
         pendingOpen: number;
+        isPending: boolean;
         hasDiscrepancy: boolean;
         totalViolations: number;
         examTitle: string;
@@ -3266,7 +3313,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     submissions.forEach((sub) => {
       const pendingOpen = getPendingSubjectiveCount(sub);
       const ev = safeParseJson(sub?.Full_Evaluation);
-      const isPending = isEvaluationPending(ev) || pendingOpen > 0;
+      const isPending =
+        isEvaluationPending(ev) ||
+        pendingOpen > 0 ||
+        String(sub?.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
       const displayGrade = isPending ? "N.V." : (sub?.Voto_Suggerito || "N/A");
       const rawNum = isPending ? -1 : parseSubmissionNumericGrade(sub.Voto_Suggerito);
       const numericGrade = Number.isNaN(rawNum) ? -1 : rawNum;
@@ -3283,6 +3333,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         displayGrade,
         numericGrade,
         pendingOpen,
+        isPending,
         hasDiscrepancy,
         totalViolations,
         examTitle,
@@ -3321,6 +3372,43 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
   }, [submissions, submissionMetaMap, filterClass]);
 
+  const matchesStatusFilter = React.useCallback(
+    (sub: SavedSubmission): boolean => {
+      if (filterStatus === "all") return true;
+      const meta = submissionMetaMap.get(sub.id);
+      const isPending = meta?.isPending ?? String(sub?.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+      if (filterStatus === "unvalidated") return !sub.Convalida_Docente_At;
+      if (filterStatus === "pending_nv") return isPending;
+      if (filterStatus === "violations") return (meta?.totalViolations ?? 0) > 0;
+      if (filterStatus === "attention") {
+        return !isPending && Boolean(meta?.hasDiscrepancy || ((meta?.numericGrade ?? -1) >= 0 && (meta?.numericGrade ?? -1) < 6));
+      }
+      return true;
+    },
+    [filterStatus, submissionMetaMap]
+  );
+
+  const statusCounts = React.useMemo(() => {
+    let total = 0;
+    let unvalidated = 0;
+    let pendingNv = 0;
+    let violations = 0;
+    let attention = 0;
+    classScopedSubmissions.forEach((sub) => {
+      if (filterType !== "All" && sub.Tipo !== filterType) return;
+      total++;
+      const meta = submissionMetaMap.get(sub.id);
+      const isPending = meta?.isPending ?? false;
+      if (!sub.Convalida_Docente_At) unvalidated++;
+      if (isPending) pendingNv++;
+      if ((meta?.totalViolations ?? 0) > 0) violations++;
+      if (!isPending && (meta?.hasDiscrepancy || ((meta?.numericGrade ?? -1) >= 0 && (meta?.numericGrade ?? -1) < 6))) {
+        attention++;
+      }
+    });
+    return { total, unvalidated, pendingNv, violations, attention };
+  }, [classScopedSubmissions, filterType, submissionMetaMap]);
+
   // Submissions filtered list logic (chronological) with multi-sorting
   const filteredSubmissions = React.useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
@@ -3330,6 +3418,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const examTitle = (meta?.examTitle || "").toLowerCase();
       const subClass = meta?.resolvedClass || resolveSubmissionClass(sub);
       if (filterClass !== "All" && subClass !== filterClass) return false;
+      if (!matchesStatusFilter(sub)) return false;
       const matchesSearch =
         !q ||
         (blindGradingMode
@@ -3379,7 +3468,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [submissions, submissionMetaMap, searchQuery, filterType, filterClass, chronologicalSortBy, blindGradingMode]);
+  }, [submissions, submissionMetaMap, searchQuery, filterType, filterClass, chronologicalSortBy, blindGradingMode, matchesStatusFilter]);
 
   // Aggregated submissions grouped by student (strictly scoped to selected class)
   const studentSummaries: StudentSummary[] = React.useMemo(() => {
@@ -3503,6 +3592,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         );
         if (!hasClassSub) return false;
       }
+      if (filterStatus !== "all" && !stu.submissions.some((s) => matchesStatusFilter(s))) return false;
       if (filterType === "Quiz") return stu.quizCount > 0;
       if (filterType === "Workbook") return stu.workbookCount > 0;
       return true;
@@ -3529,7 +3619,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
       if (studentSortBy === "name_asc") {
         return blindGradingMode
-          ? getStudentRosterBlindCode(a.email || a.key).localeCompare(getStudentRosterBlindCode(b.email || b.key))
+          ? getStudentRosterBlindCode(a.email || a.key).localeCompare(getStudentRosterBlindCode(b.email || a.key))
           : a.name.localeCompare(b.name);
       }
       if (studentSortBy === "recent") {
@@ -3539,7 +3629,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [studentSummaries, submissionMetaMap, searchQuery, filterType, filterClass, studentSortBy, blindGradingMode]);
+  }, [studentSummaries, submissionMetaMap, searchQuery, filterType, filterClass, studentSortBy, blindGradingMode, filterStatus, matchesStatusFilter]);
 
   // Group submissions by exam / test session (strictly scoped to selected class)
   const examSummaries: ExamSummary[] = React.useMemo(() => {
@@ -3687,6 +3777,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         );
         if (!hasClassSub) return false;
       }
+      if (filterStatus !== "all" && !ex.submissions.some((s) => matchesStatusFilter(s))) return false;
       if (filterType === "Quiz") return ex.tipo === "Quiz" || ex.tipo === "Misto";
       if (filterType === "Workbook") return ex.tipo === "Workbook" || ex.tipo === "Misto";
       return true;
@@ -3717,7 +3808,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [examSummaries, submissionMetaMap, searchQuery, filterType, filterClass, examSortBy, blindGradingMode]);
+  }, [examSummaries, submissionMetaMap, searchQuery, filterType, filterClass, examSortBy, blindGradingMode, filterStatus, matchesStatusFilter]);
 
   // Group submissions by scholastic class (respecting type and class filters for accurate class KPIs)
   const classSummaries: ClassSummary[] = React.useMemo(() => {
@@ -3738,6 +3829,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const filteredClassSummaries = React.useMemo(() => {
     const q = searchQuery.toLowerCase().trim();
     let result = classSummaries.filter((cls) => {
+      if (filterStatus !== "all" && !cls.submissions.some((s) => matchesStatusFilter(s))) {
+        return false;
+      }
       if (!q) return true;
       return (
         cls.className.toLowerCase().includes(q) ||
@@ -3778,7 +3872,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     });
 
     return result;
-  }, [classSummaries, searchQuery, classSortBy, blindGradingMode]);
+  }, [classSummaries, searchQuery, classSortBy, blindGradingMode, filterStatus, matchesStatusFilter]);
 
   const expandAllExams = () => {
     setExpandedExamKeys(new Set(filteredExamSummaries.map(e => e.key)));
@@ -4313,7 +4407,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                             <option value="">Oppure scegli Fila B da libreria...</option>
                             {library.map((it) => (
                               <option key={it.id} value={it.id}>
-                                {it.title} ({it.tipo})
+                                {it.title} ({it.examType})
                               </option>
                             ))}
                           </select>
@@ -5411,6 +5505,85 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </div>
                 </div>
 
+                {/* Quick-filter status pills */}
+                {submissions.length > 0 && (
+                  <div className="flex items-center gap-2 flex-wrap">
+                    <span className="text-[10px] uppercase tracking-wider font-bold text-slate-500 mr-1">
+                      Stato rapido:
+                    </span>
+                    <button
+                      type="button"
+                      onClick={() => setFilterStatus("all")}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold border transition-all cursor-pointer ${
+                        filterStatus === "all"
+                          ? "bg-white text-slate-950 border-white font-bold shadow-sm"
+                          : "bg-slate-950/50 text-slate-400 border-white/10 hover:text-white"
+                      }`}
+                    >
+                      Tutte ({statusCounts.total})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilterStatus((prev) => (prev === "unvalidated" ? "all" : "unvalidated"))}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold border transition-all cursor-pointer ${
+                        filterStatus === "unvalidated"
+                          ? "bg-indigo-500/25 text-indigo-200 border-indigo-400/60 font-bold shadow-sm"
+                          : "bg-slate-950/50 text-slate-400 border-white/10 hover:text-indigo-200"
+                      }`}
+                    >
+                      Da convalidare ({statusCounts.unvalidated})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilterStatus((prev) => (prev === "pending_nv" ? "all" : "pending_nv"))}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold border transition-all cursor-pointer ${
+                        filterStatus === "pending_nv"
+                          ? "bg-rose-500/25 text-rose-200 border-rose-400/60 font-bold shadow-sm"
+                          : statusCounts.pendingNv > 0
+                          ? "bg-rose-500/10 text-rose-300 border-rose-500/25 hover:bg-rose-500/20"
+                          : "bg-slate-950/50 text-slate-500 border-white/5 hover:text-slate-300"
+                      }`}
+                    >
+                      Sospese N.V. ({statusCounts.pendingNv})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilterStatus((prev) => (prev === "violations" ? "all" : "violations"))}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold border transition-all cursor-pointer ${
+                        filterStatus === "violations"
+                          ? "bg-amber-500/25 text-amber-200 border-amber-400/60 font-bold shadow-sm"
+                          : statusCounts.violations > 0
+                          ? "bg-amber-500/10 text-amber-300 border-amber-500/25 hover:bg-amber-500/20"
+                          : "bg-slate-950/50 text-slate-500 border-white/5 hover:text-slate-300"
+                      }`}
+                    >
+                      Con segnalazioni ({statusCounts.violations})
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => setFilterStatus((prev) => (prev === "attention" ? "all" : "attention"))}
+                      className={`px-2.5 py-1 rounded-xl text-[11px] font-semibold border transition-all cursor-pointer ${
+                        filterStatus === "attention"
+                          ? "bg-orange-500/25 text-orange-200 border-orange-400/60 font-bold shadow-sm"
+                          : statusCounts.attention > 0
+                          ? "bg-orange-500/10 text-orange-300 border-orange-500/25 hover:bg-orange-500/20"
+                          : "bg-slate-950/50 text-slate-500 border-white/5 hover:text-slate-300"
+                      }`}
+                    >
+                      Da attenzionare &lt;6 ({statusCounts.attention})
+                    </button>
+                    {filterStatus !== "all" && (
+                      <button
+                        type="button"
+                        onClick={() => setFilterStatus("all")}
+                        className="px-2 py-1 text-[10px] font-semibold text-slate-400 hover:text-white underline cursor-pointer"
+                      >
+                        Ripristina
+                      </button>
+                    )}
+                  </div>
+                )}
+
                 {deleteNotify && (
                   <div className={`p-3.5 rounded-2xl mb-4 text-xs font-semibold border ${
                     deleteNotify.type === "success" 
@@ -6437,6 +6610,28 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
                                     <button
                                       type="button"
+                                      onClick={async (e) => {
+                                        e.stopPropagation();
+                                        try {
+                                          await exportExamLedgerPdf(exam.submissions, {
+                                            examTitle: exam.title,
+                                            pin: exam.pin,
+                                            blindMode: blindGradingMode,
+                                          });
+                                          showNotify("success", `Tabellone Scrutinio PDF esportato per "${exam.title}".`);
+                                        } catch (err: any) {
+                                          showNotify("error", err?.message || "Impossibile generare il Tabellone PDF.");
+                                        }
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-sky-600/20 hover:bg-sky-600 text-sky-300 hover:text-white border border-sky-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                                      title="Esporta il Tabellone Scrutinio A4 in PDF (elenco studenti, fasce voti e firma docente)"
+                                    >
+                                      <Printer className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">Tabellone PDF</span>
+                                    </button>
+
+                                    <button
+                                      type="button"
                                       disabled={isExportingZip}
                                       onClick={(e) => {
                                         e.stopPropagation();
@@ -6517,6 +6712,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                     submissions={exam.submissions}
                                     examTitle={exam.title}
                                     blindGradingMode={blindGradingMode}
+                                    getAuthHeaders={getAuthHeaders}
                                     onGenerateRecoveryExam={(prefill) => {
                                       setAiModalPrefill(prefill);
                                       setShowAiModal(true);
@@ -7066,6 +7262,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             onValidateSubmission={handleValidateSubmission}
             validatingId={validatingId}
             onRetouchSubjectiveItem={handleRetouchSubjectiveItem}
+            getAuthHeaders={getAuthHeaders}
             currentIndex={speedIdx >= 0 ? speedIdx : undefined}
             totalCount={speedIdx >= 0 ? speedGraderList.length : undefined}
             onNavigate={

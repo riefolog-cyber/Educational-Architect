@@ -10,11 +10,16 @@ import {
   buildSubjectiveReviewEntries,
   collectExamMultipleChoice,
   collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
+  evaluateMcSelection,
+  formatItalianScholasticGrade,
   getPendingSubjectiveCount,
   isEvaluationPending,
   isWorkbookExamData,
   safeParseJson,
 } from "../utils";
+import { buildExamLedgerSummary } from "./examAnalytics";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping";
 
@@ -372,16 +377,10 @@ export function createSubmissionPdfDoc(
       currentY += 6;
 
       mcqList.forEach((q: any, idx: number) => {
-        const selectedOptIdx = ansObj.mc?.[q.id];
-        const opts = Array.isArray(q.options) ? q.options : [];
-        const hasSelection = selectedOptIdx !== undefined && selectedOptIdx !== null && selectedOptIdx !== "";
-        const parsedIdx = hasSelection ? Number(selectedOptIdx) : -1;
-        const selectedOptText =
-          hasSelection && Number.isInteger(parsedIdx) && opts[parsedIdx] !== undefined
-            ? String(opts[parsedIdx])
-            : "Risposta non data o mancante";
-        const correctOptText = opts[q.correctIndex] !== undefined ? String(opts[q.correctIndex]) : "N/D";
-        const isCorrect = hasSelection && Number.isInteger(parsedIdx) && parsedIdx === Number(q.correctIndex);
+        const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+        const selectedOptText = sel.hasSelection
+          ? sel.selectedText
+          : "Risposta non data o mancante";
 
         checkPageBreak(18);
         writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
@@ -401,12 +400,22 @@ export function createSubmissionPdfDoc(
           } catch {}
         }
 
-        if (isCorrect) {
+        if (!sel.hasCorrectKey) {
+          writeText(
+            sel.hasSelection
+              ? `[?] Selezione studente: "${selectedOptText}" (Chiave soluzioni differita / protetta)`
+              : `[-] Risposta non data o mancante (Chiave soluzioni differita / protetta)`,
+            8.5,
+            false,
+            [71, 85, 105],
+            18
+          );
+        } else if (sel.isCorrect) {
           writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
         } else {
           writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
           currentY += 1;
-          writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
+          writeText(`Opzione corretta: "${sel.correctText || "N/D"}"`, 8.5, false, [5, 150, 105], 18);
         }
         currentY += 4.5;
       });
@@ -479,34 +488,69 @@ export function createSubmissionPdfDoc(
       currentY += 6;
 
       wbMcqList.forEach((q: any, idx: number) => {
-        const selectedOptIdx = ansObj.mc?.[q.id];
-        const opts = Array.isArray(q.options) ? q.options : [];
-        const hasSelection = selectedOptIdx !== undefined && selectedOptIdx !== null && selectedOptIdx !== "";
-        const parsedIdx = hasSelection ? Number(selectedOptIdx) : -1;
-        const selectedOptText =
-          hasSelection && Number.isInteger(parsedIdx) && opts[parsedIdx] !== undefined
-            ? String(opts[parsedIdx])
-            : "Risposta non data o mancante";
-        const correctOptText = opts[q.correctIndex] !== undefined ? String(opts[q.correctIndex]) : "N/D";
-        const isCorrect = hasSelection && Number.isInteger(parsedIdx) && parsedIdx === Number(q.correctIndex);
+        const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+        const selectedOptText = sel.hasSelection
+          ? sel.selectedText
+          : "Risposta non data o mancante";
 
         checkPageBreak(18);
         writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
         currentY += 1;
 
-        if (isCorrect) {
+        const wbMcImg = domandeObj?.images?.[q.id];
+        if (wbMcImg) {
+          checkPageBreak(70);
+          try {
+            const mfmt = wbMcImg.includes("image/png")
+              ? "PNG"
+              : wbMcImg.includes("image/jpeg") || wbMcImg.includes("image/jpg")
+              ? "JPEG"
+              : "PNG";
+            doc.addImage(wbMcImg, mfmt, 18, currentY, 80, 60);
+            currentY += 65;
+          } catch {}
+        }
+
+        if (!sel.hasCorrectKey) {
+          writeText(
+            sel.hasSelection
+              ? `[?] Selezione studente: "${selectedOptText}" (Chiave soluzioni differita / protetta)`
+              : `[-] Risposta non data o mancante (Chiave soluzioni differita / protetta)`,
+            8.5,
+            false,
+            [71, 85, 105],
+            18
+          );
+        } else if (sel.isCorrect) {
           writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
         } else {
           writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
           currentY += 1;
-          writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
+          writeText(`Opzione corretta: "${sel.correctText || "N/D"}"`, 8.5, false, [5, 150, 105], 18);
         }
         currentY += 4.5;
       });
       currentY += 3;
     }
 
-    if (sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0)) {
+    const allFibItems: Array<{ fib: any; label: string }> = [
+      ...(Array.isArray(domandeObj?.fillInTheBlank)
+        ? domandeObj.fillInTheBlank.map((fib: any, idx: number) => ({
+            fib,
+            label: `Esercizio ${idx + 1} (Generale)`,
+          }))
+        : []),
+      ...sections.flatMap((sec: any, secIdx: number) =>
+        Array.isArray(sec?.fillInTheBlank)
+          ? sec.fillInTheBlank.map((fib: any, fIdx: number) => ({
+              fib,
+              label: `Esercizio ${fIdx + 1} (Sezione ${secIdx + 1})`,
+            }))
+          : []
+      ),
+    ];
+
+    if (allFibItems.length > 0) {
       checkPageBreak(15);
       doc.setFont("Helvetica", "bold");
       doc.setFontSize(10);
@@ -514,46 +558,49 @@ export function createSubmissionPdfDoc(
       doc.text("A) Verifiche di Completamento Terminologico (Fill-in-the-Blank)", 15, currentY);
       currentY += 6;
 
-      sections.forEach((sec: any, secIdx: number) => {
-        const fibList = sec.fillInTheBlank || [];
-        if (fibList.length === 0) return;
+      allFibItems.forEach(({ fib, label }) => {
+        const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
+        const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
+        const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
+        const hasKey = Boolean(String(expected || "").trim());
+        const isCorrect = hasKey && isFibAnswerCorrect(val, expected, fib.sentence);
+        const { before, after } = getFibSentenceParts(fib.sentence, expected);
+        const statusLabel = !hasKey ? "Chiave protetta" : isCorrect ? "Corretto" : "Errato";
+        const fullText = `${before} [Inserito: ${val || "____"} (${statusLabel})] ${after}`;
 
-        fibList.forEach((fib: any, fIdx: number) => {
-          const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
-          const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
-          const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-          const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-          const { before, after } = getFibSentenceParts(fib.sentence, expected);
-          const fullText = `${before} [Inserito: ${val || "____"} (${isCorrect ? "Corretto" : "Errato"})] ${after}`;
+        checkPageBreak(15);
+        writeText(`${label}:`, 9, true, [51, 65, 85], 15);
+        currentY += 1;
 
-          checkPageBreak(15);
-          writeText(`Esercizio ${fIdx + 1} (Sezione ${secIdx + 1}):`, 9, true, [51, 65, 85], 15);
-          currentY += 1;
+        const fibImg = domandeObj?.images?.[fib.id];
+        if (fibImg) {
+          checkPageBreak(70);
+          try {
+            const ffmt = fibImg.includes("image/png")
+              ? "PNG"
+              : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg")
+              ? "JPEG"
+              : "PNG";
+            doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
+            currentY += 65;
+          } catch {}
+        }
 
-          const fibImg = domandeObj?.images?.[fib.id];
-          if (fibImg) {
-            checkPageBreak(70);
-            try {
-              const ffmt = fibImg.includes("image/png")
-                ? "PNG"
-                : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg")
-                ? "JPEG"
-                : "PNG";
-              doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
-              currentY += 65;
-            } catch {}
-          }
-
-          writeText(fullText, 8.5, false, [71, 85, 105], 15);
-          currentY += 1;
-          writeText(`Soluzioni ammesse: ${expected || fib.answer || "N/D"}`, 8, false, [100, 116, 139], 18);
-          currentY += 5;
-        });
+        writeText(fullText, 8.5, false, [71, 85, 105], 15);
+        currentY += 1;
+        writeText(
+          `Soluzioni ammesse: ${hasKey ? expected : "Protette / non disponibili"}`,
+          8,
+          false,
+          [100, 116, 139],
+          18
+        );
+        currentY += 5;
       });
       currentY += 3;
     }
 
-    const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+    const rqList = collectWorkbookReflections(domandeObj);
     const rqEntries = buildSubjectiveReviewEntries(
       rqList,
       details,
@@ -864,6 +911,27 @@ export async function exportBlankExamPaperPdf(
     renderMcBlock(examObj.multipleChoice, "PARTE OGGETTIVA - SCELTA MULTIPLA");
   }
 
+  if (Array.isArray(examObj.fillInTheBlank) && examObj.fillInTheBlank.length > 0) {
+    checkBreak(14);
+    writeWrapped("COMPLETAMENTO TERMINI (GENERALE):", 10, true, [30, 41, 59], 15, 5);
+    currentY += 1.5;
+    examObj.fillInTheBlank.forEach((fib: any) => {
+      fibCounter++;
+      const rawAns = String(fib?.answer || "").trim();
+      const bracketMatch = typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "";
+      const { before, after } = getFibSentenceParts(fib?.sentence || "", rawAns || bracketMatch || "");
+      const maskedSentence = `${fibCounter}. ${before} ________________ ${after}`;
+      writeWrapped(maskedSentence, 9.5, false, [30, 41, 59], 17, 4.8);
+      renderQuestionImage(fib?.id);
+      fibKeyEntries.push({
+        num: fibCounter,
+        answer: rawAns || bracketMatch || "N/D",
+      });
+      currentY += 1.5;
+    });
+    currentY += 2;
+  }
+
   const rootOpenEnded = Array.isArray(examObj.openEnded) ? examObj.openEnded : [];
   if (rootOpenEnded.length > 0) {
     checkBreak(16);
@@ -873,6 +941,19 @@ export async function exportBlankExamPaperPdf(
       checkBreak(24);
       writeWrapped(`${idx + 1}. ${String(oe?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
       renderQuestionImage(oe?.id);
+      drawWritingLines(5);
+    });
+  }
+
+  const rootReflections = Array.isArray(examObj.reflectionQuestions) ? examObj.reflectionQuestions : [];
+  if (rootReflections.length > 0) {
+    checkBreak(16);
+    writeWrapped("RIFLESSIONI CRITICHE", 10.5, true, [30, 41, 59], 15, 5.2);
+    currentY += 2;
+    rootReflections.forEach((rq: any, idx: number) => {
+      checkBreak(24);
+      writeWrapped(`${idx + 1}. ${String(rq?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
+      renderQuestionImage(rq?.id);
       drawWritingLines(5);
     });
   }
@@ -969,4 +1050,215 @@ export async function exportBlankExamPaperPdf(
     ? "_" + trackLabel.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
     : "";
   doc.save(`traccia_${slug}${trackSlug}.pdf`);
+}
+
+export interface ExamLedgerPdfOptions {
+  examTitle?: string;
+  pin?: string;
+  blindMode?: boolean;
+  filterLabel?: string;
+}
+
+/**
+ * Generates an official A4 printable class council ledger ("Tabellone / Verbale della Prova")
+ * summarizing mean, median, pass rate, grade distribution, Fila A/B equity, and student rows.
+ */
+export async function exportExamLedgerPdf(
+  submissions: SavedSubmission[],
+  options?: ExamLedgerPdfOptions
+): Promise<void> {
+  const summary = buildExamLedgerSummary(submissions, options);
+  if (summary.totalStudents === 0) {
+    throw new Error("Nessuna consegna disponibile per generare il tabellone PDF.");
+  }
+
+  const { jsPDF } = await import("jspdf");
+  const doc = new jsPDF();
+  const pageHeight = 278;
+  let currentY = 18;
+
+  const checkBreak = (neededHeight: number) => {
+    if (currentY + neededHeight > pageHeight) {
+      doc.addPage();
+      doc.setFont("Helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(148, 163, 184);
+      doc.text(
+        sanitizePdfText(`Tabellone Prova | ${summary.examTitle} | PIN ${summary.pin}`),
+        14,
+        11
+      );
+      doc.setDrawColor(226, 232, 240);
+      doc.line(14, 13, 196, 13);
+      currentY = 20;
+    }
+  };
+
+  // Header
+  doc.setFillColor(248, 250, 252);
+  doc.setDrawColor(203, 213, 225);
+  doc.roundedRect(14, 14, 182, 28, 2.5, 2.5, "FD");
+
+  doc.setFont("Helvetica", "bold");
+  doc.setFontSize(8.5);
+  doc.setTextColor(79, 70, 229);
+  doc.text("EDUCATIONAL ARCHITECT | VERBALE E TABELLONE SCRUTINIO PROVA", 18, 21);
+
+  doc.setFontSize(13);
+  doc.setTextColor(15, 23, 42);
+  doc.text(sanitizePdfText(summary.examTitle).slice(0, 64), 18, 28);
+
+  doc.setFont("Helvetica", "normal");
+  doc.setFontSize(8.5);
+  doc.setTextColor(71, 85, 105);
+  doc.text(
+    sanitizePdfText(
+      `PIN: ${summary.pin}  |  Tipo: ${summary.tipo}  |  Classi: ${summary.classes.join(", ")}  |  Filtro: ${summary.filterLabel}${
+        summary.blindMode ? "  |  GDPR CIECO" : ""
+      }`
+    ),
+    18,
+    34.5
+  );
+  doc.text(
+    sanitizePdfText(`Generato il ${new Date().toLocaleString("it-IT")}  |  Studenti: ${summary.totalStudents}  |  Convalidati: ${summary.validatedCount}/${summary.totalStudents}`),
+    18,
+    39.5
+  );
+
+  currentY = 48;
+
+  // KPI strip
+  const avgFormatted =
+    summary.distribution.meanGrade !== null
+      ? formatItalianScholasticGrade(summary.distribution.meanGrade)
+      : "N.V.";
+  const medFormatted =
+    summary.distribution.medianGrade !== null
+      ? formatItalianScholasticGrade(summary.distribution.medianGrade)
+      : "N.V.";
+  const passText =
+    summary.distribution.passRate !== null
+      ? `${summary.distribution.passRate}% (${summary.distribution.passCount}/${summary.distribution.gradedCount})`
+      : "N.V.";
+
+  doc.setFillColor(241, 245, 249);
+  doc.roundedRect(14, currentY, 182, 18, 2, 2, "F");
+  doc.setFont("Helvetica", "bold");
+  doc.setFontSize(7.5);
+  doc.setTextColor(100, 116, 139);
+  doc.text("MEDIA CLASSE", 18, currentY + 5.5);
+  doc.text("MEDIANA", 66, currentY + 5.5);
+  doc.text("SUFFICIENZE (>= 6)", 108, currentY + 5.5);
+  doc.text("SEGNALAZIONI", 160, currentY + 5.5);
+
+  doc.setFontSize(10.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text(sanitizePdfText(avgFormatted), 18, currentY + 13);
+  doc.text(sanitizePdfText(medFormatted), 66, currentY + 13);
+  doc.text(sanitizePdfText(passText), 108, currentY + 13);
+  doc.text(String(summary.totalViolations), 160, currentY + 13);
+  currentY += 23;
+
+  // Grade distribution summary
+  doc.setFont("Helvetica", "bold");
+  doc.setFontSize(9.5);
+  doc.setTextColor(15, 23, 42);
+  doc.text("Distribuzione per Fasce di Voto:", 14, currentY);
+  currentY += 5;
+  doc.setFont("Helvetica", "normal");
+  doc.setFontSize(8.5);
+  doc.setTextColor(51, 65, 85);
+  const bandLine = summary.distribution.buckets
+    .map((b) => `${b.shortLabel}: ${b.count} (${b.percent}%)`)
+    .join("   |   ");
+  const wrappedBand: string[] = doc.splitTextToSize(sanitizePdfText(bandLine), 180);
+  wrappedBand.forEach((ln) => {
+    doc.text(ln, 14, currentY);
+    currentY += 4.5;
+  });
+
+  if (summary.filaEquity.hasMixedFila) {
+    currentY += 1;
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(8.5);
+    doc.setTextColor(88, 28, 135);
+    doc.text(
+      sanitizePdfText(
+        `Equità Fila A / Fila B: Fila A (${summary.filaEquity.filaA.count} st., media ${summary.filaEquity.filaA.averageFormatted}) vs Fila B (${summary.filaEquity.filaB.count} st., media ${summary.filaEquity.filaB.averageFormatted})${
+          summary.filaEquity.gradeDelta !== null ? ` — Scarto ${summary.filaEquity.gradeDelta} pt` : ""
+        }`
+      ),
+      14,
+      currentY
+    );
+    currentY += 6;
+  } else {
+    currentY += 3;
+  }
+
+  // Table header
+  const drawTableHeader = () => {
+    doc.setFillColor(30, 41, 59);
+    doc.rect(14, currentY, 182, 7, "F");
+    doc.setFont("Helvetica", "bold");
+    doc.setFontSize(7.5);
+    doc.setTextColor(255, 255, 255);
+    doc.text("#", 16, currentY + 4.8);
+    doc.text(summary.blindMode ? "CODICE CIECO" : "STUDENTE", 23, currentY + 4.8);
+    doc.text("CLASSE", 79, currentY + 4.8);
+    doc.text("FILA", 96, currentY + 4.8);
+    doc.text("VOTO", 110, currentY + 4.8);
+    doc.text("AUTOV.", 135, currentY + 4.8);
+    doc.text("STATO", 150, currentY + 4.8);
+    doc.text("NOTE", 172, currentY + 4.8);
+    currentY += 8.5;
+  };
+
+  drawTableHeader();
+
+  summary.rows.forEach((row, idx) => {
+    if (currentY + 8 > pageHeight) {
+      checkBreak(16);
+      drawTableHeader();
+    }
+    if (idx % 2 === 1) {
+      doc.setFillColor(248, 250, 252);
+      doc.rect(14, currentY - 3.8, 182, 6.2, "F");
+    }
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(8);
+    doc.setTextColor(30, 41, 59);
+    doc.text(String(idx + 1), 16, currentY);
+    doc.text(sanitizePdfText(row.studentLabel).slice(0, 28), 23, currentY);
+    doc.text(sanitizePdfText(row.className).slice(0, 9), 79, currentY);
+    doc.text(sanitizePdfText(row.assignedFila).slice(0, 7), 96, currentY);
+
+    doc.setFont("Helvetica", "bold");
+    doc.setTextColor(
+      row.finalGrade === "N.V." || (row.numericGrade !== null && row.numericGrade < 6)
+        ? 185
+        : 5,
+      row.finalGrade === "N.V." || (row.numericGrade !== null && row.numericGrade < 6)
+        ? 28
+        : 120,
+      row.finalGrade === "N.V." || (row.numericGrade !== null && row.numericGrade < 6)
+        ? 28
+        : 95
+    );
+    doc.text(sanitizePdfText(row.finalGrade).slice(0, 14), 110, currentY);
+
+    doc.setFont("Helvetica", "normal");
+    doc.setTextColor(71, 85, 105);
+    doc.text(sanitizePdfText(row.selfGrade).slice(0, 7), 135, currentY);
+    doc.text(sanitizePdfText(row.validatedLabel).slice(0, 11), 150, currentY);
+    doc.text(sanitizePdfText(row.notes).slice(0, 14), 172, currentY);
+    currentY += 6.2;
+  });
+
+  const slug = (summary.examTitle || "tabellone")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  doc.save(`tabellone_${slug}_pin_${summary.pin.toLowerCase()}.pdf`);
 }

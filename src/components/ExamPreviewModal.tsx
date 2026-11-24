@@ -185,6 +185,7 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
           </span>
         )}
       </div>
+      {renderImageBlock(f?.id)}
       {showTeacherKey && f?.answer && (
         <p className="text-[11px] text-emerald-300 font-semibold">
           Soluzione attesa: <span className="font-mono bg-emerald-500/15 px-1.5 py-0.5 rounded">{f.answer}</span>

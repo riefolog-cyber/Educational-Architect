@@ -21,6 +21,8 @@ import {
   evaluateMcSelection,
   isEvaluationPending,
   sanitizeAiHtml,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
 } from "../src/utils";
 import {
   computeExamItemAnalysis,
@@ -29,7 +31,11 @@ import {
   computeMetacognitionSummary,
   buildExamOutcomeMatrix,
   buildExamItemAnalysisCsv,
+  computeGradeDistribution,
+  matchesGradeBand,
+  buildExamLedgerSummary,
 } from "../src/utils/examAnalytics";
+import { normalizeExamStructure } from "../src/utils/examStructureRepair";
 import {
   buildExamPreviewSummary,
   extractReusableExamFromSubmissions,
@@ -2084,6 +2090,134 @@ test("Round 7: buildExamOutcomeMatrix & buildExamItemAnalysisCsv", () => {
   assert.ok(csvBlind.includes("Studente STU-"));
   assert.ok(csvBlind.includes(';"OK";"OK";"8"'));
   assert.ok(csvBlind.includes(';"ERR";"VUOTO";"4"'));
+});
+
+test("Regression: ID mancanti/duplicati, correctIndex stringa/lettera e protezione unkeyed", () => {
+  const dirtyExam: any = {
+    title: "Prova con ID sporchi",
+    images: { dup: "data:image/png;base64,AAA" },
+    multipleChoice: [
+      { id: "dup", question: "Q1?", options: ["Uno", "Due", "Tre"], correctIndex: "B", explanation: "Due" },
+      { id: "dup", question: "Q2?", options: ["Alpha", "Beta"], correctIndex: "0" },
+      { question: "Q3 senza id?", options: ["X", "Y", "Z"], correctIndex: 2 },
+    ],
+  };
+
+  normalizeExamStructure(dirtyExam);
+  const mcIds = dirtyExam.multipleChoice.map((q: any) => q.id);
+  assert.equal(new Set(mcIds).size, 3);
+  assert.equal(dirtyExam.multipleChoice[0].correctIndex, 1);
+  assert.equal(dirtyExam.multipleChoice[1].correctIndex, 0);
+  assert.equal(dirtyExam.multipleChoice[2].correctIndex, 2);
+
+  const { sanitizedExam, answerKey } = stripExamAnswers(dirtyExam);
+  assert.equal(sanitizedExam.multipleChoice[0].correctIndex, undefined);
+  assert.equal(answerKey.mc[mcIds[0]], 1);
+  assert.equal(answerKey.mc[mcIds[1]], 0);
+  assert.equal(answerKey.mc[mcIds[2]], 2);
+
+  // Unkeyed selection must never report isCorrect=false as a scored wrong answer
+  const unkeyedEval = evaluateMcSelection(sanitizedExam.multipleChoice[0], 1);
+  assert.equal(unkeyedEval.hasCorrectKey, false);
+  assert.equal(unkeyedEval.hasSelection, true);
+  assert.equal(unkeyedEval.isCorrect, false);
+
+  const restored = restoreExamAnswers(sanitizedExam, answerKey);
+  assert.equal(restored.multipleChoice[0].correctIndex, 1);
+  assert.equal(evaluateMcSelection(restored.multipleChoice[0], 1).hasCorrectKey, true);
+  assert.equal(evaluateMcSelection(restored.multipleChoice[0], 1).isCorrect, true);
+
+  // Matrix & Item Analysis on stripped exam: zero false errors, uses "unkeyed" & unkeyedResponses
+  const strippedSub: any = {
+    id: "sub_unkeyed",
+    Nome: "Giulia Verdi",
+    Email: "giulia@scuola.it",
+    Tipo: "Quiz",
+    Voto_Suggerito: "N.V.",
+    Domande_Esame: JSON.stringify(sanitizedExam),
+    Risposte_Studente: JSON.stringify({ mc: { [mcIds[0]]: 1, [mcIds[1]]: 0 } }),
+  };
+  const matrix = buildExamOutcomeMatrix([strippedSub]);
+  assert.equal(matrix.rows[0].cells[0].status, "unkeyed");
+  assert.equal(matrix.rows[0].cells[1].status, "unkeyed");
+  assert.equal(matrix.rows[0].cells[2].status, "blank");
+
+  const stats = computeExamItemAnalysis([strippedSub]);
+  assert.equal(stats.mcStats[0].keyedResponses, 0);
+  assert.equal(stats.mcStats[0].unkeyedResponses, 1);
+  assert.equal(stats.mcStats[0].errorCount, 0);
+});
+
+test("Regression: Root-level Workbook fillInTheBlank & reflectionQuestions", () => {
+  const rootWb: any = {
+    title: "Workbook Radice",
+    fillInTheBlank: [{ id: "rf1", sentence: "Il Sole è una ___", answer: "stella" }],
+    reflectionQuestions: [{ id: "rr1", question: "Spiega la fusione nucleare" }],
+    sections: [
+      {
+        title: "Approfondimento",
+        fillInTheBlank: [{ id: "sf1", sentence: "La Terra ruota attorno al ___", answer: "Sole" }],
+        reflectionQuestions: [],
+      },
+    ],
+  };
+
+  assert.equal(isWorkbookExamData(rootWb), true);
+  assert.equal(collectWorkbookFillInTheBlank(rootWb).length, 2);
+  assert.equal(collectWorkbookReflections(rootWb).length, 1);
+
+  const bd = computeGradeBreakdown({
+    tipo: "Workbook",
+    examData: rootWb,
+    answers: {
+      wbFib: { rf1: "stella", sf1: "Sole" },
+      wbRq: { rr1: "Reazione termonucleare tra nuclei di idrogeno." },
+    },
+    evaluation: { reflectionDetails: [{ id: "rr1", score: 8 }] },
+  });
+  assert.equal(bd.objectivePart?.score, 2);
+  assert.equal(bd.objectivePart?.total, 2);
+  assert.equal(bd.subjectivePart?.count, 1);
+  assert.equal(bd.subjectivePart?.averageScore, 8);
+  assert.equal(bd.finalNumeric, 9);
+  assert.equal(bd.finalGradeFormatted, "9.0 (9)");
+});
+
+test("Follow-up #1 & #2: computeGradeDistribution, matchesGradeBand & buildExamLedgerSummary", () => {
+  const subs: any[] = [
+    { id: "1", Nome: "Alunno A", Email: "a@it", Classe: "3A", Assigned_Fila: "A", Voto_Suggerito: "4.0 (4)", Autovalutazione: "6" },
+    { id: "2", Nome: "Alunno B", Email: "b@it", Classe: "3A", Assigned_Fila: "B", Voto_Suggerito: "5½", Autovalutazione: "6", Convalida_Docente_At: "2026-01-01" },
+    { id: "3", Nome: "Alunno C", Email: "c@it", Classe: "3A", Assigned_Fila: "A", Voto_Suggerito: "6.5 (6½)", Autovalutazione: "7", AntiCopia_TabSwitch: 2 },
+    { id: "4", Nome: "Alunno D", Email: "d@it", Classe: "3B", Assigned_Fila: "B", Voto_Suggerito: "7.5 (7½)", Autovalutazione: "7" },
+    { id: "5", Nome: "Alunno E", Email: "e@it", Classe: "3B", Assigned_Fila: "A", Voto_Suggerito: "9.0 (9)", Autovalutazione: "8", Convalida_Docente_At: "2026-01-01" },
+    { id: "6", Nome: "Alunno F", Email: "f@it", Classe: "3B", Assigned_Fila: "B", Voto_Suggerito: "N.V.", Autovalutazione: "5" },
+  ];
+
+  const dist = computeGradeDistribution(subs);
+  assert.equal(dist.totalSubmissions, 6);
+  assert.equal(dist.gradedCount, 5);
+  assert.equal(dist.nvCount, 1);
+  assert.equal(dist.passCount, 3);
+  assert.equal(dist.passRate, 60);
+  near(dist.medianGrade!, 6.5, 0.01);
+
+  assert.equal(matchesGradeBand(subs[0], "lt45"), true);
+  assert.equal(matchesGradeBand(subs[1], "b45_59"), true);
+  assert.equal(matchesGradeBand(subs[2], "b60_69"), true);
+  assert.equal(matchesGradeBand(subs[3], "b70_79"), true);
+  assert.equal(matchesGradeBand(subs[4], "b80_105"), true);
+  assert.equal(matchesGradeBand(subs[5], "nv"), true);
+
+  const ledgerBlind = buildExamLedgerSummary(subs, {
+    examTitle: "Scrutinio Storia",
+    pin: "1234",
+    blindMode: true,
+  });
+  assert.equal(ledgerBlind.totalStudents, 6);
+  assert.equal(ledgerBlind.validatedCount, 2);
+  assert.equal(ledgerBlind.totalViolations, 2);
+  assert.ok(ledgerBlind.rows.every((r) => r.studentLabel.startsWith("Studente STU-")));
+  assert.ok(ledgerBlind.rows.every((r) => !r.secondaryLabel.includes("@")));
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

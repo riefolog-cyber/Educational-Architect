@@ -76,6 +76,8 @@ import {
   buildSubjectiveReviewEntries,
   collectExamMultipleChoice,
   collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
   evaluateMcSelection,
   isWorkbookExamData,
   auditSubjectiveEvaluation,
@@ -884,12 +886,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         answeredCount = Math.min(totalQuestions, mcDoneCount + openDoneCount);
       } else {
         const sections = Array.isArray(activeData?.sections) ? activeData.sections : [];
-        const fibList = sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []));
-        const rqList = sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []));
-        const mcList = [
-          ...(Array.isArray(activeData?.multipleChoice) ? activeData.multipleChoice : []),
-          ...sections.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
-        ];
+        const fibList = collectWorkbookFillInTheBlank(activeData);
+        const rqList = collectWorkbookReflections(activeData);
+        const mcList = collectExamMultipleChoice(activeData);
         const fibDone = fibList.length > 0
           ? fibList.filter((f: any) => String(activeAns.wbFib?.[f.id] ?? "").trim().length > 0).length
           : Object.keys(activeAns.wbFib || {}).filter((k) => String(activeAns.wbFib?.[k] ?? "").trim().length > 0).length;
@@ -3161,7 +3160,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       });
     } else {
       // Workbook structure
-      // 1. Root level multiple choice if present
+      // 1. Root level items if present
       const rootMc = examData?.multipleChoice || [];
       rootMc.forEach((q: any, idx: number) => {
         if (!hasMcAnswer(answers.mc?.[q.id])) {
@@ -3176,10 +3175,41 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         }
       });
 
-      // 2. Sections
-      const sections = examData?.sections || [];
       let fibIdx = 1;
       let rqIdx = 1;
+
+      const rootFib = examData?.fillInTheBlank || [];
+      rootFib.forEach((f: any, fIdx: number) => {
+        if (!(answers.wbFib[f.id] || "").trim()) {
+          missing.push({
+            id: f.id || `root_fib_${fIdx}`,
+            label: `Termine da inserire #${fibIdx}`,
+            type: "wbFib",
+            domandaTipoLabel: "Completamento testo",
+            domandaText: f.clue ? `Indizio: "${f.clue}"` : (f.sentence ? f.sentence.slice(0, 90) + "..." : "Termine mancante"),
+            anchorId: `wb_root_fib_${f.id || fIdx}`,
+          });
+        }
+        fibIdx++;
+      });
+
+      const rootRq = examData?.reflectionQuestions || [];
+      rootRq.forEach((r: any, rIdx: number) => {
+        if (!(answers.wbRq[r.id] || answers.oe[r.id] || "").trim()) {
+          missing.push({
+            id: r.id || `root_rq_${rIdx}`,
+            label: `Riflessione critica #${rqIdx}`,
+            type: "wbRq",
+            domandaTipoLabel: "Riflessione critica",
+            domandaText: r.question || "",
+            anchorId: `wb_root_rq_${r.id || rIdx}`,
+          });
+        }
+        rqIdx++;
+      });
+
+      // 2. Sections
+      const sections = examData?.sections || [];
 
       sections.forEach((sec: any, sIdx: number) => {
         const secTitle = sec.title || `Sezione ${sIdx + 1}`;
@@ -3717,8 +3747,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     let totalFIB = 0;
     let fibWeightedCorrect = 0;
     let fibWeightedTotal = 0;
-    if (examType === "workbook" && examData?.sections) {
-      const allFib = examData.sections.flatMap((sec: any) => sec.fillInTheBlank || []);
+    if (examType === "workbook" && examData) {
+      const allFib = collectWorkbookFillInTheBlank(examData);
       const fib = fibWeightedScore(allFib, answers.wbFib, isFibAnswerCorrect);
       calculatedFIBScore = fib.correct;
       totalFIB = fib.total;
@@ -3739,14 +3769,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         const text = answers.oe[q.id] || "";
         if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
       });
-    } else if (examType === "workbook" && examData?.sections) {
-      examData.sections.forEach((sec: any) => {
-        if (sec.reflectionQuestions) {
-          sec.reflectionQuestions.forEach((rq: any) => {
-            const text = answers.wbRq[rq.id] || "";
-            if (detectGibberish(text)) sanitizedAnswers.wbRq[rq.id] = "[VUOTO]";
-          });
-        }
+    } else if (examType === "workbook" && examData) {
+      collectWorkbookReflections(examData).forEach((rq: any) => {
+        const text = answers.wbRq[rq.id] || "";
+        if (detectGibberish(text)) sanitizedAnswers.wbRq[rq.id] = "[VUOTO]";
       });
     }
 
@@ -4441,34 +4467,42 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                               )}
                             </div>
                             <div className="grid grid-cols-1 gap-2.5">
-                              {[...(parsedExamData?.multipleChoice || []), ...((parsedExamData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
+                              {collectExamMultipleChoice(parsedExamData).map((q: any, iIdx: number) => {
                                 const sel = evaluateMcSelection(q, parsedAnswers?.mc?.[q.id]);
                                 const isCorrect = sel.isCorrect;
+                                const hideDetail = pastSolutionsMasked || !sel.hasCorrectKey;
                                 const uAns = sel.hasSelection ? sel.selectedText : "Scelta mancante";
                                 return (
                                   <div
-                                    key={q.id}
+                                    key={q.id || iIdx}
                                     className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                      pastSolutionsMasked
+                                      hideDetail
                                         ? "bg-slate-900/50 border-white/10 text-slate-300"
                                         : isCorrect
                                         ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                                         : "bg-red-950/15 border-red-500/20 text-red-300"
                                     }`}
                                   >
-                                    <span className="font-bold text-sm">{pastSolutionsMasked ? "📝" : isCorrect ? "✅" : "❌"}</span>
+                                    <span className="font-bold text-sm">
+                                      {pastSolutionsMasked ? "📝" : !sel.hasCorrectKey ? "🔒" : isCorrect ? "✅" : "❌"}
+                                    </span>
                                     <div>
                                       <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
                                       <QuestionFigure src={parsedExamData?.images?.[q.id]} />
                                       <p className="mt-1">
                                         La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                                       </p>
-                                      {!pastSolutionsMasked && !isCorrect && (
-                                        <p className="mt-1 text-emerald-400">
-                                          Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
+                                      {!pastSolutionsMasked && !sel.hasCorrectKey && (
+                                        <p className="mt-1 text-amber-300/90 text-[11px]">
+                                          Soluzione non inclusa in questa copia archiviata.
                                         </p>
                                       )}
-                                      {!pastSolutionsMasked && q.explanation && (
+                                      {!hideDetail && !isCorrect && sel.correctText && (
+                                        <p className="mt-1 text-emerald-400">
+                                          Risposta corretta: <span className="font-semibold">{sel.correctText}</span>
+                                        </p>
+                                      )}
+                                      {!hideDetail && q.explanation && (
                                         <div className="mt-2 text-[11px] text-slate-300 bg-black/30 p-2 rounded-lg border border-white/5 flex items-start gap-1.5">
                                           <span className="shrink-0">💡</span>
                                           <span><strong className="text-slate-200">Spiegazione:</strong> {q.explanation}</span>
@@ -4483,86 +4517,100 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         )}
 
                         {/* Detailed Workbook Fill-in-the-Blank (FIB) / Completamento Review */}
-                        {parsedExamData?.sections && parsedExamData.sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0) && (
-                          <div className="space-y-4 pt-2">
-                            <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                              Dettaglio Risposte & Correzioni Singole: Completamento
-                            </h4>
-                            <div className="space-y-4">
-                              {parsedExamData.sections.map((sec: any, sIdx: number) => {
-                                const fibList = sec.fillInTheBlank || [];
-                                if (fibList.length === 0) return null;
-                                return (
+                        {collectWorkbookFillInTheBlank(parsedExamData).length > 0 && (() => {
+                          const rootFib = Array.isArray(parsedExamData?.fillInTheBlank) ? parsedExamData.fillInTheBlank : [];
+                          const secGroups = (parsedExamData?.sections || []).filter(
+                            (s: any) => Array.isArray(s?.fillInTheBlank) && s.fillInTheBlank.length > 0
+                          );
+                          const renderPastFibList = (fibList: any[]) =>
+                            fibList.map((fib: any, fIdx: number) => {
+                              const rawVal = parsedAnswers?.wbFib?.[fib.id] ?? parsedAnswers?.fib?.[fib.id] ?? "";
+                              const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
+                              const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                              const hasExpected = String(expected).trim().length > 0;
+                              const hideFibDetail = pastSolutionsMasked || !hasExpected;
+                              const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
+                              const { before, after } = getFibSentenceParts(fib.sentence, expected);
+                              const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
+
+                              return (
+                                <div
+                                  key={fib.id || fIdx}
+                                  className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
+                                    hideFibDetail
+                                      ? "bg-slate-900/50 border-white/10 text-slate-300"
+                                      : isCorrect
+                                      ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
+                                      : "bg-red-950/15 border-red-500/20 text-red-300"
+                                  }`}
+                                >
+                                  <span className="font-bold text-sm shrink-0">
+                                    {pastSolutionsMasked ? "📝" : !hasExpected ? "🔒" : isCorrect ? "✅" : "❌"}
+                                  </span>
+                                  <div className="space-y-1.5 flex-1">
+                                    <p className="font-semibold text-slate-200">
+                                      {before}
+                                      <span
+                                        className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
+                                          hideFibDetail
+                                            ? "bg-slate-800 text-slate-200 border-white/15"
+                                            : isCorrect
+                                            ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                            : "bg-red-500/20 text-red-200 border-red-500/30"
+                                        }`}
+                                      >
+                                        {val || "[Nessuna risposta]"}
+                                      </span>
+                                      {after}
+                                    </p>
+                                    <QuestionFigure src={parsedExamData?.images?.[fib.id]} />
+                                    <div className="text-[11px] space-y-0.5">
+                                      <p className="text-slate-400">
+                                        La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
+                                      </p>
+                                      {!hideFibDetail && !isCorrect && expected && (
+                                        <p className="text-emerald-400">
+                                          Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
+                                        </p>
+                                      )}
+                                      {!hideFibDetail && isSynonymAcceptance && (
+                                        <p className="text-teal-300 text-[10.5px] italic">
+                                          💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
+                                        </p>
+                                      )}
+                                    </div>
+                                  </div>
+                                </div>
+                              );
+                            });
+
+                          return (
+                            <div className="space-y-4 pt-2">
+                              <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                                Dettaglio Risposte & Correzioni Singole: Completamento
+                              </h4>
+                              <div className="space-y-4">
+                                {rootFib.length > 0 && (
+                                  <div className="grid grid-cols-1 gap-2.5">
+                                    {renderPastFibList(rootFib)}
+                                  </div>
+                                )}
+                                {secGroups.map((sec: any, sIdx: number) => (
                                   <div key={`past-fib-sec-${sIdx}`} className="space-y-3">
-                                    {parsedExamData.sections.length > 1 && (
+                                    {secGroups.length > 1 && (
                                       <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-white/5 pb-1">
                                         {sec.title || `Sezione ${sIdx + 1}`}
                                       </p>
                                     )}
                                     <div className="grid grid-cols-1 gap-2.5">
-                                      {fibList.map((fib: any, fIdx: number) => {
-                                        const rawVal = parsedAnswers?.wbFib?.[fib.id] ?? parsedAnswers?.fib?.[fib.id] ?? "";
-                                        const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
-                                        const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
-                                        const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-                                        const { before, after } = getFibSentenceParts(fib.sentence, expected);
-                                        const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
-
-                                        return (
-                                          <div
-                                            key={fib.id || fIdx}
-                                            className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                              pastSolutionsMasked
-                                                ? "bg-slate-900/50 border-white/10 text-slate-300"
-                                                : isCorrect
-                                                ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
-                                                : "bg-red-950/15 border-red-500/20 text-red-300"
-                                            }`}
-                                          >
-                                            <span className="font-bold text-sm shrink-0">{pastSolutionsMasked ? "📝" : isCorrect ? "✅" : "❌"}</span>
-                                            <div className="space-y-1.5 flex-1">
-                                              <p className="font-semibold text-slate-200">
-                                                {before}
-                                                <span
-                                                  className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
-                                                    pastSolutionsMasked
-                                                      ? "bg-slate-800 text-slate-200 border-white/15"
-                                                      : isCorrect
-                                                      ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
-                                                      : "bg-red-500/20 text-red-200 border-red-500/30"
-                                                  }`}
-                                                >
-                                                  {val || "[Nessuna risposta]"}
-                                                </span>
-                                                {after}
-                                              </p>
-                                              <QuestionFigure src={parsedExamData?.images?.[fib.id]} />
-                                              <div className="text-[11px] space-y-0.5">
-                                                <p className="text-slate-400">
-                                                  La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
-                                                </p>
-                                                {!pastSolutionsMasked && !isCorrect && expected && (
-                                                  <p className="text-emerald-400">
-                                                    Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
-                                                  </p>
-                                                )}
-                                                {!pastSolutionsMasked && isSynonymAcceptance && (
-                                                  <p className="text-teal-300 text-[10.5px] italic">
-                                                    💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
-                                                  </p>
-                                                )}
-                                              </div>
-                                            </div>
-                                          </div>
-                                        );
-                                      })}
+                                      {renderPastFibList(sec.fillInTheBlank || [])}
                                     </div>
                                   </div>
-                                );
-                              })}
+                                ))}
+                              </div>
                             </div>
-                          </div>
-                        )}
+                          );
+                        })()}
 
                         {/* Detailed Open Ended Review Mapping (all questions, also pending) */}
                         {selectedPastSub.Tipo === "Quiz" && (() => {
@@ -4621,8 +4669,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         })()}
 
                         {/* Workbook Detailed Reflections Reviews Mapping (all questions, also pending) */}
-                        {selectedPastSub.Tipo !== "Quiz" && parsedExamData?.sections && (() => {
-                          const rqList = parsedExamData.sections.flatMap((sec: any) => sec.reflectionQuestions || []);
+                        {selectedPastSub.Tipo !== "Quiz" && (() => {
+                          const rqList = collectWorkbookReflections(parsedExamData);
                           const entries = buildSubjectiveReviewEntries(
                             rqList,
                             parsedEval?.reflectionDetails || [],
@@ -5332,6 +5380,24 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     shortType: "Scelta multipla",
                   });
                 });
+                const rootFibNav = Array.isArray(examData?.fillInTheBlank) ? examData.fillInTheBlank : [];
+                rootFibNav.forEach((f: any, fIdx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `wb_root_fib_${f.id || fIdx}`,
+                    answered: Boolean((answers.wbFib[f.id] || "").trim()),
+                    shortType: "Completamento",
+                  });
+                });
+                const rootRqNav = Array.isArray(examData?.reflectionQuestions) ? examData.reflectionQuestions : [];
+                rootRqNav.forEach((rq: any, rIdx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `wb_root_rq_${rq.id || rIdx}`,
+                    answered: Boolean((answers.wbRq[rq.id] || answers.oe[rq.id] || "").trim()),
+                    shortType: "Riflessione",
+                  });
+                });
                 const wbSections = Array.isArray(examData?.sections) ? examData.sections : [];
                 wbSections.forEach((sec: any, sIdx: number) => {
                   (sec.fillInTheBlank || []).forEach((f: any, fIdx: number) => {
@@ -5636,6 +5702,40 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   </div>
                 )}
 
+                {/* Root level fill-in-the-blank questions if present in Workbook */}
+                {examData?.fillInTheBlank && examData.fillInTheBlank.length > 0 && (
+                  <div className="p-5 bg-slate-950/20 border border-white/5 rounded-2xl space-y-4">
+                    <h3 className="text-sm font-bold text-teal-400 flex items-center gap-2">
+                      <FileText className="w-4 h-4" />
+                      <span>Completamento testo</span>
+                    </h3>
+                    <div className="space-y-3.5">
+                      {examData.fillInTheBlank.map((fib: any, fIdx: number) => {
+                        const userText = answers.wbFib[fib.id] || "";
+                        const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+                        return (
+                          <div key={fib.id || fIdx} id={`wb_root_fib_${fib.id || fIdx}`} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300 transition-all">
+                            <span>{before}</span>
+                            <input
+                              type="text"
+                              value={userText}
+                              onChange={(e) => handleInputFib(fib.id, e.target.value)}
+                              placeholder="..."
+                              className="mx-1.5 px-2.5 py-0.5 text-center bg-slate-900 border-b-2 border-teal-500 text-teal-300 font-bold focus:outline-none focus:border-teal-300 w-36 text-sm select-text"
+                            />
+                            <span>{after}</span>
+                            {renderSpeakButton(
+                              `${before} spazio da completare ${after}`,
+                              `wb_root_fib_${fib.id || fIdx}`
+                            )}
+                            <QuestionMeta q={fib} tone="teal" />
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+
                 {examData?.sections && examData.sections.map((sec: any, sIdx: number) => (
                   <div key={sIdx} className="p-5 bg-slate-950/20 border border-white/5 rounded-2xl space-y-6">
                     <h3 className="text-sm font-bold text-teal-400 flex items-center gap-2">
@@ -5815,6 +5915,41 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     )}
                   </div>
                 ))}
+
+                {/* Root level reflection questions if present in Workbook */}
+                {examData?.reflectionQuestions && examData.reflectionQuestions.length > 0 && (
+                  <div className="p-5 bg-slate-950/20 border border-white/5 rounded-2xl space-y-4">
+                    <h3 className="text-sm font-bold text-teal-400 flex items-center gap-2">
+                      <BookOpen className="w-4 h-4" />
+                      <span>Domande di riflessione critiche</span>
+                    </h3>
+                    <div className="space-y-4">
+                      {examData.reflectionQuestions.map((rq: any, rIdx: number) => {
+                        const rqValue = answers.wbRq[rq.id] || "";
+                        const wordCount = rqValue.trim() ? rqValue.trim().split(/\s+/).length : 0;
+                        return (
+                          <div key={rq.id || rIdx} id={`wb_root_rq_${rq.id || rIdx}`} className="space-y-2 transition-all rounded-xl p-2 -m-2">
+                            <p className="text-xs font-semibold text-slate-300">
+                              {rIdx + 1}. {rq.question}
+                              {renderSpeakButton(String(rq.question || ""), `wb_root_rq_${rq.id || rIdx}`)}
+                              {renderAudioAnswerButton(`wb_root_rq_${rq.id || rIdx}`, "wbRq", rq.id)}
+                              <QuestionMeta q={rq} tone="teal" />
+                            </p>
+                            <textarea
+                              value={rqValue}
+                              onChange={(e) => handleInputRq(rq.id, e.target.value)}
+                              placeholder="Inserisci la tua argomentazione ed i nessi logici..."
+                              className="w-full min-h-[90px] p-3 bg-slate-950/40 border border-white/10 rounded-xl text-white placeholder-slate-700 focus:outline-none focus:border-indigo-500 transition-colors text-sm line-relaxed select-text"
+                            />
+                            <div className="text-[11px] text-right text-slate-500">
+                              {wordCount} parole {wordCount < 15 && "(severità minima adatta: 15-20 parole)"}
+                            </div>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
               </div>
             )}
 
@@ -5994,12 +6129,11 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   {deferSolutionsSession && !solutionsReleased ? (
                     <span className="text-base text-amber-300 font-bold">🔒 Differito</span>
                   ) : examType === "quiz" ? (() => {
-                    const allMcQs = [
-                      ...(Array.isArray(examData?.multipleChoice) ? examData.multipleChoice : []),
-                      ...((Array.isArray(examData?.sections) ? examData.sections : []).flatMap((s: any) =>
-                        Array.isArray(s?.multipleChoice) ? s.multipleChoice : []
-                      )),
-                    ];
+                    const allMcQs = collectExamMultipleChoice(examData);
+                    const keyedCount = allMcQs.filter((q: any) => evaluateMcSelection(q, 0).hasCorrectKey).length;
+                    if (allMcQs.length > 0 && keyedCount === 0) {
+                      return <span className="text-base text-amber-300 font-bold">🔒 Protetto</span>;
+                    }
                     const mcHits = allMcQs.reduce((acc, q: any) => (evaluateMcSelection(q, answers.mc?.[q.id]).isCorrect ? acc + 1 : acc), 0);
                     return (
                       <>
@@ -6237,35 +6371,43 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   Dettaglio Risposte Sezione Multipla:
                 </h4>
                 <div className="grid grid-cols-1 gap-2.5">
-                  {[...(examData?.multipleChoice || []), ...((examData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
+                  {collectExamMultipleChoice(examData).map((q: any, iIdx: number) => {
                     const hideSol = deferSolutionsSession && !solutionsReleased;
                     const sel = evaluateMcSelection(q, answers.mc?.[q.id]);
+                    const hideDetail = hideSol || !sel.hasCorrectKey;
                     const isCorrect = sel.isCorrect;
                     const uAns = sel.hasSelection ? sel.selectedText : "Scelta mancante";
                     return (
                       <div
-                        key={q.id}
+                        key={q.id || iIdx}
                         className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                          hideSol
+                          hideDetail
                             ? "bg-slate-900/50 border-white/10 text-slate-300"
                             : isCorrect
                             ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
                             : "bg-red-950/15 border-red-500/20 text-red-300"
                         }`}
                       >
-                        <span className="font-bold text-sm">{hideSol ? "📝" : isCorrect ? "✅" : "❌"}</span>
+                        <span className="font-bold text-sm">
+                          {hideSol ? "📝" : !sel.hasCorrectKey ? "🔒" : isCorrect ? "✅" : "❌"}
+                        </span>
                         <div>
                           <p className="font-semibold text-slate-200">{iIdx + 1}. {q.question}</p>
                           <QuestionFigure src={examData?.images?.[q.id]} />
                           <p className="mt-1">
                             La tua risposta: <span className="font-mono font-bold bg-slate-900/60 px-1.5 py-0.5 rounded">{uAns}</span>
                           </p>
-                          {!hideSol && !isCorrect && (
-                            <p className="mt-1 text-emerald-400">
-                              Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
+                          {!hideSol && !sel.hasCorrectKey && (
+                            <p className="mt-1 text-amber-300/90 text-[11px]">
+                              Chiave di correzione protetta.
                             </p>
                           )}
-                          {!hideSol && q.explanation && (
+                          {!hideDetail && !isCorrect && sel.correctText && (
+                            <p className="mt-1 text-emerald-400">
+                              Risposta corretta: <span className="font-semibold">{sel.correctText}</span>
+                            </p>
+                          )}
+                          {!hideDetail && q.explanation && (
                             <div className="mt-2 text-[11px] text-slate-300 bg-black/30 p-2 rounded-lg border border-white/5 flex items-start gap-1.5">
                               <span className="shrink-0">💡</span>
                               <span><strong className="text-slate-200">Spiegazione:</strong> {q.explanation}</span>
@@ -6337,92 +6479,106 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             })()}
 
             {/* Workbook Detailed Fill-in-the-Blank (FIB) / Completamento Review */}
-            {examType === "workbook" && examData?.sections && examData.sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0) && (
-              <div className="space-y-4 pt-2">
-                <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
-                  Dettaglio Risposte & Correzioni Singole: Completamento
-                </h4>
-                <div className="space-y-4">
-                  {examData.sections.map((sec: any, sIdx: number) => {
-                    const fibList = sec.fillInTheBlank || [];
-                    if (fibList.length === 0) return null;
-                    return (
+            {examType === "workbook" && collectWorkbookFillInTheBlank(examData).length > 0 && (() => {
+              const rootFib = Array.isArray(examData?.fillInTheBlank) ? examData.fillInTheBlank : [];
+              const secGroups = (examData?.sections || []).filter(
+                (s: any) => Array.isArray(s?.fillInTheBlank) && s.fillInTheBlank.length > 0
+              );
+              const renderActiveFibList = (fibList: any[]) =>
+                fibList.map((fib: any, fIdx: number) => {
+                  const hideSol = deferSolutionsSession && !solutionsReleased;
+                  const rawVal = answers.wbFib?.[fib.id] ?? "";
+                  const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
+                  const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                  const hasExpected = String(expected).trim().length > 0;
+                  const hideFibDetail = hideSol || !hasExpected;
+                  const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
+                  const { before, after } = getFibSentenceParts(fib.sentence, expected);
+                  const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
+
+                  return (
+                    <div
+                      key={fib.id || fIdx}
+                      className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
+                        hideFibDetail
+                          ? "bg-slate-900/50 border-white/10 text-slate-300"
+                          : isCorrect
+                          ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
+                          : "bg-red-950/15 border-red-500/20 text-red-300"
+                      }`}
+                    >
+                      <span className="font-bold text-sm shrink-0">
+                        {hideSol ? "📝" : !hasExpected ? "🔒" : isCorrect ? "✅" : "❌"}
+                      </span>
+                      <div className="space-y-1.5 flex-1">
+                        <p className="font-semibold text-slate-200">
+                          {before}
+                          <span
+                            className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
+                              hideFibDetail
+                                ? "bg-slate-800 text-slate-200 border-white/15"
+                                : isCorrect
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                : "bg-red-500/20 text-red-200 border-red-500/30"
+                            }`}
+                          >
+                            {val || "[Nessuna risposta]"}
+                          </span>
+                          {after}
+                        </p>
+                        <QuestionFigure src={examData?.images?.[fib.id]} />
+                        <div className="text-[11px] space-y-0.5">
+                          <p className="text-slate-400">
+                            La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
+                          </p>
+                          {!hideFibDetail && !isCorrect && expected && (
+                            <p className="text-emerald-400">
+                              Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
+                            </p>
+                          )}
+                          {!hideFibDetail && isSynonymAcceptance && (
+                            <p className="text-teal-300 text-[10.5px] italic">
+                              💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
+                            </p>
+                          )}
+                        </div>
+                      </div>
+                    </div>
+                  );
+                });
+
+              return (
+                <div className="space-y-4 pt-2">
+                  <h4 className="text-xs font-bold tracking-wider text-slate-400 uppercase">
+                    Dettaglio Risposte & Correzioni Singole: Completamento
+                  </h4>
+                  <div className="space-y-4">
+                    {rootFib.length > 0 && (
+                      <div className="grid grid-cols-1 gap-2.5">
+                        {renderActiveFibList(rootFib)}
+                      </div>
+                    )}
+                    {secGroups.map((sec: any, sIdx: number) => (
                       <div key={`active-fib-sec-${sIdx}`} className="space-y-3">
-                        {examData.sections.length > 1 && (
+                        {secGroups.length > 1 && (
                           <p className="text-[11px] font-bold text-slate-400 uppercase tracking-wider border-b border-white/5 pb-1">
                             {sec.title || `Sezione ${sIdx + 1}`}
                           </p>
                         )}
                         <div className="grid grid-cols-1 gap-2.5">
-                          {fibList.map((fib: any, fIdx: number) => {
-                            const hideSol = deferSolutionsSession && !solutionsReleased;
-                            const rawVal = answers.wbFib?.[fib.id] ?? "";
-                            const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
-                            const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
-                            const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-                            const { before, after } = getFibSentenceParts(fib.sentence, expected);
-                            const isSynonymAcceptance = isCorrect && val.toLowerCase() !== expected.toLowerCase();
-
-                            return (
-                              <div
-                                key={fib.id || fIdx}
-                                className={`p-3.5 rounded-xl border text-xs leading-relaxed flex items-start gap-2.5 ${
-                                  hideSol
-                                    ? "bg-slate-900/50 border-white/10 text-slate-300"
-                                    : isCorrect
-                                    ? "bg-emerald-950/15 border-emerald-500/20 text-emerald-300"
-                                    : "bg-red-950/15 border-red-500/20 text-red-300"
-                                }`}
-                              >
-                                <span className="font-bold text-sm shrink-0">{hideSol ? "📝" : isCorrect ? "✅" : "❌"}</span>
-                                <div className="space-y-1.5 flex-1">
-                                  <p className="font-semibold text-slate-200">
-                                    {before}
-                                    <span
-                                      className={`inline-block font-mono font-bold px-2 py-0.5 rounded mx-1 text-xs border ${
-                                        hideSol
-                                          ? "bg-slate-800 text-slate-200 border-white/15"
-                                          : isCorrect
-                                          ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
-                                          : "bg-red-500/20 text-red-200 border-red-500/30"
-                                      }`}
-                                    >
-                                      {val || "[Nessuna risposta]"}
-                                    </span>
-                                    {after}
-                                  </p>
-                                  <QuestionFigure src={examData?.images?.[fib.id]} />
-                                  <div className="text-[11px] space-y-0.5">
-                                    <p className="text-slate-400">
-                                      La tua risposta: <span className="font-mono font-bold text-slate-200 bg-slate-900/60 px-1.5 py-0.5 rounded">{val || "Nessuna data"}</span>
-                                    </p>
-                                    {!hideSol && !isCorrect && expected && (
-                                      <p className="text-emerald-400">
-                                        Risposta attesa / accettata: <span className="font-semibold">{expected}</span>
-                                      </p>
-                                    )}
-                                    {!hideSol && isSynonymAcceptance && (
-                                      <p className="text-teal-300 text-[10.5px] italic">
-                                        💡 Risposta accettata con flessibilità didattica come sinonimo o variante valida del termine atteso ({expected}).
-                                      </p>
-                                    )}
-                                  </div>
-                                </div>
-                              </div>
-                            );
-                          })}
+                          {renderActiveFibList(sec.fillInTheBlank || [])}
                         </div>
                       </div>
-                    );
-                  })}
+                    ))}
+                  </div>
                 </div>
-              </div>
-            )}
+              );
+            })()}
 
             {/* Workbook detailed reflections reviews mapping (always show every
                 reflection, even when the AI did not return a score for it) */}
-            {examType === "workbook" && examData?.sections && (() => {
-              const rqList = examData.sections.flatMap((sec: any) => sec.reflectionQuestions || []);
+            {examType === "workbook" && (() => {
+              const rqList = collectWorkbookReflections(examData);
               const entries = buildSubjectiveReviewEntries(
                 rqList,
                 evaluation?.reflectionDetails || [],

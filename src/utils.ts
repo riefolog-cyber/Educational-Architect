@@ -374,12 +374,44 @@ export function collectQuizOpenEnded(examData: any): any[] {
 }
 
 /**
- * Distinguishes a true Workbook (sections with fillInTheBlank, reflectionQuestions,
- * sintesi, glossary, or checklist) from a Quiz (including sectioned Quizzes whose
- * sections only hold multipleChoice / openEnded, or malformed empty `sections: []`).
+ * Collects all Workbook fill-in-the-blank items across root `examData.fillInTheBlank`
+ * and any `examData.sections[].fillInTheBlank`.
+ */
+export function collectWorkbookFillInTheBlank(examData: any): any[] {
+  if (!examData || typeof examData !== "object") return [];
+  const root = Array.isArray(examData.fillInTheBlank) ? examData.fillInTheBlank : [];
+  const sections = Array.isArray(examData.sections) ? examData.sections : [];
+  const nested = sections.flatMap((s: any) =>
+    s && Array.isArray(s.fillInTheBlank) ? s.fillInTheBlank : []
+  );
+  return [...root, ...nested];
+}
+
+/**
+ * Collects all Workbook reflection questions across root `examData.reflectionQuestions`
+ * and any `examData.sections[].reflectionQuestions`.
+ */
+export function collectWorkbookReflections(examData: any): any[] {
+  if (!examData || typeof examData !== "object") return [];
+  const root = Array.isArray(examData.reflectionQuestions) ? examData.reflectionQuestions : [];
+  const sections = Array.isArray(examData.sections) ? examData.sections : [];
+  const nested = sections.flatMap((s: any) =>
+    s && Array.isArray(s.reflectionQuestions) ? s.reflectionQuestions : []
+  );
+  return [...root, ...nested];
+}
+
+/**
+ * Distinguishes a true Workbook (sections or root items with fillInTheBlank,
+ * reflectionQuestions, sintesi, glossary, or checklist) from a Quiz (including
+ * sectioned Quizzes whose sections only hold multipleChoice / openEnded, or
+ * malformed empty `sections: []`).
  */
 export function isWorkbookExamData(examData: any): boolean {
   if (!examData || typeof examData !== "object") return false;
+  if (Array.isArray(examData.fillInTheBlank) && examData.fillInTheBlank.length > 0) {
+    return true;
+  }
   if (!Array.isArray(examData.sections) || examData.sections.length === 0) return false;
   const hasWorkbookSpecificContent = examData.sections.some((s: any) => {
     if (!s || typeof s !== "object") return false;
@@ -580,26 +612,9 @@ export function computeGradeBreakdown(params: {
     });
   } else {
     // Workbook
-    const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
-    const fibList = [
-      ...(Array.isArray(params.examData?.fillInTheBlank) ? params.examData.fillInTheBlank : []),
-      ...sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
-    ];
-    const rqList = [
-      ...(Array.isArray(params.examData?.reflectionQuestions) ? params.examData.reflectionQuestions : []),
-      ...sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : [])),
-    ];
-
-    // Check multiple choice in Workbook (both in sections and root level)
-    const wbMcList: any[] = [];
-    if (Array.isArray(params.examData?.multipleChoice)) {
-      wbMcList.push(...params.examData.multipleChoice);
-    }
-    sections.forEach((s: any) => {
-      if (Array.isArray(s.multipleChoice)) {
-        wbMcList.push(...s.multipleChoice);
-      }
-    });
+    const fibList = collectWorkbookFillInTheBlank(params.examData);
+    const rqList = collectWorkbookReflections(params.examData);
+    const wbMcList = collectExamMultipleChoice(params.examData);
 
     const fibStats = buildStats(
       fibList,
@@ -667,7 +682,10 @@ export function computeGradeBreakdown(params: {
     (Array.isArray(params.examData?.multipleChoice) && params.examData.multipleChoice.length > 0) ||
     sections.some((s: any) => Array.isArray(s.multipleChoice) && s.multipleChoice.length > 0)
   );
-  const wbHasFib = tipo === "Workbook" && sections.some((s: any) => Array.isArray(s.fillInTheBlank) && s.fillInTheBlank.length > 0);
+  const wbHasFib = tipo === "Workbook" && (
+    (Array.isArray(params.examData?.fillInTheBlank) && params.examData.fillInTheBlank.length > 0) ||
+    sections.some((s: any) => Array.isArray(s.fillInTheBlank) && s.fillInTheBlank.length > 0)
+  );
   
   let resolvedObjName = "Completamento frasi (FIB)";
   if (tipo === "Quiz") {
@@ -1037,6 +1055,7 @@ export function auditSubjectiveEvaluation(params: {
 
 export interface McSelectionEvaluation {
   hasSelection: boolean;
+  hasCorrectKey: boolean;
   selectedIndex: number | null;
   isCorrect: boolean;
   selectedText: string;
@@ -1050,11 +1069,14 @@ export interface McSelectionEvaluation {
  */
 export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEvaluation {
   const options = Array.isArray(q?.options) ? q.options : [];
-  const correctIdx = Number(q?.correctIndex);
-  const correctText =
-    Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length
-      ? String(options[correctIdx] ?? "")
-      : "";
+  const rawCorrect = q?.correctIndex;
+  const correctIsBlank =
+    rawCorrect === undefined ||
+    rawCorrect === null ||
+    (typeof rawCorrect === "string" && rawCorrect.trim() === "");
+  const correctIdx = correctIsBlank ? NaN : Number(rawCorrect);
+  const hasCorrectKey = Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length;
+  const correctText = hasCorrectKey ? String(options[correctIdx] ?? "") : "";
 
   const isBlank =
     rawSelected === undefined ||
@@ -1064,6 +1086,7 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
   if (isBlank) {
     return {
       hasSelection: false,
+      hasCorrectKey,
       selectedIndex: null,
       isCorrect: false,
       selectedText: "",
@@ -1075,6 +1098,7 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
   if (!Number.isInteger(parsedIdx) || parsedIdx < 0 || parsedIdx >= options.length) {
     return {
       hasSelection: false,
+      hasCorrectKey,
       selectedIndex: null,
       isCorrect: false,
       selectedText: "",
@@ -1084,8 +1108,9 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
 
   return {
     hasSelection: true,
+    hasCorrectKey,
     selectedIndex: parsedIdx,
-    isCorrect: Number.isInteger(correctIdx) && parsedIdx === correctIdx,
+    isCorrect: hasCorrectKey && parsedIdx === correctIdx,
     selectedText: String(options[parsedIdx] ?? ""),
     correctText,
   };
@@ -1188,7 +1213,7 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
   try {
     const questions =
       tipo === "Workbook"
-        ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
+        ? collectWorkbookReflections(examData)
         : collectQuizOpenEnded(examData);
     if (Array.isArray(questions) && questions.length > 0) {
       const audit = auditSubjectiveEvaluation({
@@ -1249,7 +1274,7 @@ export function getPendingSubjectiveCount(sub: any): number {
     const evaluation = safeParseJson(sub?.Full_Evaluation);
     const questions =
       tipo === "Workbook"
-        ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
+        ? collectWorkbookReflections(examData)
         : collectQuizOpenEnded(examData);
     if (!Array.isArray(questions) || questions.length === 0) return 0;
 

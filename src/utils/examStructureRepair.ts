@@ -502,6 +502,12 @@ export function normalizeExamStructure<T = any>(examObj: T): T {
   if (!examObj || typeof examObj !== "object" || Array.isArray(examObj)) return examObj;
   const obj = examObj as any;
 
+  if (Array.isArray(obj.fillInTheBlank)) {
+    for (const fib of obj.fillInTheBlank) {
+      sanitizeFibQuestion(fib);
+    }
+  }
+
   if (Array.isArray(obj.sections)) {
     for (const sec of obj.sections) {
       if (sec && Array.isArray(sec.fillInTheBlank)) {
@@ -544,6 +550,79 @@ export function normalizeExamStructure<T = any>(examObj: T): T {
       }
     }
     delete obj.reflectionQuestions;
+  }
+
+  // Deterministic unique IDs per category across root + sections so strip/restore,
+  // randomization, and student answer keying never drop or overwrite items.
+  const ensureListIdsAndKeys = (
+    list: any[] | undefined,
+    seen: Set<string>,
+    fallbackPrefix: string,
+    isMc = false
+  ) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((item, idx) => {
+      if (!item || typeof item !== "object") return;
+      const origId = String(item.id ?? "").trim();
+      let candidate = origId || `${fallbackPrefix}_${idx + 1}`;
+      if (seen.has(candidate)) {
+        let suffix = 2;
+        while (seen.has(`${candidate}__${suffix}`)) {
+          suffix++;
+        }
+        candidate = `${candidate}__${suffix}`;
+      }
+      seen.add(candidate);
+      item.id = candidate;
+      if (
+        origId &&
+        candidate !== origId &&
+        obj.images &&
+        typeof obj.images === "object" &&
+        obj.images[origId] &&
+        !obj.images[candidate]
+      ) {
+        obj.images[candidate] = obj.images[origId];
+      }
+
+      if (isMc && item.correctIndex !== undefined && item.correctIndex !== null) {
+        const optsLen = Array.isArray(item.options) ? item.options.length : 0;
+        if (typeof item.correctIndex === "string") {
+          const trimmed = item.correctIndex.trim();
+          if (/^\d+$/.test(trimmed)) {
+            const parsed = Number(trimmed);
+            if (optsLen === 0 || parsed < optsLen) {
+              item.correctIndex = parsed;
+            }
+          } else if (/^[a-z]$/i.test(trimmed)) {
+            const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+            if (letterIdx >= 0 && (optsLen === 0 || letterIdx < optsLen)) {
+              item.correctIndex = letterIdx;
+            }
+          }
+        }
+      }
+    });
+  };
+
+  const seenMc = new Set<string>();
+  const seenFib = new Set<string>();
+  const seenOe = new Set<string>();
+  const seenRq = new Set<string>();
+
+  ensureListIdsAndKeys(obj.multipleChoice, seenMc, "mc", true);
+  ensureListIdsAndKeys(obj.fillInTheBlank, seenFib, "fib", false);
+  ensureListIdsAndKeys(obj.openEnded, seenOe, "oe", false);
+  ensureListIdsAndKeys(obj.reflectionQuestions, seenRq, "rq", false);
+
+  if (Array.isArray(obj.sections)) {
+    obj.sections.forEach((sec: any, sIdx: number) => {
+      if (!sec || typeof sec !== "object") return;
+      ensureListIdsAndKeys(sec.multipleChoice, seenMc, `sec${sIdx + 1}_mc`, true);
+      ensureListIdsAndKeys(sec.fillInTheBlank, seenFib, `sec${sIdx + 1}_fib`, false);
+      ensureListIdsAndKeys(sec.openEnded, seenOe, `sec${sIdx + 1}_oe`, false);
+      ensureListIdsAndKeys(sec.reflectionQuestions, seenRq, `sec${sIdx + 1}_rq`, false);
+    });
   }
 
   return examObj;
@@ -736,8 +815,11 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       sections: correctedSections,
       answerKey: parsed.answerKey || parsed.criteri || undefined,
       ...(parsed.multipleChoice && Array.isArray(parsed.multipleChoice) ? { multipleChoice: parsed.multipleChoice } : {}),
+      ...(parsed.fillInTheBlank && Array.isArray(parsed.fillInTheBlank) ? { fillInTheBlank: parsed.fillInTheBlank } : {}),
+      ...(parsed.reflectionQuestions && Array.isArray(parsed.reflectionQuestions) ? { reflectionQuestions: parsed.reflectionQuestions } : {}),
       ...(parsed.images ? { images: parsed.images } : {}),
     };
+    normalizeExamStructure(finalWorkbook);
 
     const formattedJson = JSON.stringify(finalWorkbook, null, 2);
     return {

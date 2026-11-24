@@ -166,6 +166,11 @@ export function sanitizeWorkbookExamJson(rawJson: string): string {
   try {
     const obj = JSON.parse(rawJson);
     let changed = false;
+    if (obj && Array.isArray(obj.fillInTheBlank)) {
+      for (const fib of obj.fillInTheBlank) {
+        if (sanitizeFibQuestion(fib)) changed = true;
+      }
+    }
     if (obj && Array.isArray(obj.sections)) {
       for (const sec of obj.sections) {
         if (Array.isArray(sec?.fillInTheBlank)) {
@@ -216,6 +221,7 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
   }
 
   const mc = Array.isArray(examObj.multipleChoice) ? examObj.multipleChoice.length : 0;
+  const fibRoot = Array.isArray(examObj.fillInTheBlank) ? examObj.fillInTheBlank.length : 0;
   const oe = Array.isArray(examObj.openEnded) ? examObj.openEnded.length : 0;
   const rq = Array.isArray(examObj.reflectionQuestions) ? examObj.reflectionQuestions.length : 0;
   const generic = Array.isArray(examObj.questions)
@@ -224,7 +230,7 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
     ? examObj.domande.length
     : 0;
 
-  totalCount += mc + oe + rq + (mc === 0 && oe === 0 ? generic : 0);
+  totalCount += mc + fibRoot + oe + rq + (mc === 0 && oe === 0 ? generic : 0);
 
   return {
     type: isWorkbook ? "Workbook" : "Quiz",

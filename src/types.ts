@@ -68,6 +68,8 @@ export interface WorkbookExam {
   title: string;
   sections: WorkbookSection[];
   multipleChoice?: MultipleChoiceQuestion[];
+  fillInTheBlank?: FillInTheBlank[];
+  reflectionQuestions?: ReflectionQuestion[];
   answerKey?: WorkbookAnswerKey;
   images?: Record<string, string>;
 }
@@ -313,6 +315,8 @@ export interface McItemStat {
   correctCount: number;
   errorCount: number;
   blankCount: number;
+  keyedResponses?: number;
+  unkeyedResponses?: number;
   accuracyPercent: number;
   topWrongOption?: { text: string; count: number };
   needsReview: boolean;
@@ -325,6 +329,8 @@ export interface FibItemStat {
   expectedAnswer: string;
   totalResponses: number;
   correctCount: number;
+  keyedResponses?: number;
+  unkeyedResponses?: number;
   accuracyPercent: number;
   topWrongAnswer?: { text: string; count: number };
   needsReview: boolean;

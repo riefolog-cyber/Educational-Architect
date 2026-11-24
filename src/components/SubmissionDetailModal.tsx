@@ -24,11 +24,14 @@ import {
   buildSubjectiveReviewEntries,
   collectExamMultipleChoice,
   collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
   evaluateMcSelection,
   isEvaluationPending,
   parseItalianGrade,
   safeParseJson,
 } from "../utils";
+import { getAuthHeaders as defaultGetAuthHeaders } from "../firebase";
 import GradeCalculationReport from "./GradeCalculationReport";
 
 interface SubmissionDetailModalProps {
@@ -55,6 +58,7 @@ interface SubmissionDetailModalProps {
     newScore: number,
     newFeedback: string
   ) => Promise<void>;
+  getAuthHeaders?: () => Promise<Record<string, string>>;
   currentIndex?: number;
   totalCount?: number;
   onNavigate?: (dir: "prev" | "next") => void;
@@ -78,6 +82,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   onValidateSubmission,
   validatingId,
   onRetouchSubjectiveItem,
+  getAuthHeaders: resolveAuthHeaders = defaultGetAuthHeaders,
   currentIndex,
   totalCount,
   onNavigate,
@@ -91,6 +96,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const [itemScoreInput, setItemScoreInput] = useState("");
   const [itemFeedbackInput, setItemFeedbackInput] = useState("");
   const [savingItemKey, setSavingItemKey] = useState<string | null>(null);
+  const [unlockedDomandeMap, setUnlockedDomandeMap] = useState<Record<string, any>>({});
 
   useEffect(() => {
     setGradeEditOpen(false);
@@ -103,6 +109,65 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     setItemFeedbackInput("");
     setSavingItemKey(null);
   }, [submission?.id]);
+
+  useEffect(() => {
+    if (!submission?.id || !submission?.Pin) return;
+    if (unlockedDomandeMap[submission.id]) return;
+
+    const rawDomande = safeParseJson(submission.Domande_Esame);
+    if (!rawDomande || typeof rawDomande !== "object") return;
+
+    const mcList = collectExamMultipleChoice(rawDomande);
+    const fibList = collectWorkbookFillInTheBlank(rawDomande);
+    const missingMcKey = mcList.some((q: any) => {
+      if (!Array.isArray(q?.options) || q.options.length === 0) return false;
+      return !evaluateMcSelection(q, 0).hasCorrectKey;
+    });
+    const missingFibKey = fibList.some((f: any) => {
+      const ans = String(f?.answer || "").trim();
+      const bracket = typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence);
+      return !ans && !bracket;
+    });
+
+    if (!missingMcKey && !missingFibKey) return;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const authHeaders = await resolveAuthHeaders();
+        const subClass = resolveSubmissionClass(submission);
+        const resp = await fetch("/api/session/unlock-solutions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            ...authHeaders,
+          },
+          body: JSON.stringify({
+            pin: String(submission.Pin).trim().toUpperCase(),
+            sessionId: String(submission.Session_Id || "").trim(),
+            studentEmail: submission.Email || "",
+            studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
+            assignedFila: submission.Assigned_Fila || "",
+            mcOptionOrder: safeParseJson(submission.MC_Order) || undefined,
+            examData: rawDomande,
+            answers: safeParseJson(submission.Risposte_Studente) || {},
+            tipo: submission.Tipo || "Quiz",
+          }),
+        });
+        if (!resp.ok) return;
+        const data = await resp.json().catch(() => null);
+        if (!cancelled && data?.resolvedDomande) {
+          setUnlockedDomandeMap((prev) => ({ ...prev, [submission.id]: data.resolvedDomande }));
+        }
+      } catch {
+        // Keep modal usable with neutral unkeyed badges if server vault lookup fails
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders]);
 
   useEffect(() => {
     if (!submission) return;
@@ -178,6 +243,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     }
   };
 
+  const unlockedDomande = unlockedDomandeMap[submission.id];
+  const effectiveSubmission = unlockedDomande
+    ? { ...submission, Domande_Esame: JSON.stringify(unlockedDomande) }
+    : submission;
   const evalObj = safeParseJson(submission.Full_Evaluation);
   const blindCode = getSubmissionBlindCode(submission);
   const resolvedClass = resolveSubmissionClass(submission);
@@ -434,7 +503,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             </div>
           </div>
 
-          <GradeCalculationReport breakdown={extractBreakdownFromSubmission(submission)} />
+          <GradeCalculationReport breakdown={extractBreakdownFromSubmission(effectiveSubmission)} />
 
           {isBorderline && (
             <div className="p-3 bg-amber-500/10 border border-amber-500/30 rounded-xl text-[11px] text-amber-200 leading-relaxed">
@@ -488,7 +557,8 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <button
                 type="button"
                 onClick={() => {
-                  setGradeEditValue(submission.Voto_Suggerito || "");
+                  const cur = String(submission.Voto_Suggerito || "").trim();
+                  setGradeEditValue(cur.toUpperCase().includes("N.V.") ? "" : cur);
                   setGradeEditOpen(true);
                 }}
                 className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
@@ -714,7 +784,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 </p>
                 {(() => {
                   const ansObj = safeParseJson(submission.Risposte_Studente) || {};
-                  const domandeObj = safeParseJson(submission.Domande_Esame);
+                  const domandeObj = unlockedDomande || safeParseJson(submission.Domande_Esame);
 
                   if (submission.Tipo === "Quiz") {
                     const mcqList = collectExamMultipleChoice(domandeObj);
@@ -743,19 +813,40 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                               return (
                                 <div
                                   key={q.id || idx}
-                                  className={`p-3 bg-slate-950/60 border ${isCorrect ? "border-teal-500/20" : "border-rose-500/20"} rounded-xl space-y-1`}
+                                  className={`p-3 bg-slate-950/60 border ${
+                                    !sel.hasCorrectKey
+                                      ? "border-amber-500/25"
+                                      : isCorrect
+                                      ? "border-teal-500/20"
+                                      : "border-rose-500/20"
+                                  } rounded-xl space-y-1`}
                                 >
                                   <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA {idx + 1}</p>
                                   <p className="text-slate-300 text-[11px]">{q.question}</p>
                                   <div className="mt-2 text-[10px] flex gap-3 flex-wrap">
                                     <span className="text-slate-400">
-                                      Scelta: <span className={isCorrect ? "text-teal-400" : "text-rose-400"}>{selectedOptText}</span>
+                                      Scelta:{" "}
+                                      <span
+                                        className={
+                                          !sel.hasCorrectKey
+                                            ? "text-amber-300"
+                                            : isCorrect
+                                            ? "text-teal-400"
+                                            : "text-rose-400"
+                                        }
+                                      >
+                                        {selectedOptText}
+                                      </span>
                                     </span>
-                                    {!isCorrect && correctOptText && (
+                                    {!sel.hasCorrectKey ? (
+                                      <span className="text-amber-300/90">
+                                        | 🔒 Chiave protetta / non disponibile
+                                      </span>
+                                    ) : !isCorrect && correctOptText ? (
                                       <span className="text-slate-500">
                                         | Corretta: <span className="text-teal-400">{correctOptText}</span>
                                       </span>
-                                    )}
+                                    ) : null}
                                   </div>
                                   {q.explanation && (
                                     <p className="mt-1.5 p-1.5 bg-black/30 rounded border border-white/5 text-[10px] text-slate-400 italic">
@@ -881,13 +972,57 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                   const sections = domandeObj?.sections || [];
                   const wbMcqList = collectExamMultipleChoice(domandeObj);
                   const details = evalObj.reflectionDetails || [];
-                  const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+                  const rqList = collectWorkbookReflections(domandeObj);
+                  const rootFibList = Array.isArray(domandeObj?.fillInTheBlank) ? domandeObj.fillInTheBlank : [];
                   const rqEntries = buildSubjectiveReviewEntries(
                     rqList,
                     details,
                     (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
                     (d) => d.id
                   );
+
+                  const renderFibItems = (fibList: any[]) =>
+                    fibList.map((fib: any, fIdx: number) => {
+                      const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
+                      const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
+                      const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                      const hasExpected = String(expected).trim().length > 0;
+                      const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
+                      const { before, after } = getFibSentenceParts(fib.sentence, expected);
+
+                      return (
+                        <div key={fib.id || fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
+                          <p className="font-bold text-slate-300 font-mono text-[10px]">FIB {fIdx + 1}</p>
+                          <p className="text-slate-300 text-[11px] leading-relaxed">
+                            <span>{before}</span>
+                            <span
+                              className={`px-1 rounded font-bold ${
+                                !hasExpected
+                                  ? "bg-amber-500/15 text-amber-200"
+                                  : isCorrect
+                                  ? "bg-teal-500/20 text-teal-300"
+                                  : "bg-rose-500/20 text-rose-300"
+                              }`}
+                            >
+                              [{val || "____"}]
+                            </span>
+                            <span>{after}</span>
+                          </p>
+                          <div className="flex items-center gap-2 mt-1 flex-wrap">
+                            {hasExpected ? (
+                              <p className="text-[9px] text-slate-500">Accettate: {expected}</p>
+                            ) : (
+                              <p className="text-[9px] text-amber-300/90">🔒 Chiave protetta / non disponibile</p>
+                            )}
+                            {hasExpected && isCorrect && val && expected && val.toLowerCase().trim() !== expected.toLowerCase().trim() && (
+                              <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-300 border border-teal-500/20">
+                                ✓ Variante/Sinonimo
+                              </span>
+                            )}
+                          </div>
+                        </div>
+                      );
+                    });
 
                   return (
                     <div className="space-y-4">
@@ -905,19 +1040,40 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                             return (
                               <div
                                 key={q.id || idx}
-                                className={`p-3 bg-slate-950/60 border ${isCorrect ? "border-teal-500/20" : "border-rose-500/20"} rounded-xl space-y-1`}
+                                className={`p-3 bg-slate-950/60 border ${
+                                  !sel.hasCorrectKey
+                                    ? "border-amber-500/25"
+                                    : isCorrect
+                                    ? "border-teal-500/20"
+                                    : "border-rose-500/20"
+                                } rounded-xl space-y-1`}
                               >
                                 <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA MC {idx + 1}</p>
                                 <p className="text-slate-300 text-[11px]">{q.question}</p>
                                 <div className="mt-2 text-[10px] flex gap-3 flex-wrap">
                                   <span className="text-slate-400">
-                                    Scelta: <span className={isCorrect ? "text-teal-400" : "text-rose-400"}>{selectedOptText}</span>
+                                    Scelta:{" "}
+                                    <span
+                                      className={
+                                        !sel.hasCorrectKey
+                                          ? "text-amber-300"
+                                          : isCorrect
+                                          ? "text-teal-400"
+                                          : "text-rose-400"
+                                      }
+                                    >
+                                      {selectedOptText}
+                                    </span>
                                   </span>
-                                  {!isCorrect && correctOptText && (
+                                  {!sel.hasCorrectKey ? (
+                                    <span className="text-amber-300/90">
+                                      | 🔒 Chiave protetta / non disponibile
+                                    </span>
+                                  ) : !isCorrect && correctOptText ? (
                                     <span className="text-slate-500">
                                       | Corretta: <span className="text-teal-400">{correctOptText}</span>
                                     </span>
-                                  )}
+                                  ) : null}
                                 </div>
                                 {q.explanation && (
                                   <p className="mt-1.5 p-1.5 bg-black/30 rounded border border-white/5 text-[10px] text-slate-400 italic">
@@ -927,6 +1083,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                               </div>
                             );
                           })}
+                        </div>
+                      )}
+
+                      {rootFibList.length > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">
+                            Completamento (Generale)
+                          </p>
+                          {renderFibItems(rootFibList)}
                         </div>
                       )}
 
@@ -940,34 +1105,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                   <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1 mt-3">
                                     Completamento (Sezione {secIdx + 1})
                                   </p>
-                                  {fibList.map((fib: any, fIdx: number) => {
-                                    const rawVal = ansObj.wbFib?.[fib.id];
-                                    const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
-                                    const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-                                    const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
-                                    const { before, after } = getFibSentenceParts(fib.sentence, expected);
-
-                                    return (
-                                      <div key={fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
-                                        <p className="font-bold text-slate-300 font-mono text-[10px]">FIB {fIdx + 1}</p>
-                                        <p className="text-slate-300 text-[11px] leading-relaxed">
-                                          <span>{before}</span>
-                                          <span className={`px-1 rounded font-bold ${isCorrect ? "bg-teal-500/20 text-teal-300" : "bg-rose-500/20 text-rose-300"}`}>
-                                            [{val || "____"}]
-                                          </span>
-                                          <span>{after}</span>
-                                        </p>
-                                        <div className="flex items-center gap-2 mt-1">
-                                          <p className="text-[9px] text-slate-500">Accettate: {expected || fib.answer}</p>
-                                          {isCorrect && val && expected && val.toLowerCase().trim() !== expected.toLowerCase().trim() && (
-                                            <span className="text-[9px] px-1.5 py-0.5 rounded bg-teal-500/10 text-teal-300 border border-teal-500/20">
-                                              ✓ Variante/Sinonimo
-                                            </span>
-                                          )}
-                                        </div>
-                                      </div>
-                                    );
-                                  })}
+                                  {renderFibItems(fibList)}
                                 </>
                               )}
                             </div>

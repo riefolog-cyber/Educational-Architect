@@ -131,12 +131,61 @@ export function stripExamAnswers(
   };
   const reduceDistractors = Boolean(options?.reduceDistractors);
 
+  const seenMcIds = new Set<string>();
+  const seenFibIds = new Set<string>();
+  let mcSeq = 0;
+  let fibSeq = 0;
+
+  const ensureUniqueItemId = (
+    item: any,
+    seen: Set<string>,
+    fallbackPrefix: string,
+    seq: number
+  ): string => {
+    const origId = String(item?.id ?? "").trim();
+    let candidate = origId || `${fallbackPrefix}_${seq}`;
+    if (seen.has(candidate)) {
+      let suffix = 2;
+      while (seen.has(`${candidate}__${suffix}`)) {
+        suffix++;
+      }
+      candidate = `${candidate}__${suffix}`;
+    }
+    seen.add(candidate);
+    item.id = candidate;
+    if (
+      origId &&
+      candidate !== origId &&
+      sanitizedExam.images &&
+      typeof sanitizedExam.images === "object" &&
+      sanitizedExam.images[origId] &&
+      !sanitizedExam.images[candidate]
+    ) {
+      sanitizedExam.images[candidate] = sanitizedExam.images[origId];
+    }
+    return candidate;
+  };
+
   const stripMcList = (list: any[]) => {
     for (const q of list) {
       if (!q || typeof q !== "object") continue;
-      const qId = String(q.id || "");
-      let effectiveCorrect =
-        q.correctIndex !== undefined && q.correctIndex !== null ? Number(q.correctIndex) : undefined;
+      mcSeq++;
+      const qId = ensureUniqueItemId(q, seenMcIds, "mc", mcSeq);
+      let effectiveCorrect: number | undefined;
+      if (q.correctIndex !== undefined && q.correctIndex !== null && String(q.correctIndex).trim() !== "") {
+        const rawC = typeof q.correctIndex === "string" ? q.correctIndex.trim() : q.correctIndex;
+        if (typeof rawC === "string" && /^[a-z]$/i.test(rawC)) {
+          const letterIdx = rawC.toUpperCase().charCodeAt(0) - 65;
+          if (Array.isArray(q.options) && letterIdx >= 0 && letterIdx < q.options.length) {
+            effectiveCorrect = letterIdx;
+          }
+        } else {
+          const numC = Number(rawC);
+          if (Number.isInteger(numC)) {
+            effectiveCorrect = numC;
+          }
+        }
+      }
 
       if (
         reduceDistractors &&
@@ -173,7 +222,8 @@ export function stripExamAnswers(
   const stripFibList = (list: any[]) => {
     for (const fib of list) {
       if (!fib || typeof fib !== "object") continue;
-      const fId = String(fib.id || "");
+      fibSeq++;
+      const fId = ensureUniqueItemId(fib, seenFibIds, "fib", fibSeq);
       let expected = typeof fib.answer === "string" ? fib.answer : "";
       if (!expected && typeof fib.sentence === "string") {
         const m = fib.sentence.match(/\[([^\]]+)\]/);

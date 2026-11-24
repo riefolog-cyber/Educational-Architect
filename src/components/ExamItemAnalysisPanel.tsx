@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X, FileText, Copy, Check, Download, Table } from "lucide-react";
 import { SavedSubmission, AiModalPrefill } from "../types";
 import {
@@ -6,16 +6,27 @@ import {
   buildExamOutcomeMatrix,
   computeExamItemAnalysisByFila,
   computeFilaEquitySummary,
+  computeGradeDistribution,
   computeMetacognitionSummary,
+  matchesGradeBand,
+  type GradeDistributionBandKey,
 } from "../utils/examAnalytics";
-import { getAuthHeaders } from "../firebase";
-import { safeParseJson, sanitizeAiHtml } from "../utils";
+import { getAuthHeaders as defaultGetAuthHeaders } from "../firebase";
+import {
+  collectExamMultipleChoice,
+  collectWorkbookFillInTheBlank,
+  evaluateMcSelection,
+  safeParseJson,
+  sanitizeAiHtml,
+} from "../utils";
 import { scrubPromptPii } from "../utils/privacyPseudonym";
+import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
 
 interface ExamItemAnalysisPanelProps {
   submissions: SavedSubmission[];
   examTitle?: string;
   blindGradingMode?: boolean;
+  getAuthHeaders?: () => Promise<Record<string, string>>;
   onGenerateRecoveryExam?: (prefill: AiModalPrefill) => void;
 }
 
@@ -36,12 +47,15 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   submissions,
   examTitle,
   blindGradingMode = false,
+  getAuthHeaders: resolveAuthHeaders = defaultGetAuthHeaders,
   onGenerateRecoveryExam,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [filaFilter, setFilaFilter] = useState<"all" | "A" | "B">("all");
   const [viewMode, setViewMode] = useState<"stats" | "matrix">("stats");
   const [onlyIssuesInMatrix, setOnlyIssuesInMatrix] = useState(false);
+  const [gradeBandFilter, setGradeBandFilter] = useState<GradeDistributionBandKey | null>(null);
+  const [resolvedExamBySubId, setResolvedExamBySubId] = useState<Record<string, string>>({});
   const [synthesizingErrors, setSynthesizingErrors] = useState(false);
   const [synthesisError, setSynthesisError] = useState<string | null>(null);
   const [errorSynthesis, setErrorSynthesis] = useState<ClassErrorSummaryResult | null>(null);
@@ -49,10 +63,89 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   const [reviewSheet, setReviewSheet] = useState<MiniReviewSheetResult | null>(null);
   const [copiedSheet, setCopiedSheet] = useState(false);
 
+  // Hydrate stripped/deferred exam solutions on-demand when teacher opens the panel
+  useEffect(() => {
+    if (!isOpen || submissions.length === 0) return;
+
+    const toHydrate = submissions.filter((sub) => {
+      if (!sub?.id || !sub?.Pin || resolvedExamBySubId[sub.id]) return false;
+      const rawDomande = safeParseJson(sub.Domande_Esame);
+      if (!rawDomande || typeof rawDomande !== "object") return false;
+      const missingMc = collectExamMultipleChoice(rawDomande).some(
+        (q: any) => Array.isArray(q?.options) && q.options.length > 0 && !evaluateMcSelection(q, 0).hasCorrectKey
+      );
+      const missingFib = collectWorkbookFillInTheBlank(rawDomande).some((f: any) => {
+        const ans = String(f?.answer || "").trim();
+        const bracket = typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence);
+        return !ans && !bracket;
+      });
+      return missingMc || missingFib;
+    });
+
+    if (toHydrate.length === 0) return;
+    let cancelled = false;
+
+    (async () => {
+      try {
+        const authHeaders = await resolveAuthHeaders();
+        const updates: Record<string, string> = {};
+        await Promise.all(
+          toHydrate.map(async (sub) => {
+            try {
+              const rawDomande = safeParseJson(sub.Domande_Esame);
+              const subClass = resolveSubmissionClass(sub);
+              const resp = await fetch("/api/session/unlock-solutions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  ...authHeaders,
+                },
+                body: JSON.stringify({
+                  pin: String(sub.Pin).trim().toUpperCase(),
+                  sessionId: String(sub.Session_Id || "").trim(),
+                  studentEmail: sub.Email || "",
+                  studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
+                  assignedFila: sub.Assigned_Fila || "",
+                  mcOptionOrder: safeParseJson(sub.MC_Order) || undefined,
+                  examData: rawDomande,
+                  answers: safeParseJson(sub.Risposte_Studente) || {},
+                  tipo: sub.Tipo || "Quiz",
+                }),
+              });
+              if (!resp.ok) return;
+              const data = await resp.json().catch(() => null);
+              if (data?.resolvedDomande) {
+                updates[sub.id] = JSON.stringify(data.resolvedDomande);
+              }
+            } catch {
+              // Skip individual failure cleanly
+            }
+          })
+        );
+        if (!cancelled && Object.keys(updates).length > 0) {
+          setResolvedExamBySubId((prev) => ({ ...prev, ...updates }));
+        }
+      } catch {
+        // Skip silently
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, submissions, resolvedExamBySubId, resolveAuthHeaders]);
+
+  const hydratedSubmissions = useMemo(() => {
+    if (Object.keys(resolvedExamBySubId).length === 0) return submissions;
+    return submissions.map((s) =>
+      resolvedExamBySubId[s.id] ? { ...s, Domande_Esame: resolvedExamBySubId[s.id] } : s
+    );
+  }, [submissions, resolvedExamBySubId]);
+
   const filaBundle = useMemo(() => {
-    if (submissions.length === 0) return null;
-    return computeExamItemAnalysisByFila(submissions);
-  }, [submissions]);
+    if (hydratedSubmissions.length === 0) return null;
+    return computeExamItemAnalysisByFila(hydratedSubmissions);
+  }, [hydratedSubmissions]);
 
   const effectiveFila: "all" | "A" | "B" =
     filaBundle?.hasMixedFila ? filaFilter : "all";
@@ -65,13 +158,14 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   }, [filaBundle, effectiveFila]);
 
   const activeSubmissions = useMemo(() => {
-    if (effectiveFila === "A") return submissions.filter((s) => s.Assigned_Fila === "A");
-    if (effectiveFila === "B") return submissions.filter((s) => s.Assigned_Fila === "B");
-    return submissions;
-  }, [submissions, effectiveFila]);
+    if (effectiveFila === "A") return hydratedSubmissions.filter((s) => s.Assigned_Fila === "A");
+    if (effectiveFila === "B") return hydratedSubmissions.filter((s) => s.Assigned_Fila === "B");
+    return hydratedSubmissions;
+  }, [hydratedSubmissions, effectiveFila]);
 
-  const equitySummary = useMemo(() => computeFilaEquitySummary(submissions), [submissions]);
+  const equitySummary = useMemo(() => computeFilaEquitySummary(hydratedSubmissions), [hydratedSubmissions]);
   const metacognitionSummary = useMemo(() => computeMetacognitionSummary(activeSubmissions), [activeSubmissions]);
+  const gradeDistribution = useMemo(() => computeGradeDistribution(activeSubmissions), [activeSubmissions]);
   const outcomeMatrix = useMemo(() => buildExamOutcomeMatrix(activeSubmissions), [activeSubmissions]);
 
   const totalItems =
@@ -192,7 +286,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         safeParseJson(activeSubmissions[0]?.Domande_Esame)?.title ||
         "Verifica di classe";
 
-      const authHeaders = await getAuthHeaders();
+      const authHeaders = await resolveAuthHeaders();
       const resp = await fetch("/api/class-error-summary", {
         method: "POST",
         headers: {
@@ -254,7 +348,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         safeParseJson(activeSubmissions[0]?.Domande_Esame)?.title ||
         "Verifica di classe";
 
-      const authHeaders = await getAuthHeaders();
+      const authHeaders = await resolveAuthHeaders();
       const resp = await fetch("/api/teacher/generate-review-sheet", {
         method: "POST",
         headers: {
@@ -307,6 +401,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     const csv = buildExamItemAnalysisCsv(analysis, outcomeMatrix, {
       examTitle: resolvedTitle,
       blindMode: blindGradingMode,
+      distribution: gradeDistribution,
     });
     const slug = resolvedTitle
       .toLowerCase()
@@ -324,9 +419,11 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   };
 
-  const displayedMatrixRows = onlyIssuesInMatrix
-    ? outcomeMatrix.rows.filter((r) => r.hasIssues)
-    : outcomeMatrix.rows;
+  const displayedMatrixRows = outcomeMatrix.rows.filter((r) => {
+    if (onlyIssuesInMatrix && !r.hasIssues) return false;
+    if (gradeBandFilter && !matchesGradeBand(r.finalGrade, gradeBandFilter)) return false;
+    return true;
+  });
 
   return (
     <div className="bg-slate-950/60 border border-white/10 rounded-xl overflow-hidden">
@@ -386,6 +483,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       type="button"
                       onClick={() => {
                         setFilaFilter(tab.key);
+                        setGradeBandFilter(null);
                         setErrorSynthesis(null);
                         setReviewSheet(null);
                       }}
@@ -469,6 +567,103 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                 <span className="text-emerald-300">Calibrati: <b>{metacognitionSummary.calibratedCount}</b></span>
                 <span className="text-slate-600">·</span>
                 <span className="text-amber-300">Sovrastima: <b>{metacognitionSummary.overestimatedCount}</b></span>
+              </div>
+            </div>
+          )}
+
+          {(gradeDistribution.gradedCount > 0 || gradeDistribution.pendingCount > 0) && (
+            <div className="p-3 rounded-xl bg-slate-900/70 border border-white/10 space-y-2.5">
+              <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
+                <span className="font-bold text-slate-200 flex items-center gap-1.5">
+                  <BarChart2 className="w-3.5 h-3.5 text-teal-400" />
+                  <span>Distribuzione Voti per Fascia ({gradeDistribution.gradedCount} valutati{gradeDistribution.pendingCount > 0 ? ` · ${gradeDistribution.pendingCount} N.V.` : ""})</span>
+                </span>
+                {gradeBandFilter && (
+                  <button
+                    type="button"
+                    onClick={() => setGradeBandFilter(null)}
+                    className="text-[10px] font-semibold text-indigo-300 hover:text-white underline cursor-pointer"
+                  >
+                    Mostra tutte le fasce
+                  </button>
+                )}
+              </div>
+              {gradeDistribution.gradedCount > 0 && (
+                <div className="w-full h-2.5 rounded-full bg-slate-950 border border-white/5 overflow-hidden flex">
+                  {gradeDistribution.buckets
+                    .filter((b) => b.key !== "pending" && b.count > 0)
+                    .map((b) => {
+                      const barColors: Record<string, string> = {
+                        excellent: "bg-emerald-500",
+                        good: "bg-teal-400",
+                        sufficient: "bg-sky-400",
+                        almost: "bg-amber-400",
+                        insufficient: "bg-rose-500",
+                      };
+                      const wPct = Math.max(4, Math.round((b.count / gradeDistribution.gradedCount) * 100));
+                      return (
+                        <button
+                          key={b.key}
+                          type="button"
+                          onClick={() => {
+                            const next = gradeBandFilter === b.key ? null : b.key;
+                            setGradeBandFilter(next);
+                            if (next) setViewMode("matrix");
+                          }}
+                          title={`${b.label}: ${b.count} (${b.percent}%) — Clicca per filtrare la Matrice Classe`}
+                          className={`h-full ${barColors[b.key] || "bg-slate-500"} hover:brightness-110 transition-all cursor-pointer`}
+                          style={{ width: `${wPct}%` }}
+                        />
+                      );
+                    })}
+                </div>
+              )}
+              <div className="flex flex-wrap items-center gap-1.5">
+                {gradeDistribution.buckets
+                  .filter((b) => b.key !== "pending" || b.count > 0)
+                  .map((b) => {
+                    const isActive = gradeBandFilter === b.key;
+                    const pillColors: Record<string, string> = {
+                      excellent: isActive
+                        ? "bg-emerald-500 text-slate-950 border-emerald-400"
+                        : "bg-emerald-500/10 text-emerald-300 border-emerald-500/25 hover:bg-emerald-500/20",
+                      good: isActive
+                        ? "bg-teal-400 text-slate-950 border-teal-300"
+                        : "bg-teal-500/10 text-teal-300 border-teal-500/25 hover:bg-teal-500/20",
+                      sufficient: isActive
+                        ? "bg-sky-400 text-slate-950 border-sky-300"
+                        : "bg-sky-500/10 text-sky-300 border-sky-500/25 hover:bg-sky-500/20",
+                      almost: isActive
+                        ? "bg-amber-400 text-slate-950 border-amber-300"
+                        : "bg-amber-500/10 text-amber-300 border-amber-500/25 hover:bg-amber-500/20",
+                      insufficient: isActive
+                        ? "bg-rose-500 text-white border-rose-400"
+                        : "bg-rose-500/10 text-rose-300 border-rose-500/25 hover:bg-rose-500/20",
+                      pending: isActive
+                        ? "bg-amber-500 text-slate-950 border-amber-400"
+                        : "bg-slate-800 text-amber-300 border-amber-500/30 hover:bg-slate-700",
+                    };
+                    return (
+                      <button
+                        key={b.key}
+                        type="button"
+                        disabled={b.count === 0}
+                        onClick={() => {
+                          const next = gradeBandFilter === b.key ? null : b.key;
+                          setGradeBandFilter(next);
+                          if (next) setViewMode("matrix");
+                        }}
+                        className={`px-2 py-0.5 rounded-lg border text-[10px] font-bold transition-colors cursor-pointer disabled:opacity-40 disabled:cursor-default ${
+                          pillColors[b.key] || "bg-slate-800 text-slate-300 border-white/10"
+                        }`}
+                      >
+                        {b.label}: <span className="font-mono">{b.count}</span>
+                        {b.key !== "pending" && b.count > 0 && (
+                          <span className="opacity-80 ml-1">({b.percent}%)</span>
+                        )}
+                      </button>
+                    );
+                  })}
               </div>
             </div>
           )}
@@ -786,6 +981,19 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                                 </td>
                               );
                             }
+                            if (cell.status === "unkeyed") {
+                              return (
+                                <td
+                                  key={cell.columnKey}
+                                  title={`${col?.code || ""}: ${col?.label || ""} — Chiave protetta o non disponibile${cell.detailText ? ` (${cell.detailText.slice(0, 80)})` : ""}`}
+                                  className="py-1.5 px-1.5 text-center"
+                                >
+                                  <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 font-mono text-[10px]">
+                                    🔒
+                                  </span>
+                                </td>
+                              );
+                            }
                             return (
                               <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
                                 <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-slate-800/80 text-slate-500 font-mono">
@@ -809,12 +1017,18 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                 Scelta Multipla ({analysis.mcStats.length})
               </p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                {analysis.mcStats.map((m) => (
+                {analysis.mcStats.map((m) => {
+                  const keyed = m.keyedResponses ?? m.totalResponses;
+                  const unkeyed = m.unkeyedResponses ?? 0;
+                  const onlyProtected = keyed === 0 && unkeyed > 0;
+                  return (
                   <div
                     key={m.id}
                     className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
                       m.needsReview
                         ? "bg-amber-950/20 border-amber-500/30"
+                        : onlyProtected
+                        ? "bg-slate-900/60 border-amber-500/20"
                         : "bg-slate-900/60 border-white/5"
                     }`}
                   >
@@ -825,31 +1039,44 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       </p>
                       <span
                         className={`font-mono font-bold text-xs shrink-0 ${
-                          m.accuracyPercent >= 70
+                          onlyProtected
+                            ? "text-amber-300"
+                            : m.accuracyPercent >= 70
                             ? "text-emerald-400"
                             : m.accuracyPercent >= 50
                             ? "text-teal-300"
                             : "text-amber-300"
                         }`}
                       >
-                        {m.accuracyPercent}%
+                        {onlyProtected ? "🔒" : `${m.accuracyPercent}%`}
                       </span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full ${
-                          m.accuracyPercent >= 70
+                          onlyProtected
+                            ? "bg-amber-400/50"
+                            : m.accuracyPercent >= 70
                             ? "bg-emerald-500"
                             : m.accuracyPercent >= 50
                             ? "bg-teal-400"
                             : "bg-amber-400"
                         }`}
-                        style={{ width: `${m.accuracyPercent}%` }}
+                        style={{ width: onlyProtected ? "100%" : `${m.accuracyPercent}%` }}
                       />
                     </div>
                     <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-400">
                       <span>
-                        Corrette: <b className="text-slate-200">{m.correctCount}/{m.totalResponses}</b>
+                        {onlyProtected ? (
+                          <span className="text-amber-300">Chiave protetta ({unkeyed} risp.)</span>
+                        ) : (
+                          <>
+                            Corrette: <b className="text-slate-200">{m.correctCount}/{keyed}</b>
+                            {unkeyed > 0 && (
+                              <span className="text-amber-300 ml-1">({unkeyed} protette)</span>
+                            )}
+                          </>
+                        )}
                       </span>
                       {m.topWrongOption && (
                         <span className="truncate max-w-[230px]" title={m.topWrongOption.text}>
@@ -859,7 +1086,8 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       )}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}
@@ -870,12 +1098,18 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                 Completamento Terminologico ({analysis.fibStats.length})
               </p>
               <div className="grid grid-cols-1 md:grid-cols-2 gap-2">
-                {analysis.fibStats.map((f) => (
+                {analysis.fibStats.map((f) => {
+                  const keyed = f.keyedResponses ?? f.totalResponses;
+                  const unkeyed = f.unkeyedResponses ?? 0;
+                  const onlyProtected = keyed === 0 && unkeyed > 0;
+                  return (
                   <div
                     key={f.id}
                     className={`p-2.5 rounded-xl border text-xs space-y-1.5 ${
                       f.needsReview
                         ? "bg-amber-950/20 border-amber-500/30"
+                        : onlyProtected
+                        ? "bg-slate-900/60 border-amber-500/20"
                         : "bg-slate-900/60 border-white/5"
                     }`}
                   >
@@ -886,31 +1120,44 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       </p>
                       <span
                         className={`font-mono font-bold text-xs shrink-0 ${
-                          f.accuracyPercent >= 70
+                          onlyProtected
+                            ? "text-amber-300"
+                            : f.accuracyPercent >= 70
                             ? "text-emerald-400"
                             : f.accuracyPercent >= 50
                             ? "text-teal-300"
                             : "text-amber-300"
                         }`}
                       >
-                        {f.accuracyPercent}%
+                        {onlyProtected ? "🔒" : `${f.accuracyPercent}%`}
                       </span>
                     </div>
                     <div className="w-full h-1.5 bg-slate-800 rounded-full overflow-hidden">
                       <div
                         className={`h-full rounded-full ${
-                          f.accuracyPercent >= 70
+                          onlyProtected
+                            ? "bg-amber-400/50"
+                            : f.accuracyPercent >= 70
                             ? "bg-emerald-500"
                             : f.accuracyPercent >= 50
                             ? "bg-teal-400"
                             : "bg-amber-400"
                         }`}
-                        style={{ width: `${f.accuracyPercent}%` }}
+                        style={{ width: onlyProtected ? "100%" : `${f.accuracyPercent}%` }}
                       />
                     </div>
                     <div className="flex flex-wrap items-center justify-between gap-1 text-[10px] text-slate-400">
                       <span>
-                        Esatte: <b className="text-slate-200">{f.correctCount}/{f.totalResponses}</b>
+                        {onlyProtected ? (
+                          <span className="text-amber-300">Chiave protetta ({unkeyed} risp.)</span>
+                        ) : (
+                          <>
+                            Esatte: <b className="text-slate-200">{f.correctCount}/{keyed}</b>
+                            {unkeyed > 0 && (
+                              <span className="text-amber-300 ml-1">({unkeyed} protette)</span>
+                            )}
+                          </>
+                        )}
                       </span>
                       {f.topWrongAnswer && (
                         <span className="truncate max-w-[230px]" title={f.topWrongAnswer.text}>
@@ -920,7 +1167,8 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       )}
                     </div>
                   </div>
-                ))}
+                  );
+                })}
               </div>
             </div>
           )}

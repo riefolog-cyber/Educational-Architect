@@ -1,6 +1,6 @@
 import React from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
@@ -71,7 +71,7 @@ export default function PrintableReportModal({
   const subjectiveEntries = buildSubjectiveReviewEntries(
     isQuiz
       ? collectQuizOpenEnded(examObj)
-      : (examObj?.sections || []).flatMap((s: any) => s.reflectionQuestions || []),
+      : collectWorkbookReflections(examObj),
     isQuiz
       ? (evaluationObj?.openEndedDetails || [])
       : (evaluationObj?.reflectionDetails || []),
@@ -99,7 +99,8 @@ export default function PrintableReportModal({
 
   const tabSwitches = Number(submission.AntiCopia_TabSwitch) || 0;
   const pasteBlocked = Number(submission.AntiCopia_IncollaBloccato) || 0;
-  const isSecurityClean = tabSwitches === 0 && pasteBlocked === 0;
+  const splitScreens = Number(submission.AntiCopia_SchermoDiviso) || 0;
+  const isSecurityClean = tabSwitches === 0 && pasteBlocked === 0 && splitScreens === 0;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto animate-fadeIn">
@@ -314,7 +315,7 @@ export default function PrintableReportModal({
                 <span className="text-[11px] text-slate-600">
                   {isSecurityClean
                     ? "Regolare (nessuna anomalia rilevata dal sistema durante la prova)"
-                    : `Segnalazioni registrate: ${tabSwitches} uscite dalla scheda, ${pasteBlocked} tentativi di incolla`}
+                    : `Segnalazioni registrate: ${tabSwitches} uscite dalla scheda, ${pasteBlocked} tentativi di incolla${splitScreens > 0 ? `, ${splitScreens} schermo diviso` : ""}`}
                 </span>
               </div>
               <span className="text-[10px] font-mono text-slate-500">

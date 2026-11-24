@@ -116,7 +116,7 @@ export default function TeacherBulkGradingModal({
   const isSubPending = (s: SavedSubmission) =>
     isEvaluationPending(safeParseJson(s.Full_Evaluation)) ||
     getPendingSubjectiveCount(s) > 0 ||
-    s.Voto_Suggerito === "N.V.";
+    String(s.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
 
   const quickCounts = useMemo(() => {
     let unvalidated = 0;
@@ -124,11 +124,12 @@ export default function TeacherBulkGradingModal({
     let attention = 0;
     let pending = 0;
     for (const s of classFiltered) {
+      const isPendingSub = isSubPending(s);
       if (!s.Convalida_Docente_At) unvalidated++;
       if (getViolationsCount(s) > 0) violations++;
       const g = parseItalianGrade(s.Voto_Suggerito);
-      if (detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6)) attention++;
-      if (isSubPending(s)) pending++;
+      if (!isPendingSub && (detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6))) attention++;
+      if (isPendingSub) pending++;
     }
     return { all: classFiltered.length, unvalidated, violations, attention, pending };
   }, [classFiltered]);
@@ -154,6 +155,7 @@ export default function TeacherBulkGradingModal({
       if (quickFilter === "unvalidated") return !s.Convalida_Docente_At;
       if (quickFilter === "violations") return getViolationsCount(s) > 0;
       if (quickFilter === "attention") {
+        if (isSubPending(s)) return false;
         const g = parseItalianGrade(s.Voto_Suggerito);
         return detectGradeDiscrepancy(s) || (!Number.isNaN(g) && g < 6);
       }
@@ -626,7 +628,12 @@ export default function TeacherBulkGradingModal({
                             return (
                               <input
                                 type="text"
-                                placeholder={sub.Voto_Suggerito || "es. 7½"}
+                                placeholder={
+                                  sub.Voto_Suggerito &&
+                                  !String(sub.Voto_Suggerito).trim().toUpperCase().includes("N.V.")
+                                    ? sub.Voto_Suggerito
+                                    : "es. 7½"
+                                }
                                 value={typedVal}
                                 onChange={(e) => {
                                   const val = e.target.value;

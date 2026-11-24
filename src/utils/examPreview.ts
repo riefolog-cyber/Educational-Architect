@@ -2,6 +2,8 @@ import { SavedSubmission } from "../types";
 import {
   collectExamMultipleChoice,
   collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
   isWorkbookExamData,
   safeParseJson,
 } from "../utils";
@@ -27,30 +29,6 @@ export interface ReusableExamExtraction {
   examType: "Quiz" | "Workbook";
 }
 
-function collectAllFib(examData: any): any[] {
-  if (!examData || typeof examData !== "object") return [];
-  const root = Array.isArray(examData.fillInTheBlank) ? examData.fillInTheBlank : [];
-  const sections = Array.isArray(examData.sections) ? examData.sections : [];
-  const nested = sections.flatMap((s: any) =>
-    s && Array.isArray(s.fillInTheBlank) ? s.fillInTheBlank : []
-  );
-  return [...root, ...nested];
-}
-
-function collectAllReflections(examData: any): any[] {
-  if (!examData || typeof examData !== "object") return [];
-  const root = Array.isArray(examData.reflectionQuestions) ? examData.reflectionQuestions : [];
-  const sections = Array.isArray(examData.sections) ? examData.sections : [];
-  const nested = sections.flatMap((s: any) =>
-    s && Array.isArray(s.reflectionQuestions) ? s.reflectionQuestions : []
-  );
-  return [...root, ...nested];
-}
-
-/**
- * Computes structural counts, estimated completion time, and BES option-reduction eligibility
- * for any parsed Quiz or Workbook JSON object.
- */
 export function buildExamPreviewSummary(examData: any): ExamPreviewSummary {
   if (!examData || typeof examData !== "object") {
     return {
@@ -71,9 +49,9 @@ export function buildExamPreviewSummary(examData: any): ExamPreviewSummary {
   const examType: "Quiz" | "Workbook" = isWorkbookExamData(examData) ? "Workbook" : "Quiz";
   const sections = Array.isArray(examData.sections) ? examData.sections : [];
   const mcList = collectExamMultipleChoice(examData);
-  const fibList = collectAllFib(examData);
+  const fibList = collectWorkbookFillInTheBlank(examData);
   const oeList = collectQuizOpenEnded(examData);
-  const rqList = collectAllReflections(examData);
+  const rqList = collectWorkbookReflections(examData);
   const glossaryCount = sections.reduce(
     (acc: number, s: any) => acc + (Array.isArray(s?.glossary) ? s.glossary.length : 0),
     0
@@ -137,9 +115,9 @@ export function extractReusableExamFromSubmissions(
     if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) continue;
 
     const mcList = collectExamMultipleChoice(parsed);
-    const fibList = collectAllFib(parsed);
+    const fibList = collectWorkbookFillInTheBlank(parsed);
     const oeList = collectQuizOpenEnded(parsed);
-    const rqList = collectAllReflections(parsed);
+    const rqList = collectWorkbookReflections(parsed);
     const totalQuestions = mcList.length + fibList.length + oeList.length + rqList.length;
     if (totalQuestions === 0) continue;
 

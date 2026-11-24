@@ -6,7 +6,7 @@ import crypto from "crypto";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
 import firebaseConfig from "./firebase-applet-config.json";
-import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, collectExamMultipleChoice, collectQuizOpenEnded, isWorkbookExamData } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish, evaluateMcSelection, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, isWorkbookExamData } from "./src/utils";
 import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
@@ -723,34 +723,40 @@ function buildPendingEvaluation(params: {
   punteggioMC?: number;
   punteggioFIB?: number;
   cause?: string;
+  customReason?: string;
+  objectiveKeysMissing?: boolean;
 }) {
   const { tipo, examData, answers, missing } = params;
   const count = missing.length;
   const label = tipo === "Quiz" ? "domanda/e aperta/e" : "riflessione/i critica/he";
   const cause = params.cause ? ` (${params.cause})` : "";
   const reason =
-    count > 0
+    params.customReason ||
+    (count > 0
       ? `Valutazione sospesa${cause}: ${count} ${label} con una risposta scritta dallo studente ` +
         `non ha/hanno ricevuto una valutazione numerica. Per evitare un voto errato, ` +
         `la prova NON è stata valutata: il voto resta "N.V." fino alla correzione del docente.`
       : `Valutazione sospesa${cause}: la correzione automatica non è stata completata. ` +
-        `Per evitare un voto errato, la prova resta "N.V." fino alla verifica del docente.`;
+        `Per evitare un voto errato, la prova resta "N.V." fino alla verifica del docente.`);
 
-  const breakdown = computeGradeBreakdown({
-    tipo,
-    examData,
-    answers,
-    punteggioMC: params.punteggioMC,
-    punteggioFIB: params.punteggioFIB,
-    votoSuggerito: "N.V.",
-    // Never turn a missing evaluation into a zero.
-    pendingSubjective: "hold",
-  });
+  const breakdown = params.objectiveKeysMissing
+    ? undefined
+    : computeGradeBreakdown({
+        tipo,
+        examData,
+        answers,
+        punteggioMC: params.punteggioMC,
+        punteggioFIB: params.punteggioFIB,
+        votoSuggerito: "N.V.",
+        // Never turn a missing evaluation into a zero.
+        pendingSubjective: "hold",
+      });
 
   return {
     suggestedGrade: "N.V.",
     evaluationMode: "pending",
     requiresManualReview: true,
+    ...(params.objectiveKeysMissing ? { objectiveKeysMissing: true } : {}),
     manualReviewReason: reason,
     // Only the feedback field actually rendered by the relative view is set,
     // so the same notice is not repeated three times.
@@ -759,18 +765,23 @@ function buildPendingEvaluation(params: {
     overallFeedback: tipo === "Workbook" ? reason : undefined,
     openEndedDetails: [],
     reflectionDetails: [],
-    gradeBreakdown: breakdown,
+    ...(breakdown ? { gradeBreakdown: breakdown } : {}),
   };
 }
 
 // --- Session Answer Key Vault (AES-256-GCM) ---
 const VAULT_SECRET_FILE = path.join(os.tmpdir(), "ea_session_secret.key");
 let cachedVaultKey: Buffer | null = null;
+function deriveVaultKeyFromSecret(secret: string): Buffer {
+  return crypto.createHash("sha256").update(`ea_vault:${secret}`).digest();
+}
+
 function getSessionVaultKey(): Buffer {
   if (cachedVaultKey) return cachedVaultKey;
-  const envSecret = String(process.env.SESSION_SECRET || "").trim();
-  if (envSecret) {
-    cachedVaultKey = crypto.createHash("sha256").update(`ea_vault:${envSecret}`).digest();
+  const deterministicSecret =
+    String(process.env.SESSION_SECRET || "").trim() || getCandidateApiKeys()[0] || "";
+  if (deterministicSecret) {
+    cachedVaultKey = deriveVaultKeyFromSecret(deterministicSecret);
     return cachedVaultKey;
   }
   try {
@@ -786,15 +797,40 @@ function getSessionVaultKey(): Buffer {
     cachedVaultKey = crypto.createHash("sha256").update(generated).digest();
     return cachedVaultKey;
   } catch {
-    cachedVaultKey = crypto.createHash("sha256").update("ea_fallback_ephemeral_vault").digest();
+    cachedVaultKey = crypto.randomBytes(32);
     return cachedVaultKey;
   }
 }
 
-function getLegacyGeminiVaultKey(): Buffer | null {
-  const apiSecret = String(process.env.GEMINI_API_KEY || "").trim();
-  if (!apiSecret) return null;
-  return crypto.createHash("sha256").update(`ea_vault:${apiSecret}`).digest();
+function getCandidateVaultKeys(): Buffer[] {
+  const keys: Buffer[] = [getSessionVaultKey()];
+  const seenHex = new Set<string>(keys.map((k) => k.toString("hex")));
+  const pushUnique = (buf: Buffer | null) => {
+    if (!buf) return;
+    const hex = buf.toString("hex");
+    if (!seenHex.has(hex)) {
+      seenHex.add(hex);
+      keys.push(buf);
+    }
+  };
+
+  const envSecret = String(process.env.SESSION_SECRET || "").trim();
+  if (envSecret) pushUnique(deriveVaultKeyFromSecret(envSecret));
+
+  for (const apiKey of getCandidateApiKeys()) {
+    pushUnique(deriveVaultKeyFromSecret(apiKey));
+  }
+
+  try {
+    if (fs.existsSync(VAULT_SECRET_FILE)) {
+      const saved = fs.readFileSync(VAULT_SECRET_FILE, "utf8").trim();
+      if (saved) {
+        pushUnique(crypto.createHash("sha256").update(saved).digest());
+      }
+    }
+  } catch {}
+
+  return keys;
 }
 
 export function encryptAnswerKey(answerKey: any): string {
@@ -814,7 +850,7 @@ function decryptWithKey(iv: Buffer, tag: Buffer, encrypted: Buffer, key: Buffer)
   return JSON.parse(decrypted.toString("utf8"));
 }
 
-function decryptAnswerKey(token: unknown): any | null {
+export function decryptAnswerKey(token: unknown): any | null {
   if (typeof token !== "string" || !token.trim()) return null;
   const parts = token.trim().split(".");
   if (parts.length !== 3) return null;
@@ -823,15 +859,15 @@ function decryptAnswerKey(token: unknown): any | null {
     const iv = Buffer.from(ivB64, "base64url");
     const tag = Buffer.from(tagB64, "base64url");
     const encrypted = Buffer.from(dataB64, "base64url");
-    try {
-      return decryptWithKey(iv, tag, encrypted, getSessionVaultKey());
-    } catch {
-      const legacyKey = getLegacyGeminiVaultKey();
-      if (legacyKey) {
-        return decryptWithKey(iv, tag, encrypted, legacyKey);
+    const candidateKeys = getCandidateVaultKeys();
+    for (const candidateKey of candidateKeys) {
+      try {
+        return decryptWithKey(iv, tag, encrypted, candidateKey);
+      } catch {
+        // Try next candidate key
       }
-      throw new Error("Decryption failed with primary vault key");
     }
+    throw new Error("Decryption failed with all candidate vault keys");
   } catch (err: any) {
     console.warn("[SessionVault] Impossibile decifrare answerKey:", err?.message || err);
     return null;
@@ -883,41 +919,27 @@ function parseSessionDeferredFields(fields: any) {
   };
 }
 
+function hasValidMcCorrectKey(q: any): boolean {
+  if (!q || typeof q !== "object") return false;
+  const opts = Array.isArray(q.options) ? q.options : [];
+  const raw = q.correctIndex;
+  if (raw === undefined || raw === null || (typeof raw === "string" && raw.trim() === "")) {
+    return false;
+  }
+  const idx = Number(raw);
+  return Number.isInteger(idx) && idx >= 0 && idx < opts.length;
+}
+
+function hasValidFibKey(fib: any): boolean {
+  if (!fib || typeof fib !== "object") return false;
+  if (typeof fib.answer === "string" && fib.answer.trim().length > 0) return true;
+  if (typeof fib.sentence === "string" && /\[[^\]]+\]/.test(fib.sentence)) return true;
+  return false;
+}
+
 async function runEvaluationCore(reqBody: any) {
   const { tipo, prompt, report } = reqBody;
   let deferSolutions = Boolean(reqBody?.deferSolutions);
-
-  // Server-authoritative guard: a student cannot bypass an active deferred lock
-  // on Firestore by tampering with reqBody.deferSolutions = false.
-  const cleanSessionPin = String(reqBody?.sessionPin || "").trim().toUpperCase();
-  if (!deferSolutions && cleanSessionPin && reqBody?.forceReevaluation !== true) {
-    try {
-      const fsResult = await fetchActiveSessionDoc(cleanSessionPin);
-      if (fsResult.ok && fsResult.fields) {
-        const parsedFs = parseSessionDeferredFields(fsResult.fields);
-        const reqSessionId = String(reqBody?.sessionId || "").trim();
-        const sameRun = !reqSessionId || !parsedFs.fsSessionId || reqSessionId === parsedFs.fsSessionId;
-        if (sameRun && parsedFs.fsDefer) {
-          const unlockedForStudent = isDeferredUnlockedForStudent({
-            deferSolutions: parsedFs.fsDefer,
-            solutionsReleased: parsedFs.fsReleased,
-            releasedClasses: parsedFs.fsReleasedClasses,
-            studentClass: String(reqBody?.studentClass || "").trim(),
-            autoReleaseSolutions: parsedFs.fsAutoRelease,
-            expiry: parsedFs.fsExpiry,
-            createdAt: parsedFs.fsCreatedAt,
-            maxExtendedExpiry: parsedFs.fsMaxExtendedExpiry,
-            besExtraTimePercent: parsedFs.fsBesExtraPct,
-          });
-          if (!unlockedForStudent) {
-            deferSolutions = true;
-          }
-        }
-      }
-    } catch (fsCheckErr) {
-      console.warn("[evaluate] Verifica server-side deferSolutions fallita:", fsCheckErr);
-    }
-  }
 
   if (!getApiKey()) {
     throw new Error("La chiave API di Gemini non è configurata nell'ambiente.");
@@ -927,49 +949,141 @@ async function runEvaluationCore(reqBody: any) {
     throw new Error("Dati della prova o risposte non pervenute al server.");
   }
 
-  let restoredFromVault = false;
-  if (reqBody.encryptedAnswerKey && report.domande) {
-    const answerKey = decryptAnswerKey(reqBody.encryptedAnswerKey);
-    if (answerKey) {
-      report.domande = restoreExamAnswers(report.domande, answerKey, reqBody.mcOptionOrder);
-      restoredFromVault = true;
+  const cleanSessionPin = String(reqBody?.sessionPin || "").trim().toUpperCase();
+  const reqSessionId = String(reqBody?.sessionId || "").trim();
+  const normalizedTipo = String(tipo || "").trim().toLowerCase();
+
+  let cachedFsResult: { ok: boolean; status: number; fields: any } | null = null;
+  const loadSessionDocOnce = async () => {
+    if (cachedFsResult !== null) return cachedFsResult;
+    if (!cleanSessionPin) {
+      cachedFsResult = { ok: false, status: 400, fields: null };
+      return cachedFsResult;
+    }
+    try {
+      cachedFsResult = await fetchActiveSessionDoc(cleanSessionPin);
+    } catch (fsErr) {
+      console.warn("[evaluate] Lettura sessione Firestore non riuscita:", fsErr);
+      cachedFsResult = { ok: false, status: 500, fields: null };
+    }
+    return cachedFsResult;
+  };
+
+  // Server-authoritative guard: a student cannot bypass an active deferred lock
+  // on Firestore by tampering with reqBody.deferSolutions = false.
+  if (!deferSolutions && cleanSessionPin && reqBody?.forceReevaluation !== true) {
+    const fsResult = await loadSessionDocOnce();
+    if (fsResult.ok && fsResult.fields) {
+      const parsedFs = parseSessionDeferredFields(fsResult.fields);
+      const sameRun = !reqSessionId || !parsedFs.fsSessionId || reqSessionId === parsedFs.fsSessionId;
+      if (sameRun && parsedFs.fsDefer) {
+        const unlockedForStudent = isDeferredUnlockedForStudent({
+          deferSolutions: parsedFs.fsDefer,
+          solutionsReleased: parsedFs.fsReleased,
+          releasedClasses: parsedFs.fsReleasedClasses,
+          studentClass: String(reqBody?.studentClass || "").trim(),
+          autoReleaseSolutions: parsedFs.fsAutoRelease,
+          expiry: parsedFs.fsExpiry,
+          createdAt: parsedFs.fsCreatedAt,
+          maxExtendedExpiry: parsedFs.fsMaxExtendedExpiry,
+          besExtraTimePercent: parsedFs.fsBesExtraPct,
+        });
+        if (!unlockedForStudent) {
+          deferSolutions = true;
+        }
+      }
     }
   }
 
-  // Authoritatively recompute objective scores server-side once keys are present
-  const normalizedTipo = String(tipo || "").trim().toLowerCase();
-  const sectionsAll = Array.isArray(report.domande?.sections) ? report.domande.sections : [];
+  let restoredFromVault = false;
+  let answerKey: any = reqBody.encryptedAnswerKey ? decryptAnswerKey(reqBody.encryptedAnswerKey) : null;
+  let resolvedSessionId = reqSessionId;
+  let fsFieldsForSession: any = cachedFsResult?.fields || null;
+
+  // Fallback: if encryptedAnswerKey was missing or undecryptable, fetch the session's vault key from active_sessions
+  const initialMcList = collectExamMultipleChoice(report.domande);
+  const initialFibList = normalizedTipo === "workbook" ? collectWorkbookFillInTheBlank(report.domande) : [];
+  const needsVaultKeys =
+    !initialMcList.every(hasValidMcCorrectKey) || !initialFibList.every(hasValidFibKey);
+
+  if (!answerKey && cleanSessionPin && (reqBody.encryptedAnswerKey || needsVaultKeys)) {
+    const fsResult = await loadSessionDocOnce();
+    if (fsResult.ok && fsResult.fields) {
+      fsFieldsForSession = fsResult.fields;
+      const fsSessionId = String(fsResult.fields?.sessionId?.stringValue || "").trim();
+      const sameRun = !reqSessionId || !fsSessionId || reqSessionId === fsSessionId;
+      if (!resolvedSessionId && fsSessionId) resolvedSessionId = fsSessionId;
+      if (sameRun) {
+        const assignedFila = String(reqBody?.assignedFila || "").trim().toUpperCase();
+        const fsKeySource =
+          assignedFila === "B" && fsResult.fields?.encryptedFilaBAnswerKey?.stringValue
+            ? String(fsResult.fields.encryptedFilaBAnswerKey.stringValue)
+            : String(fsResult.fields?.encryptedAnswerKey?.stringValue || "");
+        if (fsKeySource && fsKeySource !== String(reqBody.encryptedAnswerKey || "").trim()) {
+          answerKey = decryptAnswerKey(fsKeySource);
+        }
+      }
+    }
+  }
+
+  if (answerKey && report.domande) {
+    let effectiveMcOrder =
+      reqBody.mcOptionOrder && typeof reqBody.mcOptionOrder === "object" && Object.keys(reqBody.mcOptionOrder).length > 0
+        ? reqBody.mcOptionOrder
+        : undefined;
+
+    if (!effectiveMcOrder) {
+      let fsRandomize = Boolean(
+        fsFieldsForSession?.randomizeQuestions?.booleanValue ?? reqBody?.randomizeQuestions
+      );
+      if (!fsRandomize && cleanSessionPin && reqBody?.studentEmail && !cachedFsResult) {
+        const fsRes = await loadSessionDocOnce();
+        if (fsRes.ok && fsRes.fields) {
+          fsFieldsForSession = fsRes.fields;
+          const fsSessionId = String(fsRes.fields?.sessionId?.stringValue || "").trim();
+          if (!resolvedSessionId && fsSessionId) resolvedSessionId = fsSessionId;
+          fsRandomize = Boolean(fsRes.fields?.randomizeQuestions?.booleanValue);
+        }
+      }
+      if (fsRandomize && reqBody?.studentEmail && cleanSessionPin) {
+        effectiveMcOrder = reconstructExamMcOrder(
+          report.domande,
+          reqBody.studentEmail,
+          cleanSessionPin,
+          resolvedSessionId
+        );
+      }
+    }
+
+    report.domande = restoreExamAnswers(report.domande, answerKey, effectiveMcOrder);
+    restoredFromVault = true;
+  }
+
+  const mcListAll = collectExamMultipleChoice(report.domande);
+  const fibListAll = normalizedTipo === "workbook" ? collectWorkbookFillInTheBlank(report.domande) : [];
+  const mcKeysValid = mcListAll.every(hasValidMcCorrectKey);
+  const fibKeysValid = fibListAll.every(hasValidFibKey);
+
+  // Authoritatively recompute objective scores server-side ONLY when valid keys are present
   if (normalizedTipo === "quiz") {
-    const mcListAll = [
-      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
-      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
-    ];
-    if (mcListAll.length > 0 && report.risposte?.mc) {
+    if (mcListAll.length > 0 && mcKeysValid && report.risposte?.mc) {
       const mcCalc = mcWeightedScore(mcListAll, report.risposte.mc);
       report.punteggioMC = mcCalc.correct;
     }
   } else if (normalizedTipo === "workbook") {
-    const wbMcAll = [
-      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
-      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
-    ];
-    if (wbMcAll.length > 0 && report.risposte?.mc) {
-      const mcCalc = mcWeightedScore(wbMcAll, report.risposte.mc);
+    if (mcListAll.length > 0 && mcKeysValid && report.risposte?.mc) {
+      const mcCalc = mcWeightedScore(mcListAll, report.risposte.mc);
       report.punteggioMC = mcCalc.correct;
     }
-    const wbFibAll = [
-      ...(Array.isArray(report.domande?.fillInTheBlank) ? report.domande.fillInTheBlank : []),
-      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
-    ];
     const hasWbFibAns = Boolean(report.risposte?.wbFib || report.risposte?.fib);
-    if (wbFibAll.length > 0 && hasWbFibAns) {
+    if (fibListAll.length > 0 && fibKeysValid && hasWbFibAns) {
       const mergedWbFibAns = {
         ...(report.risposte?.fib && typeof report.risposte.fib === "object" ? report.risposte.fib : {}),
         ...(report.risposte?.wbFib && typeof report.risposte.wbFib === "object" ? report.risposte.wbFib : {}),
       };
-      const fibCalc = fibWeightedScore(wbFibAll, mergedWbFibAns, isFibAnswerCorrect);
+      const fibCalc = fibWeightedScore(fibListAll, mergedWbFibAns, isFibAnswerCorrect);
       report.punteggioFIB = fibCalc.correct;
-      report.totaleFIB = wbFibAll.length;
+      report.totaleFIB = fibListAll.length;
     }
   }
 
@@ -993,8 +1107,10 @@ async function runEvaluationCore(reqBody: any) {
         resObj.mainErrors = deferredNotice;
       }
     }
-    resObj.calculatedMCScore = Number(report.punteggioMC || 0);
-    if (report.punteggioFIB !== undefined) {
+    if (mcKeysValid && (mcListAll.length > 0 || report.punteggioMC !== undefined)) {
+      resObj.calculatedMCScore = Number(report.punteggioMC || 0);
+    }
+    if (fibKeysValid && report.punteggioFIB !== undefined) {
       resObj.calculatedFIBScore = Number(report.punteggioFIB || 0);
     }
     if (report.totaleFIB !== undefined) {
@@ -1003,31 +1119,42 @@ async function runEvaluationCore(reqBody: any) {
     return resObj;
   };
 
+  // CRITICAL GUARD: if MC or FIB keys could not be restored, suspend evaluation as N.V.
+  // rather than marking every question wrong (0/N).
+  if ((mcListAll.length > 0 && !mcKeysValid) || (fibListAll.length > 0 && !fibKeysValid)) {
+    console.warn("[evaluate] Chiavi oggettive mancanti/non decifrabili: valutazione sospesa come N.V. per evitare falsi 0.");
+    return attachAuthoritativeFields(
+      buildPendingEvaluation({
+        tipo: normalizedTipo === "workbook" ? "Workbook" : "Quiz",
+        examData: report.domande,
+        answers: report.risposte,
+        missing: [],
+        objectiveKeysMissing: true,
+        customReason:
+          "Valutazione sospesa (chiavi delle risposte oggettive non disponibili per la verifica automatica): " +
+          'per evitare di segnare tutte le risposte errate, la prova resta "N.V." fino alla revisione o al ripristino da parte del docente.',
+      })
+    );
+  }
+
   if (normalizedTipo === "quiz") {
     const mcScore = report.punteggioMC || 0;
-    const mcList = [
-      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
-      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
-    ];
+    const mcList = mcListAll;
     const mcCount = mcList.length;
-    const oeList = [
-      ...(Array.isArray(report.domande?.openEnded) ? report.domande.openEnded : []),
-      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.openEnded) ? s.openEnded : [])),
-    ];
+    const oeList = collectQuizOpenEnded(report.domande);
     const oeCount = oeList.length;
 
     // CASE 1: QUIZ WITH ONLY MULTIPLE CHOICE QUESTIONS (No open-ended questions in exam)
     if (oeCount === 0) {
       const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
       mcList.forEach((q: any, idx: number) => {
-        const userIdx = report.risposte?.mc?.[q.id];
-        const isMatch = userIdx !== undefined && userIdx !== null && Number(userIdx) === Number(q.correctIndex);
-        if (!isMatch) {
+        const sel = evaluateMcSelection(q, report.risposte?.mc?.[q.id]);
+        if (!sel.isCorrect) {
           wrongQuestions.push({
             number: idx + 1,
             question: q.question,
-            studentChoice: (userIdx !== undefined && q.options?.[userIdx]) ? q.options[userIdx] : "Nessuna risposta selezionata",
-            correctChoice: q.options?.[q.correctIndex] || "Opzione corretta"
+            studentChoice: sel.hasSelection ? sel.selectedText : "Nessuna risposta selezionata",
+            correctChoice: sel.correctText || "Opzione corretta",
           });
         }
       });
@@ -1291,20 +1418,13 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     }
 
   } else if (normalizedTipo === "workbook") {
-    const sections = report.domande?.sections || [];
-    const fibList = [
-      ...(Array.isArray(report.domande?.fillInTheBlank) ? report.domande.fillInTheBlank : []),
-      ...sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
-    ];
-    const rqList = [
-      ...(Array.isArray(report.domande?.reflectionQuestions) ? report.domande.reflectionQuestions : []),
-      ...sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : [])),
-    ];
+    const fibList = fibListAll;
+    const rqList = collectWorkbookReflections(report.domande);
 
     // Calculate or re-verify FIB score authoritatively on the server
     const hasFibAns = Boolean(report.risposte?.wbFib || report.risposte?.fib);
     let fibScore = Number(report.punteggioFIB || 0);
-    if (fibList.length > 0 && hasFibAns) {
+    if (fibList.length > 0 && fibKeysValid && hasFibAns) {
       const fibAnswersMerged = {
         ...(report.risposte?.fib && typeof report.risposte.fib === "object" ? report.risposte.fib : {}),
         ...(report.risposte?.wbFib && typeof report.risposte.wbFib === "object" ? report.risposte.wbFib : {}),
@@ -1315,7 +1435,7 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
     const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
     const rqCount = rqList.length;
 
-    const wbMcList = collectExamMultipleChoice(report.domande);
+    const wbMcList = mcListAll;
     const wbMcCount = wbMcList.length;
     const mcScore = Number(report.punteggioMC || 0);
 
@@ -1728,7 +1848,7 @@ async function runRecoveryCore(reqBody: any) {
 
   const hasOpenEnded =
     collectQuizOpenEnded(examData).length > 0 ||
-    ((examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []).length > 0);
+    collectWorkbookReflections(examData).length > 0;
 
   const examFormatInstruction = hasOpenEnded
     ? "La prova include domande aperte o di riflessione critica: valuta la padronanza argomentativa, il lessico e la completezza delle spiegazioni fornite."
@@ -2774,22 +2894,28 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     }
 
     let resolvedDomande = examData;
-    let keySource = encryptedAnswerKey;
     const assignedFila = String(req.body?.assignedFila || "").trim().toUpperCase();
-    if (!keySource) {
-      if (!cachedFields) {
-        const fsResult = await fetchActiveSessionDoc(cleanPin);
-        if (fsResult.ok) {
+    let answerKey = encryptedAnswerKey ? decryptAnswerKey(encryptedAnswerKey) : null;
+
+    if (!cachedFields && (!answerKey || (!(rawMcOptionOrder && typeof rawMcOptionOrder === "object" && Object.keys(rawMcOptionOrder).length > 0) && req.body?.randomizeQuestions === undefined))) {
+      const fsResult = await fetchActiveSessionDoc(cleanPin);
+      if (fsResult.ok && fsResult.fields) {
+        const { fsSessionId } = parseSessionDeferredFields(fsResult.fields);
+        if (!requestedSessionId || !fsSessionId || requestedSessionId === fsSessionId) {
           cachedFields = fsResult.fields;
-          if (!resolvedSessionId && cachedFields?.sessionId?.stringValue) {
-            resolvedSessionId = String(cachedFields.sessionId.stringValue).trim();
+          if (!resolvedSessionId && fsSessionId) {
+            resolvedSessionId = fsSessionId;
           }
         }
       }
-      if (cachedFields) {
-        keySource = assignedFila === "B" && cachedFields?.encryptedFilaBAnswerKey?.stringValue
-          ? String(cachedFields.encryptedFilaBAnswerKey.stringValue)
-          : String(cachedFields?.encryptedAnswerKey?.stringValue || "");
+    }
+
+    if (!answerKey && cachedFields) {
+      const fsKeySource = assignedFila === "B" && cachedFields?.encryptedFilaBAnswerKey?.stringValue
+        ? String(cachedFields.encryptedFilaBAnswerKey.stringValue)
+        : String(cachedFields?.encryptedAnswerKey?.stringValue || "");
+      if (fsKeySource) {
+        answerKey = decryptAnswerKey(fsKeySource);
       }
     }
 
@@ -2803,37 +2929,21 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
         ? reconstructExamMcOrder(examData, studentEmail, cleanPin, resolvedSessionId)
         : undefined;
 
-    if (keySource) {
-      const answerKey = decryptAnswerKey(keySource);
-      if (answerKey) {
-        resolvedDomande = restoreExamAnswers(examData, answerKey, effectiveMcOrder);
-      }
+    if (answerKey) {
+      resolvedDomande = restoreExamAnswers(examData, answerKey, effectiveMcOrder);
     }
 
     let mainErrors: string | undefined;
-    const mcLists: any[] = [];
-    if (Array.isArray(resolvedDomande?.multipleChoice)) {
-      mcLists.push(...resolvedDomande.multipleChoice);
-    }
-    if (Array.isArray(resolvedDomande?.sections)) {
-      for (const sec of resolvedDomande.sections) {
-        if (sec && Array.isArray(sec.multipleChoice)) mcLists.push(...sec.multipleChoice);
-      }
-    }
-    const fibLists: any[] = [
-      ...(Array.isArray(resolvedDomande?.fillInTheBlank) ? resolvedDomande.fillInTheBlank : []),
-      ...(Array.isArray(resolvedDomande?.sections)
-        ? resolvedDomande.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
-        : []),
-    ];
+    const mcLists = collectExamMultipleChoice(resolvedDomande);
+    const fibLists = collectWorkbookFillInTheBlank(resolvedDomande);
 
     const wrongList: string[] = [];
     mcLists.forEach((q: any, idx: number) => {
-      if (q.correctIndex === undefined || q.correctIndex === null) return;
-      const uIdx = answers?.mc?.[q.id];
-      if (uIdx === undefined || uIdx === null || Number(uIdx) !== Number(q.correctIndex)) {
-        const chosenText = uIdx !== undefined && q.options?.[uIdx] ? q.options[uIdx] : "Nessuna";
-        const correctText = q.options?.[q.correctIndex] || "Opzione corretta";
+      const sel = evaluateMcSelection(q, answers?.mc?.[q.id]);
+      if (!sel.hasCorrectKey) return;
+      if (!sel.isCorrect) {
+        const chosenText = sel.hasSelection ? sel.selectedText : "Nessuna";
+        const correctText = sel.correctText || "Opzione corretta";
         wrongList.push(`${idx + 1}) ${q.question} (scelta: ${chosenText} → corretta: ${correctText})`);
       }
     });

@@ -13,7 +13,10 @@ import {
 } from "../types";
 import {
   buildSubjectiveReviewEntries,
+  collectExamMultipleChoice,
   collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
   evaluateMcSelection,
   formatItalianScholasticGrade,
   getPendingSubjectiveCount,
@@ -25,6 +28,13 @@ import {
 import { getSubmissionBlindCode } from "./privacyPseudonym";
 import { resolveSubmissionClass } from "./classGrouping";
 import { sanitizeCsvCell } from "./gradebookExport";
+
+function hasFibKey(fib: any): boolean {
+  if (!fib || typeof fib !== "object") return false;
+  if (typeof fib.answer === "string" && fib.answer.trim().length > 0) return true;
+  if (typeof fib.sentence === "string" && /\[[^\]]+\]/.test(fib.sentence)) return true;
+  return false;
+}
 
 export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamItemAnalysis {
   if (!Array.isArray(submissions) || submissions.length === 0) {
@@ -62,14 +72,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     const evaluation = safeParseJson(sub.Full_Evaluation) || {};
 
     const recOeQuestions = collectQuizOpenEnded(domande);
-    const recRqQuestions = [
-      ...(Array.isArray(domande?.reflectionQuestions) ? domande.reflectionQuestions : []),
-      ...(Array.isArray(domande?.sections)
-        ? domande.sections.flatMap((s: any) =>
-            Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []
-          )
-        : []),
-    ];
+    const recRqQuestions = collectWorkbookReflections(domande);
 
     const oeEntries = buildSubjectiveReviewEntries(
       recOeQuestions,
@@ -95,35 +98,28 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
   });
 
   // 1. Multiple Choice Questions (Quiz root + Workbook sections/root)
-  const mcQuestions: any[] = [];
-  if (Array.isArray(referenceExam.multipleChoice)) {
-    mcQuestions.push(...referenceExam.multipleChoice);
-  }
-  if (Array.isArray(referenceExam.sections)) {
-    for (const sec of referenceExam.sections) {
-      if (Array.isArray(sec?.multipleChoice)) {
-        mcQuestions.push(...sec.multipleChoice);
-      }
-    }
-  }
+  const mcQuestions: any[] = collectExamMultipleChoice(referenceExam);
 
   const mcStats: McItemStat[] = mcQuestions.map((q: any, idx: number) => {
     const qId = String(q?.id || `mc_${idx}`);
     let correctCount = 0;
     let errorCount = 0;
     let blankCount = 0;
+    let keyedResponses = 0;
+    let unkeyedResponses = 0;
     const wrongCounts = new Map<string, number>();
 
     for (const rec of parsedRecords) {
       // If exam was randomized for a student, resolve the question inside that student's Domande_Esame by id first
-      const studentMcList = [
-        ...(Array.isArray(rec.domande?.multipleChoice) ? rec.domande.multipleChoice : []),
-        ...(Array.isArray(rec.domande?.sections)
-          ? rec.domande.sections.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : []))
-          : []),
-      ];
+      const studentMcList = collectExamMultipleChoice(rec.domande);
       const studentQ = studentMcList.find((sq: any) => String(sq?.id) === qId) || q;
       const sel = evaluateMcSelection(studentQ, rec.answers?.mc?.[qId]);
+      if (!sel.hasCorrectKey) {
+        unkeyedResponses++;
+        if (!sel.hasSelection) blankCount++;
+        continue;
+      }
+      keyedResponses++;
       if (!sel.hasSelection) {
         blankCount++;
         errorCount++;
@@ -146,7 +142,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     }
 
     const totalResponses = parsedRecords.length;
-    const accuracyPercent = totalResponses > 0 ? Math.round((correctCount / totalResponses) * 100) : 0;
+    const accuracyPercent = keyedResponses > 0 ? Math.round((correctCount / keyedResponses) * 100) : 0;
     return {
       id: qId,
       index: idx + 1,
@@ -155,29 +151,35 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
       correctCount,
       errorCount,
       blankCount,
+      keyedResponses,
+      unkeyedResponses,
       accuracyPercent,
       topWrongOption,
-      needsReview: accuracyPercent < 50,
+      needsReview: keyedResponses > 0 && accuracyPercent < 50,
     };
   });
 
   // 2. Fill-in-the-Blank Questions (Workbook sections + optional root fillInTheBlank)
-  const fibQuestions: any[] = [
-    ...(Array.isArray(referenceExam.fillInTheBlank) ? referenceExam.fillInTheBlank : []),
-    ...(Array.isArray(referenceExam.sections)
-      ? referenceExam.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
-      : []),
-  ];
+  const fibQuestions: any[] = collectWorkbookFillInTheBlank(referenceExam);
 
   const fibStats: FibItemStat[] = fibQuestions.map((fib: any, idx: number) => {
     const fId = String(fib?.id || `fib_${idx}`);
     let correctCount = 0;
+    let keyedResponses = 0;
+    let unkeyedResponses = 0;
     const wrongAnswers = new Map<string, number>();
 
     for (const rec of parsedRecords) {
+      const studentFibList = collectWorkbookFillInTheBlank(rec.domande);
+      const studentFib = studentFibList.find((sf: any) => String(sf?.id) === fId) || fib;
       const rawVal = rec.answers?.wbFib?.[fId] ?? rec.answers?.fib?.[fId];
       const val = typeof rawVal === "string" ? rawVal : String(rawVal?.[0] || "");
-      if (isFibAnswerCorrect(val, fib.answer, fib.sentence)) {
+      if (!hasFibKey(studentFib)) {
+        unkeyedResponses++;
+        continue;
+      }
+      keyedResponses++;
+      if (isFibAnswerCorrect(val, studentFib.answer, studentFib.sentence)) {
         correctCount++;
       } else if (val.trim()) {
         const cleanWrong = val.trim();
@@ -193,7 +195,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     }
 
     const totalResponses = parsedRecords.length;
-    const accuracyPercent = totalResponses > 0 ? Math.round((correctCount / totalResponses) * 100) : 0;
+    const accuracyPercent = keyedResponses > 0 ? Math.round((correctCount / keyedResponses) * 100) : 0;
     return {
       id: fId,
       index: idx + 1,
@@ -201,20 +203,17 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
       expectedAnswer: String(fib?.answer || ""),
       totalResponses,
       correctCount,
+      keyedResponses,
+      unkeyedResponses,
       accuracyPercent,
       topWrongAnswer,
-      needsReview: accuracyPercent < 50,
+      needsReview: keyedResponses > 0 && accuracyPercent < 50,
     };
   });
 
   // 3. Subjective Questions (Open Ended in Quiz + Reflection Questions in Workbook)
   const oeQuestions: any[] = collectQuizOpenEnded(referenceExam);
-  const rqQuestions: any[] = [
-    ...(Array.isArray(referenceExam.reflectionQuestions) ? referenceExam.reflectionQuestions : []),
-    ...(Array.isArray(referenceExam.sections)
-      ? referenceExam.sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []))
-      : []),
-  ];
+  const rqQuestions: any[] = collectWorkbookReflections(referenceExam);
 
   const subjDefs: Array<{ kind: "open_ended" | "reflection"; q: any; index: number }> = [
     ...oeQuestions.map((q, idx) => ({ kind: "open_ended" as const, q, index: idx + 1 })),
@@ -317,7 +316,13 @@ export interface MetacognitionSummary {
 
 function resolveNumericFinalGrade(sub: SavedSubmission): number {
   const ev = safeParseJson(sub.Full_Evaluation);
-  if (isEvaluationPending(ev) || getPendingSubjectiveCount(sub) > 0) return NaN;
+  if (
+    isEvaluationPending(ev) ||
+    getPendingSubjectiveCount(sub) > 0 ||
+    String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.")
+  ) {
+    return NaN;
+  }
   const g = parseItalianGrade(sub.Voto_Suggerito);
   return Number.isFinite(g) ? g : NaN;
 }
@@ -437,7 +442,7 @@ export function computeExamItemAnalysisByFila(submissions: SavedSubmission[]): F
   };
 }
 
-export type ExamOutcomeCellStatus = "correct" | "wrong" | "blank" | "scored" | "pending";
+export type ExamOutcomeCellStatus = "correct" | "wrong" | "blank" | "scored" | "pending" | "unkeyed";
 
 export interface ExamOutcomeMatrixColumn {
   key: string;
@@ -488,25 +493,10 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
     return { columns: [], rows: [] };
   }
 
-  const mcQuestions: any[] = [
-    ...(Array.isArray(referenceExam.multipleChoice) ? referenceExam.multipleChoice : []),
-    ...(Array.isArray(referenceExam.sections)
-      ? referenceExam.sections.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : []))
-      : []),
-  ];
-  const fibQuestions: any[] = [
-    ...(Array.isArray(referenceExam.fillInTheBlank) ? referenceExam.fillInTheBlank : []),
-    ...(Array.isArray(referenceExam.sections)
-      ? referenceExam.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
-      : []),
-  ];
+  const mcQuestions: any[] = collectExamMultipleChoice(referenceExam);
+  const fibQuestions: any[] = collectWorkbookFillInTheBlank(referenceExam);
   const oeQuestions: any[] = collectQuizOpenEnded(referenceExam);
-  const rqQuestions: any[] = [
-    ...(Array.isArray(referenceExam.reflectionQuestions) ? referenceExam.reflectionQuestions : []),
-    ...(Array.isArray(referenceExam.sections)
-      ? referenceExam.sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []))
-      : []),
-  ];
+  const rqQuestions: any[] = collectWorkbookReflections(referenceExam);
 
   const columns: ExamOutcomeMatrixColumn[] = [
     ...mcQuestions.map((q, idx) => ({
@@ -540,25 +530,10 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
     const answers = safeParseJson(sub.Risposte_Studente) || {};
     const evaluation = safeParseJson(sub.Full_Evaluation) || {};
 
-    const studentMcList = [
-      ...(Array.isArray(domande?.multipleChoice) ? domande.multipleChoice : []),
-      ...(Array.isArray(domande?.sections)
-        ? domande.sections.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : []))
-        : []),
-    ];
-    const studentFibList = [
-      ...(Array.isArray(domande?.fillInTheBlank) ? domande.fillInTheBlank : []),
-      ...(Array.isArray(domande?.sections)
-        ? domande.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
-        : []),
-    ];
+    const studentMcList = collectExamMultipleChoice(domande);
+    const studentFibList = collectWorkbookFillInTheBlank(domande);
     const studentOeList = collectQuizOpenEnded(domande);
-    const studentRqList = [
-      ...(Array.isArray(domande?.reflectionQuestions) ? domande.reflectionQuestions : []),
-      ...(Array.isArray(domande?.sections)
-        ? domande.sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []))
-        : []),
-    ];
+    const studentRqList = collectWorkbookReflections(domande);
 
     const oeEntries = buildSubjectiveReviewEntries(
       studentOeList,
@@ -581,6 +556,12 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       const sel = evaluateMcSelection(studentQ, answers?.mc?.[qId]);
       if (!sel.hasSelection) {
         cells.push({ columnKey: `mc:${qId}`, status: "blank" });
+      } else if (!sel.hasCorrectKey) {
+        cells.push({
+          columnKey: `mc:${qId}`,
+          status: "unkeyed",
+          detailText: sel.selectedText || undefined,
+        });
       } else if (sel.isCorrect) {
         cells.push({
           columnKey: `mc:${qId}`,
@@ -604,6 +585,8 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       const trimmed = val.trim();
       if (!trimmed) {
         cells.push({ columnKey: `fib:${fId}`, status: "blank" });
+      } else if (!hasFibKey(studentFib)) {
+        cells.push({ columnKey: `fib:${fId}`, status: "unkeyed", detailText: trimmed });
       } else if (isFibAnswerCorrect(trimmed, studentFib?.answer, studentFib?.sentence)) {
         cells.push({ columnKey: `fib:${fId}`, status: "correct", detailText: trimmed });
       } else {
@@ -667,7 +650,10 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       }
     });
 
-    const isPending = isEvaluationPending(evaluation) || getPendingSubjectiveCount(sub) > 0;
+    const isPending =
+      isEvaluationPending(evaluation) ||
+      getPendingSubjectiveCount(sub) > 0 ||
+      String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
     const finalGrade = isPending ? "N.V." : String(sub.Voto_Suggerito || "N.D.");
     const numericGrade = resolveNumericFinalGrade(sub);
     const hasIssues =
@@ -699,7 +685,7 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
 export function buildExamItemAnalysisCsv(
   analysis: ExamItemAnalysis,
   matrix: ExamOutcomeMatrix,
-  options?: { examTitle?: string; blindMode?: boolean }
+  options?: { examTitle?: string; blindMode?: boolean; distribution?: GradeDistributionSummary }
 ): string {
   const blindMode = Boolean(options?.blindMode);
   const examTitle = String(options?.examTitle || "Verifica di classe").trim();
@@ -720,26 +706,28 @@ export function buildExamItemAnalysisCsv(
   ];
 
   analysis.mcStats.forEach((m) => {
+    const denom = typeof m.keyedResponses === "number" ? m.keyedResponses : m.totalResponses;
     lines.push([
       `D${m.index}`,
       "Scelta Multipla",
       m.question,
       String(m.correctCount),
-      String(m.totalResponses),
-      `${m.accuracyPercent}%`,
+      String(denom),
+      denom > 0 ? `${m.accuracyPercent}%` : "PROTETTO",
       m.needsReview ? "Sì" : "No",
       m.topWrongOption ? `${m.topWrongOption.text} (${m.topWrongOption.count}x)` : "",
     ]);
   });
 
   analysis.fibStats.forEach((f) => {
+    const denom = typeof f.keyedResponses === "number" ? f.keyedResponses : f.totalResponses;
     lines.push([
       `F${f.index}`,
       "Completamento",
       f.sentence,
       String(f.correctCount),
-      String(f.totalResponses),
-      `${f.accuracyPercent}%`,
+      String(denom),
+      denom > 0 ? `${f.accuracyPercent}%` : "PROTETTO",
       f.needsReview ? "Sì" : "No",
       f.topWrongAnswer ? `${f.topWrongAnswer.text} (${f.topWrongAnswer.count}x)` : "",
     ]);
@@ -757,6 +745,14 @@ export function buildExamItemAnalysisCsv(
       s.pendingCount > 0 ? `${s.pendingCount} in attesa` : "",
     ]);
   });
+
+  if (options?.distribution) {
+    lines.push([]);
+    lines.push(["Distribuzione Docimologica per Fasce di Voto", "Conteggio", "Percentuale"]);
+    options.distribution.buckets.forEach((b) => {
+      lines.push([b.label, String(b.count), `${b.percent}%`]);
+    });
+  }
 
   if (matrix.rows.length > 0 && matrix.columns.length > 0) {
     lines.push([]);
@@ -776,6 +772,7 @@ export function buildExamItemAnalysisCsv(
         if (c.status === "correct") return "OK";
         if (c.status === "wrong") return "ERR";
         if (c.status === "blank") return "VUOTO";
+        if (c.status === "unkeyed") return "PROTETTO";
         if (c.status === "pending") return "N.V.";
         return c.score !== undefined ? String(c.score).replace(".", ",") : "";
       });
@@ -794,4 +791,223 @@ export function buildExamItemAnalysisCsv(
     "\ufeff" +
     lines.map((row) => row.map((cell) => sanitizeCsvCell(cell)).join(";")).join("\r\n")
   );
+}
+
+export type GradeDistributionBandKey =
+  | "lt45"
+  | "b45_59"
+  | "b60_69"
+  | "b70_79"
+  | "b80_105"
+  | "nv";
+
+export interface GradeDistributionBucket {
+  key: GradeDistributionBandKey;
+  label: string;
+  shortLabel: string;
+  count: number;
+  percent: number;
+}
+
+export interface GradeDistributionSummary {
+  totalSubmissions: number;
+  gradedCount: number;
+  nvCount: number;
+  passCount: number;
+  passRate: number | null;
+  meanGrade: number | null;
+  medianGrade: number | null;
+  buckets: GradeDistributionBucket[];
+}
+
+export function matchesGradeBand(sub: SavedSubmission, band: GradeDistributionBandKey): boolean {
+  const num = resolveNumericFinalGrade(sub);
+  if (!Number.isFinite(num)) {
+    return band === "nv";
+  }
+  if (band === "lt45") return num < 4.5;
+  if (band === "b45_59") return num >= 4.5 && num < 6;
+  if (band === "b60_69") return num >= 6 && num < 7;
+  if (band === "b70_79") return num >= 7 && num < 8;
+  if (band === "b80_105") return num >= 8;
+  return false;
+}
+
+export function computeGradeDistribution(submissions: SavedSubmission[]): GradeDistributionSummary {
+  const safeList = Array.isArray(submissions) ? submissions : [];
+  const counts: Record<GradeDistributionBandKey, number> = {
+    lt45: 0,
+    b45_59: 0,
+    b60_69: 0,
+    b70_79: 0,
+    b80_105: 0,
+    nv: 0,
+  };
+  const validGrades: number[] = [];
+
+  for (const sub of safeList) {
+    const num = resolveNumericFinalGrade(sub);
+    if (!Number.isFinite(num)) {
+      counts.nv++;
+    } else {
+      validGrades.push(num);
+      if (num < 4.5) counts.lt45++;
+      else if (num < 6) counts.b45_59++;
+      else if (num < 7) counts.b60_69++;
+      else if (num < 8) counts.b70_79++;
+      else counts.b80_105++;
+    }
+  }
+
+  const totalSubmissions = safeList.length;
+  const gradedCount = validGrades.length;
+  const passCount = counts.b60_69 + counts.b70_79 + counts.b80_105;
+  const passRate = gradedCount > 0 ? Math.round((passCount / gradedCount) * 100) : null;
+  const meanGrade =
+    gradedCount > 0
+      ? Math.round((validGrades.reduce((a, b) => a + b, 0) / gradedCount) * 100) / 100
+      : null;
+
+  let medianGrade: number | null = null;
+  if (gradedCount > 0) {
+    const sorted = [...validGrades].sort((a, b) => a - b);
+    const mid = Math.floor(sorted.length / 2);
+    const rawMed = sorted.length % 2 === 1 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
+    medianGrade = Math.round(rawMed * 100) / 100;
+  }
+
+  const defs: Array<{ key: GradeDistributionBandKey; label: string; shortLabel: string }> = [
+    { key: "lt45", label: "Gravemente insuff. (< 4.5)", shortLabel: "< 4.5" },
+    { key: "b45_59", label: "Insufficiente (4.5 – 5.9)", shortLabel: "4.5–5.9" },
+    { key: "b60_69", label: "Sufficiente (6.0 – 6.9)", shortLabel: "6.0–6.9" },
+    { key: "b70_79", label: "Buono / Discreto (7.0 – 7.9)", shortLabel: "7.0–7.9" },
+    { key: "b80_105", label: "Ottimo / Eccellente (≥ 8.0)", shortLabel: "≥ 8.0" },
+    { key: "nv", label: "Da valutare (N.V.)", shortLabel: "N.V." },
+  ];
+
+  const buckets: GradeDistributionBucket[] = defs.map((d) => ({
+    key: d.key,
+    label: d.label,
+    shortLabel: d.shortLabel,
+    count: counts[d.key],
+    percent: totalSubmissions > 0 ? Math.round((counts[d.key] / totalSubmissions) * 100) : 0,
+  }));
+
+  return {
+    totalSubmissions,
+    gradedCount,
+    nvCount: counts.nv,
+    passCount,
+    passRate,
+    meanGrade,
+    medianGrade,
+    buckets,
+  };
+}
+
+export interface ExamLedgerRow {
+  submissionId: string;
+  studentLabel: string;
+  secondaryLabel: string;
+  className: string;
+  assignedFila: string;
+  finalGrade: string;
+  numericGrade: number | null;
+  selfGrade: string;
+  validatedLabel: string;
+  violationsCount: number;
+  notes: string;
+}
+
+export interface ExamLedgerSummary {
+  examTitle: string;
+  pin: string;
+  tipo: string;
+  filterLabel: string;
+  blindMode: boolean;
+  totalStudents: number;
+  validatedCount: number;
+  totalViolations: number;
+  classes: string[];
+  distribution: GradeDistributionSummary;
+  filaEquity: FilaEquitySummary;
+  rows: ExamLedgerRow[];
+}
+
+export function buildExamLedgerSummary(
+  submissions: SavedSubmission[],
+  options?: { examTitle?: string; pin?: string; blindMode?: boolean; filterLabel?: string }
+): ExamLedgerSummary {
+  const safeList = Array.isArray(submissions) ? [...submissions] : [];
+  const blindMode = Boolean(options?.blindMode);
+  const distribution = computeGradeDistribution(safeList);
+  const filaEquity = computeFilaEquitySummary(safeList);
+
+  const pin =
+    String(options?.pin || safeList.find((s) => s.Pin && s.Pin.trim())?.Pin || "—").trim() || "—";
+  const firstTitle =
+    String(options?.examTitle || "").trim() ||
+    safeList.find((s) => s.Session_Titolo?.trim())?.Session_Titolo?.trim() ||
+    "Verifica Didattica";
+  const types = new Set(safeList.map((s) => s.Tipo).filter(Boolean));
+  const tipo = types.size > 1 ? "Misto" : Array.from(types)[0] || "Quiz";
+
+  const classSet = new Set<string>();
+  let validatedCount = 0;
+  let totalViolations = 0;
+
+  safeList.sort((a, b) => {
+    const labelA = blindMode ? getSubmissionBlindCode(a) : (a.Nome || "");
+    const labelB = blindMode ? getSubmissionBlindCode(b) : (b.Nome || "");
+    return labelA.localeCompare(labelB, "it");
+  });
+
+  const rows: ExamLedgerRow[] = safeList.map((sub) => {
+    const cls = resolveSubmissionClass(sub);
+    classSet.add(cls);
+    const blindCode = getSubmissionBlindCode(sub);
+    const numeric = resolveNumericFinalGrade(sub);
+    const isPending = !Number.isFinite(numeric);
+    const finalGrade = isPending ? "N.V." : String(sub.Voto_Suggerito || "N.D.");
+    const violationsCount =
+      (sub.AntiCopia_TabSwitch || 0) +
+      (sub.AntiCopia_IncollaBloccato || 0) +
+      (sub.AntiCopia_SchermoDiviso || 0);
+    totalViolations += violationsCount;
+    if (sub.Convalida_Docente_At) validatedCount++;
+
+    const notesParts: string[] = [];
+    if (sub.Voto_Originale_IA) notesParts.push(`Ritoccato (orig. ${sub.Voto_Originale_IA})`);
+    if (sub.Soluzioni_Differite) notesParts.push("Soluzioni differite");
+    if (violationsCount > 0) notesParts.push(`${violationsCount} segnalaz.`);
+
+    return {
+      submissionId: sub.id,
+      studentLabel: blindMode ? `Studente ${blindCode}` : (sub.Nome || "Anonimo"),
+      secondaryLabel: blindMode ? blindCode : (sub.Email || blindCode),
+      className: cls,
+      assignedFila: sub.Assigned_Fila ? `Fila ${sub.Assigned_Fila}` : "Unica",
+      finalGrade,
+      numericGrade: Number.isFinite(numeric) ? numeric : null,
+      selfGrade: sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "—",
+      validatedLabel: sub.Convalida_Docente_At ? "Convalidato" : "In attesa",
+      violationsCount,
+      notes: notesParts.join(" · ") || "—",
+    };
+  });
+
+  return {
+    examTitle: firstTitle,
+    pin,
+    tipo,
+    filterLabel: String(options?.filterLabel || "Tutte le consegne filtrabili").trim(),
+    blindMode,
+    totalStudents: safeList.length,
+    validatedCount,
+    totalViolations,
+    classes: Array.from(classSet),
+    distribution,
+    filaEquity,
+    rows,
+  };
 }
