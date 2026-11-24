@@ -1,7 +1,13 @@
 import React, { useMemo, useState } from "react";
-import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X, FileText, Copy, Check } from "lucide-react";
+import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X, FileText, Copy, Check, Download, Table } from "lucide-react";
 import { SavedSubmission, AiModalPrefill } from "../types";
-import { computeExamItemAnalysisByFila } from "../utils/examAnalytics";
+import {
+  buildExamItemAnalysisCsv,
+  buildExamOutcomeMatrix,
+  computeExamItemAnalysisByFila,
+  computeFilaEquitySummary,
+  computeMetacognitionSummary,
+} from "../utils/examAnalytics";
 import { getAuthHeaders } from "../firebase";
 import { safeParseJson, sanitizeAiHtml } from "../utils";
 import { scrubPromptPii } from "../utils/privacyPseudonym";
@@ -9,6 +15,7 @@ import { scrubPromptPii } from "../utils/privacyPseudonym";
 interface ExamItemAnalysisPanelProps {
   submissions: SavedSubmission[];
   examTitle?: string;
+  blindGradingMode?: boolean;
   onGenerateRecoveryExam?: (prefill: AiModalPrefill) => void;
 }
 
@@ -28,10 +35,13 @@ interface MiniReviewSheetResult {
 const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo(({
   submissions,
   examTitle,
+  blindGradingMode = false,
   onGenerateRecoveryExam,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
   const [filaFilter, setFilaFilter] = useState<"all" | "A" | "B">("all");
+  const [viewMode, setViewMode] = useState<"stats" | "matrix">("stats");
+  const [onlyIssuesInMatrix, setOnlyIssuesInMatrix] = useState(false);
   const [synthesizingErrors, setSynthesizingErrors] = useState(false);
   const [synthesisError, setSynthesisError] = useState<string | null>(null);
   const [errorSynthesis, setErrorSynthesis] = useState<ClassErrorSummaryResult | null>(null);
@@ -59,6 +69,10 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     if (effectiveFila === "B") return submissions.filter((s) => s.Assigned_Fila === "B");
     return submissions;
   }, [submissions, effectiveFila]);
+
+  const equitySummary = useMemo(() => computeFilaEquitySummary(submissions), [submissions]);
+  const metacognitionSummary = useMemo(() => computeMetacognitionSummary(activeSubmissions), [activeSubmissions]);
+  const outcomeMatrix = useMemo(() => buildExamOutcomeMatrix(activeSubmissions), [activeSubmissions]);
 
   const totalItems =
     (analysis?.mcStats.length || 0) +
@@ -284,6 +298,36 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     }).catch(() => {});
   };
 
+  const handleExportAnalysisCsv = () => {
+    const resolvedTitle =
+      examTitle ||
+      activeSubmissions[0]?.Session_Titolo ||
+      safeParseJson(activeSubmissions[0]?.Domande_Esame)?.title ||
+      "Verifica_di_classe";
+    const csv = buildExamItemAnalysisCsv(analysis, outcomeMatrix, {
+      examTitle: resolvedTitle,
+      blindMode: blindGradingMode,
+    });
+    const slug = resolvedTitle
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/gi, "_")
+      .replace(/^_+|_+$/g, "")
+      .slice(0, 40) || "item_analysis";
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `item_analysis_${slug}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+
+  const displayedMatrixRows = onlyIssuesInMatrix
+    ? outcomeMatrix.rows.filter((r) => r.hasIssues)
+    : outcomeMatrix.rows;
+
   return (
     <div className="bg-slate-950/60 border border-white/10 rounded-xl overflow-hidden">
       <button
@@ -326,33 +370,105 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
       {isOpen && (
         <div className="p-3.5 border-t border-white/10 space-y-4">
           {filaBundle?.hasMixedFila && (
-            <div className="flex flex-wrap items-center justify-between gap-2 pb-2 border-b border-white/5">
-              <span className="text-[11px] font-semibold text-purple-200">
-                🔀 Prova mista nello stesso PIN: seleziona la traccia da analizzare
-              </span>
-              <div className="flex items-center gap-1.5">
-                {([
-                  { key: "all", label: `Tutte (${submissions.length})` },
-                  { key: "A", label: `Fila A (${filaBundle.filaACount})` },
-                  { key: "B", label: `Fila B (${filaBundle.filaBCount})` },
-                ] as const).map((tab) => (
-                  <button
-                    key={tab.key}
-                    type="button"
-                    onClick={() => {
-                      setFilaFilter(tab.key);
-                      setErrorSynthesis(null);
-                      setReviewSheet(null);
-                    }}
-                    className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
-                      effectiveFila === tab.key
-                        ? "bg-purple-500 text-white shadow-sm"
-                        : "bg-slate-900 text-slate-300 border border-white/10 hover:text-white"
+            <div className="space-y-2.5 pb-2 border-b border-white/5">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <span className="text-[11px] font-semibold text-purple-200">
+                  🔀 Prova mista nello stesso PIN: seleziona la traccia da analizzare
+                </span>
+                <div className="flex items-center gap-1.5">
+                  {([
+                    { key: "all", label: `Tutte (${submissions.length})` },
+                    { key: "A", label: `Fila A (${filaBundle.filaACount})` },
+                    { key: "B", label: `Fila B (${filaBundle.filaBCount})` },
+                  ] as const).map((tab) => (
+                    <button
+                      key={tab.key}
+                      type="button"
+                      onClick={() => {
+                        setFilaFilter(tab.key);
+                        setErrorSynthesis(null);
+                        setReviewSheet(null);
+                      }}
+                      className={`px-2.5 py-1 rounded-lg text-[11px] font-bold transition-colors cursor-pointer ${
+                        effectiveFila === tab.key
+                          ? "bg-purple-500 text-white shadow-sm"
+                          : "bg-slate-900 text-slate-300 border border-white/10 hover:text-white"
+                      }`}
+                    >
+                      {tab.label}
+                    </button>
+                  ))}
+                </div>
+              </div>
+
+              {equitySummary.hasMixedFila && (
+                <div className="grid grid-cols-1 sm:grid-cols-3 gap-2 p-2.5 rounded-xl bg-purple-950/25 border border-purple-500/20 text-[11px]">
+                  <div>
+                    <span className="text-[10px] uppercase tracking-wider text-purple-300 font-bold">Fila A ({equitySummary.filaA.count})</span>
+                    <p className="text-slate-100 font-bold mt-0.5">
+                      Media {equitySummary.filaA.averageFormatted}
+                      {equitySummary.filaA.passRate !== null && (
+                        <span className="text-slate-400 font-normal ml-1.5">({equitySummary.filaA.passRate}% suff.)</span>
+                      )}
+                    </p>
+                  </div>
+                  <div>
+                    <span className="text-[10px] uppercase tracking-wider text-purple-300 font-bold">Fila B ({equitySummary.filaB.count})</span>
+                    <p className="text-slate-100 font-bold mt-0.5">
+                      Media {equitySummary.filaB.averageFormatted}
+                      {equitySummary.filaB.passRate !== null && (
+                        <span className="text-slate-400 font-normal ml-1.5">({equitySummary.filaB.passRate}% suff.)</span>
+                      )}
+                    </p>
+                  </div>
+                  <div className="flex sm:flex-col sm:items-end justify-between sm:justify-center gap-1">
+                    <span className="text-[10px] uppercase tracking-wider text-slate-400 font-bold">Equità Tracce</span>
+                    {equitySummary.gradeDelta !== null ? (
+                      <span
+                        className={`px-2 py-0.5 rounded-md font-bold text-[10px] border ${
+                          equitySummary.isBalanced
+                            ? "bg-emerald-500/15 text-emerald-300 border-emerald-500/30"
+                            : "bg-amber-500/15 text-amber-300 border-amber-500/30"
+                        }`}
+                      >
+                        Δ {equitySummary.gradeDelta.toFixed(2)} · {equitySummary.isBalanced ? "Bilanciate" : "Divario elevato"}
+                      </span>
+                    ) : (
+                      <span className="text-slate-400 text-[10px]">Voti in attesa</span>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          )}
+
+          {metacognitionSummary.count >= 2 && (
+            <div className="p-2.5 rounded-xl bg-slate-900/70 border border-indigo-500/20 flex flex-wrap items-center justify-between gap-2 text-[11px]">
+              <div className="flex flex-wrap items-center gap-2">
+                <span className="font-bold text-indigo-300">🧭 Calibrazione Metacognitiva ({metacognitionSummary.count} alunni):</span>
+                <span className="text-slate-300">
+                  Autovoto medio <b className="text-white">{metacognitionSummary.avgSelfGrade?.toFixed(2)}</b> vs esito <b className="text-white">{metacognitionSummary.avgFinalGrade?.toFixed(2)}</b>
+                </span>
+                {metacognitionSummary.meanBias !== null && (
+                  <span
+                    className={`font-mono font-bold px-1.5 py-0.5 rounded text-[10px] ${
+                      Math.abs(metacognitionSummary.meanBias) < 0.75
+                        ? "bg-emerald-500/15 text-emerald-300"
+                        : metacognitionSummary.meanBias > 0
+                        ? "bg-amber-500/15 text-amber-300"
+                        : "bg-sky-500/15 text-sky-300"
                     }`}
                   >
-                    {tab.label}
-                  </button>
-                ))}
+                    Δ {metacognitionSummary.meanBias > 0 ? `+${metacognitionSummary.meanBias.toFixed(2)}` : metacognitionSummary.meanBias.toFixed(2)}
+                  </span>
+                )}
+              </div>
+              <div className="flex flex-wrap items-center gap-2 text-[10px]">
+                <span className="text-sky-300">Sottostima: <b>{metacognitionSummary.underestimatedCount}</b></span>
+                <span className="text-slate-600">·</span>
+                <span className="text-emerald-300">Calibrati: <b>{metacognitionSummary.calibratedCount}</b></span>
+                <span className="text-slate-600">·</span>
+                <span className="text-amber-300">Sovrastima: <b>{metacognitionSummary.overestimatedCount}</b></span>
               </div>
             </div>
           )}
@@ -516,6 +632,177 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
               )}
             </div>
           )}
+
+          {/* Sub-view mode switch & Export CSV Analisi */}
+          <div className="flex flex-wrap items-center justify-between gap-2 pb-1 border-b border-white/5">
+            <div className="flex items-center gap-1 bg-slate-900/90 p-1 rounded-xl border border-white/10">
+              <button
+                type="button"
+                onClick={() => setViewMode("stats")}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  viewMode === "stats"
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                <BarChart2 className="w-3.5 h-3.5" />
+                <span>Statistiche Quesiti</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => setViewMode("matrix")}
+                className={`px-2.5 py-1 rounded-lg text-[11px] font-bold flex items-center gap-1.5 transition-colors cursor-pointer ${
+                  viewMode === "matrix"
+                    ? "bg-indigo-600 text-white shadow-sm"
+                    : "text-slate-400 hover:text-white"
+                }`}
+              >
+                <Table className="w-3.5 h-3.5" />
+                <span>Matrice Classe ({outcomeMatrix.rows.length})</span>
+              </button>
+            </div>
+
+            <div className="flex items-center gap-2 flex-wrap">
+              {viewMode === "matrix" && (
+                <label className="flex items-center gap-1.5 text-[11px] text-slate-300 cursor-pointer select-none px-2 py-1 rounded-lg bg-slate-900 border border-white/10">
+                  <input
+                    type="checkbox"
+                    checked={onlyIssuesInMatrix}
+                    onChange={(e) => setOnlyIssuesInMatrix(e.target.checked)}
+                    className="accent-amber-400 cursor-pointer"
+                  />
+                  <span>Solo studenti sotto soglia / con errori</span>
+                </label>
+              )}
+              <button
+                type="button"
+                onClick={handleExportAnalysisCsv}
+                className="px-2.5 py-1.5 rounded-lg bg-teal-600/20 hover:bg-teal-600 text-teal-200 hover:text-white border border-teal-500/30 font-bold text-[11px] flex items-center gap-1.5 transition-colors cursor-pointer"
+                title="Esporta statistiche quesiti e matrice completa in CSV compatibile con Excel"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Esporta CSV Analisi</span>
+              </button>
+            </div>
+          </div>
+
+          {viewMode === "matrix" ? (
+            <div className="space-y-2">
+              {displayedMatrixRows.length === 0 ? (
+                <p className="text-xs text-slate-400 italic py-4 text-center">
+                  Nessuno studente corrisponde al filtro selezionato.
+                </p>
+              ) : (
+                <div className="overflow-x-auto rounded-xl border border-white/10 bg-slate-900/50">
+                  <table className="w-full text-left border-collapse text-[11px]">
+                    <thead>
+                      <tr className="border-b border-white/10 bg-slate-950/70 text-[10px] uppercase text-slate-400">
+                        <th className="py-2 px-2.5 sticky left-0 z-10 bg-slate-950/95 min-w-[150px]">Studente</th>
+                        <th className="py-2 px-2 text-center">Voto</th>
+                        {outcomeMatrix.columns.map((col) => (
+                          <th
+                            key={col.key}
+                            title={col.label}
+                            className="py-2 px-1.5 text-center font-mono whitespace-nowrap"
+                          >
+                            {col.code}
+                          </th>
+                        ))}
+                      </tr>
+                    </thead>
+                    <tbody className="divide-y divide-white/5">
+                      {displayedMatrixRows.map((row) => (
+                        <tr key={row.submissionId} className="hover:bg-white/[0.02]">
+                          <td className="py-1.5 px-2.5 sticky left-0 z-10 bg-slate-900/95 border-r border-white/5">
+                            <div className="flex items-center gap-1.5 min-w-0">
+                              <span className="font-semibold text-slate-200 truncate max-w-[140px]">
+                                {blindGradingMode ? `Studente ${row.pseudoId}` : row.studentName}
+                              </span>
+                              {row.assignedFila && (
+                                <span className="px-1 py-0.2 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-500/30 font-mono text-[9px] shrink-0">
+                                  {row.assignedFila}
+                                </span>
+                              )}
+                            </div>
+                          </td>
+                          <td className="py-1.5 px-2 text-center font-mono font-bold whitespace-nowrap">
+                            <span
+                              className={
+                                row.finalGrade === "N.V."
+                                  ? "text-amber-300"
+                                  : row.numericGrade >= 6
+                                  ? "text-emerald-400"
+                                  : "text-rose-300"
+                              }
+                            >
+                              {row.finalGrade}
+                            </span>
+                          </td>
+                          {row.cells.map((cell, cIdx) => {
+                            const col = outcomeMatrix.columns[cIdx];
+                            const tooltip = `${col?.code || ""}: ${col?.label || ""}${cell.detailText ? ` — Risposta: ${cell.detailText.slice(0, 120)}` : ""}`;
+                            if (cell.status === "correct") {
+                              return (
+                                <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
+                                  <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-emerald-500/20 text-emerald-300 font-bold">
+                                    ✓
+                                  </span>
+                                </td>
+                              );
+                            }
+                            if (cell.status === "wrong") {
+                              return (
+                                <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
+                                  <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-rose-500/20 text-rose-300 font-bold">
+                                    ✗
+                                  </span>
+                                </td>
+                              );
+                            }
+                            if (cell.status === "scored") {
+                              const sc = cell.score ?? 0;
+                              return (
+                                <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
+                                  <span
+                                    className={`inline-flex items-center justify-center min-w-[24px] h-5 px-1 rounded font-mono font-bold text-[10px] ${
+                                      sc >= 6
+                                        ? "bg-emerald-500/20 text-emerald-300"
+                                        : sc >= 5
+                                        ? "bg-amber-500/20 text-amber-300"
+                                        : "bg-rose-500/20 text-rose-300"
+                                    }`}
+                                  >
+                                    {sc}
+                                  </span>
+                                </td>
+                              );
+                            }
+                            if (cell.status === "pending") {
+                              return (
+                                <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
+                                  <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-amber-500/15 text-amber-300 font-mono">
+                                    …
+                                  </span>
+                                </td>
+                              );
+                            }
+                            return (
+                              <td key={cell.columnKey} title={tooltip} className="py-1.5 px-1.5 text-center">
+                                <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-slate-800/80 text-slate-500 font-mono">
+                                  —
+                                </span>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          ) : (
+            <>
           {analysis.mcStats.length > 0 && (
             <div className="space-y-2">
               <p className="text-[10px] font-bold uppercase tracking-wider text-slate-400">
@@ -688,6 +975,8 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                 ))}
               </div>
             </div>
+          )}
+            </>
           )}
         </div>
       )}

@@ -12,12 +12,28 @@ import {
   parseItalianGrade,
   isFibAnswerCorrect,
   buildSubjectiveReviewEntries,
+  collectExamMultipleChoice,
+  collectQuizOpenEnded,
+  isWorkbookExamData,
   getPendingSubjectiveCount,
   auditSubjectiveEvaluation,
+  applySubjectiveRetouchToDetails,
+  evaluateMcSelection,
   isEvaluationPending,
   sanitizeAiHtml,
 } from "../src/utils";
-import { computeExamItemAnalysis, computeExamItemAnalysisByFila } from "../src/utils/examAnalytics";
+import {
+  computeExamItemAnalysis,
+  computeExamItemAnalysisByFila,
+  computeFilaEquitySummary,
+  computeMetacognitionSummary,
+  buildExamOutcomeMatrix,
+  buildExamItemAnalysisCsv,
+} from "../src/utils/examAnalytics";
+import {
+  buildExamPreviewSummary,
+  extractReusableExamFromSubmissions,
+} from "../src/utils/examPreview";
 import {
   stripExamAnswers,
   restoreExamAnswers,
@@ -1639,6 +1655,438 @@ test("sharedPc storage isolation: in modalità PC condiviso non legge né scrive
   assert.equal(localStore.getItem("draft_PIN99_mario_scuola_it"), '{"mc":{"1":0}}');
 });
 
+test("sectioned Quiz: collectQuizOpenEnded/MC, getPendingSubjectiveCount e extractBreakdownFromSubmission gestiscono sections[].openEnded", () => {
+  const sectionedQuiz = {
+    title: "Verifica Storica a Sezioni",
+    multipleChoice: [{ id: "mc_root", question: "Root?", options: ["A", "B"], correctIndex: 0 }],
+    sections: [
+      {
+        title: "Sezione A",
+        multipleChoice: [{ id: "mc_sec1", question: "Sec1?", options: ["X", "Y"], correctIndex: 1 }],
+        openEnded: [{ id: "oe_sec1", question: "Spiega la rivoluzione industriale." }],
+      },
+    ],
+  };
+
+  assert.deepEqual(
+    collectExamMultipleChoice(sectionedQuiz).map((q) => q.id),
+    ["mc_root", "mc_sec1"]
+  );
+  assert.deepEqual(
+    collectQuizOpenEnded(sectionedQuiz).map((q) => q.id),
+    ["oe_sec1"]
+  );
+
+  const pendingSub = {
+    Tipo: "Quiz",
+    Domande_Esame: JSON.stringify(sectionedQuiz),
+    Risposte_Studente: JSON.stringify({
+      mc: { mc_root: 0, mc_sec1: 1 },
+      oe: { oe_sec1: "Risposta articolata dello studente sulla prima rivoluzione industriale." },
+    }),
+    Full_Evaluation: JSON.stringify({ openEndedDetails: [], evaluationMode: "deterministic" }),
+    Punteggio_MC: 2,
+    Voto_Suggerito: "N.V.",
+  };
+
+  assert.equal(getPendingSubjectiveCount(pendingSub), 1);
+  const breakdown = extractBreakdownFromSubmission(pendingSub);
+  assert.equal(breakdown.finalGradeFormatted, "N.V.");
+  assert.equal(breakdown.objectivePart?.score, 2);
+  assert.equal(breakdown.objectivePart?.total, 2);
+});
+
+test("computeExamItemAnalysis: include openEnded e multipleChoice nelle sezioni del Quiz", () => {
+  const examObj = {
+    title: "Quiz Strutturato",
+    sections: [
+      {
+        title: "Modulo 1",
+        multipleChoice: [{ id: "s_mc", question: "Domanda sez.", options: ["A", "B"], correctIndex: 0 }],
+        openEnded: [{ id: "s_oe", question: "Domanda aperta sez." }],
+      },
+    ],
+  };
+
+  const subs = [
+    {
+      id: "sub_1",
+      Tipo: "Quiz",
+      Domande_Esame: JSON.stringify(examObj),
+      Risposte_Studente: JSON.stringify({ mc: { s_mc: 0 }, oe: { s_oe: "Risposta valida" } }),
+      Full_Evaluation: JSON.stringify({
+        openEndedDetails: [{ questionId: "s_oe", score: 4, feedback: "Parziale" }],
+      }),
+    },
+  ] as any[];
+
+  const analysis = computeExamItemAnalysis(subs);
+  assert.equal(analysis.mcStats.length, 1);
+  assert.equal(analysis.mcStats[0].accuracyPercent, 100);
+  assert.equal(analysis.subjectiveStats.length, 1);
+  assert.equal(analysis.subjectiveStats[0].id, "s_oe");
+  assert.equal(analysis.subjectiveStats[0].averageScore, 4);
+  assert.equal(analysis.subjectiveStats[0].needsReview, true);
+});
+
+test("isWorkbookExamData: distingue correttamente Workbook reali da Quiz a sezioni o array vuoti", () => {
+  assert.equal(isWorkbookExamData(null), false);
+  assert.equal(isWorkbookExamData({ title: "Quiz Base", multipleChoice: [{ id: "1" }] }), false);
+  assert.equal(isWorkbookExamData({ title: "Quiz sections vuoto", sections: [], multipleChoice: [{ id: "1" }] }), false);
+  assert.equal(
+    isWorkbookExamData({
+      title: "Quiz a Sezioni",
+      sections: [
+        {
+          title: "Parte 1",
+          multipleChoice: [{ id: "mc1", question: "Q1", options: ["A", "B"], correctIndex: 0 }],
+          openEnded: [{ id: "oe1", question: "Aperta" }],
+        },
+      ],
+    }),
+    false
+  );
+  assert.equal(
+    isWorkbookExamData({
+      title: "Workbook Reale",
+      sections: [
+        {
+          title: "Unita 1",
+          sintesi: "Testo di sintesi didattica",
+          fillInTheBlank: [{ id: "fib1", sentence: "____", answer: "test" }],
+          reflectionQuestions: [{ id: "rq1", question: "Rifletti" }],
+        },
+      ],
+    }),
+    true
+  );
+});
+
+test("Round 5: Quiz a sezioni calcolo voto + detectGradeDiscrepancy e Workbook sole crocette", () => {
+  const secQuiz = {
+    title: "Quiz Sezioni",
+    sections: [
+      {
+        title: "Mod 1",
+        multipleChoice: [
+          { id: "q_mc1", correctIndex: 0 },
+          { id: "q_mc2", correctIndex: 1 },
+        ],
+        openEnded: [{ id: "q_oe1", question: "Spiega" }],
+      },
+    ],
+  };
+  const quizBreakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData: secQuiz,
+    answers: { mc: { q_mc1: 0, q_mc2: 0 }, oe: { q_oe1: "Risposta chiara" } },
+    evaluation: { openEndedDetails: [{ questionId: "q_oe1", score: 8 }] },
+  });
+  // MC 1/2 = 5/10 (2.5 pt) + OE 8/10 (4 pt) = 6.5
+  near(quizBreakdown.finalNumeric, 6.5);
+  assert.equal(
+    detectGradeDiscrepancy({
+      Tipo: "Quiz",
+      Voto_Suggerito: quizBreakdown.finalGradeFormatted,
+      Domande_Esame: JSON.stringify(secQuiz),
+      Risposte_Studente: JSON.stringify({ mc: { q_mc1: 0, q_mc2: 0 }, oe: { q_oe1: "Risposta chiara" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "q_oe1", score: 8 }] }),
+      Punteggio_MC: 1,
+    }),
+    false
+  );
+  assert.equal(
+    detectGradeDiscrepancy({
+      Tipo: "Quiz",
+      Voto_Suggerito: "9.0 (9)",
+      Domande_Esame: JSON.stringify(secQuiz),
+      Risposte_Studente: JSON.stringify({ mc: { q_mc1: 0, q_mc2: 0 }, oe: { q_oe1: "Risposta chiara" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "q_oe1", score: 8 }] }),
+      Punteggio_MC: 1,
+    }),
+    true
+  );
+
+  // Workbook with ONLY multipleChoice (root + sections[], rqCount === 0, fibCount === 0)
+  const wbOnlyMc = {
+    title: "Workbook Solo Crocette",
+    multipleChoice: [{ id: "w_r1", correctIndex: 0 }],
+    sections: [
+      {
+        title: "Sezione MC",
+        multipleChoice: [{ id: "w_s1", correctIndex: 1 }],
+      },
+    ],
+  };
+  const wbBreakdown = extractBreakdownFromSubmission({
+    Tipo: "Workbook",
+    Domande_Esame: JSON.stringify(wbOnlyMc),
+    Risposte_Studente: JSON.stringify({ mc: { w_r1: 0, w_s1: 1 } }),
+    Full_Evaluation: JSON.stringify({ evaluationMode: "deterministic", calculatedMCScore: 2 }),
+    Punteggio_MC: 2,
+    Voto_Suggerito: "10.0 (10)",
+  });
+  assert.notEqual(wbBreakdown.finalGradeFormatted, "N.V.");
+  near(wbBreakdown.finalNumeric, 10);
+  assert.equal(wbBreakdown.objectivePart?.score, 2);
+  assert.equal(wbBreakdown.objectivePart?.total, 2);
+});
+
+test("Round 5: parseItalianGrade rifiuta o segnala fuori scala i voti di rettifica massiva", () => {
+  assert.ok(Number.isNaN(parseItalianGrade("abc")));
+  const tooHigh = parseItalianGrade("15");
+  assert.equal(tooHigh < 1 || tooHigh > 10.5, true);
+  const tooLow = parseItalianGrade("0");
+  assert.equal(tooLow < 1 || tooLow > 10.5, true);
+  near(parseItalianGrade("10 e lode"), 10.5);
+  near(parseItalianGrade("6,5"), 6.5);
+});
+
+test("Round 6: computeExamItemAnalysis non ruba score di details[0] per domande aperte omesse o senza id", () => {
+  const examWithTwoOpenAndRootFib = {
+    openEnded: [
+      { id: "oe1", question: "Prima aperta" },
+      { id: "oe2", question: "Seconda aperta (omessa)" },
+    ],
+    fillInTheBlank: [
+      { id: "rf1", sentence: "La ___ tutela i cittadini", answer: "legge" },
+    ],
+  };
+
+  // Submission 1: only oe1 evaluated; oe2 missing -> oe2 must stay pending, NOT steal oe1 score (9)
+  // Submission 2: legacy ID-less details -> positional 1-to-1 alignment (6 and 8), NOT [6, 6]
+  const subs: any[] = [
+    {
+      id: "r6_1",
+      Tipo: "Quiz",
+      Domande_Esame: JSON.stringify(examWithTwoOpenAndRootFib),
+      Risposte_Studente: JSON.stringify({ oe: { oe1: "Risposta 1", oe2: "Risposta 2" }, wbFib: { rf1: "legge" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 9 }] }),
+    },
+    {
+      id: "r6_2",
+      Tipo: "Quiz",
+      Domande_Esame: JSON.stringify(examWithTwoOpenAndRootFib),
+      Risposte_Studente: JSON.stringify({ oe: { oe1: "Altra 1", oe2: "Altra 2" }, fib: { rf1: "norma" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ score: 6 }, { score: 8 }] }),
+    },
+  ];
+
+  const analysis = computeExamItemAnalysis(subs);
+  assert.equal(analysis.fibStats.length, 1);
+  assert.equal(analysis.fibStats[0].accuracyPercent, 50);
+
+  assert.equal(analysis.subjectiveStats.length, 2);
+  // oe1: scores 9 and 6 -> avg 7.5, pending 0
+  near(analysis.subjectiveStats[0].averageScore!, 7.5);
+  assert.equal(analysis.subjectiveStats[0].evaluatedCount, 2);
+  assert.equal(analysis.subjectiveStats[0].pendingCount, 0);
+  // oe2: only score 8 from r6_2; r6_1 stayed pending (did NOT steal 9)
+  near(analysis.subjectiveStats[1].averageScore!, 8);
+  assert.equal(analysis.subjectiveStats[1].evaluatedCount, 1);
+  assert.equal(analysis.subjectiveStats[1].pendingCount, 1);
+});
+
+test("Round 6: evaluateMcSelection gestisce stringhe, vuoti, indici fuori range senza falsi zeri", () => {
+  const q = { id: "q1", options: ["Zero", "Uno", "Due"], correctIndex: 0 };
+  assert.equal(evaluateMcSelection(q, 0).isCorrect, true);
+  assert.equal(evaluateMcSelection(q, "0").isCorrect, true);
+  assert.equal(evaluateMcSelection(q, "0").selectedText, "Zero");
+  // Empty string or whitespace must NOT coerce via Number("") === 0!
+  assert.equal(evaluateMcSelection(q, "").hasSelection, false);
+  assert.equal(evaluateMcSelection(q, "").isCorrect, false);
+  assert.equal(evaluateMcSelection(q, "   ").hasSelection, false);
+  assert.equal(evaluateMcSelection(q, undefined).hasSelection, false);
+  assert.equal(evaluateMcSelection(q, null).hasSelection, false);
+  // Out of bounds or non-integer rejected safely
+  assert.equal(evaluateMcSelection(q, 5).hasSelection, false);
+  assert.equal(evaluateMcSelection(q, -1).hasSelection, false);
+  assert.equal(evaluateMcSelection(q, "abc").hasSelection, false);
+  // Correct non-zero index
+  const q2 = { id: "q2", options: ["A", "B"], correctIndex: 1 };
+  assert.equal(evaluateMcSelection(q2, "1").isCorrect, true);
+  assert.equal(evaluateMcSelection(q2, 0).isCorrect, false);
+});
+
+test("Round 6: applySubjectiveRetouchToDetails normalizza voci legacy senza id evitando duplicati", () => {
+  const questions = [
+    { id: "oe_1", question: "Prima" },
+    { id: "oe_2", question: "Seconda" },
+  ];
+  const legacyDetails = [
+    { score: 5, feedback: "Vecchio 1" },
+    { score: 7, feedback: "Vecchio 2" },
+  ];
+  const updated = applySubjectiveRetouchToDetails({
+    kind: "open_ended",
+    questions,
+    details: legacyDetails,
+    getAnswer: () => "Testo",
+    questionId: "oe_2",
+    newScore: 8.5,
+    newFeedback: "Rivista dal docente",
+  });
+  assert.equal(updated.length, 2);
+  assert.equal(updated[0].questionId, "oe_1");
+  assert.equal(updated[0].score, 5);
+  assert.equal(updated[1].questionId, "oe_2");
+  assert.equal(updated[1].score, 8.5);
+  assert.equal(updated[1].teacherEdited, true);
+});
+
+test("Round 6: computeFilaEquitySummary & computeMetacognitionSummary", () => {
+  const subs: any[] = [
+    { id: "1", Assigned_Fila: "A", Voto_Suggerito: "8", Autovalutazione: "6", Full_Evaluation: "{}" },
+    { id: "2", Assigned_Fila: "A", Voto_Suggerito: "7.5", Autovalutazione: "7.5", Full_Evaluation: "{}" },
+    { id: "3", Assigned_Fila: "B", Voto_Suggerito: "5.5", Autovalutazione: "7", Full_Evaluation: "{}" },
+    { id: "4", Assigned_Fila: "B", Voto_Suggerito: "6", Autovalutazione: "6", Full_Evaluation: "{}" },
+    { id: "5", Assigned_Fila: "B", Voto_Suggerito: "N.V.", Autovalutazione: "8", Full_Evaluation: '{"evaluationMode":"pending"}' },
+  ];
+
+  const equity = computeFilaEquitySummary(subs);
+  assert.equal(equity.hasMixedFila, true);
+  assert.equal(equity.filaA.count, 2);
+  near(equity.filaA.averageGrade!, 7.75);
+  assert.equal(equity.filaA.passRate, 100);
+  assert.equal(equity.filaB.count, 3);
+  assert.equal(equity.filaB.gradedCount, 2);
+  near(equity.filaB.averageGrade!, 5.75);
+  assert.equal(equity.filaB.passRate, 50);
+  near(equity.gradeDelta!, 2);
+  assert.equal(equity.isBalanced, false);
+
+  const meta = computeMetacognitionSummary(subs);
+  assert.equal(meta.count, 4); // N.V. skipped
+  assert.equal(meta.underestimatedCount, 1); // 6 - 8 = -2
+  assert.equal(meta.calibratedCount, 2); // deltas 0 and 0
+  assert.equal(meta.overestimatedCount, 1); // 7 - 5.5 = +1.5
+  near(meta.avgSelfGrade!, 6.63, 0.02);
+  near(meta.avgFinalGrade!, 6.75, 0.02);
+});
+
+test("Round 7: buildExamPreviewSummary & extractReusableExamFromSubmissions", () => {
+  const wbExam = {
+    title: "Workbook Costituzione",
+    sections: [
+      {
+        title: "Principi Fondamentali",
+        sintesi: "Analisi dei primi articoli.",
+        multipleChoice: [
+          { id: "mc1", question: "Q1?", options: ["A", "B", "C", "D"], correctIndex: 1 },
+          { id: "mc2", question: "Q2?", options: ["Si", "No"], correctIndex: 0 },
+        ],
+        fillInTheBlank: [{ id: "f1", sentence: "Art. 1: L'Italia è una ___", answer: "repubblica" }],
+        reflectionQuestions: [{ id: "rq1", question: "Commenta l'art. 3" }],
+        glossary: [{ term: "Democrazia", definition: "Governo del popolo" }],
+      },
+    ],
+  };
+
+  const summary = buildExamPreviewSummary(wbExam);
+  assert.equal(summary.examType, "Workbook");
+  assert.equal(summary.sectionsCount, 1);
+  assert.equal(summary.mcCount, 2);
+  assert.equal(summary.fibCount, 1);
+  assert.equal(summary.reflectionCount, 1);
+  assert.equal(summary.glossaryCount, 1);
+  assert.equal(summary.totalItems, 4);
+  assert.equal(summary.besReducedMcCount, 1); // Only mc1 has >=4 options
+  assert.ok(summary.estimatedMinutes >= 5);
+
+  const strippedDeferred = stripExamAnswers(wbExam).sanitizedExam;
+  const subs: any[] = [
+    {
+      id: "sub_def",
+      Soluzioni_Differite: true,
+      Session_Titolo: "Workbook Costituzione",
+      Domande_Esame: JSON.stringify(strippedDeferred),
+    },
+    {
+      id: "sub_ok",
+      Soluzioni_Differite: false,
+      Session_Titolo: "Workbook Costituzione",
+      Domande_Esame: JSON.stringify(wbExam),
+    },
+  ];
+
+  const extractedOnlyStripped = extractReusableExamFromSubmissions([subs[0]]);
+  assert.equal(extractedOnlyStripped, null);
+
+  const extracted = extractReusableExamFromSubmissions(subs);
+  assert.ok(extracted !== null);
+  assert.equal(extracted?.examType, "Workbook");
+  assert.equal(extracted?.title, "Workbook Costituzione");
+  assert.equal(extracted?.examObj?.sections?.[0]?.multipleChoice?.[0]?.correctIndex, 1);
+  assert.equal(extracted?.examObj?.sections?.[0]?.fillInTheBlank?.[0]?.answer, "repubblica");
+});
+
+test("Round 7: buildExamOutcomeMatrix & buildExamItemAnalysisCsv", () => {
+  const quizExam = {
+    title: "Verifica Storia",
+    multipleChoice: [
+      { id: "mc1", question: "Domanda 1", options: ["A", "B"], correctIndex: 0 },
+      { id: "mc2", question: "Domanda 2", options: ["X", "Y"], correctIndex: 1 },
+    ],
+    openEnded: [{ id: "oe1", question: "Spiega le cause" }],
+  };
+
+  const subs: any[] = [
+    {
+      id: "s1",
+      Nome: "Mario Rossi",
+      Email: "mario@scuola.it",
+      Classe: "3A",
+      Assigned_Fila: "A",
+      Voto_Suggerito: "9.0 (9)",
+      Domande_Esame: JSON.stringify(quizExam),
+      Risposte_Studente: JSON.stringify({ mc: { mc1: 0, mc2: 1 }, oe: { oe1: "Ottima spiegazione" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 8 }] }),
+    },
+    {
+      id: "s2",
+      Nome: "Lucia Bianchi",
+      Email: "lucia@scuola.it",
+      Classe: "3A",
+      Assigned_Fila: "B",
+      Voto_Suggerito: "4.0 (4)",
+      Domande_Esame: JSON.stringify(quizExam),
+      Risposte_Studente: JSON.stringify({ mc: { mc1: 1 }, oe: { oe1: "=FORMULA_INJECTION" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oe1", score: 4 }] }),
+    },
+  ];
+
+  const analysis = computeExamItemAnalysis(subs);
+  const matrix = buildExamOutcomeMatrix(subs);
+  assert.deepEqual(
+    matrix.columns.map((c) => c.code),
+    ["D1", "D2", "A1"]
+  );
+  assert.equal(matrix.rows.length, 2);
+  assert.equal(matrix.rows[0].hasIssues, false);
+  assert.deepEqual(
+    matrix.rows[0].cells.map((c) => c.status),
+    ["correct", "correct", "scored"]
+  );
+  assert.equal(matrix.rows[1].hasIssues, true);
+  assert.deepEqual(
+    matrix.rows[1].cells.map((c) => c.status),
+    ["wrong", "blank", "scored"]
+  );
+  assert.equal(matrix.rows[1].cells[2].score, 4);
+
+  const csvBlind = buildExamItemAnalysisCsv(analysis, matrix, {
+    examTitle: "Verifica Storia",
+    blindMode: true,
+  });
+  assert.ok(csvBlind.startsWith("\ufeff"));
+  assert.ok(!csvBlind.includes("Mario Rossi"));
+  assert.ok(!csvBlind.includes("lucia@scuola.it"));
+  assert.ok(csvBlind.includes("Studente STU-"));
+  assert.ok(csvBlind.includes(';"OK";"OK";"8"'));
+  assert.ok(csvBlind.includes(';"ERR";"VUOTO";"4"'));
+});
+
 console.log(`\n${passed} test superati, ${failed} falliti.`);
 process.exit(failed > 0 ? 1 : 0);
+
 

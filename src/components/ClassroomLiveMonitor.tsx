@@ -19,7 +19,8 @@ import {
   MessageSquare,
   Send,
   Eye,
-  EyeOff
+  EyeOff,
+  Download
 } from "lucide-react";
 import { collection, onSnapshot, deleteDoc, doc, updateDoc, getDocs, writeBatch } from "firebase/firestore";
 import { dbFirestore } from "../firebase";
@@ -27,6 +28,7 @@ import type { LiveSessionSummary } from "../types";
 import { deriveStudentPseudonym } from "../utils/privacyPseudonym";
 import { compareClassLabels, normalizeClassLabel } from "../utils/classGrouping";
 import { addMinutesToExpiryIso } from "../utils/deferredSolutions";
+import { sanitizeCsvCell } from "../utils/gradebookExport";
 
 export interface LiveStudentData {
   id: string;
@@ -68,6 +70,7 @@ interface ClassroomLiveMonitorProps {
   onTerminateAllSessions?: () => void;
   onToggleSolutionsReleased?: (pin: string, nextReleased: boolean, targetClass?: string) => Promise<void>;
   onExtendSessionTime?: (pin: string, minutesToAdd: number) => Promise<void>;
+  onSessionMaxExtended?: (pin: string, nextMaxIso: string) => void;
   onPurgeArchivedSession?: (pin: string) => Promise<void>;
   terminatingPin?: string | null;
   terminatingAll?: boolean;
@@ -90,6 +93,7 @@ export default function ClassroomLiveMonitor({
   onTerminateAllSessions,
   onToggleSolutionsReleased,
   onExtendSessionTime,
+  onSessionMaxExtended,
   onPurgeArchivedSession,
   terminatingPin = null,
   terminatingAll = false,
@@ -101,7 +105,7 @@ export default function ClassroomLiveMonitor({
   const [loading, setLoading] = useState(true);
   const [snapshotError, setSnapshotError] = useState("");
   const [search, setSearch] = useState("");
-  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked">("all");
+  const [filter, setFilter] = useState<"all" | "in_progress" | "submitted" | "alerts" | "locked" | "stuck">("all");
   const [currentTime, setCurrentTime] = useState(Date.now());
   const [clearing, setClearing] = useState(false);
   const [confirmClear, setConfirmClear] = useState(false);
@@ -212,6 +216,7 @@ export default function ClassroomLiveMonitor({
 
   // Listen to Firestore real-time collection of live students in this session
   useEffect(() => {
+    progressChangedAtRef.current = {};
     if (!dbFirestore || !cleanPin) {
       setStudents([]);
       setLoading(false);
@@ -319,6 +324,14 @@ export default function ClassroomLiveMonitor({
   const alertsCount = resolvedStudents.filter(
     s => isSendingSignal(s.lastHeartbeat) && (s.tabSwitches > 0 || s.pasteAttempts > 0)
   ).length;
+  const isStudentStuck = (s: LiveStudentData) => {
+    if (s.status === "offline" || s.status === "submitted" || s.locked) return false;
+    if (s.answeredCount >= s.totalQuestions) return false;
+    const track = progressChangedAtRef.current[s.id];
+    const stagnantMs = track ? currentTime - track.changedAt : 0;
+    return stagnantMs >= 3 * 60 * 1000;
+  };
+  const stuckCount = resolvedStudents.filter(isStudentStuck).length;
   const connectedCount = inProgressCount + submittedCount + waitingCount;
   const submittedNamesSummary = submittedStudents.length === 1
     ? getMonitorName(submittedStudents[0])
@@ -400,6 +413,7 @@ export default function ClassroomLiveMonitor({
       if (!matchesSearch) return false;
 
       if (filter === "locked") return s.locked;
+      if (filter === "stuck") return isStudentStuck(s);
       if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
       if (filter === "submitted") return s.status === "submitted";
       if (filter === "alerts") return s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0;
@@ -416,6 +430,68 @@ export default function ClassroomLiveMonitor({
       // 3. Alphabetical (respect blind LIM mode so order doesn't reveal surname)
       return getMonitorName(a).localeCompare(getMonitorName(b));
     });
+
+  const handleExportLiveCsv = () => {
+    if (!cleanPin || resolvedStudents.length === 0) return;
+    const rows = [
+      [
+        "Studente",
+        "Email / Codice",
+        "Classe",
+        "Fila",
+        "Stato",
+        "Risposte Date",
+        "Totale Domande",
+        "Progresso %",
+        "Uscite Pagina",
+        "Incolla Bloccati",
+        "Bloccato",
+        "Motivo Blocco",
+        "Ingresso Aula",
+        "Ultimo Segnale",
+      ],
+      ...filteredStudents.map((s) => [
+        sanitizeCsvCell(getMonitorName(s)),
+        sanitizeCsvCell(blindLimMode ? getMonitorCode(s) : s.studentEmail),
+        sanitizeCsvCell(s.studentClass || ""),
+        sanitizeCsvCell(s.assignedFila || ""),
+        sanitizeCsvCell(
+          s.status === "submitted"
+            ? "Consegnato"
+            : s.locked
+            ? "Bloccato"
+            : s.status === "offline"
+            ? "Non connesso"
+            : s.status === "waiting"
+            ? "In attesa"
+            : s.status === "self_evaluating"
+            ? "Autovalutazione"
+            : isStudentStuck(s)
+            ? "Fermo >3m"
+            : "In prova"
+        ),
+        String(Math.min(s.answeredCount, s.totalQuestions)),
+        String(s.totalQuestions),
+        `${Math.min(100, Math.max(0, s.currentProgressPercent || 0))}%`,
+        String(s.tabSwitches),
+        String(s.pasteAttempts),
+        s.locked ? "SI" : "NO",
+        sanitizeCsvCell(blindLimMode ? (s.locked ? "Modalita LIM cieca" : "") : s.lockReason || ""),
+        sanitizeCsvCell(s.joinedAt ? new Date(s.joinedAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) : ""),
+        sanitizeCsvCell(s.lastHeartbeat ? new Date(s.lastHeartbeat).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""),
+      ]),
+    ];
+    const csvContent = "\uFEFF" + rows.map((r) => r.join(";")).join("\r\n");
+    const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement("a");
+    a.href = url;
+    a.download = `monitor_aula_${cleanPin}_${new Date().toISOString().slice(0, 10)}.csv`;
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
 
   const handleClearRoom = async () => {
     const cleanPin = pin?.trim().toUpperCase();
@@ -440,6 +516,7 @@ export default function ClassroomLiveMonitor({
       }
 
       // Also ensure local state is immediately cleared without waiting for listener
+      progressChangedAtRef.current = {};
       setStudents([]);
       setClearSuccess(true);
       setConfirmClear(false);
@@ -539,6 +616,7 @@ export default function ClassroomLiveMonitor({
           await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
             maxExtendedExpiry: nextIso,
           });
+          onSessionMaxExtended?.(cleanPin, nextIso);
         } catch (syncMaxErr) {
           console.warn("Aggiornamento maxExtendedExpiry sessione non riuscito (non bloccante):", syncMaxErr);
         }
@@ -791,6 +869,17 @@ export default function ClassroomLiveMonitor({
                         Scadenza: {new Date(s.expiry).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
                       </p>
                     )}
+                    {s.maxExtendedExpiry &&
+                      Date.parse(s.maxExtendedExpiry) > currentTime &&
+                      (!s.expiry || Date.parse(s.maxExtendedExpiry) > Date.parse(s.expiry) + 30_000) && (
+                        <p className="text-[10px] text-sky-300 font-mono font-semibold">
+                          ⏱️ Estesa fino alle{" "}
+                          {new Date(s.maxExtendedExpiry).toLocaleTimeString("it-IT", {
+                            hour: "2-digit",
+                            minute: "2-digit",
+                          })}
+                        </p>
+                      )}
                     <div className="flex flex-wrap items-center gap-1.5 mt-1.5">
                       {s.deferSolutions && (
                         <span
@@ -1005,6 +1094,22 @@ export default function ClassroomLiveMonitor({
               <span className="text-xs px-2.5 py-0.5 rounded-lg bg-indigo-500/20 text-indigo-300 font-mono font-bold border border-indigo-500/30">
                 PIN: {cleanPin || "—"}
               </span>
+              {activeMonitoredSession?.maxExtendedExpiry &&
+                Date.parse(activeMonitoredSession.maxExtendedExpiry) > currentTime &&
+                (!activeMonitoredSession.expiry ||
+                  Date.parse(activeMonitoredSession.maxExtendedExpiry) >
+                    Date.parse(activeMonitoredSession.expiry) + 30_000) && (
+                  <span
+                    className="text-[11px] px-2 py-0.5 rounded-lg bg-sky-500/15 text-sky-200 border border-sky-500/30 font-mono font-bold"
+                    title="Scadenza effettiva più estesa considerando proroghe individuali/collettive attive"
+                  >
+                    ⏱️ Estesa fino alle{" "}
+                    {new Date(activeMonitoredSession.maxExtendedExpiry).toLocaleTimeString("it-IT", {
+                      hour: "2-digit",
+                      minute: "2-digit",
+                    })}
+                  </span>
+                )}
             </h3>
           </div>
           <p className="text-xs text-slate-400 mt-1">
@@ -1129,6 +1234,16 @@ export default function ClassroomLiveMonitor({
             <Unlock className="w-3.5 h-3.5 text-emerald-400" />
             <span>Sblocco Docente Diretto 1-Click</span>
           </div>
+          <button
+            type="button"
+            onClick={handleExportLiveCsv}
+            disabled={!cleanPin || filteredStudents.length === 0}
+            className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white hover:border-teal-400/40 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-40"
+            title="Esporta in CSV l'elenco live delle presenze, avanzamento e segnalazioni (rispetta Modalità LIM Cieca)"
+          >
+            <Download className="w-3.5 h-3.5 text-teal-400" />
+            <span>Esporta CSV</span>
+          </button>
           <div className="px-3 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-xs font-mono text-slate-300 flex items-center gap-1.5">
             <Wifi className="w-3.5 h-3.5 text-emerald-400" />
             <span>Feed Real-time Attivo</span>
@@ -1583,6 +1698,20 @@ export default function ClassroomLiveMonitor({
             >
               <Lock className="w-3.5 h-3.5 text-red-400" />
               <span>Bloccati ({lockedCount})</span>
+            </button>
+          )}
+          {stuckCount > 0 && (
+            <button
+              onClick={() => setFilter(filter === "stuck" ? "all" : "stuck")}
+              className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
+                filter === "stuck"
+                  ? "bg-amber-500 text-slate-950 shadow-md ring-2 ring-amber-300"
+                  : "bg-amber-950/60 text-amber-200 hover:text-white border border-amber-500/40"
+              }`}
+              title="Studenti connessi senza avanzamento da oltre 3 minuti"
+            >
+              <Clock className="w-3.5 h-3.5" />
+              <span>Fermi &gt;3m ({stuckCount})</span>
             </button>
           )}
           {[

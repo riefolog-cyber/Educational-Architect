@@ -130,6 +130,7 @@ export interface Evaluation {
   fibScore?: number; // Calculated fill-in-blank score
   fibTotal?: number; // Total blanks
   gradeBreakdown?: any; // Full mathematical breakdown, when available
+  deferredSolutionsLocked?: boolean;
 }
 
 export interface SavedSubmission {

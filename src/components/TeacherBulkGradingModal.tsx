@@ -9,6 +9,7 @@ import {
   EyeOff,
   FileSpreadsheet,
   Loader2,
+  Search,
 } from "lucide-react";
 import type { SavedSubmission } from "../types";
 import {
@@ -68,6 +69,8 @@ export default function TeacherBulkGradingModal({
   const [preset, setPreset] = useState<GradebookExportPreset>("argo_didup");
   const [onlyValidatedExport, setOnlyValidatedExport] = useState(false);
   const [applyRoundingOnValidate, setApplyRoundingOnValidate] = useState(true);
+  const [searchTerm, setSearchTerm] = useState<string>("");
+  const [sortOrder, setSortOrder] = useState<"recent" | "grade_desc" | "grade_asc" | "name_asc">("recent");
   const [quickFilter, setQuickFilter] = useState<"all" | "unvalidated" | "violations" | "attention" | "pending">("all");
   const [overrides, setOverrides] = useState<Record<string, string>>({});
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
@@ -131,7 +134,23 @@ export default function TeacherBulkGradingModal({
   }, [classFiltered]);
 
   const rows = useMemo(() => {
-    return classFiltered.filter((s) => {
+    const q = searchTerm.trim().toLowerCase();
+    const filtered = classFiltered.filter((s) => {
+      if (q) {
+        const blindCode = getSubmissionBlindCode(s).toLowerCase();
+        const pin = String(s.Pin || "").toLowerCase();
+        const title = String(s.Session_Titolo || s.Tipo || "").toLowerCase();
+        const cls = resolveSubmissionClass(s).toLowerCase();
+        const matches = blindGradingMode
+          ? blindCode.includes(q) || pin.includes(q) || title.includes(q) || cls.includes(q)
+          : String(s.Nome || "").toLowerCase().includes(q) ||
+            String(s.Email || "").toLowerCase().includes(q) ||
+            blindCode.includes(q) ||
+            pin.includes(q) ||
+            title.includes(q) ||
+            cls.includes(q);
+        if (!matches) return false;
+      }
       if (quickFilter === "unvalidated") return !s.Convalida_Docente_At;
       if (quickFilter === "violations") return getViolationsCount(s) > 0;
       if (quickFilter === "attention") {
@@ -141,7 +160,25 @@ export default function TeacherBulkGradingModal({
       if (quickFilter === "pending") return isSubPending(s);
       return true;
     });
-  }, [classFiltered, quickFilter]);
+
+    const sorted = [...filtered];
+    sorted.sort((a, b) => {
+      if (sortOrder === "grade_desc" || sortOrder === "grade_asc") {
+        const rawA = parseItalianGrade(overrides[a.id] ?? a.Voto_Suggerito);
+        const rawB = parseItalianGrade(overrides[b.id] ?? b.Voto_Suggerito);
+        const numA = Number.isFinite(rawA) ? rawA : sortOrder === "grade_desc" ? -1 : 99;
+        const numB = Number.isFinite(rawB) ? rawB : sortOrder === "grade_desc" ? -1 : 99;
+        if (numA !== numB) return sortOrder === "grade_desc" ? numB - numA : numA - numB;
+      } else if (sortOrder === "name_asc") {
+        const nameA = blindGradingMode ? getSubmissionBlindCode(a) : String(a.Nome || "");
+        const nameB = blindGradingMode ? getSubmissionBlindCode(b) : String(b.Nome || "");
+        const cmp = nameA.localeCompare(nameB);
+        if (cmp !== 0) return cmp;
+      }
+      return Date.parse(b.Timestamp || "") - Date.parse(a.Timestamp || "");
+    });
+    return sorted;
+  }, [classFiltered, quickFilter, searchTerm, sortOrder, blindGradingMode, overrides]);
 
   if (!isOpen) return null;
 
@@ -189,11 +226,21 @@ export default function TeacherBulkGradingModal({
       return;
     }
 
+    const invalidRows: string[] = [];
     const updates: BulkValidationUpdate[] = [];
     for (const sub of targetRows) {
-      const raw = overrides[sub.id] ?? sub.Voto_Suggerito;
+      const typedRaw = overrides[sub.id];
+      if (typedRaw !== undefined && typedRaw.trim() !== "") {
+        const parsedOverride = parseItalianGrade(typedRaw);
+        if (!Number.isFinite(parsedOverride) || parsedOverride < 1 || parsedOverride > 10.5) {
+          const label = blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Studente");
+          invalidRows.push(`${label} ("${typedRaw.trim()}")`);
+          continue;
+        }
+      }
+      const raw = typedRaw && typedRaw.trim() !== "" ? typedRaw : sub.Voto_Suggerito;
       if (!raw || raw === "N.V.") continue;
-      if (applyRoundingOnValidate || overrides[sub.id] !== undefined) {
+      if (applyRoundingOnValidate || (typedRaw !== undefined && typedRaw.trim() !== "")) {
         const formatted = formatGradeForRegister(raw, applyRoundingOnValidate ? roundingMode : "exact");
         updates.push({
           id: sub.id,
@@ -202,6 +249,13 @@ export default function TeacherBulkGradingModal({
       } else {
         updates.push({ id: sub.id, nextGrade: sub.Voto_Suggerito });
       }
+    }
+
+    if (invalidRows.length > 0) {
+      setStatusMsg(
+        `⚠️ Voto manuale non valido per: ${invalidRows.slice(0, 3).join(", ")}${invalidRows.length > 3 ? "…" : ""}. Inserisci un voto tra 1 e 10 (es. 6+, 7½, 8).`
+      );
+      return;
     }
 
     if (updates.length === 0) {
@@ -370,7 +424,7 @@ export default function TeacherBulkGradingModal({
           </div>
         </div>
 
-        {/* Quick Filters & Smart Selection row */}
+        {/* Quick Filters, Search, Sort & Smart Selection row */}
         <div className="px-4 sm:px-5 py-2.5 bg-slate-950/60 border-b border-white/10 flex flex-wrap items-center justify-between gap-2 text-[11px]">
           <div className="flex flex-wrap items-center gap-1.5">
             {(
@@ -400,16 +454,39 @@ export default function TeacherBulkGradingModal({
               </button>
             ))}
           </div>
-          <button
-            type="button"
-            onClick={handleSelectCleanUnvalidated}
-            disabled={cleanUnvalidatedRows.length === 0}
-            className="px-3 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-40 border border-emerald-500/35 text-emerald-200 font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
-            title="Seleziona in 1 click gli elaborati non convalidati, valutati e senza segnalazioni anti-copia"
-          >
-            <Check className="w-3.5 h-3.5" />
-            <span>Seleziona regolari ({cleanUnvalidatedRows.length})</span>
-          </button>
+          <div className="flex flex-wrap items-center gap-2">
+            <div className="relative">
+              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-2.5 top-1/2 -translate-y-1/2 pointer-events-none" />
+              <input
+                type="text"
+                value={searchTerm}
+                onChange={(e) => setSearchTerm(e.target.value)}
+                placeholder={blindGradingMode ? "Cerca codice/PIN..." : "Cerca studente/PIN..."}
+                className="pl-7 pr-2.5 py-1 bg-slate-900 border border-white/15 rounded-lg text-white placeholder-slate-500 text-[11px] outline-none focus:border-indigo-400 w-40 sm:w-48"
+              />
+            </div>
+            <select
+              value={sortOrder}
+              onChange={(e) => setSortOrder(e.target.value as any)}
+              className="px-2 py-1 bg-slate-900 border border-white/15 rounded-lg text-slate-200 text-[11px] outline-none cursor-pointer"
+              title="Ordina tabella registro rapido"
+            >
+              <option value="recent">🕒 Recenti</option>
+              <option value="grade_desc">🏆 Voto 10 ➔ 1</option>
+              <option value="grade_asc">📉 Voto 1 ➔ 10</option>
+              <option value="name_asc">🔤 Ordine A-Z</option>
+            </select>
+            <button
+              type="button"
+              onClick={handleSelectCleanUnvalidated}
+              disabled={cleanUnvalidatedRows.length === 0}
+              className="px-3 py-1 rounded-lg bg-emerald-500/15 hover:bg-emerald-500/25 disabled:opacity-40 border border-emerald-500/35 text-emerald-200 font-bold flex items-center gap-1.5 cursor-pointer transition-colors"
+              title="Seleziona in 1 click gli elaborati non convalidati, valutati e senza segnalazioni anti-copia"
+            >
+              <Check className="w-3.5 h-3.5" />
+              <span>Seleziona regolari ({cleanUnvalidatedRows.length})</span>
+            </button>
+          </div>
         </div>
 
         {/* Options row & notifications */}
@@ -435,7 +512,7 @@ export default function TeacherBulkGradingModal({
             </label>
           </div>
           {statusMsg && (
-            <span className="font-semibold text-emerald-300">{statusMsg}</span>
+            <span className={`font-semibold ${statusMsg.startsWith("⚠️") || statusMsg.startsWith("❌") ? "text-rose-300" : "text-emerald-300"}`}>{statusMsg}</span>
           )}
         </div>
 
@@ -539,19 +616,34 @@ export default function TeacherBulkGradingModal({
                           )}
                         </td>
                         <td className="p-3 text-center">
-                          <input
-                            type="text"
-                            placeholder={sub.Voto_Suggerito || "es. 7½"}
-                            value={overrides[sub.id] ?? ""}
-                            onChange={(e) => {
-                              const val = e.target.value;
-                              setOverrides((prev) => ({ ...prev, [sub.id]: val }));
-                              if (val.trim()) {
-                                setSelectedIds((prev) => new Set(prev).add(sub.id));
-                              }
-                            }}
-                            className="w-20 px-2 py-1 text-center bg-slate-950 border border-white/15 focus:border-amber-400 rounded-lg text-amber-200 font-mono text-xs outline-none"
-                          />
+                          {(() => {
+                            const typedVal = overrides[sub.id] ?? "";
+                            const trimmedTyped = typedVal.trim();
+                            const parsedTyped = trimmedTyped ? parseItalianGrade(trimmedTyped) : NaN;
+                            const isInvalidTyped =
+                              trimmedTyped !== "" &&
+                              (!Number.isFinite(parsedTyped) || parsedTyped < 1 || parsedTyped > 10.5);
+                            return (
+                              <input
+                                type="text"
+                                placeholder={sub.Voto_Suggerito || "es. 7½"}
+                                value={typedVal}
+                                onChange={(e) => {
+                                  const val = e.target.value;
+                                  setOverrides((prev) => ({ ...prev, [sub.id]: val }));
+                                  if (val.trim()) {
+                                    setSelectedIds((prev) => new Set(prev).add(sub.id));
+                                  }
+                                }}
+                                title={isInvalidTyped ? "Valore non valido (usa 1–10, es. 6+, 7½)" : "Inserisci voto manuale"}
+                                className={`w-20 px-2 py-1 text-center bg-slate-950 border rounded-lg font-mono text-xs outline-none ${
+                                  isInvalidTyped
+                                    ? "border-rose-500 text-rose-300 focus:border-rose-400"
+                                    : "border-white/15 focus:border-amber-400 text-amber-200"
+                                }`}
+                              />
+                            );
+                          })()}
                         </td>
                         <td className="p-3 text-center">
                           <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-teal-500/10 border border-teal-500/25 text-teal-300 font-mono font-bold">

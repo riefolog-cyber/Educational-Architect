@@ -160,6 +160,10 @@ service cloud.firestore {
         (!('mixFilaAB' in data) || data.mixFilaAB is bool) &&
         (!('allowAudioAnswers' in data) || data.allowAudioAnswers is bool) &&
         (!('besOptions' in data) || data.besOptions is map) &&
+        (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
+        (!('unlockCode' in data) || (data.unlockCode is string && data.unlockCode.size() <= 64)) &&
+        (!('data' in data) || data.data is map || (data.data is string && data.data.size() <= 650000)) &&
+        (!('filaBData' in data) || data.filaBData is map || (data.filaBData is string && data.filaBData.size() <= 650000)) &&
         (!('solutionsReleasedAt' in data) || (data.solutionsReleasedAt is string && data.solutionsReleasedAt.size() <= 64));
     }
 
@@ -188,10 +192,23 @@ service cloud.firestore {
         (!('Nome' in data) || (data.Nome is string && data.Nome.size() <= 200)) &&
         (!('Classe' in data) || (data.Classe is string && data.Classe.size() <= 40)) &&
         (!('Pseudo_Id' in data) || (data.Pseudo_Id is string && data.Pseudo_Id.size() <= 64)) &&
+        (!('PII_Oscurate_Count' in data) || (data.PII_Oscurate_Count is int && data.PII_Oscurate_Count >= 0 && data.PII_Oscurate_Count <= 10000)) &&
+        (!('Voto_Originale_IA' in data) || (data.Voto_Originale_IA is string && data.Voto_Originale_IA.size() <= 40)) &&
+        (!('Autovalutazione' in data) || (data.Autovalutazione is string && data.Autovalutazione.size() <= 2000)) &&
+        (!('Punteggio_MC' in data) || (data.Punteggio_MC is number && data.Punteggio_MC >= 0 && data.Punteggio_MC <= 1000)) &&
+        (!('Punteggio_FIB' in data) || (data.Punteggio_FIB is number && data.Punteggio_FIB >= 0 && data.Punteggio_FIB <= 1000)) &&
+        (!('AntiCopia_TabSwitch' in data) || (data.AntiCopia_TabSwitch is int && data.AntiCopia_TabSwitch >= 0 && data.AntiCopia_TabSwitch <= 10000)) &&
+        (!('AntiCopia_IncollaBloccato' in data) || (data.AntiCopia_IncollaBloccato is int && data.AntiCopia_IncollaBloccato >= 0 && data.AntiCopia_IncollaBloccato <= 10000)) &&
+        (!('AntiCopia_SchermoDiviso' in data) || (data.AntiCopia_SchermoDiviso is int && data.AntiCopia_SchermoDiviso >= 0 && data.AntiCopia_SchermoDiviso <= 10000)) &&
+        (!('AntiCopia_InfractionsLog' in data) || (data.AntiCopia_InfractionsLog is string && data.AntiCopia_InfractionsLog.size() <= 100000)) &&
+        (!('Errori_Principali' in data) || (data.Errori_Principali is string && data.Errori_Principali.size() <= 100000)) &&
+        (!('Feedback_Generale' in data) || (data.Feedback_Generale is string && data.Feedback_Generale.size() <= 100000)) &&
         (!('Full_Evaluation' in data) || (data.Full_Evaluation is string && data.Full_Evaluation.size() <= 300000)) &&
         (!('Risposte_Studente' in data) || (data.Risposte_Studente is string && data.Risposte_Studente.size() <= 250000)) &&
         (!('Domande_Esame' in data) || (data.Domande_Esame is string && data.Domande_Esame.size() <= 600000)) &&
         (!('Piano_Recupero' in data) || (data.Piano_Recupero is string && data.Piano_Recupero.size() <= 40000)) &&
+        (!('Convalida_Docente_At' in data) || (data.Convalida_Docente_At is string && data.Convalida_Docente_At.size() <= 64)) &&
+        (!('Convalida_Docente_Email' in data) || (data.Convalida_Docente_Email is string && data.Convalida_Docente_Email.size() <= 200)) &&
         (!('Soluzioni_Differite' in data) || data.Soluzioni_Differite is bool) &&
         (!('Assigned_Fila' in data) || data.Assigned_Fila in ['A', 'B']) &&
         (!('MC_Order' in data) || (data.MC_Order is string && data.MC_Order.size() <= 40000)) &&
@@ -209,7 +226,8 @@ service cloud.firestore {
     function isStudentRecoveryPlanUpdate() {
       return incoming().diff(existing()).affectedKeys().hasOnly(['Piano_Recupero']) &&
         incoming().Piano_Recupero is string &&
-        incoming().Piano_Recupero.size() <= 40000;
+        incoming().Piano_Recupero.size() <= 40000 &&
+        (!isSignedIn() || existing().Email.lower() == request.auth.token.email.lower());
     }
 
     function isValidLiveStudentWrite(data) {
@@ -239,13 +257,13 @@ service cloud.firestore {
         (!('lockState' in data) || data.lockState in ['locked', 'unlocked']) &&
         (!('lockReason' in data) || (data.lockReason is string && data.lockReason.size() <= 400)) &&
         (!('lockedAt' in data) || (data.lockedAt is string && data.lockedAt.size() <= 64)) &&
-        (!('answeredCount' in data) || data.answeredCount is int) &&
-        (!('totalQuestions' in data) || data.totalQuestions is int) &&
-        (!('mcDoneCount' in data) || data.mcDoneCount is int) &&
-        (!('openDoneCount' in data) || data.openDoneCount is int) &&
-        (!('currentProgressPercent' in data) || data.currentProgressPercent is int) &&
-        (!('tabSwitches' in data) || data.tabSwitches is int) &&
-        (!('pasteAttempts' in data) || data.pasteAttempts is int) &&
+        (!('answeredCount' in data) || (data.answeredCount is int && data.answeredCount >= 0 && data.answeredCount <= 500)) &&
+        (!('totalQuestions' in data) || (data.totalQuestions is int && data.totalQuestions >= 1 && data.totalQuestions <= 500)) &&
+        (!('mcDoneCount' in data) || (data.mcDoneCount is int && data.mcDoneCount >= 0 && data.mcDoneCount <= 500)) &&
+        (!('openDoneCount' in data) || (data.openDoneCount is int && data.openDoneCount >= 0 && data.openDoneCount <= 500)) &&
+        (!('currentProgressPercent' in data) || (data.currentProgressPercent is int && data.currentProgressPercent >= 0 && data.currentProgressPercent <= 100)) &&
+        (!('tabSwitches' in data) || (data.tabSwitches is int && data.tabSwitches >= 0 && data.tabSwitches <= 10000)) &&
+        (!('pasteAttempts' in data) || (data.pasteAttempts is int && data.pasteAttempts >= 0 && data.pasteAttempts <= 10000)) &&
         (!('remoteUnlockId' in data) || (data.remoteUnlockId is string && data.remoteUnlockId.size() <= 128)) &&
         (!('unlockedAt' in data) || (data.unlockedAt is string && data.unlockedAt.size() <= 64)) &&
         (!('unlockedBy' in data) || (data.unlockedBy is string && data.unlockedBy.size() <= 200)) &&
@@ -274,10 +292,13 @@ service cloud.firestore {
         !incoming().diff(existing()).affectedKeys().hasAny([
           'remoteUnlockId', 'unlockedAt', 'unlockedBy', 'teacherNotice', 'teacherNoticeAt', 'extendedExpiryIso'
         ]) &&
+        (!('assignedFila' in existing()) || incoming().get('assignedFila', '') == existing().assignedFila) &&
+        (!('joinedAt' in existing()) || existing().joinedAt.size() == 0 || incoming().get('joinedAt', '') == existing().joinedAt) &&
+        incoming().get('tabSwitches', 0) >= existing().get('tabSwitches', 0) &&
+        incoming().get('pasteAttempts', 0) >= existing().get('pasteAttempts', 0) &&
         (
           incoming().get('locked', false) == true ||
-          existing().get('locked', false) == false ||
-          incoming().get('status', '') == 'submitted'
+          existing().get('locked', false) == false
         );
     }
 
@@ -353,7 +374,11 @@ service cloud.firestore {
           (isTeacher() && isValidLiveStudentWrite(incoming())) ||
           isStudentLiveUpdate(sessionId)
         );
-        allow delete: if isTeacher() && isValidId(sessionId) && isValidId(studentId);
+        allow delete: if isTeacher() && isValidId(sessionId) && isValidId(studentId) && (
+          isPrimaryTeacher() ||
+          !exists(/databases/$(database)/documents/active_sessions/$(sessionId)) ||
+          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.teacherEmail.lower() == request.auth.token.email.lower()
+        );
       }
     }
   }

@@ -19,6 +19,7 @@ import {
   type LinkedFormQuestion
 } from "../utils/googleFormsLink";
 import { compressImageSource, fileToExamImage } from "../utils/imageData";
+import { getAuthHeaders } from "../firebase";
 
 interface GoogleFormsImportModalProps {
   isOpen: boolean;
@@ -195,8 +196,9 @@ export default function GoogleFormsImportModal({
 
     setLoadingLink(true);
     try {
+      const authHeaders = await getAuthHeaders();
       const response = await fetch(`/api/forms-import?url=${encodeURIComponent(value)}`, {
-        headers: { Accept: "application/json" }
+        headers: { Accept: "application/json", ...authHeaders }
       });
       const data = await response.json().catch(() => null);
       if (!response.ok) {
@@ -229,12 +231,13 @@ export default function GoogleFormsImportModal({
 
     setLoadingScript(true);
     try {
+      const authHeaders = await getAuthHeaders();
       // Se il docente ha incollato anche il link del modulo nel campo principale,
       // l'app lo inoltra allo script (?form=ID) così uno standalone legge quel modulo.
       const formParam = link.trim();
       const suffix = formParam ? `&form=${encodeURIComponent(formParam)}` : "";
       const response = await fetch(`/api/forms-script?app=${encodeURIComponent(app)}${suffix}`, {
-        headers: { Accept: "application/json" }
+        headers: { Accept: "application/json", ...authHeaders }
       });
       const data = await response.json().catch(() => null);
       if (!response.ok) {

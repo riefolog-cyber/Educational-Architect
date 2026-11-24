@@ -6,7 +6,7 @@ import crypto from "crypto";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
 import firebaseConfig from "./firebase-applet-config.json";
-import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, collectExamMultipleChoice, collectQuizOpenEnded, isWorkbookExamData } from "./src/utils";
 import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
@@ -471,6 +471,16 @@ async function requireTeacherAuth(req: express.Request, res: express.Response, n
   return next();
 }
 
+async function requireTeacherAuthStrict(req: express.Request, res: express.Response, next: express.NextFunction) {
+  if (req.method === "OPTIONS") return res.status(204).end();
+  const check = await verifyTeacherFromRequest(req);
+  if ("error" in check) {
+    return res.status(check.status).json({ error: check.error });
+  }
+  (req as any).teacherAuth = check;
+  return next();
+}
+
 // --- In-Memory Job Queue System (Evaluation Queue) ---
 interface EvaluationJob {
   id: string;
@@ -828,9 +838,86 @@ function decryptAnswerKey(token: unknown): any | null {
   }
 }
 
+async function fetchActiveSessionDoc(cleanPin: string): Promise<{ ok: boolean; status: number; fields: any }> {
+  const projectId = (firebaseConfig as any).projectId;
+  const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
+  if (!projectId || !cleanPin) return { ok: false, status: 500, fields: null };
+  const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 5000);
+  try {
+    const fsResp = await fetch(docUrl, { signal: controller.signal });
+    if (!fsResp.ok) return { ok: false, status: fsResp.status, fields: null };
+    const fsDoc: any = await fsResp.json().catch(() => null);
+    return { ok: true, status: 200, fields: fsDoc?.fields || {} };
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function parseSessionDeferredFields(fields: any) {
+  const fsSessionId = String(fields?.sessionId?.stringValue || "").trim();
+  const fsDefer = Boolean(fields?.deferSolutions?.booleanValue);
+  const fsReleased = Boolean(fields?.solutionsReleased?.booleanValue);
+  const fsReleasedClasses: string[] = Array.isArray(fields?.releasedClasses?.arrayValue?.values)
+    ? fields.releasedClasses.arrayValue.values
+        .map((v: any) => String(v?.stringValue || "").trim())
+        .filter(Boolean)
+    : [];
+  const fsAutoRelease = Boolean(fields?.autoReleaseSolutions?.booleanValue);
+  const fsExpiry = String(fields?.expiry?.stringValue || "").trim() || null;
+  const fsCreatedAt = String(fields?.createdAt?.stringValue || "").trim() || null;
+  const fsMaxExtendedExpiry = String(fields?.maxExtendedExpiry?.stringValue || "").trim() || null;
+  const besExtraField = fields?.besOptions?.mapValue?.fields?.extraTimePercent;
+  const fsBesExtraPct = Number(besExtraField?.integerValue ?? besExtraField?.doubleValue ?? 0) || 0;
+  return {
+    fsSessionId,
+    fsDefer,
+    fsReleased,
+    fsReleasedClasses,
+    fsAutoRelease,
+    fsExpiry,
+    fsCreatedAt,
+    fsMaxExtendedExpiry,
+    fsBesExtraPct,
+  };
+}
+
 async function runEvaluationCore(reqBody: any) {
   const { tipo, prompt, report } = reqBody;
-  const deferSolutions = Boolean(reqBody?.deferSolutions);
+  let deferSolutions = Boolean(reqBody?.deferSolutions);
+
+  // Server-authoritative guard: a student cannot bypass an active deferred lock
+  // on Firestore by tampering with reqBody.deferSolutions = false.
+  const cleanSessionPin = String(reqBody?.sessionPin || "").trim().toUpperCase();
+  if (!deferSolutions && cleanSessionPin && reqBody?.forceReevaluation !== true) {
+    try {
+      const fsResult = await fetchActiveSessionDoc(cleanSessionPin);
+      if (fsResult.ok && fsResult.fields) {
+        const parsedFs = parseSessionDeferredFields(fsResult.fields);
+        const reqSessionId = String(reqBody?.sessionId || "").trim();
+        const sameRun = !reqSessionId || !parsedFs.fsSessionId || reqSessionId === parsedFs.fsSessionId;
+        if (sameRun && parsedFs.fsDefer) {
+          const unlockedForStudent = isDeferredUnlockedForStudent({
+            deferSolutions: parsedFs.fsDefer,
+            solutionsReleased: parsedFs.fsReleased,
+            releasedClasses: parsedFs.fsReleasedClasses,
+            studentClass: String(reqBody?.studentClass || "").trim(),
+            autoReleaseSolutions: parsedFs.fsAutoRelease,
+            expiry: parsedFs.fsExpiry,
+            createdAt: parsedFs.fsCreatedAt,
+            maxExtendedExpiry: parsedFs.fsMaxExtendedExpiry,
+            besExtraTimePercent: parsedFs.fsBesExtraPct,
+          });
+          if (!unlockedForStudent) {
+            deferSolutions = true;
+          }
+        }
+      }
+    } catch (fsCheckErr) {
+      console.warn("[evaluate] Verifica server-side deferSolutions fallita:", fsCheckErr);
+    }
+  }
 
   if (!getApiKey()) {
     throw new Error("La chiave API di Gemini non è configurata nell'ambiente.");
@@ -851,14 +938,17 @@ async function runEvaluationCore(reqBody: any) {
 
   // Authoritatively recompute objective scores server-side once keys are present
   const normalizedTipo = String(tipo || "").trim().toLowerCase();
+  const sectionsAll = Array.isArray(report.domande?.sections) ? report.domande.sections : [];
   if (normalizedTipo === "quiz") {
-    const mcListAll = Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : [];
+    const mcListAll = [
+      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
+      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
+    ];
     if (mcListAll.length > 0 && report.risposte?.mc) {
       const mcCalc = mcWeightedScore(mcListAll, report.risposte.mc);
       report.punteggioMC = mcCalc.correct;
     }
   } else if (normalizedTipo === "workbook") {
-    const sectionsAll = Array.isArray(report.domande?.sections) ? report.domande.sections : [];
     const wbMcAll = [
       ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
       ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
@@ -871,8 +961,13 @@ async function runEvaluationCore(reqBody: any) {
       ...(Array.isArray(report.domande?.fillInTheBlank) ? report.domande.fillInTheBlank : []),
       ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
     ];
-    if (wbFibAll.length > 0 && report.risposte?.wbFib) {
-      const fibCalc = fibWeightedScore(wbFibAll, report.risposte.wbFib, isFibAnswerCorrect);
+    const hasWbFibAns = Boolean(report.risposte?.wbFib || report.risposte?.fib);
+    if (wbFibAll.length > 0 && hasWbFibAns) {
+      const mergedWbFibAns = {
+        ...(report.risposte?.fib && typeof report.risposte.fib === "object" ? report.risposte.fib : {}),
+        ...(report.risposte?.wbFib && typeof report.risposte.wbFib === "object" ? report.risposte.wbFib : {}),
+      };
+      const fibCalc = fibWeightedScore(wbFibAll, mergedWbFibAns, isFibAnswerCorrect);
       report.punteggioFIB = fibCalc.correct;
       report.totaleFIB = wbFibAll.length;
     }
@@ -885,6 +980,7 @@ async function runEvaluationCore(reqBody: any) {
   const safePrompt = scrubPromptPii(String(prompt || ""), piiIdentity).scrubbedText;
   const { scrubbedAnswers: aiSafeAnswers } = scrubAnswersForAi(report.risposte || {}, piiIdentity);
 
+  const deferredNotice = "Soluzioni e dettagli degli errori nascosti fino al rilascio da parte del docente.";
   const attachAuthoritativeFields = (resObj: any) => {
     if (!resObj || typeof resObj !== "object") return resObj;
     if (restoredFromVault && report.domande && !deferSolutions) {
@@ -893,6 +989,9 @@ async function runEvaluationCore(reqBody: any) {
     if (deferSolutions) {
       resObj.deferredSolutionsLocked = true;
       delete resObj.gradeBreakdown;
+      if (normalizedTipo === "quiz") {
+        resObj.mainErrors = deferredNotice;
+      }
     }
     resObj.calculatedMCScore = Number(report.punteggioMC || 0);
     if (report.punteggioFIB !== undefined) {
@@ -906,9 +1005,15 @@ async function runEvaluationCore(reqBody: any) {
 
   if (normalizedTipo === "quiz") {
     const mcScore = report.punteggioMC || 0;
-    const mcList = report.domande?.multipleChoice || [];
+    const mcList = [
+      ...(Array.isArray(report.domande?.multipleChoice) ? report.domande.multipleChoice : []),
+      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.multipleChoice) ? s.multipleChoice : [])),
+    ];
     const mcCount = mcList.length;
-    const oeList = report.domande?.openEnded || [];
+    const oeList = [
+      ...(Array.isArray(report.domande?.openEnded) ? report.domande.openEnded : []),
+      ...sectionsAll.flatMap((s: any) => (Array.isArray(s?.openEnded) ? s.openEnded : [])),
+    ];
     const oeCount = oeList.length;
 
     // CASE 1: QUIZ WITH ONLY MULTIPLE CHOICE QUESTIONS (No open-ended questions in exam)
@@ -934,8 +1039,6 @@ async function runEvaluationCore(reqBody: any) {
         punteggioMC: mcScore
       });
       const mathGrade = mathBreakdown.finalGradeFormatted;
-
-      const deferredNotice = "Soluzioni e dettagli degli errori nascosti fino al rilascio da parte del docente.";
       const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
 Questa prova è un Quiz composto ESCLUSIVAMENTE da domande a scelta multipla (crocette). In questo esame NON sono presenti domande aperte.
 Lo studente ha ottenuto un punteggio di ${mcScore} risposte esatte su ${mcCount} domande (punteggio matematico: ${((mcScore / (mcCount || 1)) * 10).toFixed(1)}/10), con voto scolastico: ${mathGrade}.
@@ -1189,32 +1292,53 @@ Dedica l'ultimo paragrafo del tuo giudizio complessivo ("openEndedEvaluation") a
 
   } else if (normalizedTipo === "workbook") {
     const sections = report.domande?.sections || [];
-    const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
-    const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-    
-    // Calculate or re-verify FIB score using flexible pedagogical synonym matching
-    let fibScore = report.punteggioFIB || 0;
-    if (fibList.length > 0 && report.risposte?.wbFib) {
-      const fibCalc = fibWeightedScore(fibList, report.risposte.wbFib, isFibAnswerCorrect);
-      fibScore = Math.max(fibScore, fibCalc.correct);
+    const fibList = [
+      ...(Array.isArray(report.domande?.fillInTheBlank) ? report.domande.fillInTheBlank : []),
+      ...sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
+    ];
+    const rqList = [
+      ...(Array.isArray(report.domande?.reflectionQuestions) ? report.domande.reflectionQuestions : []),
+      ...sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : [])),
+    ];
+
+    // Calculate or re-verify FIB score authoritatively on the server
+    const hasFibAns = Boolean(report.risposte?.wbFib || report.risposte?.fib);
+    let fibScore = Number(report.punteggioFIB || 0);
+    if (fibList.length > 0 && hasFibAns) {
+      const fibAnswersMerged = {
+        ...(report.risposte?.fib && typeof report.risposte.fib === "object" ? report.risposte.fib : {}),
+        ...(report.risposte?.wbFib && typeof report.risposte.wbFib === "object" ? report.risposte.wbFib : {}),
+      };
+      const fibCalc = fibWeightedScore(fibList, fibAnswersMerged, isFibAnswerCorrect);
+      fibScore = fibCalc.correct;
     }
     const fibCount = fibList.length > 0 ? fibList.length : (report.totaleFIB || 0);
     const rqCount = rqList.length;
 
-    // CASE 1: WORKBOOK WITH ONLY FILL-IN-THE-BLANK (No reflection questions)
+    const wbMcList = collectExamMultipleChoice(report.domande);
+    const wbMcCount = wbMcList.length;
+    const mcScore = Number(report.punteggioMC || 0);
+
+    // CASE 1: WORKBOOK WITH ONLY OBJECTIVE QUESTIONS (FIB and/or MC, no reflection questions)
     if (rqCount === 0) {
       const mathBreakdown = computeGradeBreakdown({
         tipo: "Workbook",
         examData: report.domande,
         answers: report.risposte,
-        punteggioFIB: fibScore
+        punteggioFIB: fibScore,
+        punteggioMC: mcScore,
       });
       const mathGrade = mathBreakdown.finalGradeFormatted;
-      const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
-Questa prova di Workbook è composta ESCLUSIVAMENTE da completamenti terminologici (Fill-in-the-blank / frasi da completare). NON sono presenti domande di riflessione aperta.
-L'alunno ha completato correttamente ${fibScore} frasi su ${fibCount} (voto matematico: ${mathGrade}).
-Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10.
+      const objectiveDescParts: string[] = [];
+      if (fibCount > 0) objectiveDescParts.push(`${fibScore}/${fibCount} completamenti FIB`);
+      if (wbMcCount > 0) objectiveDescParts.push(`${mcScore}/${wbMcCount} crocette a scelta multipla`);
+      const objectiveSummaryStr = objectiveDescParts.join(" e ") || `${fibScore}/${fibCount} completamenti FIB`;
 
+      const systemInstruction = `Sei un docente esperto della scuola secondaria di secondo grado italiana.
+Questa prova di Workbook è composta ESCLUSIVAMENTE da quesiti oggettivi (${fibCount > 0 && wbMcCount > 0 ? "completamenti terminologici e scelta multipla" : wbMcCount > 0 ? "domande a scelta multipla" : "completamenti terminologici / frasi da completare"}). NON sono presenti domande di riflessione aperta.
+L'alunno ha conseguito: ${objectiveSummaryStr} (voto matematico: ${mathGrade}).
+Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10.
+${deferSolutions ? `\nMODALITÀ SOLUZIONI DIFFERITE ATTIVA: NON rivelare nel feedback le parole attese o le opzioni corrette/errate dei singoli quesiti.\n` : ""}
 Fornisci un giudizio complessivo equilibrato e motivante.
 Dedica l'ultimo paragrafo all'analisi metacognitiva confrontando il voto ottenuto (${mathGrade}) con l'autovalutazione (${report.autovalutazione}/10).
 NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
@@ -1223,7 +1347,9 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         const response = await generateWithRetry({
           model: TASK_MODEL_PREFERENCE["evaluate"][0],
           models: TASK_MODEL_PREFERENCE["evaluate"],
-          contents: `Valuta la prova di completamento Workbook. Punteggio: ${fibScore}/${fibCount}. Risposte date: ${JSON.stringify(aiSafeAnswers)}`,
+          contents: deferSolutions
+            ? `Valuta la prova oggettiva Workbook (${objectiveSummaryStr}). I testi delle soluzioni sono nascosti per rilascio differito.`
+            : `Valuta la prova oggettiva Workbook. Punteggio: ${objectiveSummaryStr}. Risposte date: ${JSON.stringify(aiSafeAnswers)}`,
           config: {
             systemInstruction,
             temperature: 0.1,
@@ -1250,18 +1376,20 @@ NON menzionare riflessioni aperte mancanti poiché la prova non le prevedeva.`;
         evaluation.evaluationMode = "ai";
         evaluation.suggestedGrade = mathBreakdown.finalGradeFormatted;
         evaluation.fibScore = fibScore;
+        evaluation.fibTotal = fibCount;
         evaluation.reflectionDetails = [];
         evaluation.gradeBreakdown = mathBreakdown;
         return attachAuthoritativeFields(evaluation);
       } catch (aiErr: any) {
-        console.warn("[evaluate] Fallback deterministico workbook di soli completamenti:", aiErr?.message || aiErr);
-        // Nessuna riflessione da valutare: il voto resta quello dei completamenti.
-        const reserveGrade = fibCount > 0 ? mathBreakdown.finalGradeFormatted : "N.V.";
+        console.warn("[evaluate] Fallback deterministico workbook solo oggettivo:", aiErr?.message || aiErr);
+        // Nessuna riflessione da valutare: il voto resta quello dei quesiti oggettivi (FIB e/o MC).
+        const reserveGrade = (fibCount > 0 || wbMcCount > 0) ? mathBreakdown.finalGradeFormatted : "N.V.";
         return attachAuthoritativeFields({
           suggestedGrade: reserveGrade,
-          overallFeedback: `Valutazione deterministica (riserva senza IA): frasi completate correttamente ${fibScore}/${fibCount}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
+          overallFeedback: `Valutazione deterministica (riserva senza IA): ${objectiveSummaryStr}, voto scolastico ${reserveGrade}. Autovalutazione studente: ${report.autovalutazione || "N/D"}/10.`,
           reflectionDetails: [],
           fibScore: fibScore,
+          fibTotal: fibCount,
           evaluationMode: "deterministic",
           gradeBreakdown: mathBreakdown
         });
@@ -1293,11 +1421,14 @@ Ogni feedback per ciascuna risposta a domanda di riflessione ("reflectionDetails
 - 💡 **Spunto di riflessione:** [Crea un aggancio stimolante, ponendo un nuovo quesito o spunto che stimoli lo studente a proseguire il proprio percorso di maturazione concettuale]
 
 [DIRETTIVA CRITICA DI COERENZA DIDATTICA]
-${fibCount > 0
-  ? `L'alunno ha totalizzato un punteggio di ${fibScore} su ${fibCount} nella sezione delle frasi da completare (Fill-in-the-blank / parole mancanti).
-Il voto finale complessivo viene calcolato matematicamente sul server integrando questo punteggio con i voti che assegnerai alle riflessioni critiche (peso: 50% parole mancanti/FIB, 50% riflessioni scritte).
-Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie ad un punteggio positivo nei completamenti delle frasi, EVITA di definire l'andamento della prova come globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci che lo studente mostra un'ottima comprensione dei concetti oggettivi (frasi completate correttamente), valorizzando con tatto i progressi anche nella parte di riflessione. Custodisci la coerenza logica tra il voto finale numerico e la valutazione qualitativa complessiva.`
-  : `Questa prova di Workbook è composta ESCLUSIVAMENTE da domande di riflessione critica (non sono presenti completamenti di frasi o parole mancanti). Il voto finale sarà determinato al 100% dalla profondità, onestà e maturità delle riflessioni scritte. Non menzionare esercizi di completamento.`}
+${(fibCount > 0 || wbMcCount > 0)
+  ? `Oltre alle riflessioni aperte, la prova prevede quesiti oggettivi in cui l'alunno ha conseguito: ${[
+      fibCount > 0 ? `${fibScore}/${fibCount} frasi completate (FIB)` : "",
+      wbMcCount > 0 ? `${mcScore}/${wbMcCount} crocette a scelta multipla` : "",
+    ].filter(Boolean).join(" e ")}.
+Il voto finale complessivo viene calcolato matematicamente sul server integrando questa parte oggettiva (peso 50%) con i voti che assegnerai alle riflessioni critiche (peso 50%).
+Nel tuo giudizio generale complessivo ("overallFeedback"), assicurati di essere coerente: se il voto finale complessivo risulta ampiamente sufficiente (voto >= 6.0) ad esempio grazie a un buon punteggio nella parte oggettiva, EVITA di definire l'andamento della prova come globalmente "insufficiente". Sii invece equilibrato e motivante: chiarisci cosa ha già consolidato nei quesiti oggettivi e valorizza con tatto i margini di miglioramento nelle riflessioni, custodendo la coerenza logica tra voto numerico e giudizio.`
+  : `Questa prova di Workbook è composta ESCLUSIVAMENTE da domande di riflessione critica (non sono presenti completamenti di frasi né crocette a scelta multipla). Il voto finale sarà determinato al 100% dalla profondità, onestà e maturità delle riflessioni scritte. Non menzionare esercizi di completamento o a scelta multipla.`}
 
 [ANALISI METACOGNITIVA]
 Lo studente si è autovalutato con il voto: ${report.autovalutazione || "Non specificato"}/10. 
@@ -1392,6 +1523,7 @@ Dedica l'ultima parte del tuo giudizio complessivo ("overallFeedback") ad analiz
       evaluation.reflectionDetails = audit.details;
 
       evaluation.fibScore = fibScore;
+      evaluation.fibTotal = fibCount;
       evaluation.evaluationMode = "ai";
       const mixedBreakdown = computeGradeBreakdown({
         tipo: "Workbook",
@@ -1594,7 +1726,8 @@ async function runRecoveryCore(reqBody: any) {
     throw new Error("La chiave API di Gemini non è configurata nell'ambiente. Contatta l'amministratore scolastico.");
   }
 
-  const hasOpenEnded = ((examData?.openEnded || []).length > 0) || 
+  const hasOpenEnded =
+    collectQuizOpenEnded(examData).length > 0 ||
     ((examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []).length > 0);
 
   const examFormatInstruction = hasOpenEnded
@@ -1732,7 +1865,7 @@ function processRecoveryQueue() {
   }
 }
 
-app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
+app.post("/api/generate-recovery-plan", evalRateLimiter, async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
 
   if (!getApiKey()) {
@@ -1740,6 +1873,51 @@ app.post("/api/generate-recovery-plan", evalRateLimiter, (req, res) => {
   }
   if (!req.body || typeof req.body !== "object") {
     return res.status(400).json({ error: "Richiesta del piano di recupero priva dei dati della consegna." });
+  }
+
+  // Server-authoritative guard: if this recovery plan targets an active session
+  // whose deferred solutions are still locked for the student, block generation (403)
+  // so students cannot reconstruct solutions via tutor hints before release.
+  const cleanPin = String(req.body?.sessionPin || req.body?.pin || "").trim().toUpperCase();
+  const requestedSessionId = String(req.body?.sessionId || "").trim();
+  const studentClass = String(req.body?.studentClass || "").trim();
+  if (cleanPin) {
+    const teacherCheck = await verifyTeacherFromRequest(req);
+    if (!teacherCheck.ok) {
+      const fsResult = await fetchActiveSessionDoc(cleanPin);
+      if (fsResult.ok && fsResult.fields) {
+        const {
+          fsSessionId,
+          fsDefer,
+          fsReleased,
+          fsReleasedClasses,
+          fsAutoRelease,
+          fsExpiry,
+          fsCreatedAt,
+          fsMaxExtendedExpiry,
+          fsBesExtraPct,
+        } = parseSessionDeferredFields(fsResult.fields);
+        const sessionMatches = !requestedSessionId || !fsSessionId || requestedSessionId === fsSessionId;
+        if (sessionMatches && fsDefer) {
+          const unlockedForStudent = isDeferredUnlockedForStudent({
+            deferSolutions: fsDefer,
+            solutionsReleased: fsReleased,
+            releasedClasses: fsReleasedClasses,
+            studentClass,
+            autoReleaseSolutions: fsAutoRelease,
+            expiry: fsExpiry,
+            createdAt: fsCreatedAt,
+            maxExtendedExpiry: fsMaxExtendedExpiry,
+            besExtraTimePercent: fsBesExtraPct,
+          });
+          if (!unlockedForStudent) {
+            return res.status(403).json({
+              error: "Il Piano di Recupero personalizzato sarà disponibile dopo la pubblicazione delle soluzioni da parte del docente.",
+            });
+          }
+        }
+      }
+    }
   }
 
   // Stessa consegna => stesso piano: un doppio clic non genera due testi.
@@ -2549,48 +2727,28 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
       return res.status(400).json({ error: "Parametri sessione mancanti." });
     }
 
-    const fetchSessionDocWithTimeout = async () => {
-      const projectId = (firebaseConfig as any).projectId;
-      const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
-      if (!projectId) return { ok: false, status: 500, fields: null as any };
-      const docUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/active_sessions/${encodeURIComponent(cleanPin)}`;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), 5000);
-      try {
-        const fsResp = await fetch(docUrl, { signal: controller.signal });
-        if (!fsResp.ok) return { ok: false, status: fsResp.status, fields: null as any };
-        const fsDoc: any = await fsResp.json().catch(() => null);
-        return { ok: true, status: 200, fields: fsDoc?.fields || {} };
-      } finally {
-        clearTimeout(timer);
-      }
-    };
-
     let cachedFields: any = null;
     let resolvedSessionId = requestedSessionId;
 
     // Verify against Firestore active_sessions/{pin} unless caller is an authenticated teacher
     const teacherCheck = await verifyTeacherFromRequest(req);
     if (!teacherCheck.ok) {
-      const fsResult = await fetchSessionDocWithTimeout();
+      const fsResult = await fetchActiveSessionDoc(cleanPin);
       if (!fsResult.ok || !fsResult.fields) {
         return res.status(403).json({ error: "Sessione non più attiva o soluzioni non rilasciate pubblicamente." });
       }
       cachedFields = fsResult.fields;
-      const fsSessionId = String(cachedFields?.sessionId?.stringValue || "").trim();
-      const fsDefer = Boolean(cachedFields?.deferSolutions?.booleanValue);
-      const fsReleased = Boolean(cachedFields?.solutionsReleased?.booleanValue);
-      const fsReleasedClasses: string[] = Array.isArray(cachedFields?.releasedClasses?.arrayValue?.values)
-        ? cachedFields.releasedClasses.arrayValue.values
-            .map((v: any) => String(v?.stringValue || "").trim())
-            .filter(Boolean)
-        : [];
-      const fsAutoRelease = Boolean(cachedFields?.autoReleaseSolutions?.booleanValue);
-      const fsExpiry = String(cachedFields?.expiry?.stringValue || "").trim() || null;
-      const fsCreatedAt = String(cachedFields?.createdAt?.stringValue || "").trim() || null;
-      const fsMaxExtendedExpiry = String(cachedFields?.maxExtendedExpiry?.stringValue || "").trim() || null;
-      const besExtraField = cachedFields?.besOptions?.mapValue?.fields?.extraTimePercent;
-      const fsBesExtraPct = Number(besExtraField?.integerValue ?? besExtraField?.doubleValue ?? 0) || 0;
+      const {
+        fsSessionId,
+        fsDefer,
+        fsReleased,
+        fsReleasedClasses,
+        fsAutoRelease,
+        fsExpiry,
+        fsCreatedAt,
+        fsMaxExtendedExpiry,
+        fsBesExtraPct,
+      } = parseSessionDeferredFields(cachedFields);
 
       if (!resolvedSessionId && fsSessionId) {
         resolvedSessionId = fsSessionId;
@@ -2620,7 +2778,7 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     const assignedFila = String(req.body?.assignedFila || "").trim().toUpperCase();
     if (!keySource) {
       if (!cachedFields) {
-        const fsResult = await fetchSessionDocWithTimeout();
+        const fsResult = await fetchActiveSessionDoc(cleanPin);
         if (fsResult.ok) {
           cachedFields = fsResult.fields;
           if (!resolvedSessionId && cachedFields?.sessionId?.stringValue) {
@@ -2662,9 +2820,12 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
         if (sec && Array.isArray(sec.multipleChoice)) mcLists.push(...sec.multipleChoice);
       }
     }
-    const fibLists: any[] = Array.isArray(resolvedDomande?.sections)
-      ? resolvedDomande.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
-      : [];
+    const fibLists: any[] = [
+      ...(Array.isArray(resolvedDomande?.fillInTheBlank) ? resolvedDomande.fillInTheBlank : []),
+      ...(Array.isArray(resolvedDomande?.sections)
+        ? resolvedDomande.sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []))
+        : []),
+    ];
 
     const wrongList: string[] = [];
     mcLists.forEach((q: any, idx: number) => {
@@ -2781,7 +2942,9 @@ app.post("/api/generate-variant", teacherAiRateLimiter, requireTeacherAuth, asyn
     return res.status(400).json({ error: "Il JSON della prova sorgente non è valido." });
   }
 
-  const isWorkbook = Array.isArray(parsedSource.sections);
+  const isWorkbook = isWorkbookExamData(parsedSource);
+  const sourceMcList = isWorkbook ? [] : collectExamMultipleChoice(parsedSource);
+  const sourceOeList = isWorkbook ? [] : collectQuizOpenEnded(parsedSource);
   const sourceTitle = titleHint || String(parsedSource.title || "Verifica").trim();
   const variantTitle = /\bfila\s*b\b/i.test(sourceTitle) ? sourceTitle : `${sourceTitle} (Fila B)`;
 
@@ -2797,7 +2960,7 @@ REGOLE TASSATIVE:
       : `Sei un docente esperto della scuola italiana.
 Riceverai una verifica Quiz (Fila A) in formato JSON. Devi creare una **variante parallela equivalente (Fila B)** dello STESSO livello di difficoltà, argomento e struttura.
 REGOLE TASSATIVAMENTE RIGOROSE:
-1. Mantieni esattamente lo stesso numero di domande multipleChoice (${Array.isArray(parsedSource.multipleChoice) ? parsedSource.multipleChoice.length : 0}) e lo stesso numero di domande openEnded (${Array.isArray(parsedSource.openEnded) ? parsedSource.openEnded.length : 0}), oltre agli stessi eventuali "weight".
+1. Mantieni esattamente lo stesso numero di domande multipleChoice (${sourceMcList.length}) e lo stesso numero di domande openEnded (${sourceOeList.length}), oltre agli stessi eventuali "weight". Se la sorgente è organizzata in sezioni ("sections"), mantieni la medesima suddivisione o riporta tutte le domande equivalenti.
 2. Cambia formulazione, esempi, dati numerici/storici/testuali e distrattori affinché un alunno seduto vicino a chi fa la Fila A non possa copiare, pur affrontando prove equivalenti per difficoltà e obiettivi.
 3. Distribuisci le risposte esatte ("correctIndex" 0-3) in modo vario.
 4. Imposta "title" esattamente a "${variantTitle}".
@@ -2826,13 +2989,24 @@ REGOLE TASSATIVAMENTE RIGOROSE:
       throw new Error("L'IA ha restituito una struttura non valida per la Fila B.");
     }
     const normalized = normalizeExamStructure(parsedVariantRaw);
+    const hasNormalizedSections = Array.isArray(normalized.sections) && normalized.sections.length > 0;
     const examObj = {
       title: variantTitle,
       ...(isWorkbook
         ? { sections: normalized.sections || [] }
+        : hasNormalizedSections
+        ? {
+            sections: normalized.sections,
+            ...(Array.isArray(normalized.multipleChoice) && normalized.multipleChoice.length > 0
+              ? { multipleChoice: normalized.multipleChoice }
+              : {}),
+            ...(Array.isArray(normalized.openEnded) && normalized.openEnded.length > 0
+              ? { openEnded: normalized.openEnded }
+              : {}),
+          }
         : {
-            multipleChoice: normalized.multipleChoice || [],
-            openEnded: normalized.openEnded || [],
+            multipleChoice: collectExamMultipleChoice(normalized),
+            openEnded: collectQuizOpenEnded(normalized),
           }),
     };
     return res.json({
@@ -3172,7 +3346,7 @@ async function fetchJsonQuietly(url: string, headers: Record<string, string> = {
   }
 }
 
-app.get("/api/forms-import", async (req, res) => {
+app.get("/api/forms-import", teacherAiRateLimiter, requireTeacherAuthStrict, async (req, res) => {
   try {
     const formUrl = buildFormViewUrl(String(req.query.url || ""));
     const { html, finalUrl } = await fetchFormPage(formUrl);
@@ -3312,7 +3486,7 @@ function explainAppsScriptAnswer(answer: AppsScriptAnswer, target: string): stri
 
   return null;
 }
-app.get("/api/forms-script", async (req, res) => {
+app.get("/api/forms-script", teacherAiRateLimiter, requireTeacherAuthStrict, async (req, res) => {
   try {
     const endpoint = normalizeAppsScriptExecUrl(String(req.query.app || ""));
     if (!endpoint) {

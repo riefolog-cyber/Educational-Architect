@@ -9,6 +9,7 @@
 import { dbFirestore, handleFirestoreError, OperationType } from "../firebase";
 import { collection, getDocs, doc, getDoc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
 import { sanitizeFibQuestion } from "./examStructureRepair";
+import { isWorkbookExamData } from "../utils";
 
 export type LibraryExamType = "Quiz" | "Workbook";
 
@@ -199,9 +200,10 @@ export function countLibraryQuestions(examObj: any): { type: LibraryExamType; co
   }
 
   let totalCount = 0;
-  const isWorkbook = Array.isArray(examObj.sections) && examObj.sections.length > 0;
+  const isWorkbook = isWorkbookExamData(examObj);
+  const hasSections = Array.isArray(examObj.sections) && examObj.sections.length > 0;
 
-  if (isWorkbook) {
+  if (hasSections) {
     for (const s of examObj.sections) {
       if (!s) continue;
       if (Array.isArray(s.fillInTheBlank)) totalCount += s.fillInTheBlank.length;

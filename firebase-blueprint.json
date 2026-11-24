@@ -77,7 +77,11 @@
         "classNoticeAt": { "type": "string" },
         "classNoticeTargetClass": { "type": "string" },
         "archived": { "type": "boolean" },
-        "archivedAt": { "type": "string" }
+        "archivedAt": { "type": "string" },
+        "createdAt": { "type": "string" },
+        "unlockCode": { "type": "string" },
+        "data": { "type": "string" },
+        "filaBData": { "type": "string" }
       },
       "required": ["pin", "expiry"]
     },

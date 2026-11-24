@@ -45,10 +45,13 @@ import {
   Loader2,
   Megaphone,
   Bell,
-  X
+  X,
+  Search
 } from "lucide-react";
 
 import PrintableReportModal from "./PrintableReportModal";
+
+const hasMcAnswer = (val: unknown): boolean => val !== undefined && val !== null && val !== "";
 
 import { db, dbFirestore, handleFirestoreError, reportFirestoreError, OperationType } from "../firebase";
 import { Answers, Behavior, Evaluation, Infraction, BesOptions } from "../types";
@@ -71,6 +74,10 @@ import {
   SplitScreenDetection,
   computeGradeBreakdown,
   buildSubjectiveReviewEntries,
+  collectExamMultipleChoice,
+  collectQuizOpenEnded,
+  evaluateMcSelection,
+  isWorkbookExamData,
   auditSubjectiveEvaluation,
   isEvaluationPending,
   getPendingSubjectiveCount,
@@ -89,6 +96,7 @@ import {
   assignDeterministicFila,
   computeDeterministicMcOrder,
   computeDeterministicItemOrder,
+  stripExamAnswers,
 } from "../utils/examSecurity";
 import {
   saveScopedExamLock,
@@ -108,6 +116,7 @@ import {
   extractClassFromStudentName,
   parseAllowedClassList,
   resolveSubmissionClass,
+  compareClassLabels,
   UNSPECIFIED_CLASS_LABEL,
 } from "../utils/classGrouping";
 import { isDeferredUnlockedForStudent } from "../utils/deferredSolutions";
@@ -296,6 +305,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [activeSubTab, setActiveSubTab] = useState<"enter-pin" | "view-history">("enter-pin");
   const [historyList, setHistoryList] = useState<any[]>([]);
   const [historyClassFilter, setHistoryClassFilter] = useState<string>("ALL");
+  const [historyTypeFilter, setHistoryTypeFilter] = useState<"ALL" | "Quiz" | "Workbook" | "DEFERRED">("ALL");
+  const [historySearchQuery, setHistorySearchQuery] = useState<string>("");
   const [historyLoading, setHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState("");
   const [selectedPastSub, setSelectedPastSub] = useState<any | null>(null);
@@ -323,6 +334,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [unlockSolutionsError, setUnlockSolutionsError] = useState<string>("");
   const [unlockRetryNonce, setUnlockRetryNonce] = useState<number>(0);
   const lastExtendedExpiryIsoRef = useRef<string | null>(null);
+  const lastBaseSessionExpiryMsRef = useRef<number>(0);
   const [besExtraTimePercent, setBesExtraTimePercent] = useState<0 | 25 | 50>(0);
   const [assignedFila, setAssignedFila] = useState<"A" | "B" | undefined>(undefined);
   const assignedFilaRef = useRef<"A" | "B" | undefined>(undefined);
@@ -338,6 +350,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [pastSessionSolutionsReleased, setPastSessionSolutionsReleased] = useState<Record<string, boolean>>({});
   const [unlockedPastSubmissions, setUnlockedPastSubmissions] = useState<Record<string, { examData?: any; mainErrors?: string }>>({});
   const [pastUnlockingId, setPastUnlockingId] = useState<string | null>(null);
+  const [pastUnlockRetryNonce, setPastUnlockRetryNonce] = useState<number>(0);
+  const [pastUnlockStatusMsg, setPastUnlockStatusMsg] = useState<string>("");
+  const [printPastSub, setPrintPastSub] = useState<any | null>(null);
+  const [navOnlyMissing, setNavOnlyMissing] = useState<boolean>(false);
 
   // Answers State
   const [answers, setAnswers] = useState<Answers>({
@@ -455,10 +471,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       normalizeClassLabel(initialStudentClass) ||
       normalizeClassLabel(user?.studentClass) ||
       extractClassFromStudentName(user?.displayName) ||
-      normalizeClassLabel(loadScopedStudentClass(user?.email)) ||
+      normalizeClassLabel(loadScopedStudentClass(user?.email, undefined, undefined, sharedPcActive)) ||
       "";
     setStudentClassInput(nextClass);
-  }, [initialStudentClass, user?.email, user?.studentClass, user?.displayName]);
+  }, [initialStudentClass, user?.email, user?.studentClass, user?.displayName, sharedPcActive]);
 
   const warn5MinShownRef = useRef(false);
   const warn1MinShownRef = useRef(false);
@@ -474,6 +490,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     []
   );
 
+  const activeScreenRef = useRef(activeScreen);
+  useEffect(() => {
+    activeScreenRef.current = activeScreen;
+  }, [activeScreen]);
+
+  const deferSolutionsSessionRef = useRef(deferSolutionsSession);
+  useEffect(() => {
+    deferSolutionsSessionRef.current = deferSolutionsSession;
+  }, [deferSolutionsSession]);
+
+  const solutionsReleasedRef = useRef(solutionsReleased);
+  useEffect(() => {
+    solutionsReleasedRef.current = solutionsReleased;
+  }, [solutionsReleased]);
+
   useEffect(() => {
     setTeacherNoticeBanner(null);
     setClassNoticeBanner(null);
@@ -484,6 +515,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     lastClassNoticeAtRef.current = null;
     dismissedTeacherNoticeAtRef.current = null;
     dismissedClassNoticeAtRef.current = null;
+    lastBaseSessionExpiryMsRef.current = 0;
     setRemoteSolutionsReady(false);
   }, [sessionPin]);
 
@@ -834,14 +866,14 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       let openDoneCount = 0;
 
       if (activeType === "quiz") {
-        const mcList = Array.isArray(activeData?.multipleChoice) ? activeData.multipleChoice : [];
-        const oeList = Array.isArray(activeData?.openEnded) ? activeData.openEnded : [];
+        const mcList = collectExamMultipleChoice(activeData);
+        const oeList = collectQuizOpenEnded(activeData);
         const rqList = Array.isArray(activeData?.reflectionQuestions) ? activeData.reflectionQuestions : [];
         const mcIds = new Set(mcList.map((q: any) => q?.id).filter(Boolean));
         const oeIds = new Set(oeList.map((q: any) => q?.id).filter(Boolean));
         const mcDone = mcIds.size > 0
-          ? mcList.filter((q: any) => activeAns.mc?.[q.id] !== undefined).length
-          : Object.keys(activeAns.mc || {}).length;
+          ? mcList.filter((q: any) => hasMcAnswer(activeAns.mc?.[q.id])).length
+          : Object.values(activeAns.mc || {}).filter(hasMcAnswer).length;
         const oeDone = oeIds.size > 0
           ? oeList.filter((q: any) => String(activeAns.oe?.[q.id] ?? "").trim().length > 0).length
           : Object.keys(activeAns.oe || {}).filter((k) => String(activeAns.oe?.[k] ?? "").trim().length > 0).length;
@@ -865,8 +897,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           ? rqList.filter((r: any) => String(activeAns.wbRq?.[r.id] ?? activeAns.oe?.[r.id] ?? "").trim().length > 0).length
           : Object.keys(activeAns.wbRq || {}).filter((k) => String(activeAns.wbRq?.[k] ?? "").trim().length > 0).length;
         const mcDone = mcList.length > 0
-          ? mcList.filter((q: any) => activeAns.mc?.[q.id] !== undefined).length
-          : Object.keys(activeAns.mc || {}).length;
+          ? mcList.filter((q: any) => hasMcAnswer(activeAns.mc?.[q.id])).length
+          : Object.values(activeAns.mc || {}).filter(hasMcAnswer).length;
         mcDoneCount = mcDone + fibDone;
         openDoneCount = rqDone;
         totalQuestions = Math.max(1, fibList.length + rqList.length + mcList.length);
@@ -1084,12 +1116,14 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionPin, pin, user?.email]);
 
-  const releaseExamLock = useCallback((via: "remote" | "direct" = "remote") => {
+  const releaseExamLock = useCallback((via: "remote" | "direct" = "remote", skipCloudUnlock = false) => {
     lockedRef.current = false;
     setExamLocked(false);
     setLockReason("");
     persistExamLock(false);
-    void syncLockState(false, "");
+    if (!skipCloudUnlock && via !== "remote") {
+      void syncLockState(false, "");
+    }
     if (fullscreenLockTimerRef.current) {
       clearTimeout(fullscreenLockTimerRef.current);
       fullscreenLockTimerRef.current = null;
@@ -1120,7 +1154,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   useEffect(() => {
     if (!examLocked) return;
     if (activeScreen === "results") {
-      releaseExamLockRef.current("direct");
+      releaseExamLockRef.current("direct", true);
     }
   }, [activeScreen, examLocked]);
 
@@ -1459,7 +1493,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         if (examContent) {
           examContent = applyClientMcRandomization(examContent, !!sessionData.randomizeQuestions, savedPin, restoredRunId);
           setExamData(examContent);
-          setExamType(examContent.sections ? "workbook" : "quiz");
+          setExamType(isWorkbookExamData(examContent) ? "workbook" : "quiz");
         }
         setEncryptedAnswerKey(String(selectedKey || ""));
         const besOpts: BesOptions = sessionData.besOptions || {};
@@ -1474,6 +1508,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           .filter((v): v is string => typeof v === "string" && !isNaN(new Date(v).getTime()));
         const bestExpiry = candidateExpiries.sort((a, b) => new Date(b).getTime() - new Date(a).getTime())[0] || null;
         besExpiryIsoRef.current = extraPct > 0 ? (restoredBesExpiry || sessionData.expiry || null) : null;
+        const rawBaseMs = sessionData.expiry ? new Date(String(sessionData.expiry)).getTime() : NaN;
+        if (!isNaN(rawBaseMs)) {
+          lastBaseSessionExpiryMsRef.current = rawBaseMs;
+        }
         setExpiryTime(bestExpiry);
         setSessionCreatedAt(sessionData.createdAt || null);
         setSessionAutoRelease(!!sessionData.autoReleaseSolutions);
@@ -1602,9 +1640,13 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         email: user?.email || submission?.Email,
       });
 
+      const pastSubCls = resolveSubmissionClass(submission);
       const planHtml = await requestRecoveryPlan(
         {
           tipo: submission.Tipo,
+          sessionPin: submission?.Pin || "",
+          sessionId: submission?.Session_Id || "",
+          studentClass: pastSubCls === UNSPECIFIED_CLASS_LABEL ? "" : pastSubCls,
           studentPseudoId,
           studentName: user?.displayName || submission?.Nome || "",
           studentEmail: user?.email || submission?.Email || "",
@@ -1692,14 +1734,35 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         if (d?.expiry && !isNaN(new Date(String(d.expiry)).getTime())) {
           const nextClassExpiry = String(d.expiry);
           const nextClassMs = new Date(nextClassExpiry).getTime();
-          setExpiryTime((prevExpiry) => {
-            const prevMs = prevExpiry ? new Date(prevExpiry).getTime() : 0;
-            if (prevMs > 0 && nextClassMs > prevMs + 30_000 && activeScreen === "exam-space") {
-              const endStr = new Date(nextClassExpiry).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
-              setInfractionToastMsg(`⏱️ Il docente ha prorogato la scadenza della prova alle ${endStr}.`);
+          const prevBaseMs = lastBaseSessionExpiryMsRef.current;
+          if (prevBaseMs > 0 && nextClassMs > prevBaseMs + 30_000) {
+            const deltaMs = nextClassMs - prevBaseMs;
+            lastBaseSessionExpiryMsRef.current = nextClassMs;
+            setExpiryTime((prevExpiry) => {
+              const prevMs = prevExpiry ? new Date(prevExpiry).getTime() : prevBaseMs;
+              const extendedMs = Math.max(nextClassMs, prevMs + deltaMs);
+              const extendedIso = new Date(extendedMs).toISOString();
+              if (besExpiryIsoRef.current) {
+                const oldBesMs = Date.parse(besExpiryIsoRef.current);
+                if (Number.isFinite(oldBesMs)) {
+                  besExpiryIsoRef.current = new Date(oldBesMs + deltaMs).toISOString();
+                }
+              }
+              if (activeScreenRef.current === "exam-space") {
+                const endStr = new Date(extendedMs).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" });
+                setInfractionToastMsg(`⏱️ Il docente ha prorogato la scadenza della prova alle ${endStr}.`);
+              }
+              return extendedIso;
+            });
+          } else {
+            if (prevBaseMs === 0 || nextClassMs > prevBaseMs) {
+              lastBaseSessionExpiryMsRef.current = nextClassMs;
             }
-            return nextClassMs > prevMs ? nextClassExpiry : prevExpiry;
-          });
+            setExpiryTime((prevExpiry) => {
+              const prevMs = prevExpiry ? new Date(prevExpiry).getTime() : 0;
+              return nextClassMs > prevMs ? nextClassExpiry : prevExpiry;
+            });
+          }
         }
         const relCls = Array.isArray(d?.releasedClasses)
           ? parseAllowedClassList(d.releasedClasses.join(","))
@@ -1723,6 +1786,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         if (!readyForStudent && d?.deferSolutions === true) {
           setSolutionsReleased(false);
           setUnlockSolutionsError("");
+          setExamData((prevExam: any) => {
+            if (!prevExam || typeof prevExam !== "object") return prevExam;
+            return stripExamAnswers(prevExam).sanitizedExam;
+          });
+          setEvaluation((prevEval) =>
+            prevEval
+              ? {
+                  ...prevEval,
+                  deferredSolutionsLocked: true,
+                  ...(prevEval.mainErrors && !String(prevEval.mainErrors).toLowerCase().includes("nascost")
+                    ? { mainErrors: "Soluzioni e dettagli degli errori nascosti fino al rilascio da parte del docente." }
+                    : {}),
+                }
+              : prevEval
+          );
         }
       },
       (err) => console.warn("Ascolto sessione live:", err)
@@ -1744,7 +1822,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     const { text: cNoticeText, at: cNoticeAt, targetClass: cTargetClsRaw } = latestActiveSessionBroadcast;
     const cTargetCls = normalizeClassLabel(cTargetClsRaw);
     const myCls = normalizeClassLabel(resolvedStudentClass);
-    const noticeMatchesMyClass = !cTargetCls || !myCls || cTargetCls === myCls;
+    const noticeMatchesMyClass = !cTargetCls || cTargetCls === myCls;
 
     if (noticeMatchesMyClass) {
       recordNoticeInHistory({
@@ -1873,18 +1951,29 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   // History view: if a past submission had deferred solutions, verify Session_Id match and unlock via server vault
   useEffect(() => {
+    setPastUnlockStatusMsg("");
     if (!selectedPastSub?.Soluzioni_Differite || !selectedPastSub?.Pin || !dbFirestore) return;
     if (pastSessionSolutionsReleased[selectedPastSub.id]) return;
     const cleanPin = String(selectedPastSub.Pin).trim().toUpperCase();
     if (!cleanPin) return;
     let cancelled = false;
+    setPastUnlockingId(selectedPastSub.id);
     getDoc(doc(dbFirestore, "active_sessions", cleanPin))
       .then(async (snap) => {
-        if (cancelled || !snap.exists()) return;
+        if (cancelled) return;
+        if (!snap.exists()) {
+          if (pastUnlockRetryNonce > 0) {
+            setPastUnlockStatusMsg("Sessione d'aula già archiviata o rimossa dal server: chiedi al docente lo sblocco dal Registro.");
+          }
+          return;
+        }
         const sData = snap.data();
         const snapSessionId = String(sData?.sessionId || "").trim();
         const subSessionId = String(selectedPastSub.Session_Id || "").trim();
         if (snapSessionId && subSessionId && snapSessionId !== subSessionId) {
+          if (pastUnlockRetryNonce > 0) {
+            setPastUnlockStatusMsg("Il PIN è ora associato a una sessione successiva: chiedi al docente lo sblocco dal Registro.");
+          }
           return;
         }
         const pastStudentCls = resolveSubmissionClass(selectedPastSub);
@@ -1906,7 +1995,6 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           besExtraTimePercent: sBesExtra,
         });
         if (isPastUnlocked) {
-          setPastUnlockingId(selectedPastSub.id);
           try {
             const parsedExamData = safeParseJson(selectedPastSub.Domande_Esame) || {};
             const parsedAnswers = safeParseJson(selectedPastSub.Risposte_Studente) || {};
@@ -1936,17 +2024,31 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 },
               }));
               setPastSessionSolutionsReleased((prev) => ({ ...prev, [selectedPastSub.id]: true }));
+              setPastUnlockStatusMsg("");
+            } else if (!cancelled && pastUnlockRetryNonce > 0) {
+              setPastUnlockStatusMsg(data?.error || "Impossibile completare lo sblocco in questo momento.");
             }
-          } finally {
-            if (!cancelled) setPastUnlockingId(null);
+          } catch {
+            if (!cancelled && pastUnlockRetryNonce > 0) {
+              setPastUnlockStatusMsg("Errore di rete durante il controllo dello sblocco.");
+            }
           }
+        } else if (pastUnlockRetryNonce > 0) {
+          setPastUnlockStatusMsg("Le soluzioni risultano ancora bloccate dal docente per questa sessione.");
         }
       })
-      .catch(() => {});
+      .catch(() => {
+        if (!cancelled && pastUnlockRetryNonce > 0) {
+          setPastUnlockStatusMsg("Connessione al registro non disponibile. Riprova tra poco.");
+        }
+      })
+      .finally(() => {
+        if (!cancelled) setPastUnlockingId(null);
+      });
     return () => {
       cancelled = true;
     };
-  }, [selectedPastSub, pastSessionSolutionsReleased]);
+  }, [selectedPastSub, pastSessionSolutionsReleased, pastUnlockRetryNonce]);
 
   // Check custom pins (Firebase or Local Templates)
   const handleCheckPin = async () => {
@@ -2107,6 +2209,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setSessionRunId(currentRunIdForInit);
           setBesExtraTimePercent(extraPct);
           besExpiryIsoRef.current = anchoredBesIso;
+          const initBaseMs = sessionData.expiry ? new Date(String(sessionData.expiry)).getTime() : NaN;
+          lastBaseSessionExpiryMsRef.current = !isNaN(initBaseMs) ? initBaseMs : 0;
           if (besOpts.autoOpenAccessibilityBar) {
             setShowAccessibilityBar(true);
           }
@@ -2147,7 +2251,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           }
 
           setExamData(examContent);
-          setExamType(examContent?.sections ? "workbook" : "quiz");
+          setExamType(isWorkbookExamData(examContent) ? "workbook" : "quiz");
 
           const isDeferred = !!sessionData.deferSolutions;
           const initReleasedClasses = Array.isArray(sessionData.releasedClasses)
@@ -2915,7 +3019,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       });
       return;
     }
-    saveScopedStudentClass(user?.email, declaredClass);
+    saveScopedStudentClass(user?.email, declaredClass, undefined, undefined, sharedPcActive);
 
     // 1. Check if screen is split before starting
     const currentStatus = detectSplitScreenStatus();
@@ -3013,9 +3117,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     const missing: MissingQuestionItem[] = [];
 
     if (examType === "quiz") {
-      const mcList = examData?.multipleChoice || [];
+      const mcList = collectExamMultipleChoice(examData);
       mcList.forEach((q: any, idx: number) => {
-        if (answers.mc[q.id] === undefined) {
+        if (!hasMcAnswer(answers.mc?.[q.id])) {
           missing.push({
             id: q.id || `mc_${idx}`,
             label: `Domanda ${idx + 1}`,
@@ -3027,7 +3131,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         }
       });
 
-      const oeList = examData?.openEnded || [];
+      const oeList = collectQuizOpenEnded(examData);
       oeList.forEach((q: any, idx: number) => {
         if (!(answers.oe[q.id] || "").trim()) {
           missing.push({
@@ -3060,7 +3164,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       // 1. Root level multiple choice if present
       const rootMc = examData?.multipleChoice || [];
       rootMc.forEach((q: any, idx: number) => {
-        if (answers.mc[q.id] === undefined) {
+        if (!hasMcAnswer(answers.mc?.[q.id])) {
           missing.push({
             id: q.id || `root_mc_${idx}`,
             label: `Quesito Generale ${idx + 1}`,
@@ -3096,7 +3200,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         });
 
         (sec.multipleChoice || []).forEach((q: any, mIdx: number) => {
-          if (answers.mc[q.id] === undefined) {
+          if (!hasMcAnswer(answers.mc?.[q.id])) {
             missing.push({
               id: q.id || `mc_${sIdx}_${mIdx}`,
               label: `Quesito a scelta multipla #${mIdx + 1}`,
@@ -3110,7 +3214,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         });
 
         (sec.reflectionQuestions || []).forEach((r: any, rIdx: number) => {
-          if (!(answers.wbRq[r.id] || "").trim()) {
+          if (!(answers.wbRq[r.id] || answers.oe[r.id] || "").trim()) {
             missing.push({
               id: r.id || `rq_${sIdx}_${rIdx}`,
               label: `Riflessione critica #${rqIdx}`,
@@ -3318,7 +3422,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       // Defense in depth: even if an older server returned a partial evaluation,
       // never publish a grade when a written open answer has no numeric score.
       const openQuestions = rescue.examType === "quiz"
-        ? (rescue.examData?.openEnded || [])
+        ? collectQuizOpenEnded(rescue.examData)
         : (rescue.examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []);
       if (openQuestions.length > 0) {
         const audit = auditSubjectiveEvaluation({
@@ -3391,6 +3495,13 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             "NON SPEC.";
           const mcOrderObj = mcOptionOrderRef.current || {};
           const oralAnswersCount = oralQuestionIdsRef.current.size;
+          const effectiveDeferredLock =
+            Boolean(finalEval.deferredSolutionsLocked) ||
+            ((Boolean(rescue.deferSolutions) || deferSolutionsSessionRef.current) && !solutionsReleasedRef.current);
+          if (finalEval.deferredSolutionsLocked && !deferSolutionsSessionRef.current) {
+            setDeferSolutionsSession(true);
+            setSolutionsReleased(false);
+          }
           const submissionData: any = {
             Timestamp: timestamp,
             Docente_Email: cleanVal(rescue.teacherEmail),
@@ -3412,7 +3523,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             Full_Evaluation: JSON.stringify(finalEval),
             Risposte_Studente: JSON.stringify(rescue.answers),
             Domande_Esame: serializeExamForSubmission(rescue.examData),
-            Soluzioni_Differite: !!(rescue.deferSolutions && !rescue.solutionsReleased),
+            Soluzioni_Differite: effectiveDeferredLock,
             ...(resolvedFila ? { Assigned_Fila: resolvedFila } : {}),
             ...(Object.keys(mcOrderObj).length > 0 ? { MC_Order: JSON.stringify(mcOrderObj) } : {}),
             ...(oralAnswersCount > 0 ? { Oral_Answers_Count: oralAnswersCount } : {}),
@@ -3424,7 +3535,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             submissionData.Feedback_Generale = cleanVal(finalEval.openEndedEvaluation);
           } else {
             submissionData.Punteggio_FIB = rescue.calculatedFIBScore;
-            if (rescue.calculatedMCScore !== undefined && rescue.calculatedMCScore > 0) {
+            if (
+              rescue.calculatedMCScore !== undefined &&
+              collectExamMultipleChoice(rescue.examData).length > 0
+            ) {
               submissionData.Punteggio_MC = rescue.calculatedMCScore;
             }
             submissionData.Feedback_Generale = cleanVal(finalEval.overallFeedback);
@@ -3620,8 +3734,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       wbFib: { ...answers.wbFib },
       wbRq: { ...answers.wbRq },
     };
-    if (examType === "quiz" && examData?.openEnded) {
-      examData.openEnded.forEach((q: any) => {
+    if (examType === "quiz") {
+      collectQuizOpenEnded(examData).forEach((q: any) => {
         const text = answers.oe[q.id] || "";
         if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
       });
@@ -3695,6 +3809,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       prompt: evaluationPrompt,
       studentPseudoId,
       sessionPin: sessionPin || "",
+      sessionId: sessionRunId || "",
+      studentClass: resolvedStudentClass || "",
       encryptedAnswerKey: encryptedAnswerKey || "",
       mcOptionOrder: mcOptionOrderRef.current || {},
       deferSolutions: deferSolutionsSession && !solutionsReleased,
@@ -3842,6 +3958,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     setAllowAudioAnswersSession(false);
     setDeferSolutionsSession(false);
     setSolutionsReleased(false);
+    setRemoteSolutionsReady(false);
+    setUnlockSolutionsError("");
+    setPastUnlockStatusMsg("");
+    lastBaseSessionExpiryMsRef.current = 0;
     setActiveScreen("enter-pin");
     setPin("");
     setSessionPin("");
@@ -4091,13 +4211,23 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
                     return (
                       <div className="space-y-6 animate-fadeIn text-left text-slate-100">
-                        <button
-                          onClick={() => setSelectedPastSub(null)}
-                          className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white transition-colors mb-2 cursor-pointer"
-                        >
-                          <ArrowLeft className="w-4 h-4" />
-                          Torna all'elenco esiti
-                        </button>
+                        <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
+                          <button
+                            onClick={() => setSelectedPastSub(null)}
+                            className="flex items-center gap-1.5 text-xs text-slate-400 hover:text-white transition-colors cursor-pointer"
+                          >
+                            <ArrowLeft className="w-4 h-4" />
+                            Torna all'elenco esiti
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setPrintPastSub(selectedPastSub)}
+                            className="px-3.5 py-2 bg-indigo-600 hover:bg-indigo-500 active:scale-[0.98] text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-md shadow-indigo-600/20 cursor-pointer transition-all"
+                          >
+                            <Printer className="w-3.5 h-3.5" />
+                            <span>Stampa o Salva Scheda PDF</span>
+                          </button>
+                        </div>
 
                         <div className="p-4 bg-slate-950/60 border border-white/5 rounded-2xl flex flex-col sm:flex-row items-start sm:items-center justify-between gap-4">
                           <div>
@@ -4140,6 +4270,28 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           <div className="p-3 rounded-xl bg-indigo-500/10 border border-indigo-500/30 text-indigo-200 text-xs flex items-center gap-2">
                             <Loader2 className="w-4 h-4 animate-spin shrink-0" />
                             <span>Sblocco soluzioni differite in corso dal registro sicuro...</span>
+                          </div>
+                        )}
+
+                        {pastSolutionsMasked && pastUnlockingId !== selectedPastSub.id && (
+                          <div className="p-3.5 rounded-2xl bg-amber-950/35 border border-amber-500/30 flex flex-col sm:flex-row sm:items-center justify-between gap-2.5">
+                            <div className="space-y-1 text-xs text-amber-100/90">
+                              <p className="font-bold text-amber-300 flex items-center gap-1.5">
+                                <Lock className="w-3.5 h-3.5 shrink-0" />
+                                <span>Soluzioni e spiegazioni attualmente differite dal docente</span>
+                              </p>
+                              {pastUnlockStatusMsg && (
+                                <p className="text-[11px] text-amber-200/80">{pastUnlockStatusMsg}</p>
+                              )}
+                            </div>
+                            <button
+                              type="button"
+                              onClick={() => setPastUnlockRetryNonce((n) => n + 1)}
+                              className="px-3 py-1.5 rounded-xl bg-amber-500/20 hover:bg-amber-500/30 border border-amber-400/40 text-amber-200 text-xs font-semibold flex items-center gap-1.5 cursor-pointer shrink-0 transition-colors"
+                            >
+                              <RefreshCw className="w-3.5 h-3.5" />
+                              <span>Verifica Sblocco Ora</span>
+                            </button>
                           </div>
                         )}
 
@@ -4261,7 +4413,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                 <p className="text-xs font-bold text-slate-200 mt-0.5">
                                   {pastSolutionsMasked
                                     ? "🔒 Differito"
-                                    : selectedPastSub.Punteggio_MC !== undefined && Number(selectedPastSub.Punteggio_MC) > 0
+                                    : selectedPastSub.Punteggio_MC !== undefined &&
+                                      (collectExamMultipleChoice(parsedExamData).length > 0 || Number(selectedPastSub.Punteggio_MC) > 0)
                                     ? `${selectedPastSub.Punteggio_FIB || 0} FIB · ${selectedPastSub.Punteggio_MC} MC`
                                     : `${selectedPastSub.Punteggio_FIB || 0} esatti`}
                                 </p>
@@ -4289,9 +4442,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                             </div>
                             <div className="grid grid-cols-1 gap-2.5">
                               {[...(parsedExamData?.multipleChoice || []), ...((parsedExamData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
-                                const selectedOptIndex = parsedAnswers?.mc?.[q.id];
-                                const isCorrect = selectedOptIndex === q.correctIndex;
-                                const uAns = q.options[selectedOptIndex] || "Scelta mancante";
+                                const sel = evaluateMcSelection(q, parsedAnswers?.mc?.[q.id]);
+                                const isCorrect = sel.isCorrect;
+                                const uAns = sel.hasSelection ? sel.selectedText : "Scelta mancante";
                                 return (
                                   <div
                                     key={q.id}
@@ -4314,6 +4467,12 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                         <p className="mt-1 text-emerald-400">
                                           Risposta corretta: <span className="font-semibold">{q.options[q.correctIndex]}</span>
                                         </p>
+                                      )}
+                                      {!pastSolutionsMasked && q.explanation && (
+                                        <div className="mt-2 text-[11px] text-slate-300 bg-black/30 p-2 rounded-lg border border-white/5 flex items-start gap-1.5">
+                                          <span className="shrink-0">💡</span>
+                                          <span><strong className="text-slate-200">Spiegazione:</strong> {q.explanation}</span>
+                                        </div>
                                       )}
                                     </div>
                                   </div>
@@ -4408,11 +4567,12 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         {/* Detailed Open Ended Review Mapping (all questions, also pending) */}
                         {selectedPastSub.Tipo === "Quiz" && (() => {
                           const entries = buildSubjectiveReviewEntries(
-                            parsedExamData?.openEnded || [],
+                            collectQuizOpenEnded(parsedExamData),
                             parsedEval?.openEndedDetails || [],
                             (id) => String(parsedAnswers?.oe?.[id] ?? ""),
                             (d) => d.questionId
                           );
+                          const mcOffset = collectExamMultipleChoice(parsedExamData).length;
                           if (entries.length === 0) return null;
                           return (
                             <div className="space-y-4 pt-2">
@@ -4430,7 +4590,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                   return (
                                     <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
                                       <p className="text-xs font-bold font-mono text-slate-300">
-                                        DOMANDA APERTA {((parsedExamData?.multipleChoice || []).length) + iIdx + 1}
+                                        DOMANDA APERTA {mcOffset + iIdx + 1}
                                       </p>
                                       {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
                                       <QuestionFigure src={parsedExamData?.images?.[entry.id]} />
@@ -4526,11 +4686,34 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           .map((s) => resolveSubmissionClass(s))
                           .filter((c) => c && c !== UNSPECIFIED_CLASS_LABEL)
                       )
-                    ).sort();
-                    const visibleHistory =
-                      historyClassFilter === "ALL"
-                        ? historyList
-                        : historyList.filter((s) => resolveSubmissionClass(s) === historyClassFilter);
+                    ).sort(compareClassLabels);
+                    const qNorm = historySearchQuery.trim().toLowerCase();
+                    const deferredCount = historyList.filter(
+                      (s) => Boolean(s.Soluzioni_Differite) && !pastSessionSolutionsReleased[s.id]
+                    ).length;
+                    const visibleHistory = historyList.filter((s) => {
+                      if (historyClassFilter !== "ALL" && resolveSubmissionClass(s) !== historyClassFilter) {
+                        return false;
+                      }
+                      const isLockedDeferred = Boolean(s.Soluzioni_Differite) && !pastSessionSolutionsReleased[s.id];
+                      if (historyTypeFilter === "Quiz" && s.Tipo !== "Quiz") return false;
+                      if (historyTypeFilter === "Workbook" && s.Tipo !== "Workbook") return false;
+                      if (historyTypeFilter === "DEFERRED" && !isLockedDeferred) return false;
+                      if (qNorm) {
+                        const haystack = [
+                          s.Pin,
+                          s.Session_Titolo,
+                          s.Tipo,
+                          s.Voto_Suggerito,
+                          resolveSubmissionClass(s),
+                        ]
+                          .filter(Boolean)
+                          .join(" ")
+                          .toLowerCase();
+                        if (!haystack.includes(qNorm)) return false;
+                      }
+                      return true;
+                    });
 
                     return (
                       <div className="space-y-4">
@@ -4569,6 +4752,53 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           )}
                         </div>
 
+                        {historyList.length > 0 && (
+                          <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                            <div className="relative flex-1">
+                              <Search className="w-3.5 h-3.5 text-slate-500 absolute left-3 top-1/2 -translate-y-1/2 pointer-events-none" />
+                              <input
+                                type="text"
+                                value={historySearchQuery}
+                                onChange={(e) => setHistorySearchQuery(e.target.value)}
+                                placeholder="Cerca per PIN, materia o voto..."
+                                className="w-full pl-8 pr-3 py-1.5 bg-slate-950/70 border border-white/10 rounded-xl text-xs text-white placeholder-slate-500 outline-none focus:border-teal-500/60"
+                              />
+                            </div>
+                            <div className="flex items-center gap-1.5 flex-wrap">
+                              {(["ALL", "Quiz", "Workbook"] as const).map((tKey) => (
+                                <button
+                                  key={tKey}
+                                  type="button"
+                                  onClick={() => setHistoryTypeFilter(tKey)}
+                                  className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer ${
+                                    historyTypeFilter === tKey
+                                      ? "bg-indigo-500/20 text-indigo-200 border-indigo-500/40"
+                                      : "bg-slate-900/70 text-slate-400 border-white/10 hover:text-white"
+                                  }`}
+                                >
+                                  {tKey === "ALL" ? "Tutti" : tKey}
+                                </button>
+                              ))}
+                              {deferredCount > 0 && (
+                                <button
+                                  type="button"
+                                  onClick={() =>
+                                    setHistoryTypeFilter((prev) => (prev === "DEFERRED" ? "ALL" : "DEFERRED"))
+                                  }
+                                  className={`px-2 py-1 rounded-lg text-[10px] font-bold border transition-all cursor-pointer inline-flex items-center gap-1 ${
+                                    historyTypeFilter === "DEFERRED"
+                                      ? "bg-amber-500/25 text-amber-200 border-amber-500/50"
+                                      : "bg-slate-900/70 text-amber-300/80 border-amber-500/20 hover:border-amber-500/40"
+                                  }`}
+                                >
+                                  <Lock className="w-2.5 h-2.5" />
+                                  <span>Differite ({deferredCount})</span>
+                                </button>
+                              )}
+                            </div>
+                          </div>
+                        )}
+
                         {historyLoading ? (
                           <div className="py-10 text-center text-slate-500 text-xs flex flex-col items-center justify-center gap-3">
                             <RefreshCw className="w-5 h-5 animate-spin text-teal-400" />
@@ -4582,6 +4812,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           <div className="py-10 text-center text-slate-500 text-xs space-y-3">
                             <p>Non risultano ancora compiti registrati nel database con la tua email.</p>
                             <p className="text-slate-600 text-[11px]">Usa la scheda "Svolgi Esame" per avviare il tuo primo test d'esame.</p>
+                          </div>
+                        ) : visibleHistory.length === 0 ? (
+                          <div className="py-8 text-center text-slate-400 text-xs space-y-2 bg-slate-950/35 rounded-2xl border border-white/5">
+                            <p>Nessun compito corrisponde ai filtri selezionati.</p>
+                            <button
+                              type="button"
+                              onClick={() => {
+                                setHistoryClassFilter("ALL");
+                                setHistoryTypeFilter("ALL");
+                                setHistorySearchQuery("");
+                              }}
+                              className="px-3 py-1 rounded-lg bg-white/5 hover:bg-white/10 text-teal-300 text-[11px] font-semibold cursor-pointer"
+                            >
+                              Azzera filtri
+                            </button>
                           </div>
                         ) : (
                           <div className="space-y-2 max-h-[350px] overflow-y-auto pr-1">
@@ -4597,6 +4842,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                 isEvaluationPending(sub.Full_Evaluation) ||
                                 getPendingSubjectiveCount(sub) > 0;
                               const subClass = resolveSubmissionClass(sub);
+                              const listDeferredLocked =
+                                Boolean(sub.Soluzioni_Differite) && !pastSessionSolutionsReleased[sub.id];
                               return (
                                 <div
                                   key={sub.id}
@@ -4623,8 +4870,16 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                           Fila {sub.Assigned_Fila}
                                         </span>
                                       )}
+                                      {listDeferredLocked && (
+                                        <span className="inline-flex items-center gap-1 text-[9px] uppercase font-bold px-1.5 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                          <Lock className="w-2.5 h-2.5" />
+                                          Soluzioni differite
+                                        </span>
+                                      )}
                                     </div>
-                                    <p className="text-[10px] text-slate-500">Svolto il: {dateStr}</p>
+                                    <p className="text-[10px] text-slate-500">
+                                      {sub.Session_Titolo ? `${sub.Session_Titolo} · ` : ""}Svolto il: {dateStr}
+                                    </p>
                                     {sub.Piano_Recupero && (
                                       <span className="inline-flex items-center gap-1 text-[9px] text-emerald-400 font-bold">
                                         <Sparkles className="w-2.5 h-2.5 fill-current" />
@@ -4813,7 +5068,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   const raw = e.target.value.slice(0, 40);
                   setStudentClassInput(raw);
                   const norm = normalizeClassLabel(raw);
-                  saveScopedStudentClass(user?.email, norm);
+                  saveScopedStudentClass(user?.email, norm, undefined, undefined, sharedPcActive);
                 }}
                 onBlur={() => {
                   const norm = normalizeClassLabel(studentClassInput);
@@ -4836,7 +5091,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                       type="button"
                       onClick={() => {
                         setStudentClassInput(cls);
-                        saveScopedStudentClass(user?.email, cls);
+                        saveScopedStudentClass(user?.email, cls, undefined, undefined, sharedPcActive);
                       }}
                       className={`px-2.5 py-1 rounded-lg text-[11px] font-bold uppercase border transition-all cursor-pointer ${
                         isSelected
@@ -5037,21 +5292,164 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
               </h2>
             </div>
 
+            {(() => {
+              const navItems: Array<{ num: number; anchorId: string; answered: boolean; shortType: string }> = [];
+              if (examType === "quiz") {
+                const navMc = collectExamMultipleChoice(examData);
+                const navOe = collectQuizOpenEnded(examData);
+                const navRq = Array.isArray(examData?.reflectionQuestions) ? examData.reflectionQuestions : [];
+                navMc.forEach((q: any, idx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `q_mc_${q.id || idx}`,
+                    answered: hasMcAnswer(answers.mc?.[q.id]),
+                    shortType: "Scelta multipla",
+                  });
+                });
+                navOe.forEach((q: any, idx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `q_oe_${q.id || idx}`,
+                    answered: Boolean((answers.oe[q.id] || "").trim()),
+                    shortType: "Domanda aperta",
+                  });
+                });
+                navRq.forEach((q: any, idx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `q_rq_${q.id || idx}`,
+                    answered: Boolean((answers.oe[q.id] || answers.wbRq[q.id] || "").trim()),
+                    shortType: "Riflessione",
+                  });
+                });
+              } else {
+                const rootMc = Array.isArray(examData?.multipleChoice) ? examData.multipleChoice : [];
+                rootMc.forEach((q: any, idx: number) => {
+                  navItems.push({
+                    num: navItems.length + 1,
+                    anchorId: `wb_root_mc_${q.id || idx}`,
+                    answered: hasMcAnswer(answers.mc?.[q.id]),
+                    shortType: "Scelta multipla",
+                  });
+                });
+                const wbSections = Array.isArray(examData?.sections) ? examData.sections : [];
+                wbSections.forEach((sec: any, sIdx: number) => {
+                  (sec.fillInTheBlank || []).forEach((f: any, fIdx: number) => {
+                    navItems.push({
+                      num: navItems.length + 1,
+                      anchorId: `wb_sec_${sIdx}_fib_${f.id || fIdx}`,
+                      answered: Boolean((answers.wbFib[f.id] || "").trim()),
+                      shortType: "Completamento",
+                    });
+                  });
+                  (sec.multipleChoice || []).forEach((q: any, mIdx: number) => {
+                    navItems.push({
+                      num: navItems.length + 1,
+                      anchorId: `wb_sec_${sIdx}_mc_${q.id || mIdx}`,
+                      answered: hasMcAnswer(answers.mc?.[q.id]),
+                      shortType: "Scelta multipla",
+                    });
+                  });
+                  (sec.reflectionQuestions || []).forEach((rq: any, rIdx: number) => {
+                    navItems.push({
+                      num: navItems.length + 1,
+                      anchorId: `wb_sec_${sIdx}_rq_${rq.id || rIdx}`,
+                      answered: Boolean((answers.wbRq[rq.id] || answers.oe[rq.id] || "").trim()),
+                      shortType: "Riflessione",
+                    });
+                  });
+                });
+              }
+              if (navItems.length === 0) return null;
+              const doneCount = navItems.filter((it) => it.answered).length;
+              const missingCount = navItems.length - doneCount;
+              const pct = Math.round((doneCount / navItems.length) * 100);
+              const visibleNavItems = navOnlyMissing && missingCount > 0 ? navItems.filter((it) => !it.answered) : navItems;
+              return (
+                <div className="mb-6 p-3.5 rounded-2xl bg-slate-950/45 border border-white/10 space-y-2.5 text-left">
+                  <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2">
+                    <div className="flex items-center gap-2.5">
+                      <span className="text-xs font-bold text-slate-200">
+                        Progresso Prova: <span className="font-mono text-teal-300">{doneCount}/{navItems.length}</span>
+                      </span>
+                      <span className={`text-[11px] font-semibold ${missingCount === 0 ? "text-emerald-300" : "text-amber-300"}`}>
+                        {missingCount === 0 ? "Tutte completate ✓" : `${missingCount} da completare`}
+                      </span>
+                    </div>
+                    {missingCount > 0 && navItems.length > 3 && (
+                      <button
+                        type="button"
+                        onClick={() => setNavOnlyMissing((v) => !v)}
+                        className={`px-2.5 py-1 rounded-lg text-[11px] font-semibold border cursor-pointer transition-colors self-start sm:self-auto ${
+                          navOnlyMissing
+                            ? "bg-amber-500/20 border-amber-400/50 text-amber-200"
+                            : "bg-slate-900/70 border-white/10 text-slate-300 hover:text-white"
+                        }`}
+                      >
+                        {navOnlyMissing ? "Mostra tutti" : `Solo mancanti (${missingCount})`}
+                      </button>
+                    )}
+                  </div>
+                  <div className="h-1.5 w-full bg-slate-900 rounded-full overflow-hidden border border-white/5">
+                    <div
+                      className={`h-full transition-all duration-300 ${
+                        missingCount === 0 ? "bg-emerald-400" : "bg-teal-400"
+                      }`}
+                      style={{ width: `${pct}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center gap-1.5 flex-wrap pt-0.5">
+                    {visibleNavItems.map((it) => (
+                      <button
+                        key={it.anchorId}
+                        type="button"
+                        onClick={() => {
+                          const el = document.getElementById(it.anchorId);
+                          if (el) {
+                            el.scrollIntoView({ behavior: "smooth", block: "center" });
+                            el.classList.add("ring-2", "ring-teal-400", "transition-all", "duration-300");
+                            setTimeout(() => {
+                              el.classList.remove("ring-2", "ring-teal-400");
+                            }, 2000);
+                            const inputEl = el.querySelector<HTMLInputElement | HTMLTextAreaElement>("input, textarea");
+                            if (inputEl) inputEl.focus();
+                          }
+                        }}
+                        title={`Vai al quesito ${it.num} (${it.shortType})`}
+                        className={`w-7 h-7 rounded-lg text-xs font-mono font-bold border transition-all cursor-pointer flex items-center justify-center ${
+                          it.answered
+                            ? "bg-emerald-500/20 border-emerald-500/45 text-emerald-200 hover:bg-emerald-500/30"
+                            : "bg-slate-900/80 border-white/15 text-slate-300 hover:border-amber-400/60 hover:text-amber-200"
+                        }`}
+                      >
+                        {it.num}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              );
+            })()}
+
             {examType === "quiz" ? (
-              // QUIZ Workspace layout
+              // QUIZ Workspace layout (supports both flat root Quiz and sectioned Quiz)
+              (() => {
+                const quizMcList = collectExamMultipleChoice(examData);
+                const quizOeList = collectQuizOpenEnded(examData);
+                const quizRqList = Array.isArray(examData?.reflectionQuestions) ? examData.reflectionQuestions : [];
+                return (
               <div className="space-y-8">
                 {/* MCQ Question List */}
-                {examData?.multipleChoice && examData.multipleChoice.length > 0 && (
+                {quizMcList.length > 0 && (
                   <div className="space-y-6">
                     <h3 className="text-xs font-bold tracking-widest text-slate-400 uppercase bg-white/5 px-4 py-2 rounded-xl inline-block border border-white/5">
                       SEZIONE A: Scelta Multipla
                     </h3>
 
                     <div className="space-y-6 text-left">
-                      {examData.multipleChoice.map((q: any, qIdx: number) => {
+                      {quizMcList.map((q: any, qIdx: number) => {
                         const userSel = answers.mc[q.id];
                         return (
-                          <div key={q.id} id={`q_mc_${q.id || qIdx}`} className="p-5 bg-slate-950/30 border border-white/5 rounded-2xl space-y-4 transition-all">
+                          <div key={q.id || qIdx} id={`q_mc_${q.id || qIdx}`} className="p-5 bg-slate-950/30 border border-white/5 rounded-2xl space-y-4 transition-all">
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">{qIdx + 1}.</span>
                               {q.question}
@@ -5063,7 +5461,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                             </p>
                             <QuestionFigure src={examData?.images?.[q.id]} />
                             <div className="grid grid-cols-1 gap-2.5 pl-2">
-                              {q.options.map((opt: string, optIdx: number) => (
+                              {(q.options || []).map((opt: string, optIdx: number) => (
                                 <button
                                   key={optIdx}
                                   onClick={() => handleSelectMC(q.id, optIdx)}
@@ -5092,21 +5490,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 )}
 
                 {/* Open Ended Question List */}
-                {examData?.openEnded && examData.openEnded.length > 0 && (
+                {quizOeList.length > 0 && (
                   <div className="space-y-6 pt-4 border-t border-white/5">
                     <h3 className="text-xs font-bold tracking-widest text-slate-400 uppercase bg-white/5 px-4 py-2 rounded-xl inline-block border border-white/5">
                       SEZIONE B: Domande Aperte
                     </h3>
 
                     <div className="space-y-6 text-left">
-                      {examData.openEnded.map((q: any, qIdx: number) => {
+                      {quizOeList.map((q: any, qIdx: number) => {
                         const savedValue = answers.oe[q.id] || "";
                         const wordCount = savedValue.trim() ? savedValue.trim().split(/\s+/).length : 0;
                         return (
-                          <div key={q.id} id={`q_oe_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
+                          <div key={q.id || qIdx} id={`q_oe_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
                             <p className="font-medium text-slate-200">
                               <span className="text-emerald-400 font-bold mr-2">
-                                {((examData?.multipleChoice || []).length) + qIdx + 1}.
+                                {quizMcList.length + qIdx + 1}.
                               </span>
                               {q.question}
                               {renderSpeakButton(String(q.question || ""), `quiz_oe_${q.id || qIdx}`)}
@@ -5136,21 +5534,21 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 )}
 
                 {/* Fallback Reflection Questions if present at root in Quiz */}
-                {examData?.reflectionQuestions && examData.reflectionQuestions.length > 0 && (
+                {quizRqList.length > 0 && (
                   <div className="space-y-6 pt-4 border-t border-white/5">
                     <h3 className="text-xs font-bold tracking-widest text-teal-400 uppercase bg-teal-500/10 px-4 py-2 rounded-xl inline-block border border-teal-500/20">
                       SEZIONE C: Domande di Riflessione Critica
                     </h3>
 
                     <div className="space-y-6 text-left">
-                      {examData.reflectionQuestions.map((q: any, qIdx: number) => {
+                      {quizRqList.map((q: any, qIdx: number) => {
                         const savedValue = answers.oe[q.id] || answers.wbRq[q.id] || "";
                         const wordCount = savedValue.trim() ? savedValue.trim().split(/\s+/).length : 0;
                         return (
-                          <div key={q.id} id={`q_rq_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
+                          <div key={q.id || qIdx} id={`q_rq_${q.id || qIdx}`} className="space-y-3 transition-all rounded-2xl p-2 -m-2">
                             <p className="font-medium text-slate-200">
                               <span className="text-teal-400 font-bold mr-2">
-                                {((examData?.multipleChoice || []).length) + ((examData?.openEnded || []).length) + qIdx + 1}.
+                                {quizMcList.length + quizOeList.length + qIdx + 1}.
                               </span>
                               {q.question}
                               {renderSpeakButton(String(q.question || ""), `quiz_rq_${q.id || qIdx}`)}
@@ -5181,6 +5579,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   </div>
                 )}
               </div>
+                );
+              })()
             ) : (
               // WORKBOOK Workspace layout
               <div className="space-y-8 text-left">
@@ -5600,7 +6000,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         Array.isArray(s?.multipleChoice) ? s.multipleChoice : []
                       )),
                     ];
-                    const mcHits = allMcQs.reduce((acc, q: any) => (answers.mc[q.id] === q.correctIndex ? acc + 1 : acc), 0);
+                    const mcHits = allMcQs.reduce((acc, q: any) => (evaluateMcSelection(q, answers.mc?.[q.id]).isCorrect ? acc + 1 : acc), 0);
                     return (
                       <>
                         {mcHits}
@@ -5739,6 +6139,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         const planHtml = await requestRecoveryPlan(
                           {
                             tipo: examType === "quiz" ? "Quiz" : "Workbook",
+                            sessionPin,
+                            sessionId: sessionRunId,
+                            studentClass: resolvedStudentClass === UNSPECIFIED_CLASS_LABEL ? "" : resolvedStudentClass,
                             studentPseudoId,
                             studentName: user?.displayName || "",
                             studentEmail: user?.email || "",
@@ -5836,8 +6239,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 <div className="grid grid-cols-1 gap-2.5">
                   {[...(examData?.multipleChoice || []), ...((examData?.sections || []).flatMap((s: any) => s.multipleChoice || []))].map((q: any, iIdx: number) => {
                     const hideSol = deferSolutionsSession && !solutionsReleased;
-                    const isCorrect = answers.mc[q.id] === q.correctIndex;
-                    const uAns = q.options[answers.mc[q.id]] || "Scelta mancante";
+                    const sel = evaluateMcSelection(q, answers.mc?.[q.id]);
+                    const isCorrect = sel.isCorrect;
+                    const uAns = sel.hasSelection ? sel.selectedText : "Scelta mancante";
                     return (
                       <div
                         key={q.id}
@@ -5879,11 +6283,12 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 even when the AI did not return a score for it) */}
             {examType === "quiz" && (() => {
               const entries = buildSubjectiveReviewEntries(
-                examData?.openEnded || [],
+                collectQuizOpenEnded(examData),
                 evaluation?.openEndedDetails || [],
                 (id) => String(answers.oe?.[id] ?? ""),
                 (d) => d.questionId
               );
+              const mcOffset = collectExamMultipleChoice(examData).length;
               if (entries.length === 0) return null;
               return (
                 <div className="space-y-4 pt-2">
@@ -5902,7 +6307,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                       return (
                         <div key={entry.id || iIdx} className="bg-slate-950/40 border border-white/5 rounded-2xl p-4.5 space-y-3">
                           <p className="text-xs font-bold font-mono text-slate-300">
-                            DOMANDA APERTA {((examData?.multipleChoice || []).length) + iIdx + 1}
+                            DOMANDA APERTA {mcOffset + iIdx + 1}
                           </p>
                           {entry.question?.question && <p className="font-semibold text-slate-200 text-sm leading-relaxed">{entry.question.question}</p>}
                           <QuestionFigure src={examData?.images?.[entry.id]} />
@@ -6513,6 +6918,31 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         }}
         examTitle={examData?.title}
         examImages={examData?.images}
+      />
+
+      {/* Official Printable Report Modal for History Submissions */}
+      <PrintableReportModal
+        isOpen={!!printPastSub}
+        onClose={() => setPrintPastSub(null)}
+        deferredSolutionsLocked={Boolean(printPastSub?.Soluzioni_Differite) && !pastSessionSolutionsReleased[printPastSub?.id]}
+        submission={
+          printPastSub
+            ? {
+                ...printPastSub,
+                ...(unlockedPastSubmissions[printPastSub.id]?.examData
+                  ? { Domande_Esame: unlockedPastSubmissions[printPastSub.id].examData }
+                  : {}),
+                ...(unlockedPastSubmissions[printPastSub.id]?.mainErrors
+                  ? { Errori_Principali: unlockedPastSubmissions[printPastSub.id].mainErrors }
+                  : {}),
+              }
+            : null
+        }
+        examTitle={printPastSub?.Session_Titolo || safeParseJson(printPastSub?.Domande_Esame)?.title}
+        examImages={
+          (printPastSub && unlockedPastSubmissions[printPastSub.id]?.examData?.images) ||
+          safeParseJson(printPastSub?.Domande_Esame)?.images
+        }
       />
     </div>
   );

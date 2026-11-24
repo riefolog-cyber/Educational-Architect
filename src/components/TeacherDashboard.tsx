@@ -67,8 +67,8 @@ import {
   buildClassSummaries,
   UNSPECIFIED_CLASS_LABEL
 } from "../utils/classGrouping";
-import { exportSubmissionPdf, exportSubmissionsZip } from "../utils/pdfExport";
-import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml } from "../utils";
+import { exportSubmissionPdf, exportSubmissionsZip, exportBlankExamPaperPdf } from "../utils/pdfExport";
+import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, applySubjectiveRetouchToDetails, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml, isWorkbookExamData, collectExamMultipleChoice, collectQuizOpenEnded } from "../utils";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -110,8 +110,10 @@ import ExamLibraryPanel from "./ExamLibraryPanel";
 import ExamItemAnalysisPanel from "./ExamItemAnalysisPanel";
 import SubmissionDetailModal from "./SubmissionDetailModal";
 import TeacherBulkGradingModal, { BulkValidationUpdate } from "./TeacherBulkGradingModal";
+import ExamPreviewModal from "./ExamPreviewModal";
 import { isDeferredUnlockedForStudent, addMinutesToExpiryIso } from "../utils/deferredSolutions";
 import { stripExamAnswers } from "../utils/examSecurity";
+import { extractReusableExamFromSubmissions } from "../utils/examPreview";
 
 interface TeacherDashboardProps {
   user: any;
@@ -140,15 +142,18 @@ function submissionStructuredAccuracy(sub: SavedSubmission): number | null {
     const domande = safeParseJson(sub.Domande_Esame);
     const ans = safeParseJson(sub.Risposte_Studente);
     if (sub.Tipo === "Quiz") {
-      const mcList = domande?.multipleChoice || [];
+      const mcList = collectExamMultipleChoice(domande);
       if (mcList.length === 0) return null;
       const mcs = mcWeightedScore(mcList, ans?.mc || {});
       return mcs.weightedTotal > 0 ? mcs.weightedCorrect / mcs.weightedTotal : null;
     }
     const fibList = (domande?.sections || []).flatMap((s: any) => s.fillInTheBlank || []);
-    if (fibList.length === 0) return null;
+    const wbMcList = collectExamMultipleChoice(domande);
+    if (fibList.length === 0 && wbMcList.length === 0) return null;
     const fibs = fibWeightedScore(fibList, ans?.wbFib || {}, isFibAnswerCorrect);
-    return fibs.weightedTotal > 0 ? fibs.weightedCorrect / fibs.weightedTotal : null;
+    const mcs = mcWeightedScore(wbMcList, ans?.mc || {});
+    const total = fibs.weightedTotal + mcs.weightedTotal;
+    return total > 0 ? (fibs.weightedCorrect + mcs.weightedCorrect) / total : null;
   } catch {
     return null;
   }
@@ -210,7 +215,10 @@ export function clusterInfractionsHint(log: any[]): string | null {
  * Teacher recalculation must never invent a grade: it waits for the AI verdict
  * and returns the evaluation object produced by the server.
  */
-async function requestAiReevaluation(payload: any): Promise<any> {
+async function requestAiReevaluation(
+  payload: any,
+  onQueueProgress?: (info: { status: "pending" | "processing"; position?: number }) => void
+): Promise<any> {
   const authHeaders = await getAuthHeaders();
   const enqueueResp = await fetch("/api/evaluate/enqueue", {
     method: "POST",
@@ -228,9 +236,15 @@ async function requestAiReevaluation(payload: any): Promise<any> {
     throw new Error(enqueueData?.error || `Errore di rete durante l'accodamento (HTTP ${enqueueResp.status}).`);
   }
   const jobId = enqueueData?.jobId;
+  const jobToken = String(enqueueData?.jobToken || "");
   if (!jobId) {
     throw new Error("Il server non ha restituito un identificativo della correzione IA.");
   }
+
+  onQueueProgress?.({
+    status: enqueueData?.status === "processing" ? "processing" : "pending",
+    position: Number(enqueueData?.position) || undefined,
+  });
 
   const maxWaitMs = 10 * 60 * 1000;
   const startedAt = Date.now();
@@ -243,7 +257,12 @@ async function requestAiReevaluation(payload: any): Promise<any> {
     }
     attempt++;
 
-    const statusResp = await fetch(`/api/evaluate/status/${jobId}`);
+    const statusUrl = jobToken
+      ? `/api/evaluate/status/${encodeURIComponent(jobId)}?token=${encodeURIComponent(jobToken)}`
+      : `/api/evaluate/status/${encodeURIComponent(jobId)}`;
+    const statusResp = await fetch(statusUrl, {
+      headers: jobToken ? { "x-job-token": jobToken } : undefined,
+    });
     if (statusResp.status === 404) {
       throw new Error("La sessione di correzione IA è scaduta o il server è stato riavviato. Riprova.");
     }
@@ -252,6 +271,12 @@ async function requestAiReevaluation(payload: any): Promise<any> {
     }
 
     const statusData = await statusResp.json();
+    if (statusData.status === "pending" || statusData.status === "processing") {
+      onQueueProgress?.({
+        status: statusData.status,
+        position: typeof statusData.position === "number" ? statusData.position : undefined,
+      });
+    }
     if (statusData.status === "completed") {
       if (!statusData.evaluation) {
         throw new Error("Il server non ha restituito la valutazione IA.");
@@ -414,6 +439,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [dashboardTab, setDashboardTab] = useState<"submissions" | "grouped_exams" | "grouped_classes" | "live_monitor">("submissions");
   const [printableSub, setPrintableSub] = useState<SavedSubmission | null>(null);
   const [showPrintModal, setShowPrintModal] = useState<boolean>(false);
+  const [showPreviewModal, setShowPreviewModal] = useState<boolean>(false);
 
   // Cumulative ZIP export state
   const [isExportingZip, setIsExportingZip] = useState<boolean>(false);
@@ -425,6 +451,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [loadingSessions, setLoadingSessions] = useState(false);
   const [extendingSessionPin, setExtendingSessionPin] = useState<string | null>(null);
   const [bulkUnlockingDeferred, setBulkUnlockingDeferred] = useState(false);
+  const [bulkRecalculatingProgress, setBulkRecalculatingProgress] = useState<{ current: number; total: number } | null>(null);
 
   // Helper toggle for exam cards
   const toggleExamExpanded = (key: string) => {
@@ -670,12 +697,48 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
-  // Permanently deletes an archived deferred session doc once the teacher no longer needs it
+  // Permanently deletes an archived deferred session doc once the teacher no longer needs it,
+  // flushing/unlocking any remaining Soluzioni_Differite submissions first so students don't stay stuck.
   const handlePurgeArchivedSession = async (targetPin: string) => {
     const cleanPin = (targetPin || "").trim().toUpperCase();
     if (!cleanPin || !dbFirestore) return;
     setTerminatingPin(cleanPin);
     try {
+      const existingSess = activeSessions.find((s) => s.pin === cleanPin);
+      const sessionRun = existingSess?.sessionId || "";
+      const remainingDeferred = submissions.filter((s) => {
+        if ((s.Pin || "").trim().toUpperCase() !== cleanPin || !s.Soluzioni_Differite) return false;
+        if (sessionRun && s.Session_Id && s.Session_Id !== sessionRun) return false;
+        return true;
+      });
+      if (remainingDeferred.length > 0) {
+        try {
+          const authHeaders = await getAuthHeaders();
+          const updatedMap = new Map<string, Partial<SavedSubmission>>();
+          const chunkSize = 8;
+          for (let i = 0; i < remainingDeferred.length; i += chunkSize) {
+            const chunk = remainingDeferred.slice(i, i + chunkSize);
+            await Promise.all(
+              chunk.map(async (sub) => {
+                try {
+                  const patch = await syncUnlockedSubmissionDoc(sub, authHeaders, cleanPin, sessionRun, true);
+                  if (patch) updatedMap.set(sub.id, patch);
+                } catch (flushErr) {
+                  console.warn("Sblocco pre-eliminazione archivio non riuscito:", sub.id, flushErr);
+                }
+              })
+            );
+          }
+          if (updatedMap.size > 0) {
+            setSubmissions((prev) =>
+              prev.map((s) => (updatedMap.has(s.id) ? { ...s, ...updatedMap.get(s.id)! } : s))
+            );
+          }
+        } catch (authErr) {
+          console.warn("Auth headers sblocco pre-eliminazione non disponibili:", authErr);
+        }
+      }
+
       await purgeLiveStudents(cleanPin);
       await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin));
       setActiveSessions((prev) => prev.filter((s) => s.pin !== cleanPin));
@@ -1031,6 +1094,31 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     }
   };
 
+  // Syncs individual student time extensions done in ClassroomLiveMonitor with TeacherDashboard state + RTDB
+  const handleSessionMaxExtended = async (targetPin: string, nextMaxIso: string) => {
+    const cleanPin = (targetPin || "").trim().toUpperCase();
+    const nextMs = Date.parse(nextMaxIso);
+    if (!cleanPin || !Number.isFinite(nextMs)) return;
+    const existing = activeSessions.find((s) => s.pin === cleanPin);
+    autoReleasedPinsRef.current.delete(`${cleanPin}_${existing?.sessionId || ""}`);
+    setActiveSessions((prev) =>
+      prev.map((s) => {
+        if (s.pin !== cleanPin) return s;
+        const curMaxMs = s.maxExtendedExpiry ? Date.parse(s.maxExtendedExpiry) : 0;
+        return !Number.isFinite(curMaxMs) || nextMs > curMaxMs
+          ? { ...s, maxExtendedExpiry: nextMaxIso }
+          : s;
+      })
+    );
+    if (db) {
+      try {
+        await fbSet(fbRef(db, `sessions/${cleanPin}/maxExtendedExpiry`), nextMaxIso);
+      } catch (rtdbErr) {
+        console.warn("RTDB maxExtendedExpiry sync warning (non-blocking):", rtdbErr);
+      }
+    }
+  };
+
   // Bulk-unlock all visible deferred submissions directly from the Submissions Registry
   const handleBulkUnlockDeferredSubmissions = async (targetSubs: SavedSubmission[]) => {
     const deferredList = targetSubs.filter((s) => !!s.Soluzioni_Differite);
@@ -1231,6 +1319,21 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         };
       })
     );
+    setSelectedSub((prev) => {
+      if (!prev) return prev;
+      const upd = updateMap.get(prev.id);
+      if (!upd) return prev;
+      return {
+        ...prev,
+        Voto_Originale_IA:
+          !prev.Voto_Originale_IA && upd.nextGrade && upd.nextGrade !== prev.Voto_Suggerito
+            ? prev.Voto_Suggerito
+            : prev.Voto_Originale_IA,
+        Voto_Suggerito: upd.nextGrade || prev.Voto_Suggerito,
+        Convalida_Docente_At: nowIso,
+        Convalida_Docente_Email: teacherEmailVal,
+      };
+    });
     showNotify("success", `Convalidate ${updates.length} verifiche nel registro ufficiale.`);
   };
 
@@ -1250,10 +1353,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         return null;
       }
 
-      const isWorkbook = data.sections && Array.isArray(data.sections);
-      const isQuiz = (data.multipleChoice && Array.isArray(data.multipleChoice)) || 
-                     (data.openEnded && Array.isArray(data.openEnded)) ||
-                     (!isWorkbook && data.reflectionQuestions && Array.isArray(data.reflectionQuestions));
+      const isWorkbook = isWorkbookExamData(data);
+      const isQuiz = !isWorkbook && (
+        (data.multipleChoice && Array.isArray(data.multipleChoice)) ||
+        (data.openEnded && Array.isArray(data.openEnded)) ||
+        (data.reflectionQuestions && Array.isArray(data.reflectionQuestions)) ||
+        (data.sections && Array.isArray(data.sections) && data.sections.length > 0)
+      );
 
       if (!isWorkbook && !isQuiz) {
         setValidationError("Struttura non riconosciuta. Mancano 'sections' (Workbook) o liste di domande 'multipleChoice'/'openEnded' (Quiz).");
@@ -2154,7 +2260,320 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const hasGradeDiscrepancy = (sub: SavedSubmission): boolean =>
     detectGradeDiscrepancy(sub);
 
-  // Recalculates and repairs a submission if evaluation had discrepancies or hallucinated questions
+  // Recalculates and repairs a single submission (shared by single click & bulk N.V. retry)
+  const recalculateSingleSubmission = async (
+    sub: SavedSubmission,
+    options?: { silent?: boolean }
+  ): Promise<{ grade: string }> => {
+    if (!dbFirestore) {
+      throw new Error("Database scolastico non disponibile.");
+    }
+
+    const domandeObj = safeParseJson(sub.Domande_Esame);
+    const ansObj = safeParseJson(sub.Risposte_Studente) || {};
+    let evalObj = safeParseJson(sub.Full_Evaluation) || {};
+
+    let newGrade = sub.Voto_Suggerito;
+    let newErrors = sub.Errori_Principali;
+    let newFeedback = sub.Feedback_Generale;
+    let updatedPunteggioMC = sub.Punteggio_MC;
+    let updatedPunteggioFIB = sub.Punteggio_FIB;
+
+    if (sub.Tipo === "Quiz") {
+      const mcList = collectExamMultipleChoice(domandeObj);
+      const oeList = collectQuizOpenEnded(domandeObj);
+
+      let correctCount = 0;
+      const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
+
+      mcList.forEach((q: any, idx: number) => {
+        const chosen = ansObj.mc?.[q.id];
+        const hasChosen = chosen !== undefined && chosen !== null && chosen !== "";
+        if (hasChosen && Number(chosen) === Number(q.correctIndex)) {
+          correctCount++;
+        } else {
+          wrongQuestions.push({
+            number: idx + 1,
+            question: q.question,
+            studentChoice: (hasChosen && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
+            correctChoice: q.options?.[q.correctIndex] || ""
+          });
+        }
+      });
+
+      const hasMcAnswers = Object.keys(ansObj.mc || {}).length > 0;
+      if (!hasMcAnswers && correctCount === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
+        correctCount = sub.Punteggio_MC;
+      }
+      updatedPunteggioMC = correctCount;
+
+      const mcAnsNorm: Record<string, number> = {};
+      for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
+      const mcs = mcWeightedScore(mcList, mcAnsNorm);
+
+      if (oeList.length === 0) {
+        const breakdown = computeGradeBreakdown({
+          tipo: "Quiz",
+          examData: domandeObj,
+          answers: hasMcAnswers ? ansObj : undefined,
+          punteggioMC: correctCount
+        });
+        newGrade = breakdown.finalGradeFormatted;
+        evalObj.openEndedDetails = [];
+        evalObj.suggestedGrade = newGrade;
+        evalObj.gradeBreakdown = breakdown;
+        evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
+        newFeedback = evalObj.openEndedEvaluation;
+
+        if (wrongQuestions.length > 0) {
+          evalObj.mainErrors = `Errori riscontrati nella prova a scelta multipla (${wrongQuestions.length} su ${mcList.length}): ${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}"`).join(", ")}.`;
+          newErrors = evalObj.mainErrors;
+        } else {
+          evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
+          newErrors = evalObj.mainErrors;
+        }
+      } else {
+        const sanitizedAnswers = { ...(ansObj || {}), oe: { ...(ansObj?.oe || {}) } };
+        oeList.forEach((q: any) => {
+          const text = String(ansObj.oe?.[q?.id] ?? ansObj.openEnded?.[q?.id] ?? "");
+          if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
+          else if (!sanitizedAnswers.oe[q.id] && ansObj.openEnded?.[q?.id]) {
+            sanitizedAnswers.oe[q.id] = String(ansObj.openEnded[q.id]);
+          }
+        });
+
+        const studentPseudoId = deriveStudentPseudonym(
+          sub.Email || sub.id || sub.Nome || "anonimo",
+          sub.Session_Id || sub.Pin || ""
+        );
+        const { scrubbedAnswers: aiSafeQuizAnswers } = scrubAnswersForAi(sanitizedAnswers, {
+          fullName: sub.Nome,
+          email: sub.Email,
+        });
+
+        const evaluation = await requestAiReevaluation({
+          tipo: "Quiz",
+          forceReevaluation: true,
+          prompt:
+            "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
+          studentPseudoId,
+          sessionPin: sub.Pin || "",
+          sessionId: sub.Session_Id || "",
+          studentClass: resolveSubmissionClass(sub),
+          report: {
+            domande: domandeObj,
+            risposte: aiSafeQuizAnswers,
+            punteggioMC: correctCount,
+            punteggioMCPesato: mcs.weightedCorrect,
+            pesoMCTotale: mcs.weightedTotal,
+            autovalutazione: sub.Autovalutazione || ""
+          }
+        }, (qInfo) => {
+          if (!options?.silent && qInfo.status === "pending" && qInfo.position) {
+            showNotify("success", `⏳ Ricalcolo in coda (posizione ${qInfo.position})...`, 3500);
+          }
+        });
+
+        const audit = auditSubjectiveEvaluation({
+          questions: oeList,
+          details: evaluation?.openEndedDetails || [],
+          getAnswer: (id) => String(sanitizedAnswers.oe?.[id] ?? ""),
+          getDetailId: (d) => d?.questionId,
+        });
+        if (!audit.complete) {
+          throw new Error(
+            `Correzione IA incompleta: ${audit.missing.length} domanda/e aperta/e non ha/hanno ricevuto un voto. ` +
+            `La valutazione NON è stata salvata` +
+            (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
+            `. Riprova tra qualche minuto.`
+          );
+        }
+        evaluation.openEndedDetails = audit.details;
+
+        evalObj = { ...evalObj, ...evaluation };
+        evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
+        const breakdown = computeGradeBreakdown({
+          tipo: "Quiz",
+          examData: domandeObj,
+          answers: sanitizedAnswers,
+          evaluation: evalObj,
+          punteggioMC: correctCount
+        });
+        newGrade = breakdown.finalGradeFormatted;
+        evalObj.suggestedGrade = newGrade;
+        evalObj.gradeBreakdown = breakdown;
+        newErrors = evaluation.mainErrors || newErrors;
+        newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
+      }
+    } else if (sub.Tipo === "Workbook") {
+      const sections = domandeObj?.sections || [];
+      const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+      const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
+
+      const fibAnswersMap = ansObj.wbFib || ansObj.fib || {};
+      const hasFibAnswers = Object.keys(fibAnswersMap).length > 0;
+
+      let correctFib = 0;
+      fibList.forEach((fib: any) => {
+        if (isFibAnswerCorrect(fibAnswersMap?.[fib.id], fib.answer, fib.sentence)) correctFib++;
+      });
+
+      if (!hasFibAnswers && correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
+        correctFib = sub.Punteggio_FIB;
+      }
+      updatedPunteggioFIB = correctFib;
+
+      const fibs = fibWeightedScore(fibList, fibAnswersMap, isFibAnswerCorrect);
+
+      const wbMcList = collectExamMultipleChoice(domandeObj);
+      const hasWbMcAnswers = Object.keys(ansObj.mc || {}).length > 0;
+      let correctMc = 0;
+      if (wbMcList.length > 0) {
+        wbMcList.forEach((q: any) => {
+          const chosen = ansObj.mc?.[q.id];
+          if (chosen !== undefined && chosen !== null && chosen !== "" && Number(chosen) === Number(q.correctIndex)) {
+            correctMc++;
+          }
+        });
+        if (!hasWbMcAnswers && correctMc === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
+          correctMc = sub.Punteggio_MC;
+        }
+        updatedPunteggioMC = correctMc;
+      }
+
+      const breakdownAnswers: any = {};
+      if (hasFibAnswers) breakdownAnswers.wbFib = fibAnswersMap;
+      if (hasWbMcAnswers) breakdownAnswers.mc = ansObj.mc;
+
+      if (rqList.length === 0) {
+        const breakdown = computeGradeBreakdown({
+          tipo: "Workbook",
+          examData: domandeObj,
+          answers: breakdownAnswers,
+          punteggioFIB: correctFib,
+          punteggioMC: correctMc
+        });
+        newGrade = breakdown.finalGradeFormatted;
+        evalObj.reflectionDetails = [];
+        evalObj.fibScore = correctFib;
+        evalObj.fibTotal = fibList.length;
+        evalObj.suggestedGrade = newGrade;
+        evalObj.gradeBreakdown = breakdown;
+        evalObj.overallFeedback = wbMcList.length > 0
+          ? `Valutazione completata del quaderno di lavoro: l'alunno ha conseguito ${correctFib}/${fibList.length} termini FIB e ${correctMc}/${wbMcList.length} risposte a scelta multipla (voto matematico: ${newGrade}).`
+          : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
+        newFeedback = evalObj.overallFeedback;
+      } else {
+        const sanitizedAnswers = { ...(ansObj || {}), wbRq: { ...(ansObj?.wbRq || {}) } };
+        rqList.forEach((r: any) => {
+          const text = String(ansObj.wbRq?.[r?.id] ?? ansObj.oe?.[r?.id] ?? "");
+          if (detectGibberish(text)) sanitizedAnswers.wbRq[r.id] = "[VUOTO]";
+          else if (!sanitizedAnswers.wbRq[r.id] && ansObj.oe?.[r?.id]) {
+            sanitizedAnswers.wbRq[r.id] = String(ansObj.oe[r.id]);
+          }
+        });
+
+        const studentPseudoId = deriveStudentPseudonym(
+          sub.Email || sub.id || sub.Nome || "anonimo",
+          sub.Session_Id || sub.Pin || ""
+        );
+        const { scrubbedAnswers: aiSafeWbAnswers } = scrubAnswersForAi(sanitizedAnswers, {
+          fullName: sub.Nome,
+          email: sub.Email,
+        });
+
+        const evaluation = await requestAiReevaluation({
+          tipo: "Workbook",
+          forceReevaluation: true,
+          prompt:
+            "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
+          studentPseudoId,
+          sessionPin: sub.Pin || "",
+          sessionId: sub.Session_Id || "",
+          studentClass: resolveSubmissionClass(sub),
+          report: {
+            domande: domandeObj,
+            risposte: aiSafeWbAnswers,
+            punteggioMC: correctMc,
+            punteggioFIB: correctFib,
+            totaleFIB: fibList.length,
+            punteggioFIBPesato: fibs.weightedCorrect,
+            pesoFIBTotale: fibs.weightedTotal,
+            autovalutazione: sub.Autovalutazione || ""
+          }
+        }, (qInfo) => {
+          if (!options?.silent && qInfo.status === "pending" && qInfo.position) {
+            showNotify("success", `⏳ Ricalcolo in coda (posizione ${qInfo.position})...`, 3500);
+          }
+        });
+
+        const audit = auditSubjectiveEvaluation({
+          questions: rqList,
+          details: evaluation?.reflectionDetails || [],
+          getAnswer: (id) => String(sanitizedAnswers.wbRq?.[id] ?? sanitizedAnswers.oe?.[id] ?? ""),
+          getDetailId: (d) => d?.id,
+        });
+        if (!audit.complete) {
+          throw new Error(
+            `Correzione IA incompleta: ${audit.missing.length} riflessione/i critica/he non ha/hanno ricevuto un voto. ` +
+            `La valutazione NON è stata salvata` +
+            (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
+            `. Riprova tra qualche minuto.`
+          );
+        }
+        evaluation.reflectionDetails = audit.details;
+
+        evalObj = { ...evalObj, ...evaluation };
+        evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
+        evalObj.fibScore = correctFib;
+        evalObj.fibTotal = fibList.length;
+        const breakdown = computeGradeBreakdown({
+          tipo: "Workbook",
+          examData: domandeObj,
+          answers: breakdownAnswers,
+          evaluation: evalObj,
+          punteggioFIB: correctFib,
+          punteggioMC: correctMc
+        });
+        newGrade = breakdown.finalGradeFormatted;
+        evalObj.suggestedGrade = newGrade;
+        evalObj.gradeBreakdown = breakdown;
+        newFeedback = evaluation.overallFeedback || newFeedback;
+        if (!newErrors) {
+          newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
+            ? "Alcune riflessioni risultano senza risposta o non pertinenti."
+            : "Nessun errore grave rilevato nelle riflessioni critiche.";
+        }
+      }
+    }
+
+    const updatePayload: any = {
+      Voto_Suggerito: newGrade ?? sub.Voto_Suggerito ?? "N.V.",
+      Full_Evaluation: JSON.stringify(evalObj),
+      Errori_Principali: typeof newErrors === "string" ? newErrors : "",
+      Feedback_Generale: typeof newFeedback === "string" ? newFeedback : ""
+    };
+    if (updatedPunteggioMC !== undefined) {
+      updatePayload.Punteggio_MC = updatedPunteggioMC;
+    }
+    if (updatedPunteggioFIB !== undefined) {
+      updatePayload.Punteggio_FIB = updatedPunteggioFIB;
+    }
+    Object.keys(updatePayload).forEach((k) => {
+      if (updatePayload[k] === undefined) delete updatePayload[k];
+    });
+
+    await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
+
+    const updatedSub = { ...sub, ...updatePayload };
+    setSubmissions(prev => prev.map(item => item.id === sub.id ? updatedSub : item));
+    if (selectedSub?.id === sub.id) {
+      setSelectedSub(updatedSub);
+    }
+    return { grade: String(updatePayload.Voto_Suggerito || "N.V.") };
+  };
+
+  // Recalculates and repairs a single submission triggered from UI
   const handleRecalculateGrade = async (sub: SavedSubmission) => {
     if (!dbFirestore) {
       setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
@@ -2163,304 +2582,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
     setRecalculatingId(sub.id);
     try {
-      const domandeObj = safeParseJson(sub.Domande_Esame);
-      const ansObj = safeParseJson(sub.Risposte_Studente) || {};
-      let evalObj = safeParseJson(sub.Full_Evaluation) || {};
-
-      let newGrade = sub.Voto_Suggerito;
-      let newErrors = sub.Errori_Principali;
-      let newFeedback = sub.Feedback_Generale;
-      let updatedPunteggioMC = sub.Punteggio_MC;
-      let updatedPunteggioFIB = sub.Punteggio_FIB;
-
-      if (sub.Tipo === "Quiz") {
-        const mcList = domandeObj?.multipleChoice || [];
-        const oeList = domandeObj?.openEnded || [];
-
-        let correctCount = 0;
-        const wrongQuestions: Array<{ number: number; question: string; studentChoice: string; correctChoice: string }> = [];
-
-        mcList.forEach((q: any, idx: number) => {
-          const chosen = ansObj.mc?.[q.id];
-          const hasChosen = chosen !== undefined && chosen !== null && chosen !== "";
-          if (hasChosen && Number(chosen) === Number(q.correctIndex)) {
-            correctCount++;
-          } else {
-            wrongQuestions.push({
-              number: idx + 1,
-              question: q.question,
-              studentChoice: (hasChosen && q.options?.[chosen]) ? q.options[chosen] : "Nessuna opzione selezionata",
-              correctChoice: q.options?.[q.correctIndex] || ""
-            });
-          }
-        });
-
-        if (correctCount === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
-          correctCount = sub.Punteggio_MC;
-        }
-        updatedPunteggioMC = correctCount;
-
-        const mcAnsNorm: Record<string, number> = {};
-        for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
-        const mcs = mcWeightedScore(mcList, mcAnsNorm);
-        const hasMcAnswers = Object.keys(mcAnsNorm).length > 0;
-
-        if (oeList.length === 0) {
-          // Same unified formula used by the server, the report panel and the
-          // stored breakdown, so "Ricalcola voto" can no longer drift.
-          const breakdown = computeGradeBreakdown({
-            tipo: "Quiz",
-            examData: domandeObj,
-            answers: hasMcAnswers ? ansObj : undefined,
-            punteggioMC: correctCount
-          });
-          newGrade = breakdown.finalGradeFormatted;
-          evalObj.openEndedDetails = [];
-          evalObj.suggestedGrade = newGrade;
-          evalObj.gradeBreakdown = breakdown;
-          evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
-          newFeedback = evalObj.openEndedEvaluation;
-
-          if (wrongQuestions.length > 0) {
-            evalObj.mainErrors = `Errori riscontrati nella prova a scelta multipla (${wrongQuestions.length} su ${mcList.length}): ${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}"`).join(", ")}.`;
-            newErrors = evalObj.mainErrors;
-          } else {
-            evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
-            newErrors = evalObj.mainErrors;
-          }
-        } else {
-          // Real AI re-evaluation: never apply a fixed "dignity floor".
-          // Blank or gibberish answers are marked "[VUOTO]" so the AI scores
-          // them 0; every written answer is graded on its actual content.
-          const sanitizedAnswers = { ...(ansObj || {}), oe: { ...(ansObj?.oe || {}) } };
-          oeList.forEach((q: any) => {
-            const text = String(ansObj.oe?.[q?.id] ?? ansObj.openEnded?.[q?.id] ?? "");
-            if (detectGibberish(text)) sanitizedAnswers.oe[q.id] = "[VUOTO]";
-          });
-
-          const studentPseudoId = deriveStudentPseudonym(
-            sub.Email || sub.id || sub.Nome || "anonimo",
-            sub.Session_Id || sub.Pin || ""
-          );
-          const { scrubbedAnswers: aiSafeQuizAnswers } = scrubAnswersForAi(sanitizedAnswers, {
-            fullName: sub.Nome,
-            email: sub.Email,
-          });
-
-          const evaluation = await requestAiReevaluation({
-            tipo: "Quiz",
-            forceReevaluation: true,
-            prompt:
-              "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
-            studentPseudoId,
-            sessionPin: sub.Pin || sub.Session_Id || "",
-            report: {
-              domande: domandeObj,
-              risposte: aiSafeQuizAnswers,
-              punteggioMC: correctCount,
-              punteggioMCPesato: mcs.weightedCorrect,
-              pesoMCTotale: mcs.weightedTotal,
-              autovalutazione: sub.Autovalutazione || ""
-            }
-          });
-
-          // Safety gate: do NOT save a partial AI correction. A written answer
-          // without a score must block the update, not silently become 0.
-          const audit = auditSubjectiveEvaluation({
-            questions: oeList,
-            details: evaluation?.openEndedDetails || [],
-            getAnswer: (id) => String(sanitizedAnswers.oe?.[id] ?? ""),
-            getDetailId: (d) => d?.questionId,
-          });
-          if (!audit.complete) {
-            throw new Error(
-              `Correzione IA incompleta: ${audit.missing.length} domanda/e aperta/e non ha/hanno ricevuto un voto. ` +
-              `La valutazione NON è stata salvata` +
-              (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
-              `. Riprova tra qualche minuto.`
-            );
-          }
-          evaluation.openEndedDetails = audit.details;
-
-          evalObj = { ...evalObj, ...evaluation };
-          evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
-          const breakdown = computeGradeBreakdown({
-            tipo: "Quiz",
-            examData: domandeObj,
-            answers: sanitizedAnswers,
-            evaluation: evalObj,
-            punteggioMC: correctCount
-          });
-          newGrade = breakdown.finalGradeFormatted;
-          evalObj.suggestedGrade = newGrade;
-          evalObj.gradeBreakdown = breakdown;
-          newErrors = evaluation.mainErrors || newErrors;
-          newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
-        }
-      } else if (sub.Tipo === "Workbook") {
-        const sections = domandeObj?.sections || [];
-        const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
-        const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
-
-        let correctFib = 0;
-        fibList.forEach((fib: any) => {
-          if (isFibAnswerCorrect(ansObj.wbFib?.[fib.id], fib.answer, fib.sentence)) correctFib++;
-        });
-
-        if (correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
-          correctFib = sub.Punteggio_FIB;
-        }
-        updatedPunteggioFIB = correctFib;
-
-        const fibs = fibWeightedScore(fibList, ansObj.wbFib || {}, isFibAnswerCorrect);
-        const hasFibAnswers = Object.keys(ansObj.wbFib || {}).length > 0;
-
-        // Check for multiple-choice questions in Workbook (sections + root)
-        const wbMcList: any[] = [];
-        if (Array.isArray(domandeObj?.multipleChoice)) wbMcList.push(...domandeObj.multipleChoice);
-        sections.forEach((s: any) => {
-          if (Array.isArray(s.multipleChoice)) wbMcList.push(...s.multipleChoice);
-        });
-
-        let correctMc = 0;
-        if (wbMcList.length > 0) {
-          wbMcList.forEach((q: any) => {
-            const chosen = ansObj.mc?.[q.id];
-            if (chosen !== undefined && chosen !== null && chosen !== "" && Number(chosen) === Number(q.correctIndex)) {
-              correctMc++;
-            }
-          });
-          if (correctMc === 0 && sub.Punteggio_MC && sub.Punteggio_MC > 0) {
-            correctMc = sub.Punteggio_MC;
-          }
-          updatedPunteggioMC = correctMc;
-        }
-
-        const breakdownAnswers: any = {};
-        if (hasFibAnswers) breakdownAnswers.wbFib = ansObj.wbFib;
-        if (Object.keys(ansObj.mc || {}).length > 0) breakdownAnswers.mc = ansObj.mc;
-
-        if (rqList.length === 0) {
-          const breakdown = computeGradeBreakdown({
-            tipo: "Workbook",
-            examData: domandeObj,
-            answers: breakdownAnswers,
-            punteggioFIB: correctFib,
-            punteggioMC: correctMc
-          });
-          newGrade = breakdown.finalGradeFormatted;
-          evalObj.reflectionDetails = [];
-          evalObj.suggestedGrade = newGrade;
-          evalObj.gradeBreakdown = breakdown;
-          evalObj.overallFeedback = wbMcList.length > 0
-            ? `Valutazione completata del quaderno di lavoro: l'alunno ha conseguito ${correctFib}/${fibList.length} termini FIB e ${correctMc}/${wbMcList.length} risposte a scelta multipla (voto matematico: ${newGrade}).`
-            : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
-          newFeedback = evalObj.overallFeedback;
-        } else {
-          // Real AI re-evaluation of the reflections (same rule as the Quiz).
-          const sanitizedAnswers = { ...(ansObj || {}), wbRq: { ...(ansObj?.wbRq || {}) } };
-          rqList.forEach((r: any) => {
-            const text = String(ansObj.wbRq?.[r?.id] ?? ansObj.oe?.[r?.id] ?? "");
-            if (detectGibberish(text)) sanitizedAnswers.wbRq[r.id] = "[VUOTO]";
-          });
-
-          const studentPseudoId = deriveStudentPseudonym(
-            sub.Email || sub.id || sub.Nome || "anonimo",
-            sub.Session_Id || sub.Pin || ""
-          );
-          const { scrubbedAnswers: aiSafeWbAnswers } = scrubAnswersForAi(sanitizedAnswers, {
-            fullName: sub.Nome,
-            email: sub.Email,
-          });
-
-          const evaluation = await requestAiReevaluation({
-            tipo: "Workbook",
-            forceReevaluation: true,
-            prompt:
-              "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
-            studentPseudoId,
-            sessionPin: sub.Pin || sub.Session_Id || "",
-            report: {
-              domande: domandeObj,
-              risposte: aiSafeWbAnswers,
-              punteggioMC: correctMc,
-              punteggioFIB: correctFib,
-              totaleFIB: fibList.length,
-              punteggioFIBPesato: fibs.weightedCorrect,
-              pesoFIBTotale: fibs.weightedTotal,
-              autovalutazione: sub.Autovalutazione || ""
-            }
-          });
-
-          // Safety gate: never overwrite a submission with a partial correction.
-          const audit = auditSubjectiveEvaluation({
-            questions: rqList,
-            details: evaluation?.reflectionDetails || [],
-            getAnswer: (id) => String(sanitizedAnswers.wbRq?.[id] ?? sanitizedAnswers.oe?.[id] ?? ""),
-            getDetailId: (d) => d?.id,
-          });
-          if (!audit.complete) {
-            throw new Error(
-              `Correzione IA incompleta: ${audit.missing.length} riflessione/i critica/he non ha/hanno ricevuto un voto. ` +
-              `La valutazione NON è stata salvata` +
-              (evaluation?.manualReviewReason ? ` (${evaluation.manualReviewReason})` : "") +
-              `. Riprova tra qualche minuto.`
-            );
-          }
-          evaluation.reflectionDetails = audit.details;
-
-          evalObj = { ...evalObj, ...evaluation };
-          evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
-          evalObj.fibTotal = fibList.length;
-          const breakdown = computeGradeBreakdown({
-            tipo: "Workbook",
-            examData: domandeObj,
-            answers: breakdownAnswers,
-            evaluation: evalObj,
-            punteggioFIB: correctFib,
-            punteggioMC: correctMc
-          });
-          newGrade = breakdown.finalGradeFormatted;
-          evalObj.suggestedGrade = newGrade;
-          evalObj.gradeBreakdown = breakdown;
-          newFeedback = evaluation.overallFeedback || newFeedback;
-          if (!newErrors) {
-            newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
-              ? "Alcune riflessioni risultano senza risposta o non pertinenti."
-              : "Nessun errore grave rilevato nelle riflessioni critiche.";
-          }
-        }
-      }
-
-      // Firestore rejects documents containing `undefined`, so only include
-      // defined values (the old code crashed on a missing Errori_Principali).
-      const updatePayload: any = {
-        Voto_Suggerito: newGrade ?? sub.Voto_Suggerito ?? "N.V.",
-        Full_Evaluation: JSON.stringify(evalObj),
-        Errori_Principali: typeof newErrors === "string" ? newErrors : "",
-        Feedback_Generale: typeof newFeedback === "string" ? newFeedback : ""
-      };
-      if (updatedPunteggioMC !== undefined) {
-        updatePayload.Punteggio_MC = updatedPunteggioMC;
-      }
-      if (updatedPunteggioFIB !== undefined) {
-        updatePayload.Punteggio_FIB = updatedPunteggioFIB;
-      }
-      Object.keys(updatePayload).forEach((k) => {
-        if (updatePayload[k] === undefined) delete updatePayload[k];
-      });
-
-      await updateDoc(doc(dbFirestore, "valutazioni", sub.id), updatePayload);
-
-      const updatedSub = { ...sub, ...updatePayload };
-      setSubmissions(prev => prev.map(item => item.id === sub.id ? updatedSub : item));
-      if (selectedSub?.id === sub.id) {
-        setSelectedSub(updatedSub);
-      }
-
+      const { grade } = await recalculateSingleSubmission(sub);
       showNotify(
         "success",
-        `✅ Voto e valutazione aggiornati con successo nel database scolastico! Nuovo voto: ${newGrade}`,
+        `✅ Voto e valutazione aggiornati con successo nel database scolastico! Nuovo voto: ${grade}`,
         5000
       );
     } catch (err: any) {
@@ -2468,6 +2593,44 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setAppAlert({ msg: `Errore durante il ricalcolo: ${err.message}` });
     } finally {
       setRecalculatingId(null);
+    }
+  };
+
+  // Sequentially re-evaluates all pending (N.V.) submissions in current view
+  const handleBulkRecalculatePending = async (targetSubs: SavedSubmission[]) => {
+    if (!dbFirestore || bulkRecalculatingProgress) return;
+    const pendingList = targetSubs.filter((s) => {
+      const meta = submissionMetaMap.get(s.id);
+      return (meta ? meta.displayGrade === "N.V." || meta.pendingOpen > 0 : isEvaluationPending(safeParseJson(s.Full_Evaluation)) || getPendingSubjectiveCount(s) > 0 || s.Voto_Suggerito === "N.V.");
+    });
+    if (pendingList.length === 0) return;
+
+    setBulkRecalculatingProgress({ current: 0, total: pendingList.length });
+    let completedCount = 0;
+    let failedCount = 0;
+    try {
+      for (let i = 0; i < pendingList.length; i++) {
+        const sub = pendingList[i];
+        setBulkRecalculatingProgress({ current: i + 1, total: pendingList.length });
+        setRecalculatingId(sub.id);
+        try {
+          await recalculateSingleSubmission(sub, { silent: true });
+          completedCount++;
+        } catch (err) {
+          console.warn("Ricalcolo batch N.V. fallito per", sub.id, err);
+          failedCount++;
+        }
+      }
+      if (completedCount > 0 && failedCount === 0) {
+        showNotify("success", `✅ Ricalcolate e sbloccate tutte le ${completedCount} consegne sospese (N.V.).`, 5000);
+      } else if (completedCount > 0) {
+        showNotify("success", `⚠️ Ricalcolate ${completedCount}/${pendingList.length} consegne N.V. (${failedCount} non ancora disponibili).`, 6000);
+      } else {
+        setAppAlert({ msg: "❌ Nessuna delle consegne N.V. è riuscita a completare il ricalcolo. Riprova tra qualche minuto." });
+      }
+    } finally {
+      setRecalculatingId(null);
+      setBulkRecalculatingProgress(null);
     }
   };
 
@@ -2612,36 +2775,32 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const ansObj = safeParseJson(sub.Risposte_Studente) || {};
       const evalObj = { ...(safeParseJson(sub.Full_Evaluation) || {}) };
 
-      if (kind === "open_ended") {
-        const list = Array.isArray(evalObj.openEndedDetails) ? [...evalObj.openEndedDetails] : [];
-        const idx = list.findIndex((d: any) => String(d?.questionId) === String(questionId));
-        const nextEntry = {
-          questionId,
-          score: newScore,
-          feedback: newFeedback || (idx >= 0 ? list[idx]?.feedback : "Valutazione inserita dal docente."),
-          teacherEdited: true,
-        };
-        if (idx >= 0) list[idx] = { ...list[idx], ...nextEntry };
-        else list.push(nextEntry);
-        evalObj.openEndedDetails = list;
-      } else {
-        const list = Array.isArray(evalObj.reflectionDetails) ? [...evalObj.reflectionDetails] : [];
-        const idx = list.findIndex((d: any) => String(d?.id) === String(questionId));
-        const nextEntry = {
-          id: questionId,
-          score: newScore,
-          feedback: newFeedback || (idx >= 0 ? list[idx]?.feedback : "Valutazione inserita dal docente."),
-          teacherEdited: true,
-        };
-        if (idx >= 0) list[idx] = { ...list[idx], ...nextEntry };
-        else list.push(nextEntry);
-        evalObj.reflectionDetails = list;
-      }
-
-      const oeQuestions = Array.isArray(domandeObj?.openEnded) ? domandeObj.openEnded : [];
+      const oeQuestions = collectQuizOpenEnded(domandeObj);
       const rqQuestions = Array.isArray(domandeObj?.sections)
         ? domandeObj.sections.flatMap((s: any) => s.reflectionQuestions || [])
         : [];
+
+      if (kind === "open_ended") {
+        evalObj.openEndedDetails = applySubjectiveRetouchToDetails({
+          kind: "open_ended",
+          questions: oeQuestions,
+          details: Array.isArray(evalObj.openEndedDetails) ? evalObj.openEndedDetails : [],
+          getAnswer: (id) => String(ansObj?.oe?.[id] ?? ansObj?.openEnded?.[id] ?? ""),
+          questionId,
+          newScore,
+          newFeedback,
+        });
+      } else {
+        evalObj.reflectionDetails = applySubjectiveRetouchToDetails({
+          kind: "reflection",
+          questions: rqQuestions,
+          details: Array.isArray(evalObj.reflectionDetails) ? evalObj.reflectionDetails : [],
+          getAnswer: (id) => String(ansObj?.wbRq?.[id] ?? ansObj?.oe?.[id] ?? ""),
+          questionId,
+          newScore,
+          newFeedback,
+        });
+      }
       const audit =
         kind === "open_ended"
           ? auditSubjectiveEvaluation({
@@ -3480,7 +3639,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
       const averageGradeNumber = numericGradesCount > 0 ? numericGradesSum / numericGradesCount : null;
       const averageGradeFormatted = averageGradeNumber !== null ? formatItalianScholasticGrade(averageGradeNumber) : "N/D";
-      const passRate = (passedCount + failedCount) > 0 ? Math.round((passedCount / (passedCount + failedCount)) * 100) : 100;
+      const passRate = (passedCount + failedCount) > 0 ? Math.round((passedCount / (passedCount + failedCount)) * 100) : 0;
 
       list.push({
         key,
@@ -3871,6 +4030,47 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       <>
                         <button
                           type="button"
+                          onClick={() => {
+                            const parsed = safeParseJson(jsonText);
+                            if (!parsed) {
+                              showNotify("error", "Correggi prima la sintassi JSON della verifica.");
+                              return;
+                            }
+                            setShowPreviewModal(true);
+                          }}
+                          title="Simula la visualizzazione dello studente (con toggle soluzioni docente e modalità BES)"
+                          className="text-[10px] text-sky-300 hover:text-sky-200 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <Eye className="w-3 h-3" />
+                          <span>Anteprima Traccia</span>
+                        </button>
+                        <button
+                          type="button"
+                          onClick={async () => {
+                            const parsed = safeParseJson(jsonText);
+                            if (!parsed) {
+                              showNotify("error", "Correggi prima la sintassi JSON della verifica.");
+                              return;
+                            }
+                            try {
+                              await exportBlankExamPaperPdf(parsed, {
+                                title: materia.trim() || parsed.title || "Verifica",
+                                trackLabel: mixFilaAB ? "Fila A" : undefined,
+                                includeTeacherKeyPage: true,
+                              });
+                              showNotify("success", "Traccia cartacea A4 esportata in PDF!");
+                            } catch (err: any) {
+                              showNotify("error", err?.message || "Errore durante l'esportazione PDF.");
+                            }
+                          }}
+                          title="Esporta traccia cartacea A4 pronta da stampare (con chiave docente separata)"
+                          className="text-[10px] text-indigo-300 hover:text-indigo-200 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                        >
+                          <Printer className="w-3 h-3" />
+                          <span>Traccia PDF</span>
+                        </button>
+                        <button
+                          type="button"
                           onClick={() => downloadTextFile(libraryFilename(materia || "verifica_esame"), jsonText)}
                           title="Scarica il file JSON aggiornato sul tuo computer"
                           className="text-[10px] text-teal-400 hover:text-teal-300 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
@@ -4121,10 +4321,36 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       </div>
 
                       {filaBExamJson ? (
-                        <p className="text-emerald-300 font-semibold flex items-center gap-1.5">
-                          <CheckCircle className="w-3.5 h-3.5 shrink-0" />
-                          <span>Fila B pronta: {filaBTitle || "Variante personalizzata"}</span>
-                        </p>
+                        <div className="flex flex-wrap items-center justify-between gap-2">
+                          <p className="text-emerald-300 font-semibold flex items-center gap-1.5">
+                            <CheckCircle className="w-3.5 h-3.5 shrink-0" />
+                            <span>Fila B pronta: {filaBTitle || "Variante personalizzata"}</span>
+                          </p>
+                          <button
+                            type="button"
+                            onClick={async () => {
+                              const parsedB = safeParseJson(filaBExamJson);
+                              if (!parsedB) {
+                                showNotify("error", "Struttura Fila B non valida per l'esportazione.");
+                                return;
+                              }
+                              try {
+                                await exportBlankExamPaperPdf(parsedB, {
+                                  title: filaBTitle || materia.trim() || "Verifica",
+                                  trackLabel: "Fila B",
+                                  includeTeacherKeyPage: true,
+                                });
+                                showNotify("success", "Traccia Fila B esportata in PDF!");
+                              } catch (err: any) {
+                                showNotify("error", err?.message || "Errore esportazione Fila B.");
+                              }
+                            }}
+                            className="px-2 py-1 rounded-lg bg-purple-500/20 hover:bg-purple-500/30 border border-purple-400/30 text-purple-200 font-semibold flex items-center gap-1 cursor-pointer transition-colors"
+                          >
+                            <Printer className="w-3 h-3" />
+                            <span>PDF Fila B</span>
+                          </button>
+                        </div>
                       ) : (
                         <p className="text-amber-300/90">
                           Nessuna Fila B ancora collegata: clicca &quot;Genera Fila B con IA&quot; oppure seleziona una traccia dalla libreria.
@@ -4357,7 +4583,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           type="button"
                           disabled={isExtending}
                           onClick={() => {
-                            const isWorkbook = jsonText.includes('"sections"');
+                            const parsedPreview = safeParseJson(jsonText);
+                            const isWorkbook = isWorkbookExamData(parsedPreview);
                             if (isWorkbook) {
                               handleExtendExam("Aggiungi una domanda di riflessione critica all'interno delle sezioni del Workbook con criteri di valutazione.", "reflection");
                             } else {
@@ -4684,6 +4911,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 onTerminateAllSessions={handleTerminateAllSessions}
                 onToggleSolutionsReleased={handleToggleSolutionsReleased}
                 onExtendSessionTime={handleExtendSessionTime}
+                onSessionMaxExtended={handleSessionMaxExtended}
                 onPurgeArchivedSession={handlePurgeArchivedSession}
                 terminatingPin={terminatingPin}
                 terminatingAll={terminatingAll}
@@ -4788,6 +5016,31 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                       <HelpCircle className="w-3.5 h-3.5 text-amber-400" />
                       <span>Info Accesso Account</span>
                     </button>
+                    {(() => {
+                      const pendingNvCount = filteredSubmissions.filter((s) => {
+                        const meta = submissionMetaMap.get(s.id);
+                        return meta
+                          ? meta.displayGrade === "N.V." || meta.pendingOpen > 0
+                          : isEvaluationPending(safeParseJson(s.Full_Evaluation)) || getPendingSubjectiveCount(s) > 0 || s.Voto_Suggerito === "N.V.";
+                      }).length;
+                      if (pendingNvCount === 0) return null;
+                      return (
+                        <button
+                          type="button"
+                          disabled={!!bulkRecalculatingProgress || !!recalculatingId}
+                          onClick={() => handleBulkRecalculatePending(filteredSubmissions)}
+                          className="flex items-center gap-1.5 py-1.5 px-3 bg-rose-500/20 hover:bg-rose-500/35 text-rose-200 font-bold rounded-xl text-xs transition-colors cursor-pointer border border-rose-500/40 disabled:opacity-45"
+                          title="Riprova la correzione IA per tutte le verifiche rimaste in stato N.V."
+                        >
+                          <Wand2 className={`w-3.5 h-3.5 text-rose-300 ${bulkRecalculatingProgress ? "animate-spin" : ""}`} />
+                          <span>
+                            {bulkRecalculatingProgress
+                              ? `Ricalcolo N.V. (${bulkRecalculatingProgress.current}/${bulkRecalculatingProgress.total})...`
+                              : `Ricalcola N.V. (${pendingNvCount})`}
+                          </span>
+                        </button>
+                      );
+                    })()}
                     {filteredSubmissions.some((s) => !!s.Soluzioni_Differite) && (
                       <button
                         type="button"
@@ -5994,7 +6247,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                           {(() => {
                             const totalPass = filteredExamSummaries.reduce((acc, e) => acc + e.passedCount, 0);
                             const totalGraded = filteredExamSummaries.reduce((acc, e) => acc + e.passedCount + e.failedCount, 0);
-                            return totalGraded > 0 ? `${Math.round((totalPass / totalGraded) * 100)}%` : "100%";
+                            return totalGraded > 0 ? `${Math.round((totalPass / totalGraded) * 100)}%` : "—";
                           })()}
                         </p>
                       </div>
@@ -6062,6 +6315,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                       {exam.tipo}
                                     </span>
 
+                                    {(() => {
+                                      const deferredCount = exam.submissions.filter((s) => !!s.Soluzioni_Differite).length;
+                                      return deferredCount > 0 ? (
+                                        <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-amber-500/15 text-amber-300 border border-amber-500/30">
+                                          🔒 {deferredCount} differite
+                                        </span>
+                                      ) : null;
+                                    })()}
+
                                     <span className="text-[11px] text-slate-400">
                                       Ultima consegna: {new Date(exam.latestDate).toLocaleDateString("it-IT", { day: "2-digit", month: "2-digit", year: "numeric" })} alle {new Date(exam.latestDate).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}
                                     </span>
@@ -6097,12 +6359,69 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
                                   <div className="text-left sm:text-center">
                                     <span className="text-[10px] text-slate-400 block">Sufficienze</span>
-                                    <span className={`font-bold text-xs ${exam.passRate >= 70 ? 'text-emerald-400' : 'text-amber-400'}`}>
-                                      {exam.passedCount}/{exam.totalStudents} ({exam.passRate}%)
+                                    <span className={`font-bold text-xs ${exam.passedCount + exam.failedCount === 0 ? "text-slate-400" : exam.passRate >= 70 ? "text-emerald-400" : "text-amber-400"}`}>
+                                      {exam.passedCount + exam.failedCount > 0
+                                        ? `${exam.passedCount}/${exam.passedCount + exam.failedCount} (${exam.passRate}%)`
+                                        : "N.V."}
                                     </span>
                                   </div>
 
-                                  <div className="flex items-center gap-2">
+                                  <div className="flex items-center gap-2 flex-wrap">
+                                    <button
+                                      type="button"
+                                      onClick={(e) => {
+                                        e.stopPropagation();
+                                        const extracted = extractReusableExamFromSubmissions(exam.submissions);
+                                        if (!extracted) {
+                                          showNotify(
+                                            "error",
+                                            "Impossibile clonare questa prova: le consegne archiviate hanno ancora le soluzioni differite bloccate o una struttura incompleta."
+                                          );
+                                          return;
+                                        }
+                                        if (jsonText.trim()) {
+                                          setPreviousJsonBackup({
+                                            json: jsonText,
+                                            title: materia,
+                                            reason: `Prima di riusare "${extracted.title}"`,
+                                          });
+                                        }
+                                        setLoadedLibraryItemId(null);
+                                        setJsonText(extracted.formattedJson);
+                                        setMateria(extracted.title);
+                                        setTargetClass("");
+                                        validateExamJSON(extracted.formattedJson);
+                                        window.scrollTo({ top: 0, behavior: "smooth" });
+                                        showNotify(
+                                          "success",
+                                          `Traccia "${extracted.title}" caricata nell'editor! Imposta classe e nuovo PIN per riproporla.`
+                                        );
+                                      }}
+                                      className="flex items-center gap-1 px-2.5 py-1.5 bg-purple-600/20 hover:bg-purple-600 text-purple-200 hover:text-white border border-purple-500/30 text-xs font-semibold rounded-xl transition-all cursor-pointer"
+                                      title="Clona e ricarica questa verifica nell'editor per riproporla a un'altra classe o con un nuovo PIN"
+                                    >
+                                      <Copy className="w-3.5 h-3.5" />
+                                      <span className="hidden sm:inline">Riusa Traccia</span>
+                                    </button>
+                                    {(() => {
+                                      const deferredExamSubs = exam.submissions.filter((s) => !!s.Soluzioni_Differite);
+                                      if (deferredExamSubs.length === 0) return null;
+                                      return (
+                                        <button
+                                          type="button"
+                                          disabled={bulkUnlockingDeferred}
+                                          onClick={(e) => {
+                                            e.stopPropagation();
+                                            handleBulkUnlockDeferredSubmissions(deferredExamSubs);
+                                          }}
+                                          className="flex items-center gap-1 px-2.5 py-1.5 bg-amber-500/20 hover:bg-amber-500 text-amber-200 hover:text-slate-950 border border-amber-500/40 text-xs font-bold rounded-xl transition-all cursor-pointer disabled:opacity-40"
+                                          title={`Sblocca e pubblica subito le soluzioni differite per tutte le ${deferredExamSubs.length} consegne di questa prova`}
+                                        >
+                                          <Unlock className="w-3.5 h-3.5" />
+                                          <span>Sblocca ({deferredExamSubs.length})</span>
+                                        </button>
+                                      );
+                                    })()}
                                     <button
                                       type="button"
                                       onClick={(e) => {
@@ -6197,6 +6516,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                   <ExamItemAnalysisPanel
                                     submissions={exam.submissions}
                                     examTitle={exam.title}
+                                    blindGradingMode={blindGradingMode}
                                     onGenerateRecoveryExam={(prefill) => {
                                       setAiModalPrefill(prefill);
                                       setShowAiModal(true);
@@ -6822,6 +7142,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           "Verifica Scolastica"
         }
         examImages={safeParseJson(printableSub?.Domande_Esame)?.images}
+      />
+
+      {/* Pre-flight Student / BES Exam Preview Modal */}
+      <ExamPreviewModal
+        isOpen={showPreviewModal}
+        onClose={() => setShowPreviewModal(false)}
+        examData={safeParseJson(jsonText)}
+        titleOverride={materia}
       />
 
       {/* Educational Access & Concurrency Help Modal */}

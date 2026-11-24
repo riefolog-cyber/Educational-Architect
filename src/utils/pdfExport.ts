@@ -8,8 +8,11 @@ import {
   getFibSentenceParts,
   extractBreakdownFromSubmission,
   buildSubjectiveReviewEntries,
+  collectExamMultipleChoice,
+  collectQuizOpenEnded,
   getPendingSubjectiveCount,
   isEvaluationPending,
+  isWorkbookExamData,
   safeParseJson,
 } from "../utils";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
@@ -356,8 +359,8 @@ export function createSubmissionPdfDoc(
   const domandeObj = safeParseJson(sub.Domande_Esame);
 
   if (sub.Tipo === "Quiz") {
-    const mcqList = domandeObj?.multipleChoice || [];
-    const oeList = domandeObj?.openEnded || [];
+    const mcqList = collectExamMultipleChoice(domandeObj);
+    const oeList = collectQuizOpenEnded(domandeObj);
     const details = evalObj?.openEndedDetails || [];
 
     if (mcqList.length > 0) {
@@ -465,8 +468,45 @@ export function createSubmissionPdfDoc(
   } else {
     const sections = domandeObj?.sections || [];
     const details = evalObj?.reflectionDetails || [];
+    const wbMcqList = collectExamMultipleChoice(domandeObj);
 
-    if (sections.length > 0) {
+    if (wbMcqList.length > 0) {
+      checkPageBreak(15);
+      doc.setFont("Helvetica", "bold");
+      doc.setFontSize(10);
+      doc.setTextColor(71, 85, 105);
+      doc.text("Scelta Multipla del Workbook (Crocette)", 15, currentY);
+      currentY += 6;
+
+      wbMcqList.forEach((q: any, idx: number) => {
+        const selectedOptIdx = ansObj.mc?.[q.id];
+        const opts = Array.isArray(q.options) ? q.options : [];
+        const hasSelection = selectedOptIdx !== undefined && selectedOptIdx !== null && selectedOptIdx !== "";
+        const parsedIdx = hasSelection ? Number(selectedOptIdx) : -1;
+        const selectedOptText =
+          hasSelection && Number.isInteger(parsedIdx) && opts[parsedIdx] !== undefined
+            ? String(opts[parsedIdx])
+            : "Risposta non data o mancante";
+        const correctOptText = opts[q.correctIndex] !== undefined ? String(opts[q.correctIndex]) : "N/D";
+        const isCorrect = hasSelection && Number.isInteger(parsedIdx) && parsedIdx === Number(q.correctIndex);
+
+        checkPageBreak(18);
+        writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
+        currentY += 1;
+
+        if (isCorrect) {
+          writeText(`[v] Tua selezione esatta: "${selectedOptText}"`, 8.5, false, [5, 150, 105], 18);
+        } else {
+          writeText(`[x] Tua selezione: "${selectedOptText}"`, 8.5, false, [185, 28, 28], 18);
+          currentY += 1;
+          writeText(`Opzione corretta: "${correctOptText}"`, 8.5, false, [5, 150, 105], 18);
+        }
+        currentY += 4.5;
+      });
+      currentY += 3;
+    }
+
+    if (sections.some((s: any) => s.fillInTheBlank && s.fillInTheBlank.length > 0)) {
       checkPageBreak(15);
       doc.setFont("Helvetica", "bold");
       doc.setFontSize(10);
@@ -479,7 +519,7 @@ export function createSubmissionPdfDoc(
         if (fibList.length === 0) return;
 
         fibList.forEach((fib: any, fIdx: number) => {
-          const rawVal = ansObj.wbFib?.[fib.id];
+          const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
           const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
           const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
           const isCorrect = isFibAnswerCorrect(val, expected, fib.sentence);
@@ -506,7 +546,7 @@ export function createSubmissionPdfDoc(
 
           writeText(fullText, 8.5, false, [71, 85, 105], 15);
           currentY += 1;
-          writeText(`Soluzioni ammesse: ${fib.answer}`, 8, false, [100, 116, 139], 18);
+          writeText(`Soluzioni ammesse: ${expected || fib.answer || "N/D"}`, 8, false, [100, 116, 139], 18);
           currentY += 5;
         });
       });
@@ -668,4 +708,265 @@ export async function exportSubmissionsZip(
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 
   return cleanZipName;
+}
+
+export interface BlankExamPaperOptions {
+  title?: string;
+  trackLabel?: string;
+  includeTeacherKeyPage?: boolean;
+}
+
+/**
+ * Generates a clean, printable A4 blank exam worksheet PDF (with an optional
+ * detached final teacher answer-key page) suitable for offline classroom testing
+ * or BES/DSA paper accommodations.
+ */
+export async function exportBlankExamPaperPdf(
+  examObj: any,
+  options?: BlankExamPaperOptions
+): Promise<void> {
+  if (!examObj || typeof examObj !== "object") {
+    throw new Error("Struttura verifica non valida per l'esportazione PDF.");
+  }
+  const { jsPDF } = await import("jspdf");
+  const doc = new jsPDF();
+  const pageHeight = 278;
+  const title = String(options?.title || examObj.title || "Verifica Scritta").trim();
+  const trackLabel = String(options?.trackLabel || "").trim();
+  const isWorkbook = isWorkbookExamData(examObj);
+  let currentY = 18;
+
+  const checkBreak = (neededHeight: number) => {
+    if (currentY + neededHeight > pageHeight) {
+      doc.addPage();
+      currentY = 18;
+      doc.setFont("Helvetica", "normal");
+      doc.setFontSize(8);
+      doc.setTextColor(148, 163, 184);
+      doc.text(
+        sanitizePdfText(`${title}${trackLabel ? ` | ${trackLabel}` : ""} - Foglio Studente`),
+        15,
+        11
+      );
+      doc.setDrawColor(226, 232, 240);
+      doc.line(15, 13, 195, 13);
+      currentY = 20;
+    }
+  };
+
+  const writeWrapped = (
+    text: string,
+    fontSize = 10,
+    isBold = false,
+    color: [number, number, number] = [15, 23, 42],
+    xPos = 15,
+    lineStep = 4.8
+  ) => {
+    if (!text) return;
+    doc.setFont("Helvetica", isBold ? "bold" : "normal");
+    doc.setFontSize(fontSize);
+    doc.setTextColor(color[0], color[1], color[2]);
+    const cleanStr = sanitizePdfText(text);
+    const lines: string[] = doc.splitTextToSize(cleanStr, 195 - xPos);
+    for (const line of lines) {
+      checkBreak(lineStep + 1);
+      doc.text(line, xPos, currentY);
+      currentY += lineStep;
+    }
+  };
+
+  const renderQuestionImage = (qId?: string) => {
+    if (!qId) return;
+    const imgData = examObj?.images?.[qId];
+    if (!imgData || typeof imgData !== "string") return;
+    checkBreak(58);
+    try {
+      const fmt = imgData.includes("image/png")
+        ? "PNG"
+        : imgData.includes("image/jpeg") || imgData.includes("image/jpg")
+        ? "JPEG"
+        : "PNG";
+      doc.addImage(imgData, fmt, 18, currentY, 72, 52);
+      currentY += 56;
+    } catch {
+      // Ignore malformed data URLs during PDF export
+    }
+  };
+
+  const drawWritingLines = (numLines: number) => {
+    doc.setDrawColor(203, 213, 225);
+    for (let i = 0; i < numLines; i++) {
+      checkBreak(8);
+      currentY += 6.5;
+      doc.line(18, currentY, 192, currentY);
+    }
+    currentY += 4;
+  };
+
+  // Header Banner
+  doc.setFillColor(248, 250, 252);
+  doc.setDrawColor(203, 213, 225);
+  doc.roundedRect(15, 14, 180, 28, 2, 2, "FD");
+  doc.setFont("Helvetica", "bold");
+  doc.setFontSize(8.5);
+  doc.setTextColor(79, 70, 229);
+  doc.text("I.I.S.S. FERRARIS - FERMI | TRACCIA VERIFICA CARTACEA", 20, 21);
+  doc.setFontSize(13);
+  doc.setTextColor(15, 23, 42);
+  doc.text(sanitizePdfText(title).slice(0, 68), 20, 28);
+  doc.setFont("Helvetica", "normal");
+  doc.setFontSize(9);
+  doc.setTextColor(71, 85, 105);
+  doc.text(
+    sanitizePdfText(
+      `Tipologia: ${isWorkbook ? "Workbook / Quaderno" : "Verifica / Quiz"}${trackLabel ? `   |   ${trackLabel}` : ""}`
+    ),
+    20,
+    34
+  );
+  doc.text("Cognome e Nome: _______________________________  Classe: ______  Data: ____/____/______", 20, 39.5);
+  currentY = 49;
+
+  const mcKeyEntries: Array<{ num: number; question: string; letter: string; text: string }> = [];
+  const fibKeyEntries: Array<{ num: number; answer: string }> = [];
+  let mcCounter = 0;
+  let fibCounter = 0;
+
+  const renderMcBlock = (mcList: any[], sectionHeading?: string) => {
+    if (!Array.isArray(mcList) || mcList.length === 0) return;
+    checkBreak(14);
+    writeWrapped(sectionHeading || "SEZIONE A - DOMANDE A SCELTA MULTIPLA", 10.5, true, [30, 41, 59], 15, 5.2);
+    currentY += 2;
+    mcList.forEach((q: any) => {
+      mcCounter++;
+      checkBreak(20);
+      writeWrapped(`${mcCounter}. ${String(q?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
+      renderQuestionImage(q?.id);
+      const opts = Array.isArray(q?.options) ? q.options : [];
+      opts.forEach((opt: string, oIdx: number) => {
+        const letter = String.fromCharCode(65 + oIdx);
+        writeWrapped(`[  ] ${letter}) ${String(opt)}`, 9.5, false, [51, 65, 85], 20, 4.6);
+      });
+      const correctIdx = Number(q?.correctIndex);
+      if (Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < opts.length) {
+        mcKeyEntries.push({
+          num: mcCounter,
+          question: String(q?.question || ""),
+          letter: String.fromCharCode(65 + correctIdx),
+          text: String(opts[correctIdx] || ""),
+        });
+      }
+      currentY += 3;
+    });
+  };
+
+  if (Array.isArray(examObj.multipleChoice) && examObj.multipleChoice.length > 0) {
+    renderMcBlock(examObj.multipleChoice, "PARTE OGGETTIVA - SCELTA MULTIPLA");
+  }
+
+  const rootOpenEnded = Array.isArray(examObj.openEnded) ? examObj.openEnded : [];
+  if (rootOpenEnded.length > 0) {
+    checkBreak(16);
+    writeWrapped("DOMANDE A RISPOSTA APERTA", 10.5, true, [30, 41, 59], 15, 5.2);
+    currentY += 2;
+    rootOpenEnded.forEach((oe: any, idx: number) => {
+      checkBreak(24);
+      writeWrapped(`${idx + 1}. ${String(oe?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
+      renderQuestionImage(oe?.id);
+      drawWritingLines(5);
+    });
+  }
+
+  const sections = Array.isArray(examObj.sections) ? examObj.sections : [];
+  sections.forEach((sec: any, sIdx: number) => {
+    checkBreak(18);
+    writeWrapped(`SEZIONE ${sIdx + 1}: ${String(sec?.title || "Modulo")}`, 11, true, [79, 70, 229], 15, 5.4);
+    currentY += 1;
+
+    if (sec?.sintesi) {
+      writeWrapped(String(sec.sintesi), 9.5, false, [51, 65, 85], 15, 4.6);
+      currentY += 2.5;
+    }
+
+    if (Array.isArray(sec?.multipleChoice) && sec.multipleChoice.length > 0) {
+      renderMcBlock(sec.multipleChoice, `Scelta multipla - Sezione ${sIdx + 1}`);
+    }
+
+    if (Array.isArray(sec?.fillInTheBlank) && sec.fillInTheBlank.length > 0) {
+      checkBreak(14);
+      writeWrapped("Completamento termini (Fill-in-the-Blank):", 10, true, [30, 41, 59], 15, 5);
+      currentY += 1.5;
+      sec.fillInTheBlank.forEach((fib: any) => {
+        fibCounter++;
+        const rawAns = String(fib?.answer || "").trim();
+        const bracketMatch = typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "";
+        const { before, after } = getFibSentenceParts(fib?.sentence || "", rawAns || bracketMatch || "");
+        const maskedSentence = `${fibCounter}. ${before} ________________ ${after}`;
+        writeWrapped(maskedSentence, 9.5, false, [30, 41, 59], 17, 4.8);
+        renderQuestionImage(fib?.id);
+        fibKeyEntries.push({
+          num: fibCounter,
+          answer: rawAns || bracketMatch || "N/D",
+        });
+        currentY += 1.5;
+      });
+      currentY += 2;
+    }
+
+    if (Array.isArray(sec?.openEnded) && sec.openEnded.length > 0) {
+      checkBreak(14);
+      writeWrapped("Domande aperte:", 10, true, [30, 41, 59], 15, 5);
+      currentY += 1;
+      sec.openEnded.forEach((oe: any, oIdx: number) => {
+        checkBreak(22);
+        writeWrapped(`${oIdx + 1}. ${String(oe?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
+        renderQuestionImage(oe?.id);
+        drawWritingLines(5);
+      });
+    }
+
+    if (Array.isArray(sec?.reflectionQuestions) && sec.reflectionQuestions.length > 0) {
+      checkBreak(14);
+      writeWrapped("Riflessioni critiche:", 10, true, [30, 41, 59], 15, 5);
+      currentY += 1;
+      sec.reflectionQuestions.forEach((rq: any, rIdx: number) => {
+        checkBreak(22);
+        writeWrapped(`${rIdx + 1}. ${String(rq?.question || "")}`, 10, true, [15, 23, 42], 15, 4.8);
+        renderQuestionImage(rq?.id);
+        drawWritingLines(5);
+      });
+    }
+  });
+
+  if (options?.includeTeacherKeyPage !== false && (mcKeyEntries.length > 0 || fibKeyEntries.length > 0)) {
+    doc.addPage();
+    currentY = 20;
+    writeWrapped("CHIAVE RISPOSTE PER IL DOCENTE (FOGLIO STACCATO)", 12, true, [79, 70, 229], 15, 5.5);
+    writeWrapped(`${title}${trackLabel ? ` - ${trackLabel}` : ""}`, 9.5, false, [100, 116, 139], 15, 4.8);
+    currentY += 4;
+
+    if (mcKeyEntries.length > 0) {
+      writeWrapped("Soluzioni Scelta Multipla:", 10.5, true, [15, 23, 42], 15, 5);
+      mcKeyEntries.forEach((k) => {
+        writeWrapped(`${k.num}. Risposta ${k.letter} (${k.text})`, 9.5, false, [30, 41, 59], 18, 4.6);
+      });
+      currentY += 4;
+    }
+
+    if (fibKeyEntries.length > 0) {
+      writeWrapped("Soluzioni Completamento Termini (FIB):", 10.5, true, [15, 23, 42], 15, 5);
+      fibKeyEntries.forEach((k) => {
+        writeWrapped(`${k.num}. ${k.answer}`, 9.5, false, [30, 41, 59], 18, 4.6);
+      });
+    }
+  }
+
+  const slug = (title || "traccia_verifica")
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "_")
+    .replace(/^_|_$/g, "");
+  const trackSlug = trackLabel
+    ? "_" + trackLabel.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_|_$/g, "")
+    : "";
+  doc.save(`traccia_${slug}${trackSlug}.pdf`);
 }

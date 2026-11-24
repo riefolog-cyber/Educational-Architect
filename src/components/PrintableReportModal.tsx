@@ -1,6 +1,6 @@
 import React from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
@@ -70,7 +70,7 @@ export default function PrintableReportModal({
     String(submission.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
   const subjectiveEntries = buildSubjectiveReviewEntries(
     isQuiz
-      ? (examObj?.openEnded || [])
+      ? collectQuizOpenEnded(examObj)
       : (examObj?.sections || []).flatMap((s: any) => s.reflectionQuestions || []),
     isQuiz
       ? (evaluationObj?.openEndedDetails || [])
@@ -169,7 +169,10 @@ export default function PrintableReportModal({
               </div>
               <div>
                 <span className="text-[9px] uppercase font-bold text-slate-500 block">Data e Ora Consegna</span>
-                <span className="text-xs font-semibold text-slate-800 block">{formattedDate}</span>
+                <span className="text-xs font-semibold text-slate-800 block">
+                  {formattedDate}
+                  {deferredSolutionsLocked ? " · Soluzioni differite" : ""}
+                </span>
               </div>
             </div>
 

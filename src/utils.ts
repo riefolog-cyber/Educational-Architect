@@ -346,6 +346,66 @@ export interface GradeBreakdownResult {
 }
 
 /**
+ * Collects all multiple-choice questions across root `examData.multipleChoice`
+ * and any `examData.sections[].multipleChoice`.
+ */
+export function collectExamMultipleChoice(examData: any): any[] {
+  if (!examData || typeof examData !== "object") return [];
+  const root = Array.isArray(examData.multipleChoice) ? examData.multipleChoice : [];
+  const sections = Array.isArray(examData.sections) ? examData.sections : [];
+  const nested = sections.flatMap((s: any) =>
+    s && Array.isArray(s.multipleChoice) ? s.multipleChoice : []
+  );
+  return [...root, ...nested];
+}
+
+/**
+ * Collects all Quiz open-ended questions across root `examData.openEnded`
+ * and any `examData.sections[].openEnded`.
+ */
+export function collectQuizOpenEnded(examData: any): any[] {
+  if (!examData || typeof examData !== "object") return [];
+  const root = Array.isArray(examData.openEnded) ? examData.openEnded : [];
+  const sections = Array.isArray(examData.sections) ? examData.sections : [];
+  const nested = sections.flatMap((s: any) =>
+    s && Array.isArray(s.openEnded) ? s.openEnded : []
+  );
+  return [...root, ...nested];
+}
+
+/**
+ * Distinguishes a true Workbook (sections with fillInTheBlank, reflectionQuestions,
+ * sintesi, glossary, or checklist) from a Quiz (including sectioned Quizzes whose
+ * sections only hold multipleChoice / openEnded, or malformed empty `sections: []`).
+ */
+export function isWorkbookExamData(examData: any): boolean {
+  if (!examData || typeof examData !== "object") return false;
+  if (!Array.isArray(examData.sections) || examData.sections.length === 0) return false;
+  const hasWorkbookSpecificContent = examData.sections.some((s: any) => {
+    if (!s || typeof s !== "object") return false;
+    return (
+      (Array.isArray(s.fillInTheBlank) && s.fillInTheBlank.length > 0) ||
+      (Array.isArray(s.reflectionQuestions) && s.reflectionQuestions.length > 0) ||
+      (typeof s.sintesi === "string" && s.sintesi.trim().length > 0) ||
+      (Array.isArray(s.glossary) && s.glossary.length > 0) ||
+      (Array.isArray(s.checklist) && s.checklist.length > 0)
+    );
+  });
+  if (hasWorkbookSpecificContent) return true;
+  const hasQuizContent =
+    (Array.isArray(examData.multipleChoice) && examData.multipleChoice.length > 0) ||
+    (Array.isArray(examData.openEnded) && examData.openEnded.length > 0) ||
+    examData.sections.some(
+      (s: any) =>
+        s &&
+        typeof s === "object" &&
+        ((Array.isArray(s.multipleChoice) && s.multipleChoice.length > 0) ||
+          (Array.isArray(s.openEnded) && s.openEnded.length > 0))
+    );
+  return !hasQuizContent;
+}
+
+/**
  * Computes a detailed mathematical breakdown of how the final grade was calculated,
  * including single question scores, component averages, weights, and the applied formula.
  */
@@ -480,11 +540,19 @@ export function computeGradeBreakdown(params: {
   };
 
   const hasMcAnswers = !!params.answers?.mc && typeof params.answers.mc === "object";
-  const hasFibAnswers = !!params.answers?.wbFib && typeof params.answers.wbFib === "object";
+  const mergedFibAnswers =
+    (params.answers?.fib && typeof params.answers.fib === "object") ||
+    (params.answers?.wbFib && typeof params.answers.wbFib === "object")
+      ? {
+          ...(params.answers?.fib && typeof params.answers.fib === "object" ? params.answers.fib : {}),
+          ...(params.answers?.wbFib && typeof params.answers.wbFib === "object" ? params.answers.wbFib : {}),
+        }
+      : null;
+  const hasFibAnswers = !!mergedFibAnswers;
 
   if (tipo === "Quiz") {
-    // 1. Multiple Choice
-    const mcList = Array.isArray(params.examData?.multipleChoice) ? params.examData.multipleChoice : [];
+    // 1. Multiple Choice (root + any sections[].multipleChoice)
+    const mcList = collectExamMultipleChoice(params.examData);
     const mcStats = buildStats(
       mcList,
       hasMcAnswers,
@@ -497,8 +565,8 @@ export function computeGradeBreakdown(params: {
     objWeightedTotal += mcStats.weightedTotal;
     objHasCustomWeights = objHasCustomWeights || mcList.some((q) => itemWeight(q) !== 1);
 
-    // 2. Open-ended questions
-    const oeList = Array.isArray(params.examData?.openEnded) ? params.examData.openEnded : [];
+    // 2. Open-ended questions (root + any sections[].openEnded)
+    const oeList = collectQuizOpenEnded(params.examData);
     const oeEvalList = Array.isArray(params.evaluation?.openEndedDetails) ? params.evaluation.openEndedDetails : [];
     const oeItems = buildSubjective(
       oeList,
@@ -513,8 +581,14 @@ export function computeGradeBreakdown(params: {
   } else {
     // Workbook
     const sections = Array.isArray(params.examData?.sections) ? params.examData.sections : [];
-    const fibList = sections.flatMap((s: any) => s.fillInTheBlank || []);
-    const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
+    const fibList = [
+      ...(Array.isArray(params.examData?.fillInTheBlank) ? params.examData.fillInTheBlank : []),
+      ...sections.flatMap((s: any) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : [])),
+    ];
+    const rqList = [
+      ...(Array.isArray(params.examData?.reflectionQuestions) ? params.examData.reflectionQuestions : []),
+      ...sections.flatMap((s: any) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : [])),
+    ];
 
     // Check multiple choice in Workbook (both in sections and root level)
     const wbMcList: any[] = [];
@@ -530,7 +604,7 @@ export function computeGradeBreakdown(params: {
     const fibStats = buildStats(
       fibList,
       hasFibAnswers,
-      fibWeightedScore(fibList, params.answers?.wbFib || {}, isFibAnswerCorrect),
+      fibWeightedScore(fibList, mergedFibAnswers || {}, isFibAnswerCorrect),
       storedNumber(params.punteggioFIB) ?? storedNumber(params.evaluation?.fibScore)
     );
     const mcStats = buildStats(
@@ -961,6 +1035,123 @@ export function auditSubjectiveEvaluation(params: {
   return { complete: missing.length === 0, missing, details };
 }
 
+export interface McSelectionEvaluation {
+  hasSelection: boolean;
+  selectedIndex: number | null;
+  isCorrect: boolean;
+  selectedText: string;
+  correctText: string;
+}
+
+/**
+ * Safely evaluates a multiple-choice answer without coercion pitfalls
+ * (e.g. strict === between number/string or Number("") === 0) or
+ * out-of-bounds option lookups.
+ */
+export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEvaluation {
+  const options = Array.isArray(q?.options) ? q.options : [];
+  const correctIdx = Number(q?.correctIndex);
+  const correctText =
+    Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length
+      ? String(options[correctIdx] ?? "")
+      : "";
+
+  const isBlank =
+    rawSelected === undefined ||
+    rawSelected === null ||
+    (typeof rawSelected === "string" && rawSelected.trim() === "");
+
+  if (isBlank) {
+    return {
+      hasSelection: false,
+      selectedIndex: null,
+      isCorrect: false,
+      selectedText: "",
+      correctText,
+    };
+  }
+
+  const parsedIdx = Number(rawSelected);
+  if (!Number.isInteger(parsedIdx) || parsedIdx < 0 || parsedIdx >= options.length) {
+    return {
+      hasSelection: false,
+      selectedIndex: null,
+      isCorrect: false,
+      selectedText: "",
+      correctText,
+    };
+  }
+
+  return {
+    hasSelection: true,
+    selectedIndex: parsedIdx,
+    isCorrect: Number.isInteger(correctIdx) && parsedIdx === correctIdx,
+    selectedText: String(options[parsedIdx] ?? ""),
+    correctText,
+  };
+}
+
+/**
+ * Updates or inserts a manual teacher retouch for an open-ended/reflection item,
+ * normalizing legacy ID-less entries matched positionally so they are replaced
+ * in place instead of duplicated.
+ */
+export function applySubjectiveRetouchToDetails(params: {
+  kind: "open_ended" | "reflection";
+  questions: any[];
+  details: any[];
+  getAnswer: (id: string) => string;
+  questionId: string;
+  newScore: number;
+  newFeedback: string;
+}): any[] {
+  const { kind, questions, details, getAnswer, questionId, newScore, newFeedback } = params;
+  const targetId = String(questionId);
+  const clampedScore = Math.min(10, Math.max(0, Number.isFinite(Number(newScore)) ? Number(newScore) : 0));
+  const idKey = kind === "open_ended" ? "questionId" : "id";
+
+  const entries = buildSubjectiveReviewEntries(
+    questions,
+    details,
+    getAnswer,
+    (d) => (kind === "open_ended" ? d?.questionId ?? d?.id : d?.id ?? d?.questionId)
+  );
+
+  const nextDetails: any[] = [];
+  let updatedTarget = false;
+
+  for (const entry of entries) {
+    if (entry.id === targetId) {
+      updatedTarget = true;
+      const fallbackFeedback =
+        newFeedback ||
+        (entry.detail?.feedback ? String(entry.detail.feedback) : "Valutazione inserita dal docente.");
+      nextDetails.push({
+        ...(entry.detail && typeof entry.detail === "object" ? entry.detail : {}),
+        [idKey]: entry.id,
+        score: clampedScore,
+        feedback: fallbackFeedback,
+        teacherEdited: true,
+      });
+    } else if (entry.detail !== null && entry.detail !== undefined) {
+      const existing = typeof entry.detail === "object" ? entry.detail : { score: Number(entry.detail) || 0 };
+      const hasId = existing[idKey] !== undefined && existing[idKey] !== null && String(existing[idKey]) !== "";
+      nextDetails.push(hasId ? existing : { ...existing, [idKey]: entry.id });
+    }
+  }
+
+  if (!updatedTarget) {
+    nextDetails.push({
+      [idKey]: targetId,
+      score: clampedScore,
+      feedback: newFeedback || "Valutazione inserita dal docente.",
+      teacherEdited: true,
+    });
+  }
+
+  return nextDetails;
+}
+
 /** True when an evaluation has been intentionally left for manual review. */
 export function isEvaluationPending(evaluation: any): boolean {
   return (
@@ -998,7 +1189,7 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
     const questions =
       tipo === "Workbook"
         ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
-        : examData?.openEnded || [];
+        : collectQuizOpenEnded(examData);
     if (Array.isArray(questions) && questions.length > 0) {
       const audit = auditSubjectiveEvaluation({
         questions,
@@ -1059,7 +1250,7 @@ export function getPendingSubjectiveCount(sub: any): number {
     const questions =
       tipo === "Workbook"
         ? (examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || [])
-        : examData?.openEnded || [];
+        : collectQuizOpenEnded(examData);
     if (!Array.isArray(questions) || questions.length === 0) return 0;
 
     const audit = auditSubjectiveEvaluation({

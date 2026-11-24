@@ -22,7 +22,11 @@ import {
   getFibSentenceParts,
   extractBreakdownFromSubmission,
   buildSubjectiveReviewEntries,
+  collectExamMultipleChoice,
+  collectQuizOpenEnded,
+  evaluateMcSelection,
   isEvaluationPending,
+  parseItalianGrade,
   safeParseJson,
 } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
@@ -101,8 +105,29 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   }, [submission?.id]);
 
   useEffect(() => {
-    if (!submission || !onNavigate || !totalCount || totalCount <= 1) return;
+    if (!submission) return;
     const handleKey = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        if (editingItemKey) {
+          e.preventDefault();
+          setEditingItemKey(null);
+          return;
+        }
+        if (gradeEditOpen) {
+          e.preventDefault();
+          setGradeEditOpen(false);
+          return;
+        }
+        if (classEditOpen) {
+          e.preventDefault();
+          setClassEditOpen(false);
+          return;
+        }
+        e.preventDefault();
+        onClose();
+        return;
+      }
+      if (!onNavigate || !totalCount || totalCount <= 1) return;
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.key === "ArrowLeft" && (currentIndex ?? 0) > 0) {
@@ -115,7 +140,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [submission, onNavigate, currentIndex, totalCount]);
+  }, [submission, onNavigate, onClose, currentIndex, totalCount, editingItemKey, gradeEditOpen, classEditOpen]);
 
   if (!submission) return null;
 
@@ -379,8 +404,33 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 Autovalutazione Studente
               </p>
               <p className="text-3xl font-display font-medium text-indigo-400 mt-1">
-                {submission.Autovalutazione}/10
+                {submission.Autovalutazione ? `${submission.Autovalutazione}/10` : "—"}
               </p>
+              {(() => {
+                const gradeNum = parseItalianGrade(displayGrade);
+                const selfNum = parseItalianGrade(submission.Autovalutazione);
+                if (!Number.isFinite(gradeNum) || !Number.isFinite(selfNum)) return null;
+                const diff = Math.round((selfNum - gradeNum) * 10) / 10;
+                if (Math.abs(diff) <= 0.5) {
+                  return (
+                    <span className="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-emerald-500/15 text-emerald-300 border border-emerald-500/25 font-semibold">
+                      ✓ Stima realistica ({diff === 0 ? "0" : diff > 0 ? `+${diff}` : diff})
+                    </span>
+                  );
+                }
+                if (diff > 0.5) {
+                  return (
+                    <span className="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 font-semibold">
+                      +{diff} rispetto al voto (sovrastima)
+                    </span>
+                  );
+                }
+                return (
+                  <span className="inline-block mt-1 text-[10px] px-2 py-0.5 rounded bg-sky-500/15 text-sky-300 border border-sky-500/25 font-semibold">
+                    {diff} rispetto al voto (severo con sé)
+                  </span>
+                );
+              })()}
             </div>
           </div>
 
@@ -667,8 +717,8 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                   const domandeObj = safeParseJson(submission.Domande_Esame);
 
                   if (submission.Tipo === "Quiz") {
-                    const mcqList = domandeObj?.multipleChoice || [];
-                    const oeList = domandeObj?.openEnded || [];
+                    const mcqList = collectExamMultipleChoice(domandeObj);
+                    const oeList = collectQuizOpenEnded(domandeObj);
                     const details = evalObj.openEndedDetails || [];
                     const oeEntries = buildSubjectiveReviewEntries(
                       oeList,
@@ -685,23 +735,23 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                               Scelta Multipla
                             </p>
                             {mcqList.map((q: any, idx: number) => {
-                              const selectedOptIdx = ansObj.mc?.[q.id];
-                              const selectedOptText = selectedOptIdx !== undefined ? q.options[selectedOptIdx] : "Nessuna data";
-                              const correctOptText = q.options[q.correctIndex];
-                              const isCorrect = selectedOptIdx === q.correctIndex;
+                              const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+                              const selectedOptText = sel.hasSelection ? sel.selectedText : "Nessuna data";
+                              const correctOptText = sel.correctText;
+                              const isCorrect = sel.isCorrect;
 
                               return (
                                 <div
-                                  key={idx}
+                                  key={q.id || idx}
                                   className={`p-3 bg-slate-950/60 border ${isCorrect ? "border-teal-500/20" : "border-rose-500/20"} rounded-xl space-y-1`}
                                 >
                                   <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA {idx + 1}</p>
                                   <p className="text-slate-300 text-[11px]">{q.question}</p>
-                                  <div className="mt-2 text-[10px] flex gap-3">
+                                  <div className="mt-2 text-[10px] flex gap-3 flex-wrap">
                                     <span className="text-slate-400">
                                       Scelta: <span className={isCorrect ? "text-teal-400" : "text-rose-400"}>{selectedOptText}</span>
                                     </span>
-                                    {!isCorrect && (
+                                    {!isCorrect && correctOptText && (
                                       <span className="text-slate-500">
                                         | Corretta: <span className="text-teal-400">{correctOptText}</span>
                                       </span>
@@ -829,6 +879,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                   }
 
                   const sections = domandeObj?.sections || [];
+                  const wbMcqList = collectExamMultipleChoice(domandeObj);
                   const details = evalObj.reflectionDetails || [];
                   const rqList = sections.flatMap((s: any) => s.reflectionQuestions || []);
                   const rqEntries = buildSubjectiveReviewEntries(
@@ -840,6 +891,45 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
                   return (
                     <div className="space-y-4">
+                      {wbMcqList.length > 0 && (
+                        <div className="space-y-2">
+                          <p className="text-[10px] font-bold text-slate-500 uppercase border-b border-white/5 pb-1">
+                            Scelta Multipla (Workbook)
+                          </p>
+                          {wbMcqList.map((q: any, idx: number) => {
+                            const sel = evaluateMcSelection(q, ansObj.mc?.[q.id]);
+                            const selectedOptText = sel.hasSelection ? sel.selectedText : "Nessuna data";
+                            const correctOptText = sel.correctText;
+                            const isCorrect = sel.isCorrect;
+
+                            return (
+                              <div
+                                key={q.id || idx}
+                                className={`p-3 bg-slate-950/60 border ${isCorrect ? "border-teal-500/20" : "border-rose-500/20"} rounded-xl space-y-1`}
+                              >
+                                <p className="font-bold text-slate-300 font-mono text-[10px]">DOMANDA MC {idx + 1}</p>
+                                <p className="text-slate-300 text-[11px]">{q.question}</p>
+                                <div className="mt-2 text-[10px] flex gap-3 flex-wrap">
+                                  <span className="text-slate-400">
+                                    Scelta: <span className={isCorrect ? "text-teal-400" : "text-rose-400"}>{selectedOptText}</span>
+                                  </span>
+                                  {!isCorrect && correctOptText && (
+                                    <span className="text-slate-500">
+                                      | Corretta: <span className="text-teal-400">{correctOptText}</span>
+                                    </span>
+                                  )}
+                                </div>
+                                {q.explanation && (
+                                  <p className="mt-1.5 p-1.5 bg-black/30 rounded border border-white/5 text-[10px] text-slate-400 italic">
+                                    💡 Spiegazione: {q.explanation}
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })}
+                        </div>
+                      )}
+
                       {sections.length > 0 &&
                         sections.map((sec: any, secIdx: number) => {
                           const fibList = sec.fillInTheBlank || [];
