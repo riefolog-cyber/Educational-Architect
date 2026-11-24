@@ -795,8 +795,74 @@ async function main() {
       });
       assert.equal(unlockFallback.status, 200);
       assert.equal(unlockFallback.data.unlocked, true);
+      assert.equal(unlockFallback.data.keyRestored, true);
       assert.equal(unlockFallback.data.resolvedDomande?.multipleChoice?.[0]?.correctIndex, chosenMq1);
       assert.equal(unlockFallback.data.resolvedDomande?.multipleChoice?.[1]?.correctIndex, chosenMq2);
+    });
+
+    await runTest("SessionVault: decifra token cifrati con vecchia SESSION_SECRET durante rotazione e restituisce vaultUnavailable senza crash", async () => {
+      const { decryptAnswerKey } = await import("../server");
+      const { restoreExamFromTeacherSources } = await import("../src/utils/examSecurity");
+
+      const prevSessionSecret = process.env.SESSION_SECRET;
+      const prevSessionOld = process.env.SESSION_SECRET_OLD;
+      try {
+        process.env.SESSION_SECRET = "vault-secret-v1";
+        delete process.env.SESSION_SECRET_OLD;
+        const tokenV1 = encryptAnswerKey(answerKey);
+
+        // Rotate primary secret and keep v1 in SESSION_SECRET_OLD
+        process.env.SESSION_SECRET = "vault-secret-v2";
+        process.env.SESSION_SECRET_OLD = "vault-secret-v1";
+        const decryptedFromOld = decryptAnswerKey(tokenV1);
+        assert.deepEqual(decryptedFromOld, answerKey);
+
+        // Truly corrupted/lost key returns null cleanly and unlock-solutions reports vaultUnavailable=true without crashing
+        assert.equal(decryptAnswerKey("corrupt.invalid.token"), null);
+        mockSessionDocFields = {
+          sessionId: { stringValue: "run_lost_vault" },
+          deferSolutions: { booleanValue: false },
+          solutionsReleased: { booleanValue: true },
+          encryptedAnswerKey: { stringValue: "lost.container.ciphertext" },
+        };
+        const lostRes = await httpJsonRequest(port, "POST", "/api/session/unlock-solutions", {
+          pin: "LOST1",
+          sessionId: "run_lost_vault",
+          studentEmail: "studente@scuola.it",
+          encryptedAnswerKey: "lost.container.ciphertext",
+          examData: sanitizedExam,
+          answers: { mc: { mc1: 1 } },
+          tipo: "Quiz",
+        });
+        assert.equal(lostRes.status, 200);
+        assert.equal(lostRes.data.unlocked, false);
+        assert.equal(lostRes.data.keyRestored, false);
+        assert.equal(lostRes.data.vaultUnavailable, true);
+
+        // Teacher library fallback restores stripped exam cleanly (even with shuffled options)
+        const shuffledSanitized = {
+          ...sanitizedExam,
+          multipleChoice: [
+            {
+              ...sanitizedExam.multipleChoice[0],
+              options: ["1991", "1985", "1989", "1993"],
+            },
+          ],
+        };
+        const libFallback = restoreExamFromTeacherSources(shuffledSanitized, {
+          titleHint: sampleRawExam.title,
+          libraryItems: [{ title: sampleRawExam.title, examJson: JSON.stringify(sampleRawExam) }],
+          mcOptionOrder: { mc1: [2, 0, 1, 3] },
+        });
+        assert.equal(libFallback.restored, true);
+        assert.equal(libFallback.restoredExam.multipleChoice[0].correctIndex, 2);
+        assert.equal(libFallback.restoredExam.multipleChoice[0].explanation, sampleRawExam.multipleChoice[0].explanation);
+      } finally {
+        if (prevSessionSecret === undefined) delete process.env.SESSION_SECRET;
+        else process.env.SESSION_SECRET = prevSessionSecret;
+        if (prevSessionOld === undefined) delete process.env.SESSION_SECRET_OLD;
+        else process.env.SESSION_SECRET_OLD = prevSessionOld;
+      }
     });
   } finally {
     globalThis.fetch = originalFetch;

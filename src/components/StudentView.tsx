@@ -1932,7 +1932,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           setSolutionsReleased(true);
         } else {
           setUnlockSolutionsError(
-            data?.error || "Impossibile recuperare le soluzioni sbloccate in questo momento. Riprova tra poco."
+            data?.vaultUnavailable
+              ? "Le soluzioni crittografate di questa sessione non sono più recuperabili automaticamente (chiave di sessione scaduta o ruotata). Il docente può condividerle o ricalcolare la prova dal registro."
+              : data?.error || "Impossibile recuperare le soluzioni sbloccate in questo momento. Riprova tra poco."
           );
         }
       } catch (unlockErr) {
@@ -3834,6 +3836,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       tipo: examType === "quiz" ? "Quiz" : "Workbook",
       prompt: evaluationPrompt,
       studentPseudoId,
+      studentEmail: user?.email || "",
+      assignedFila: assignedFilaRef.current || assignedFila || "",
       sessionPin: sessionPin || "",
       sessionId: sessionRunId || "",
       studentClass: resolvedStudentClass || "",

@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   Wand2,
   Download,
@@ -32,6 +32,7 @@ import {
   safeParseJson,
 } from "../utils";
 import { getAuthHeaders as defaultGetAuthHeaders } from "../firebase";
+import { restoreExamFromTeacherSources } from "../utils/examSecurity";
 import GradeCalculationReport from "./GradeCalculationReport";
 
 interface SubmissionDetailModalProps {
@@ -59,6 +60,7 @@ interface SubmissionDetailModalProps {
     newFeedback: string
   ) => Promise<void>;
   getAuthHeaders?: () => Promise<Record<string, string>>;
+  libraryExams?: Array<{ title?: string; examJson?: string }>;
   currentIndex?: number;
   totalCount?: number;
   onNavigate?: (dir: "prev" | "next") => void;
@@ -83,6 +85,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   validatingId,
   onRetouchSubjectiveItem,
   getAuthHeaders: resolveAuthHeaders = defaultGetAuthHeaders,
+  libraryExams,
   currentIndex,
   totalCount,
   onNavigate,
@@ -97,6 +100,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const [itemFeedbackInput, setItemFeedbackInput] = useState("");
   const [savingItemKey, setSavingItemKey] = useState<string | null>(null);
   const [unlockedDomandeMap, setUnlockedDomandeMap] = useState<Record<string, any>>({});
+  const attemptedVaultIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
     setGradeEditOpen(false);
@@ -111,7 +115,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   }, [submission?.id]);
 
   useEffect(() => {
-    if (!submission?.id || !submission?.Pin) return;
+    if (!submission?.id) return;
     if (unlockedDomandeMap[submission.id]) return;
 
     const rawDomande = safeParseJson(submission.Domande_Esame);
@@ -131,6 +135,27 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
     if (!missingMcKey && !missingFibKey) return;
 
+    const parsedMcOrder = safeParseJson(submission.MC_Order) || undefined;
+    const applyLibraryFallback = () => {
+      if (!libraryExams || libraryExams.length === 0) return false;
+      const libRes = restoreExamFromTeacherSources(rawDomande, {
+        titleHint: submission.Session_Titolo || rawDomande.title,
+        libraryItems: libraryExams,
+        mcOptionOrder: parsedMcOrder,
+      });
+      if (libRes.restored) {
+        setUnlockedDomandeMap((prev) => ({ ...prev, [submission.id]: libRes.restoredExam }));
+        return true;
+      }
+      return false;
+    };
+
+    if (!submission.Pin || attemptedVaultIdsRef.current.has(submission.id)) {
+      applyLibraryFallback();
+      return;
+    }
+
+    attemptedVaultIdsRef.current.add(submission.id);
     let cancelled = false;
     (async () => {
       try {
@@ -148,26 +173,28 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             studentEmail: submission.Email || "",
             studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
             assignedFila: submission.Assigned_Fila || "",
-            mcOptionOrder: safeParseJson(submission.MC_Order) || undefined,
+            mcOptionOrder: parsedMcOrder,
             examData: rawDomande,
             answers: safeParseJson(submission.Risposte_Studente) || {},
             tipo: submission.Tipo || "Quiz",
           }),
         });
-        if (!resp.ok) return;
-        const data = await resp.json().catch(() => null);
-        if (!cancelled && data?.resolvedDomande) {
+        const data = resp.ok ? await resp.json().catch(() => null) : null;
+        if (cancelled) return;
+        if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
           setUnlockedDomandeMap((prev) => ({ ...prev, [submission.id]: data.resolvedDomande }));
+        } else {
+          applyLibraryFallback();
         }
       } catch {
-        // Keep modal usable with neutral unkeyed badges if server vault lookup fails
+        if (!cancelled) applyLibraryFallback();
       }
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders]);
+  }, [submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders, libraryExams]);
 
   useEffect(() => {
     if (!submission) return;

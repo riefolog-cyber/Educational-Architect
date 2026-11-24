@@ -112,7 +112,7 @@ import SubmissionDetailModal from "./SubmissionDetailModal";
 import TeacherBulkGradingModal, { BulkValidationUpdate } from "./TeacherBulkGradingModal";
 import ExamPreviewModal from "./ExamPreviewModal";
 import { isDeferredUnlockedForStudent, addMinutesToExpiryIso } from "../utils/deferredSolutions";
-import { stripExamAnswers } from "../utils/examSecurity";
+import { stripExamAnswers, restoreExamFromTeacherSources } from "../utils/examSecurity";
 import { extractReusableExamFromSubmissions } from "../utils/examPreview";
 
 interface TeacherDashboardProps {
@@ -848,7 +848,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           }),
         });
         const data = await resp.json().catch(() => null);
-        if (resp.ok && data?.unlocked) {
+        if (resp.ok && data?.unlocked && data?.keyRestored !== false) {
           serverUnlocked = true;
           if (data.resolvedDomande) {
             const serialized = JSON.stringify(data.resolvedDomande);
@@ -862,6 +862,26 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
       } catch (fetchErr) {
         console.warn("unlock-solutions fetch warning (continuo):", sub.id, fetchErr);
+      }
+    }
+
+    if (!serverUnlocked && parsedExam && typeof parsedExam === "object") {
+      const siblingObjs = submissions
+        .filter((s) => s.id !== sub.id)
+        .map((s) => safeParseJson(s.Domande_Esame))
+        .filter((o) => o && typeof o === "object");
+      const libRes = restoreExamFromTeacherSources(parsedExam, {
+        titleHint: sub.Session_Titolo || parsedExam?.title,
+        libraryItems: library,
+        fallbackExamObjects: siblingObjs,
+        mcOptionOrder: parsedMcOrder,
+      });
+      if (libRes.restored) {
+        serverUnlocked = true;
+        const serialized = JSON.stringify(libRes.restoredExam);
+        if (serialized.length <= 580000) {
+          resolvedDomandeJson = serialized;
+        }
       }
     }
 
@@ -2294,6 +2314,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             studentEmail: sub.Email || "",
             studentClass: resolveSubmissionClass(sub),
             assignedFila: sub.Assigned_Fila || "",
+            mcOptionOrder: safeParseJson(sub.MC_Order) || undefined,
             examData: effectiveDomandeObj,
             answers: ansObj,
             tipo: sub.Tipo || "Quiz",
@@ -2301,12 +2322,38 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         });
         if (unlockResp.ok) {
           const unlockData = await unlockResp.json();
-          if (unlockData?.resolvedDomande && typeof unlockData.resolvedDomande === "object") {
+          if (
+            unlockData?.unlocked !== false &&
+            unlockData?.keyRestored !== false &&
+            unlockData?.resolvedDomande &&
+            typeof unlockData.resolvedDomande === "object"
+          ) {
             effectiveDomandeObj = unlockData.resolvedDomande;
           }
         }
       } catch {
-        // Guard below will halt recalculation safely if keys remain missing
+        // Fall back to teacher library/sibling below
+      }
+    }
+
+    const postVaultMcList = collectExamMultipleChoice(effectiveDomandeObj);
+    const postVaultFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
+    if (
+      postVaultMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey) ||
+      postVaultFibList.some((f: any) => !String(f?.answer ?? "").trim())
+    ) {
+      const siblingObjs = submissions
+        .filter((s) => s.id !== sub.id)
+        .map((s) => safeParseJson(s.Domande_Esame))
+        .filter((o) => o && typeof o === "object");
+      const libRes = restoreExamFromTeacherSources(effectiveDomandeObj, {
+        titleHint: sub.Session_Titolo || effectiveDomandeObj?.title,
+        libraryItems: library,
+        fallbackExamObjects: siblingObjs,
+        mcOptionOrder: safeParseJson(sub.MC_Order) || undefined,
+      });
+      if (libRes.restored) {
+        effectiveDomandeObj = libRes.restoredExam;
       }
     }
 
@@ -6713,6 +6760,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                                     examTitle={exam.title}
                                     blindGradingMode={blindGradingMode}
                                     getAuthHeaders={getAuthHeaders}
+                                    libraryExams={library}
                                     onGenerateRecoveryExam={(prefill) => {
                                       setAiModalPrefill(prefill);
                                       setShowAiModal(true);
@@ -7263,6 +7311,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             validatingId={validatingId}
             onRetouchSubjectiveItem={handleRetouchSubjectiveItem}
             getAuthHeaders={getAuthHeaders}
+            libraryExams={library}
             currentIndex={speedIdx >= 0 ? speedIdx : undefined}
             totalCount={speedIdx >= 0 ? speedGraderList.length : undefined}
             onNavigate={

@@ -19,9 +19,21 @@ dotenv.config();
 export const app = express();
 const PORT = Number(process.env.PORT) || 3000;
 
-// Helper for lazy loading Gemini: standard GEMINI_API_KEY takes precedence over any legacy alias
+const splitSecretCandidates = (raw?: string): string[] =>
+  String(raw || "")
+    .split(/[\r\n,]+/)
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+// Helper for lazy loading Gemini: standard GEMINI_API_KEY takes precedence over legacy/alternate aliases
 const getCandidateApiKeys = (): string[] => {
-  const candidates = [process.env.GEMINI_API_KEY, process.env.educationaarch]
+  const candidates = [
+    process.env.GEMINI_API_KEY,
+    process.env.educationaarch,
+    process.env.GOOGLE_API_KEY,
+    ...splitSecretCandidates(process.env.GEMINI_API_KEY_OLD),
+    ...splitSecretCandidates(process.env.GEMINI_API_KEY_PREV),
+  ]
     .map((k) => String(k || "").trim())
     .filter(Boolean);
   return Array.from(new Set(candidates));
@@ -772,16 +784,35 @@ function buildPendingEvaluation(params: {
 // --- Session Answer Key Vault (AES-256-GCM) ---
 const VAULT_SECRET_FILE = path.join(os.tmpdir(), "ea_session_secret.key");
 let cachedVaultKey: Buffer | null = null;
+let cachedVaultKeySource = "";
 function deriveVaultKeyFromSecret(secret: string): Buffer {
   return crypto.createHash("sha256").update(`ea_vault:${secret}`).digest();
 }
 
+function getCandidateVaultSecrets(): string[] {
+  const ordered = [
+    ...splitSecretCandidates(process.env.SESSION_SECRET),
+    ...splitSecretCandidates(process.env.VAULT_SECRET),
+    ...splitSecretCandidates(process.env.SESSION_SECRET_OLD),
+    ...splitSecretCandidates(process.env.SESSION_SECRET_PREV),
+    ...splitSecretCandidates(process.env.VAULT_SECRET_OLD),
+    ...splitSecretCandidates(process.env.VAULT_SECRET_PREV),
+    ...getCandidateApiKeys(),
+  ];
+  return Array.from(new Set(ordered));
+}
+
 function getSessionVaultKey(): Buffer {
-  if (cachedVaultKey) return cachedVaultKey;
-  const deterministicSecret =
-    String(process.env.SESSION_SECRET || "").trim() || getCandidateApiKeys()[0] || "";
+  const deterministicSecret = getCandidateVaultSecrets()[0] || "";
   if (deterministicSecret) {
+    if (cachedVaultKey && cachedVaultKeySource === deterministicSecret) {
+      return cachedVaultKey;
+    }
     cachedVaultKey = deriveVaultKeyFromSecret(deterministicSecret);
+    cachedVaultKeySource = deterministicSecret;
+    return cachedVaultKey;
+  }
+  if (cachedVaultKey && cachedVaultKeySource === "__file__") {
     return cachedVaultKey;
   }
   try {
@@ -789,15 +820,18 @@ function getSessionVaultKey(): Buffer {
       const saved = fs.readFileSync(VAULT_SECRET_FILE, "utf8").trim();
       if (saved) {
         cachedVaultKey = crypto.createHash("sha256").update(saved).digest();
+        cachedVaultKeySource = "__file__";
         return cachedVaultKey;
       }
     }
     const generated = crypto.randomBytes(32).toString("hex");
     fs.writeFileSync(VAULT_SECRET_FILE, generated, { mode: 0o600 });
     cachedVaultKey = crypto.createHash("sha256").update(generated).digest();
+    cachedVaultKeySource = "__file__";
     return cachedVaultKey;
   } catch {
     cachedVaultKey = crypto.randomBytes(32);
+    cachedVaultKeySource = "__ephemeral__";
     return cachedVaultKey;
   }
 }
@@ -814,11 +848,9 @@ function getCandidateVaultKeys(): Buffer[] {
     }
   };
 
-  const envSecret = String(process.env.SESSION_SECRET || "").trim();
-  if (envSecret) pushUnique(deriveVaultKeyFromSecret(envSecret));
-
-  for (const apiKey of getCandidateApiKeys()) {
-    pushUnique(deriveVaultKeyFromSecret(apiKey));
+  for (const secret of getCandidateVaultSecrets()) {
+    pushUnique(deriveVaultKeyFromSecret(secret));
+    pushUnique(crypto.createHash("sha256").update(secret).digest());
   }
 
   try {
@@ -826,6 +858,7 @@ function getCandidateVaultKeys(): Buffer[] {
       const saved = fs.readFileSync(VAULT_SECRET_FILE, "utf8").trim();
       if (saved) {
         pushUnique(crypto.createHash("sha256").update(saved).digest());
+        pushUnique(deriveVaultKeyFromSecret(saved));
       }
     }
   } catch {}
@@ -859,6 +892,9 @@ export function decryptAnswerKey(token: unknown): any | null {
     const iv = Buffer.from(ivB64, "base64url");
     const tag = Buffer.from(tagB64, "base64url");
     const encrypted = Buffer.from(dataB64, "base64url");
+    if (iv.length !== 12 || tag.length !== 16 || encrypted.length === 0) {
+      return null;
+    }
     const candidateKeys = getCandidateVaultKeys();
     for (const candidateKey of candidateKeys) {
       try {
@@ -867,9 +903,8 @@ export function decryptAnswerKey(token: unknown): any | null {
         // Try next candidate key
       }
     }
-    throw new Error("Decryption failed with all candidate vault keys");
-  } catch (err: any) {
-    console.warn("[SessionVault] Impossibile decifrare answerKey:", err?.message || err);
+    return null;
+  } catch {
     return null;
   }
 }
@@ -1122,7 +1157,7 @@ async function runEvaluationCore(reqBody: any) {
   // CRITICAL GUARD: if MC or FIB keys could not be restored, suspend evaluation as N.V.
   // rather than marking every question wrong (0/N).
   if ((mcListAll.length > 0 && !mcKeysValid) || (fibListAll.length > 0 && !fibKeysValid)) {
-    console.warn("[evaluate] Chiavi oggettive mancanti/non decifrabili: valutazione sospesa come N.V. per evitare falsi 0.");
+    console.info("[evaluate] Chiavi oggettive mancanti/non decifrabili: valutazione sospesa come N.V. per evitare falsi 0.");
     return attachAuthoritativeFields(
       buildPendingEvaluation({
         tipo: normalizedTipo === "workbook" ? "Workbook" : "Quiz",
@@ -2936,6 +2971,17 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     let mainErrors: string | undefined;
     const mcLists = collectExamMultipleChoice(resolvedDomande);
     const fibLists = collectWorkbookFillInTheBlank(resolvedDomande);
+    const allKeysReady = mcLists.every(hasValidMcCorrectKey) && fibLists.every(hasValidFibKey);
+
+    if (!answerKey && !allKeysReady) {
+      return res.json({
+        status: "success",
+        unlocked: false,
+        keyRestored: false,
+        vaultUnavailable: true,
+        resolvedDomande,
+      });
+    }
 
     const wrongList: string[] = [];
     mcLists.forEach((q: any, idx: number) => {
@@ -2963,7 +3009,13 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
         : "Nessun errore rilevato nei quesiti oggettivi del workbook.";
     }
 
-    return res.json({ status: "success", unlocked: true, resolvedDomande, mainErrors });
+    return res.json({
+      status: "success",
+      unlocked: true,
+      keyRestored: true,
+      resolvedDomande,
+      mainErrors,
+    });
   } catch (err: any) {
     console.error("[session/unlock-solutions] Failed:", err);
     return res.status(500).json({ error: "Impossibile sbloccare le soluzioni." });

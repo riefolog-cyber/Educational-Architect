@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { BarChart2, AlertTriangle, ChevronDown, ChevronUp, Sparkles, BookOpenCheck, RefreshCw, X, FileText, Copy, Check, Download, Table } from "lucide-react";
 import { SavedSubmission, AiModalPrefill } from "../types";
 import {
@@ -21,12 +21,14 @@ import {
 } from "../utils";
 import { scrubPromptPii } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
+import { restoreExamFromTeacherSources } from "../utils/examSecurity";
 
 interface ExamItemAnalysisPanelProps {
   submissions: SavedSubmission[];
   examTitle?: string;
   blindGradingMode?: boolean;
   getAuthHeaders?: () => Promise<Record<string, string>>;
+  libraryExams?: Array<{ title?: string; examJson?: string }>;
   onGenerateRecoveryExam?: (prefill: AiModalPrefill) => void;
 }
 
@@ -48,6 +50,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   examTitle,
   blindGradingMode = false,
   getAuthHeaders: resolveAuthHeaders = defaultGetAuthHeaders,
+  libraryExams,
   onGenerateRecoveryExam,
 }) => {
   const [isOpen, setIsOpen] = useState(false);
@@ -56,6 +59,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   const [onlyIssuesInMatrix, setOnlyIssuesInMatrix] = useState(false);
   const [gradeBandFilter, setGradeBandFilter] = useState<GradeDistributionBandKey | null>(null);
   const [resolvedExamBySubId, setResolvedExamBySubId] = useState<Record<string, string>>({});
+  const attemptedVaultIdsRef = useRef<Set<string>>(new Set());
   const [synthesizingErrors, setSynthesizingErrors] = useState(false);
   const [synthesisError, setSynthesisError] = useState<string | null>(null);
   const [errorSynthesis, setErrorSynthesis] = useState<ClassErrorSummaryResult | null>(null);
@@ -68,7 +72,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     if (!isOpen || submissions.length === 0) return;
 
     const toHydrate = submissions.filter((sub) => {
-      if (!sub?.id || !sub?.Pin || resolvedExamBySubId[sub.id]) return false;
+      if (!sub?.id || resolvedExamBySubId[sub.id]) return false;
       const rawDomande = safeParseJson(sub.Domande_Esame);
       if (!rawDomande || typeof rawDomande !== "object") return false;
       const missingMc = collectExamMultipleChoice(rawDomande).some(
@@ -85,40 +89,77 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     if (toHydrate.length === 0) return;
     let cancelled = false;
 
+    const unstrippedSiblings = submissions
+      .map((s) => safeParseJson(resolvedExamBySubId[s.id] || s.Domande_Esame))
+      .filter((obj) => {
+        if (!obj || typeof obj !== "object") return false;
+        const mcs = collectExamMultipleChoice(obj);
+        const fibs = collectWorkbookFillInTheBlank(obj);
+        return (
+          (mcs.length > 0 || fibs.length > 0) &&
+          mcs.every((q: any) => evaluateMcSelection(q, 0).hasCorrectKey) &&
+          fibs.every((f: any) => Boolean(String(f?.answer || "").trim()) || (typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence)))
+        );
+      });
+
     (async () => {
       try {
         const authHeaders = await resolveAuthHeaders();
         const updates: Record<string, string> = {};
+        const fallbackCandidates: any[] = [...unstrippedSiblings];
+
         await Promise.all(
           toHydrate.map(async (sub) => {
-            try {
-              const rawDomande = safeParseJson(sub.Domande_Esame);
-              const subClass = resolveSubmissionClass(sub);
-              const resp = await fetch("/api/session/unlock-solutions", {
-                method: "POST",
-                headers: {
-                  "Content-Type": "application/json",
-                  ...authHeaders,
-                },
-                body: JSON.stringify({
-                  pin: String(sub.Pin).trim().toUpperCase(),
-                  sessionId: String(sub.Session_Id || "").trim(),
-                  studentEmail: sub.Email || "",
-                  studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
-                  assignedFila: sub.Assigned_Fila || "",
-                  mcOptionOrder: safeParseJson(sub.MC_Order) || undefined,
-                  examData: rawDomande,
-                  answers: safeParseJson(sub.Risposte_Studente) || {},
-                  tipo: sub.Tipo || "Quiz",
-                }),
-              });
-              if (!resp.ok) return;
-              const data = await resp.json().catch(() => null);
-              if (data?.resolvedDomande) {
-                updates[sub.id] = JSON.stringify(data.resolvedDomande);
+            const rawDomande = safeParseJson(sub.Domande_Esame);
+            const parsedMcOrder = safeParseJson(sub.MC_Order) || undefined;
+            let resolvedObj: any = null;
+
+            if (sub.Pin && !attemptedVaultIdsRef.current.has(sub.id)) {
+              attemptedVaultIdsRef.current.add(sub.id);
+              try {
+                const subClass = resolveSubmissionClass(sub);
+                const resp = await fetch("/api/session/unlock-solutions", {
+                  method: "POST",
+                  headers: {
+                    "Content-Type": "application/json",
+                    ...authHeaders,
+                  },
+                  body: JSON.stringify({
+                    pin: String(sub.Pin).trim().toUpperCase(),
+                    sessionId: String(sub.Session_Id || "").trim(),
+                    studentEmail: sub.Email || "",
+                    studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
+                    assignedFila: sub.Assigned_Fila || "",
+                    mcOptionOrder: parsedMcOrder,
+                    examData: rawDomande,
+                    answers: safeParseJson(sub.Risposte_Studente) || {},
+                    tipo: sub.Tipo || "Quiz",
+                  }),
+                });
+                const data = resp.ok ? await resp.json().catch(() => null) : null;
+                if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
+                  resolvedObj = data.resolvedDomande;
+                  fallbackCandidates.push(resolvedObj);
+                }
+              } catch {
+                // Fall back to teacher library/sibling below
               }
-            } catch {
-              // Skip individual failure cleanly
+            }
+
+            if (!resolvedObj) {
+              const libRes = restoreExamFromTeacherSources(rawDomande, {
+                titleHint: examTitle || sub.Session_Titolo || rawDomande?.title,
+                libraryItems: libraryExams,
+                fallbackExamObjects: fallbackCandidates,
+                mcOptionOrder: parsedMcOrder,
+              });
+              if (libRes.restored) {
+                resolvedObj = libRes.restoredExam;
+              }
+            }
+
+            if (resolvedObj) {
+              updates[sub.id] = JSON.stringify(resolvedObj);
             }
           })
         );
@@ -133,7 +174,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     return () => {
       cancelled = true;
     };
-  }, [isOpen, submissions, resolvedExamBySubId, resolveAuthHeaders]);
+  }, [isOpen, submissions, resolvedExamBySubId, resolveAuthHeaders, libraryExams, examTitle]);
 
   const hydratedSubmissions = useMemo(() => {
     if (Object.keys(resolvedExamBySubId).length === 0) return submissions;

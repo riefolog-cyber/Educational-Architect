@@ -313,3 +313,263 @@ export function restoreExamAnswers(
 
   return restored;
 }
+
+function normalizeMatchText(v: unknown): string {
+  return String(v || "")
+    .replace(/\[([^\]]+)\]/g, "___")
+    .replace(/\s+/g, " ")
+    .trim()
+    .toLowerCase();
+}
+
+function collectRefMcItems(examObj: any): any[] {
+  if (!examObj || typeof examObj !== "object") return [];
+  const out: any[] = [];
+  if (Array.isArray(examObj.multipleChoice)) out.push(...examObj.multipleChoice);
+  if (Array.isArray(examObj.sections)) {
+    for (const sec of examObj.sections) {
+      if (sec && Array.isArray(sec.multipleChoice)) out.push(...sec.multipleChoice);
+    }
+  }
+  return out;
+}
+
+function collectRefFibItems(examObj: any): any[] {
+  if (!examObj || typeof examObj !== "object") return [];
+  const out: any[] = [];
+  if (Array.isArray(examObj.fillInTheBlank)) out.push(...examObj.fillInTheBlank);
+  if (Array.isArray(examObj.sections)) {
+    for (const sec of examObj.sections) {
+      if (sec && Array.isArray(sec.fillInTheBlank)) out.push(...sec.fillInTheBlank);
+    }
+  }
+  return out;
+}
+
+function resolveRefMcCorrectIndex(q: any): number | null {
+  if (!q || !Array.isArray(q.options) || q.options.length === 0) return null;
+  const raw = q.correctIndex;
+  if (raw === undefined || raw === null || String(raw).trim() === "") return null;
+  if (typeof raw === "string" && /^[a-z]$/i.test(raw.trim())) {
+    const idx = raw.trim().toUpperCase().charCodeAt(0) - 65;
+    return idx >= 0 && idx < q.options.length ? idx : null;
+  }
+  const num = Number(raw);
+  return Number.isInteger(num) && num >= 0 && num < q.options.length ? num : null;
+}
+
+function resolveRefFibAnswer(fib: any): string {
+  if (!fib || typeof fib !== "object") return "";
+  if (typeof fib.answer === "string" && fib.answer.trim()) return fib.answer.trim();
+  if (typeof fib.sentence === "string") {
+    const m = fib.sentence.match(/\[([^\]]+)\]/);
+    if (m?.[1]?.trim()) return m[1].trim();
+  }
+  return "";
+}
+
+/**
+ * Recovers missing MC correctIndex / explanation and FIB answer keys on a stripped exam copy
+ * from a matching unstripped reference exam (e.g., teacher's exam_library item or unstripped sibling).
+ */
+export function restoreExamFromReferenceExam(
+  strippedExam: any,
+  referenceExamObj: any,
+  options?: { mcOptionOrder?: Record<string, number[]> }
+): {
+  restoredExam: any;
+  matchedCount: number;
+  totalObjective: number;
+  restoredMissingCount: number;
+} {
+  if (!strippedExam || typeof strippedExam !== "object" || !referenceExamObj || typeof referenceExamObj !== "object") {
+    return { restoredExam: strippedExam, matchedCount: 0, totalObjective: 0, restoredMissingCount: 0 };
+  }
+
+  const refMcList = collectRefMcItems(referenceExamObj);
+  const refFibList = collectRefFibItems(referenceExamObj);
+  if (refMcList.length === 0 && refFibList.length === 0) {
+    return { restoredExam: strippedExam, matchedCount: 0, totalObjective: 0, restoredMissingCount: 0 };
+  }
+
+  const refMcById = new Map<string, any>();
+  const refMcByText = new Map<string, any>();
+  for (const rq of refMcList) {
+    if (!rq || typeof rq !== "object") continue;
+    const id = String(rq.id || "").trim();
+    if (id) refMcById.set(id, rq);
+    const qt = normalizeMatchText(rq.question);
+    if (qt && !refMcByText.has(qt)) refMcByText.set(qt, rq);
+  }
+
+  const refFibById = new Map<string, any>();
+  const refFibByText = new Map<string, any>();
+  for (const rf of refFibList) {
+    if (!rf || typeof rf !== "object") continue;
+    const id = String(rf.id || "").trim();
+    if (id) refFibById.set(id, rf);
+    const st = normalizeMatchText(rf.sentence);
+    if (st && !refFibByText.has(st)) refFibByText.set(st, rf);
+  }
+
+  const restoredExam = deepCloneJson(strippedExam);
+  const mcOrder = options?.mcOptionOrder;
+  let matchedCount = 0;
+  let totalObjective = 0;
+  let restoredMissingCount = 0;
+
+  const patchMcList = (list: any[]) => {
+    for (const q of list) {
+      if (!q || typeof q !== "object") continue;
+      totalObjective++;
+      const qId = String(q.id || "").trim();
+      const qText = normalizeMatchText(q.question);
+      const refQ = (qId && refMcById.get(qId)) || (qText && refMcByText.get(qText));
+      if (!refQ) continue;
+
+      const refCorrectIdx = resolveRefMcCorrectIndex(refQ);
+      if (refCorrectIdx === null) continue;
+      matchedCount++;
+
+      const alreadyValid = resolveRefMcCorrectIndex(q) !== null;
+      if (!alreadyValid && Array.isArray(q.options) && q.options.length > 0) {
+        const refCorrectText = normalizeMatchText(refQ.options?.[refCorrectIdx]);
+        const order = qId ? mcOrder?.[qId] : undefined;
+        let mappedIdx = -1;
+
+        if (
+          Array.isArray(order) &&
+          order.length === q.options.length &&
+          Array.isArray(refQ.options) &&
+          order.length === refQ.options.length
+        ) {
+          const candidateIdx = order.findIndex((origIdx) => Number(origIdx) === refCorrectIdx);
+          if (
+            candidateIdx >= 0 &&
+            (!refCorrectText || normalizeMatchText(q.options[candidateIdx]) === refCorrectText)
+          ) {
+            mappedIdx = candidateIdx;
+          }
+        }
+
+        if (mappedIdx === -1 && refCorrectText) {
+          mappedIdx = q.options.findIndex((opt: unknown) => normalizeMatchText(opt) === refCorrectText);
+        }
+
+        if (mappedIdx === -1 && refCorrectIdx < q.options.length && Array.isArray(refQ.options) && q.options.length === refQ.options.length) {
+          mappedIdx = refCorrectIdx;
+        }
+
+        if (mappedIdx >= 0 && mappedIdx < q.options.length) {
+          q.correctIndex = mappedIdx;
+          restoredMissingCount++;
+        }
+      }
+
+      if (!String(q.explanation || "").trim() && typeof refQ.explanation === "string" && refQ.explanation.trim()) {
+        q.explanation = refQ.explanation;
+      }
+    }
+  };
+
+  const patchFibList = (list: any[]) => {
+    for (const fib of list) {
+      if (!fib || typeof fib !== "object") continue;
+      totalObjective++;
+      const fId = String(fib.id || "").trim();
+      const fText = normalizeMatchText(fib.sentence);
+      const refF = (fId && refFibById.get(fId)) || (fText && refFibByText.get(fText));
+      if (!refF) continue;
+
+      const refAns = resolveRefFibAnswer(refF);
+      if (!refAns) continue;
+      matchedCount++;
+
+      if (!resolveRefFibAnswer(fib)) {
+        fib.answer = refAns;
+        restoredMissingCount++;
+      }
+    }
+  };
+
+  if (Array.isArray(restoredExam.multipleChoice)) patchMcList(restoredExam.multipleChoice);
+  if (Array.isArray(restoredExam.fillInTheBlank)) patchFibList(restoredExam.fillInTheBlank);
+  if (Array.isArray(restoredExam.sections)) {
+    for (const sec of restoredExam.sections) {
+      if (!sec || typeof sec !== "object") continue;
+      if (Array.isArray(sec.multipleChoice)) patchMcList(sec.multipleChoice);
+      if (Array.isArray(sec.fillInTheBlank)) patchFibList(sec.fillInTheBlank);
+    }
+  }
+
+  return { restoredExam, matchedCount, totalObjective, restoredMissingCount };
+}
+
+/**
+ * Searches teacher's library exams and optional unstripped sibling exam objects to restore
+ * missing MC/FIB answer keys on a stripped submission when server vault decryption is unavailable.
+ */
+export function restoreExamFromTeacherSources(
+  strippedExam: any,
+  sources: {
+    titleHint?: string;
+    libraryItems?: Array<{ title?: string; examJson?: string }>;
+    fallbackExamObjects?: any[];
+    mcOptionOrder?: Record<string, number[]>;
+  }
+): { restoredExam: any; restored: boolean; matchedCount: number } {
+  if (!strippedExam || typeof strippedExam !== "object") {
+    return { restoredExam: strippedExam, restored: false, matchedCount: 0 };
+  }
+
+  const candidates: Array<{ obj: any; title: string }> = [];
+  if (Array.isArray(sources.fallbackExamObjects)) {
+    for (const obj of sources.fallbackExamObjects) {
+      if (obj && typeof obj === "object") {
+        candidates.push({ obj, title: String(obj.title || "") });
+      }
+    }
+  }
+  if (Array.isArray(sources.libraryItems)) {
+    for (const item of sources.libraryItems) {
+      if (!item?.examJson) continue;
+      try {
+        const parsed = JSON.parse(item.examJson);
+        if (parsed && typeof parsed === "object") {
+          candidates.push({ obj: parsed, title: String(item.title || parsed.title || "") });
+        }
+      } catch {
+        // Ignore unparseable library entries
+      }
+    }
+  }
+
+  const normHint = normalizeMatchText(sources.titleHint || strippedExam.title || "");
+  let bestScore = -1;
+  let bestResult: { restoredExam: any; matchedCount: number; restoredMissingCount: number } | null = null;
+
+  for (const cand of candidates) {
+    const res = restoreExamFromReferenceExam(strippedExam, cand.obj, { mcOptionOrder: sources.mcOptionOrder });
+    if (res.matchedCount === 0 || res.totalObjective === 0) continue;
+    const minRequired = res.totalObjective <= 2 ? res.totalObjective : Math.ceil(res.totalObjective * 0.6);
+    if (res.matchedCount < minRequired) continue;
+
+    const titleBonus = normHint && normalizeMatchText(cand.title) === normHint ? 0.5 : 0;
+    const score = res.matchedCount * 10 + res.restoredMissingCount + titleBonus;
+    if (score > bestScore) {
+      bestScore = score;
+      bestResult = res;
+    }
+  }
+
+  if (bestResult && bestResult.restoredMissingCount > 0) {
+    return {
+      restoredExam: bestResult.restoredExam,
+      restored: true,
+      matchedCount: bestResult.matchedCount,
+    };
+  }
+
+  return { restoredExam: strippedExam, restored: false, matchedCount: 0 };
+}
+
