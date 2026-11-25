@@ -9,6 +9,7 @@ import {
   detectGradeDiscrepancy,
   detectGibberish,
   formatItalianScholasticGrade,
+  formatMarkdown,
   parseItalianGrade,
   isFibAnswerCorrect,
   buildSubjectiveReviewEntries,
@@ -23,6 +24,8 @@ import {
   sanitizeAiHtml,
   collectWorkbookFillInTheBlank,
   collectWorkbookReflections,
+  isValidNumericScore,
+  mcWeightedScore,
 } from "../src/utils";
 import {
   computeExamItemAnalysis,
@@ -35,7 +38,7 @@ import {
   matchesGradeBand,
   buildExamLedgerSummary,
 } from "../src/utils/examAnalytics";
-import { normalizeExamStructure } from "../src/utils/examStructureRepair";
+import { normalizeExamStructure, autoCorrectExamJSON } from "../src/utils/examStructureRepair";
 import {
   buildExamPreviewSummary,
   extractReusableExamFromSubmissions,
@@ -47,6 +50,7 @@ import {
   computeDeterministicMcOrder,
   computeDeterministicItemOrder,
   reconstructExamMcOrder,
+  validateExamKeysForLaunch,
 } from "../src/utils/examSecurity";
 import {
   deriveStudentPseudonym,
@@ -87,6 +91,11 @@ import {
   computeEffectiveDeferredDeadlineMs,
   addMinutesToExpiryIso,
 } from "../src/utils/deferredSolutions";
+import { buildExamFromLinkedForm } from "../src/utils/googleFormsLink";
+import { sanitizePdfText, createSubmissionPdfDoc } from "../src/utils/pdfExport";
+import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS } from "../src/utils/transcriptParser";
+import { parseGoogleFormsImport } from "../src/utils/googleFormsImport";
+import { parseLibraryBackup } from "../src/utils/examLibrary";
 import { SavedSubmission } from "../src/types";
 
 let passed = 0;
@@ -2220,7 +2229,518 @@ test("Follow-up #1 & #2: computeGradeDistribution, matchesGradeBand & buildExamL
   assert.ok(ledgerBlind.rows.every((r) => !r.secondaryLabel.includes("@")));
 });
 
+test("CodeReview Fix: mcWeightedScore rejects empty string / boolean / null even when correctIndex is 0", () => {
+  const withOptions = [
+    { id: "q1", question: "Q1", options: ["A", "B", "C"], correctIndex: 0 },
+    { id: "q2", question: "Q2", options: ["A", "B", "C"], correctIndex: 1 },
+    { id: "q3", question: "Q3", options: ["A", "B", "C"], correctIndex: 0 },
+  ];
+  const resBlank = mcWeightedScore(withOptions, { q1: "", q2: "   ", q3: false });
+  assert.equal(resBlank.correct, 0);
+  assert.equal(resBlank.weightedCorrect, 0);
+
+  const resValid = mcWeightedScore(withOptions, { q1: 0, q2: "1", q3: null });
+  assert.equal(resValid.correct, 2);
+  assert.equal(resValid.weightedCorrect, 2);
+
+  // Minimal fixtures without options array still work safely
+  const minimal = [
+    { id: "m1", correctIndex: 0 },
+    { id: "m2", correctIndex: 2 },
+    { id: "m3" }, // missing correctIndex
+  ];
+  assert.equal(mcWeightedScore(minimal, { m1: "", m2: false, m3: 0 }).correct, 0);
+  assert.equal(mcWeightedScore(minimal, { m1: 0, m2: "2", m3: 0 }).correct, 2);
+});
+
+test("CodeReview Fix: isValidNumericScore & auditSubjectiveEvaluation reject null/blank/boolean scores", () => {
+  assert.equal(isValidNumericScore(0), true);
+  assert.equal(isValidNumericScore("7.5"), true);
+  assert.equal(isValidNumericScore("6,5"), true);
+  assert.equal(isValidNumericScore(null), false);
+  assert.equal(isValidNumericScore(undefined), false);
+  assert.equal(isValidNumericScore(""), false);
+  assert.equal(isValidNumericScore("   "), false);
+  assert.equal(isValidNumericScore(false), false);
+  assert.equal(isValidNumericScore(true), false);
+  assert.equal(isValidNumericScore(NaN), false);
+
+  const qs = [
+    { id: "oe1", question: "Domanda 1" },
+    { id: "oe2", question: "Domanda 2" },
+    { id: "oe3", question: "Domanda 3" },
+  ];
+  const audit = auditSubjectiveEvaluation({
+    questions: qs,
+    details: [
+      { questionId: "oe1", score: null, feedback: "err" },
+      { questionId: "oe2", score: "", feedback: "err" },
+      { questionId: "oe3", score: "7,5", feedback: "buona" },
+    ],
+    getAnswer: (id) => `Risposta articolata e completa dello studente per ${id}.`,
+    getDetailId: (d) => d?.questionId ?? d?.id,
+  });
+  assert.equal(audit.complete, false);
+  assert.equal(audit.missing.length, 2);
+  assert.deepEqual(
+    audit.missing.map((m) => m.id),
+    ["oe1", "oe2"]
+  );
+  assert.equal(audit.details.length, 1);
+  assert.equal(audit.details[0].score, 7.5);
+});
+
+test("CodeReview Fix: autoCorrectExamJSON warns explicitly when MC/VF answer keys are missing", () => {
+  const missingKeyQuiz = autoCorrectExamJSON(
+    JSON.stringify({
+      title: "Test senza chiavi",
+      multipleChoice: [
+        { question: "Capitale d'Italia?", options: ["Milano", "Roma", "Torino"] },
+        { question: "2 + 2 = ?", options: ["3", "4", "5"], correctIndex: 1 },
+      ],
+    })
+  );
+  assert.equal(missingKeyQuiz.success, true);
+  assert.equal(missingKeyQuiz.missingAnswerKeysCount, 1);
+  assert.ok(Array.isArray(missingKeyQuiz.warnings) && missingKeyQuiz.warnings.length === 1);
+  assert.ok(missingKeyQuiz.summaryNotice.includes("Attenzione"));
+
+  const validKeyQuiz = autoCorrectExamJSON(
+    JSON.stringify({
+      title: "Test con chiavi",
+      multipleChoice: [
+        { question: "Capitale d'Italia?", options: ["Milano", "Roma", "Torino"], correctIndex: 1 },
+      ],
+    })
+  );
+  assert.equal(validKeyQuiz.success, true);
+  assert.equal(validKeyQuiz.missingAnswerKeysCount, undefined);
+  assert.equal(validKeyQuiz.warnings, undefined);
+});
+
+test("CodeReview Fix: buildExamOutcomeMatrix handles distinct Fila A / Fila B exams with na status", () => {
+  const examA = {
+    title: "Verifica Fila A",
+    multipleChoice: [{ id: "qA1", question: "Domanda A1", options: ["X", "Y"], correctIndex: 0 }],
+    openEnded: [{ id: "oeA1", question: "Aperta A1" }],
+  };
+  const examB = {
+    title: "Verifica Fila B",
+    multipleChoice: [{ id: "qB1", question: "Domanda B1", options: ["P", "Q"], correctIndex: 1 }],
+    openEnded: [{ id: "oeB1", question: "Aperta B1" }],
+  };
+  const subs: any[] = [
+    {
+      id: "subA",
+      Nome: "Mario Rossi",
+      Email: "mario@scuola.it",
+      Tipo: "Quiz",
+      Assigned_Fila: "A",
+      Voto_Suggerito: "9.0 (9)",
+      Domande_Esame: JSON.stringify(examA),
+      Risposte_Studente: JSON.stringify({ mc: { qA1: 0 }, oe: { oeA1: "Risposta completa A" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oeA1", score: 8 }] }),
+    },
+    {
+      id: "subB",
+      Nome: "Luisa Bianchi",
+      Email: "luisa@scuola.it",
+      Tipo: "Quiz",
+      Assigned_Fila: "B",
+      Voto_Suggerito: "9.0 (9)",
+      Domande_Esame: JSON.stringify(examB),
+      Risposte_Studente: JSON.stringify({ mc: { qB1: 1 }, oe: { oeB1: "Risposta completa B" } }),
+      Full_Evaluation: JSON.stringify({ openEndedDetails: [{ questionId: "oeB1", score: 8 }] }),
+    },
+  ];
+  const matrix = buildExamOutcomeMatrix(subs);
+  assert.equal(matrix.columns.length, 4);
+  const rowA = matrix.rows[0];
+  const rowB = matrix.rows[1];
+  const statusByCol = (row: any) =>
+    Object.fromEntries(row.cells.map((c: any) => [c.columnKey, c.status]));
+
+  assert.deepEqual(statusByCol(rowA), {
+    "mc:qA1": "correct",
+    "mc:qB1": "na",
+    "oe:oeA1": "scored",
+    "oe:oeB1": "na",
+  });
+  assert.deepEqual(statusByCol(rowB), {
+    "mc:qA1": "na",
+    "mc:qB1": "correct",
+    "oe:oeA1": "na",
+    "oe:oeB1": "scored",
+  });
+  // "na" cells must not mark a high-performing student as having issues
+  assert.equal(rowA.hasIssues, false);
+  assert.equal(rowB.hasIssues, false);
+
+  const csv = buildExamItemAnalysisCsv(computeExamItemAnalysis(subs), matrix);
+  assert.ok(csv.includes(';"—";') || csv.includes(";—;"));
+});
+
+test("CodeReview Fix: manual grade 0 parses and formats cleanly", () => {
+  assert.equal(parseItalianGrade("0"), 0);
+  assert.equal(formatItalianScholasticGrade(0), "0.0");
+});
+
+test("Follow-up: validateExamKeysForLaunch catches missing sectioned keys, missing FIB answers, and duplicate IDs", () => {
+  const validExam = {
+    title: "Verifica valida",
+    multipleChoice: [{ id: "mc1", question: "2+2?", options: ["3", "4"], correctIndex: 1 }],
+    sections: [
+      {
+        title: "Sez 1",
+        fillInTheBlank: [{ id: "fib1", sentence: "La capitale è [Roma].", answer: "" }],
+        openEnded: [{ id: "oe1", question: "Spiega la risposta." }],
+      },
+    ],
+  };
+  const okRes = validateExamKeysForLaunch(validExam);
+  assert.equal(okRes.valid, true);
+  assert.deepEqual(okRes.stats, { mcCount: 1, fibCount: 1, oeCount: 1, rqCount: 0 });
+
+  const brokenExam = {
+    title: "Verifica incompleta",
+    multipleChoice: [
+      { id: "dup", question: "Q1", options: ["A", "B"], correctIndex: 0 },
+      { id: "dup", question: "Q2", options: ["A", "B"], correctIndex: 5 },
+    ],
+    sections: [
+      {
+        title: "Sez 1",
+        multipleChoice: [{ id: "s_mc1", question: "Q3", options: ["V", "F"] }],
+        fillInTheBlank: [{ id: "f1", sentence: "Manca chiave ___", answer: "" }],
+      },
+    ],
+  };
+  const badRes = validateExamKeysForLaunch(brokenExam);
+  assert.equal(badRes.valid, false);
+  assert.ok(badRes.errors.some((e) => e.includes("ID duplicato")));
+  assert.ok(badRes.errors.some((e) => e.includes("Sezione 1, Crocetta 1")));
+  assert.ok(badRes.errors.some((e) => e.includes("Completamento 1")));
+
+  assert.equal(validateExamKeysForLaunch({ title: "Vuota", multipleChoice: [] }).valid, false);
+});
+
+test("Follow-up: formatMarkdown handles asterisk bullets, quote escaping, and non-string input safely", () => {
+  const html = formatMarkdown('* Primo punto\n* Secondo "punto" con <script>alert(1)</script>');
+  assert.ok(html.includes("<li "));
+  assert.ok(!html.includes("<em>"));
+  assert.ok(!html.includes("<script>"));
+  assert.ok(html.includes("&quot;punto&quot;"));
+  assert.equal(formatMarkdown(12345 as any), "12345");
+  assert.equal(formatMarkdown(null as any), "");
+});
+
+test("Round 3 Fix: gradebookExport supports 0-10 grades, guards pending N.V., masks deferred ClasseViva errors, and exports Schermo Diviso", () => {
+  near(roundScholasticGrade(0, "exact"), 0);
+  near(roundScholasticGrade(0, "integers"), 0);
+  near(roundScholasticGrade(0.4, "halves"), 0.5);
+
+  const zeroExact = formatGradeForRegister("0", "exact");
+  assert.equal(zeroExact.numeric, 0);
+  assert.equal(zeroExact.registerDecimal, "0");
+  assert.equal(zeroExact.scholasticLabel, "0.0");
+
+  const neg = formatGradeForRegister(-1, "exact");
+  assert.equal(neg.numeric, null);
+  assert.equal(neg.registerDecimal, "N.V.");
+
+  const pendingSub: SavedSubmission = {
+    id: "sub_pending",
+    Timestamp: "2026-11-24T10:00:00Z",
+    Docente_Email: "prof@scuola.it",
+    Tipo: "Quiz",
+    Pin: "PIN0",
+    Nome: "Luca Bianchi",
+    Email: "luca@scuola.it",
+    Voto_Suggerito: "7",
+    Autovalutazione: "6",
+    AntiCopia_TabSwitch: 1,
+    AntiCopia_IncollaBloccato: 0,
+    AntiCopia_SchermoDiviso: 2,
+    AntiCopia_InfractionsLog: "[]",
+    Full_Evaluation: JSON.stringify({ evaluationMode: "pending", suggestedGrade: "N.V." }),
+    Risposte_Studente: "{}",
+    Errori_Principali: "Soluzione segreta: risposta B",
+    Soluzioni_Differite: true,
+  };
+
+  // Without explicit override, pending submission exports N.V. even if Voto_Suggerito had a stale value
+  const stdCsv = buildElectronicRegisterCsv([pendingSub], {
+    preset: "standard",
+    roundingMode: "exact",
+    blindMode: false,
+  });
+  assert.ok(stdCsv.includes('"Schermo Diviso"'));
+  assert.ok(stdCsv.includes('"N.V."'));
+  assert.ok(stdCsv.includes('"2"'));
+
+  // With explicit override "0", teacher override wins and exports "0" instead of "N.V."
+  const zeroOverrideCsv = buildElectronicRegisterCsv([pendingSub], {
+    preset: "argo_didup",
+    roundingMode: "exact",
+    blindMode: false,
+    gradeOverrides: { sub_pending: "0" },
+  });
+  assert.ok(zeroOverrideCsv.includes(';"0";"0.0";'));
+
+  // ClasseViva with Soluzioni_Differite does not leak Errori_Principali
+  const deferredGraded: SavedSubmission = {
+    ...pendingSub,
+    id: "sub_def",
+    Full_Evaluation: JSON.stringify({ evaluationMode: "full", suggestedGrade: "8" }),
+    Voto_Suggerito: "8",
+  };
+  const cvCsv = buildElectronicRegisterCsv([deferredGraded], {
+    preset: "classeviva",
+    roundingMode: "exact",
+    blindMode: false,
+  });
+  assert.ok(!cvCsv.includes("Soluzione segreta"));
+});
+
+test("Round 3 Fix: buildExamFromLinkedForm honors explicit teacher clear (-1/null) over auto-read correctIndex", () => {
+  const form = {
+    title: "Test Modulo",
+    sourceUrl: "https://docs.google.com/forms/d/e/1FAIpQLSTest/viewform",
+    skipped: [],
+    questions: [
+      {
+        id: "q1",
+        kind: "mc" as const,
+        question: "Qual è la capitale?",
+        options: ["Milano", "Roma"],
+        required: true,
+        correctIndex: 1,
+      },
+      {
+        id: "q2",
+        kind: "mc" as const,
+        question: "2 + 2?",
+        options: ["3", "4"],
+        required: true,
+        correctIndex: 1,
+      },
+    ],
+  };
+
+  const res = buildExamFromLinkedForm(form, { q1: -1, q2: 1 });
+  assert.equal(res.multipleChoiceCount, 1);
+  assert.equal(res.openEndedCount, 1);
+  const parsed = JSON.parse(res.examJson);
+  assert.equal(parsed.multipleChoice[0].question, "2 + 2?");
+  assert.equal(parsed.openEnded[0].question, "Qual è la capitale?");
+});
+
+test("Round 3 Fix: sanitizePdfText preserves Latin-1 Italian accents & decodes common HTML entities, and createSubmissionPdfDoc handles teacher attribution & deferred masking", () => {
+  const cleaned = sanitizePdfText("Cos&igrave; &egrave; &quot;esatto&quot; &mdash; perch&eacute; l&#39;alunno &lt;sa&gt;&nbsp;&hellip;");
+  assert.equal(cleaned, 'Così è "esatto" - perché l\'alunno <sa> ...');
+
+  const printedTexts: string[] = [];
+  class MockJsPdf {
+    setFont() {}
+    setFontSize() {}
+    setTextColor() {}
+    setFillColor() {}
+    setDrawColor() {}
+    rect() {}
+    roundedRect() {}
+    line() {}
+    addPage() {}
+    addImage() {}
+    splitTextToSize(str: string) {
+      return [str];
+    }
+    text(str: string) {
+      printedTexts.push(String(str));
+    }
+  }
+
+  const sub: SavedSubmission = {
+    id: "pdf_1",
+    Timestamp: "2026-11-24T12:00:00Z",
+    Docente_Email: "prof@scuola.it",
+    Tipo: "Quiz",
+    Pin: "PIN7",
+    Nome: "Giulia Verdi",
+    Email: "giulia@scuola.it",
+    Assigned_Fila: "B",
+    Voto_Suggerito: "8",
+    Voto_Originale_IA: "7.5",
+    Convalida_Docente_At: "2026-11-24T13:00:00Z",
+    Autovalutazione: "",
+    AntiCopia_TabSwitch: 0,
+    AntiCopia_IncollaBloccato: 0,
+    AntiCopia_InfractionsLog: "[]",
+    Errori_Principali: "Risposta corretta era Roma",
+    Domande_Esame: JSON.stringify({
+      title: "Geo",
+      multipleChoice: [{ id: "m1", question: "Capitale?", options: ["Milano", "Roma"], correctIndex: 1 }],
+    }),
+    Risposte_Studente: JSON.stringify({ mc: { m1: 0 } }),
+    Full_Evaluation: JSON.stringify({}),
+  };
+
+  createSubmissionPdfDoc(sub, MockJsPdf, { deferredSolutionsLocked: true });
+  const joined = printedTexts.join("\n");
+  assert.ok(joined.includes("VOTO CONVALIDATO DOCENTE"));
+  assert.ok(joined.includes("Orig. IA: 7.5"));
+  assert.ok(joined.includes("Fila B"));
+  assert.ok(!joined.includes("Risposta corretta era Roma"));
+  assert.ok(!joined.includes('Opzione corretta: "Roma"'));
+  assert.ok(!joined.includes("—"), "Must not emit raw non-Latin-1 em-dash into jsPDF");
+});
+
+test("Round 4 Fix: parseTranscriptFile preserves Italian words starting with Note* while skipping VTT NOTE blocks & aligns 120k cap", () => {
+  assert.equal(MAX_TRANSCRIPT_CHARS, 120000);
+
+  const sampleVtt = [
+    "WEBVTT",
+    "",
+    "NOTE commento tecnico interno",
+    "riga aggiuntiva del blocco note",
+    "",
+    "00:00:01.000 --> 00:00:04.000",
+    "Notiamo questo aspetto fondamentale.",
+    "",
+    "00:00:05.000 --> 00:00:08.000",
+    "Notevole progresso nella ricerca scientifica.",
+    "",
+    "00:00:09.000 --> 00:00:12.000",
+    "Note musicali e armonia classica.",
+  ].join("\n");
+
+  const parsed = parseTranscriptFile("lezione.vtt", sampleVtt);
+  assert.equal(parsed.format, "vtt");
+  assert.equal(parsed.cues, 3);
+  assert.ok(!parsed.text.includes("commento tecnico interno"));
+  assert.ok(!parsed.text.includes("riga aggiuntiva del blocco note"));
+  assert.ok(parsed.text.includes("Notiamo questo aspetto fondamentale."));
+  assert.ok(parsed.text.includes("Notevole progresso nella ricerca scientifica."));
+  assert.ok(parsed.text.includes("Note musicali e armonia classica."));
+
+  // SRT must NOT drop spoken lines starting with "Note "
+  const sampleSrt = [
+    "1",
+    "00:00:01,000 --> 00:00:04,000",
+    "Note storiche sul Rinascimento.",
+    "",
+    "2",
+    "00:00:05,000 --> 00:00:08,000",
+    "Notiamo la differenza stilistica.",
+  ].join("\n");
+  const parsedSrt = parseTranscriptFile("storia.srt", sampleSrt);
+  assert.equal(parsedSrt.format, "srt");
+  assert.ok(parsedSrt.text.includes("Note storiche sul Rinascimento."));
+  assert.ok(parsedSrt.text.includes("Notiamo la differenza stilistica."));
+
+  // Truncation cap at 120,000 chars
+  const hugeTxt = "a".repeat(130000);
+  const parsedHuge = parseTranscriptFile("lunga.txt", hugeTxt);
+  assert.equal(parsedHuge.truncated, true);
+  assert.equal(parsedHuge.chars, MAX_TRANSCRIPT_CHARS);
+});
+
+test("Round 4 Fix: parseGoogleFormsImport matches exact option text before letter/number shorthand & handles bracketed FIB in Workbook", () => {
+  const csv = [
+    "Domanda;Opzione A;Opzione B;Opzione C;Opzione D;Corretta",
+    "Quale conflitto scoppiò nel 1914?;A piedi;In treno;1 guerra mondiale;4 tempi;1 guerra mondiale",
+    "Quante fasi ha il motore Otto?;4 tempi;2 tempi;A piedi;Bici;4 tempi",
+    "Come si muoveva il messaggero?;In carrozza;A piedi;In nave;In treno;B)",
+  ].join("\n");
+
+  const quizRes = parseGoogleFormsImport(csv, { fallbackTitle: "Quiz Storia" });
+  assert.equal(quizRes.examType, "Quiz");
+  assert.equal(quizRes.multipleChoiceCount, 3);
+  const parsedQuiz = JSON.parse(quizRes.examJson);
+  // "1 guerra mondiale" must match exact option index 2, NOT digit shorthand 1 -> index 0!
+  assert.equal(parsedQuiz.multipleChoice[0].correctIndex, 2);
+  // "4 tempi" at index 0 must match exact option index 0, NOT digit shorthand 4 -> index 3!
+  assert.equal(parsedQuiz.multipleChoice[1].correctIndex, 0);
+  // Explicit "B)" shorthand resolves to index 1
+  assert.equal(parsedQuiz.multipleChoice[2].correctIndex, 1);
+
+  // Workbook FIB with bracketed solution and empty answer column + leading numbering
+  const fibCsv = [
+    "Tipo;Domanda;Corretta",
+    "completamento;1. Le piante producono glucosio grazie alla [fotosintesi].;",
+    "aperta;2. Spiega il ruolo della clorofilla.;",
+  ].join("\n");
+  const wbRes = parseGoogleFormsImport(fibCsv, { fallbackTitle: "Scienze" });
+  assert.equal(wbRes.examType, "Workbook");
+  const parsedWb = JSON.parse(wbRes.examJson);
+  const fibItem = parsedWb.sections[0].fillInTheBlank[0];
+  assert.equal(fibItem.answer, "fotosintesi");
+  assert.ok(!fibItem.sentence.startsWith("1. "), "Workbook FIB must strip leading question numbering");
+  const rqItem = parsedWb.sections[0].reflectionQuestions[0];
+  assert.ok(!rqItem.question.startsWith("2. "), "Workbook reflection must strip leading question numbering");
+});
+
+test("Round 4 Fix: examPreview strict MC key validation rejects empty string, boolean false and out-of-bounds correctIndex", () => {
+  const badQuiz: any = {
+    title: "Chiavi corrotte",
+    multipleChoice: [
+      { id: "m1", question: "Q1?", options: ["A", "B", "C", "D"], correctIndex: "" },
+      { id: "m2", question: "Q2?", options: ["A", "B", "C", "D"], correctIndex: false },
+      { id: "m3", question: "Q3?", options: ["A", "B", "C", "D"], correctIndex: 9 },
+    ],
+  };
+
+  const summary = buildExamPreviewSummary(badQuiz);
+  assert.equal(summary.mcCount, 3);
+  assert.equal(summary.besReducedMcCount, 0);
+
+  const reusable = extractReusableExamFromSubmissions([
+    {
+      id: "sub_bad",
+      Tipo: "Quiz",
+      Soluzioni_Differite: false,
+      Domande_Esame: JSON.stringify(badQuiz),
+    } as any,
+  ]);
+  assert.equal(reusable, null);
+});
+
+test("Round 4 Fix: parseLibraryBackup recomputes missing questionCount, detects Workbook & sanitizes bracketed FIB", () => {
+  const backupJson = JSON.stringify({
+    app: "EducationalArchitect",
+    kind: "exam-library-backup",
+    version: 1,
+    items: [
+      {
+        title: "Workbook Biologia",
+        examType: "Quiz", // stale/wrong type in old backup
+        questionCount: 0, // missing/zero count
+        examJson: JSON.stringify({
+          title: "Workbook Biologia",
+          sections: [
+            {
+              title: "Cellula",
+              fillInTheBlank: [
+                { id: "f1", sentence: "La centrale energetica è il [mitocondrio]." },
+              ],
+              reflectionQuestions: [
+                { id: "r1", question: "Confronta cellula animale e vegetale." },
+              ],
+            },
+          ],
+        }),
+      },
+    ],
+  });
+
+  const restored = parseLibraryBackup(backupJson, "docente@scuola.it");
+  assert.equal(restored.length, 1);
+  assert.equal(restored[0].examType, "Workbook");
+  assert.equal(restored[0].questionCount, 2);
+  const parsedExam = JSON.parse(restored[0].examJson);
+  assert.equal(parsedExam.sections[0].fillInTheBlank[0].answer, "mitocondrio");
+  assert.ok(!parsedExam.sections[0].fillInTheBlank[0].sentence.includes("[mitocondrio]"));
+  assert.ok(parsedExam.sections[0].fillInTheBlank[0].sentence.includes("________"));
+});
+
 console.log(`\n${passed} test superati, ${failed} falliti.`);
 process.exit(failed > 0 ? 1 : 0);
-
-

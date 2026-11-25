@@ -15,6 +15,7 @@ import { getAuthHeaders as defaultGetAuthHeaders } from "../firebase";
 import {
   collectExamMultipleChoice,
   collectWorkbookFillInTheBlank,
+  copyTextToClipboard,
   evaluateMcSelection,
   safeParseJson,
   sanitizeAiHtml,
@@ -415,7 +416,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     }
   };
 
-  const handleCopyReviewSheet = () => {
+  const handleCopyReviewSheet = async () => {
     if (!reviewSheet) return;
     const text = [
       `=== ${reviewSheet.title} ===`,
@@ -427,10 +428,11 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
       "ESERCIZI RAPIDI DI RIPASSO:",
       ...reviewSheet.quickExercises.map((ex, i) => `${i + 1}. ${ex.prompt}\n   Soluzione: ${ex.solution}`),
     ].join("\n");
-    navigator.clipboard?.writeText(text).then(() => {
+    const ok = await copyTextToClipboard(text);
+    if (ok) {
       setCopiedSheet(true);
       setTimeout(() => setCopiedSheet(false), 2000);
-    }).catch(() => {});
+    }
   };
 
   const handleExportAnalysisCsv = () => {
@@ -1031,6 +1033,19 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                                 >
                                   <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-amber-500/15 text-amber-300 border border-amber-500/25 font-mono text-[10px]">
                                     🔒
+                                  </span>
+                                </td>
+                              );
+                            }
+                            if (cell.status === "na") {
+                              return (
+                                <td
+                                  key={cell.columnKey}
+                                  title={`${col?.code || ""}: ${col?.label || ""} — Quesito non presente nella fila di questo studente`}
+                                  className="py-1.5 px-1.5 text-center"
+                                >
+                                  <span className="inline-flex items-center justify-center w-6 h-5 rounded bg-slate-900/50 text-slate-600 font-mono text-[10px]">
+                                    ·
                                   </span>
                                 </td>
                               );

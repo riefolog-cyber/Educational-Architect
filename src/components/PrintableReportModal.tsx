@@ -1,6 +1,6 @@
 import React from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, isEvaluationPending, getPendingSubjectiveCount, safeParseJson } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, isEvaluationPending, getPendingSubjectiveCount, isValidNumericScore, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
@@ -80,7 +80,13 @@ export default function PrintableReportModal({
         ? (answersObj?.oe?.[id] ?? answersObj?.openEnded?.[id] ?? "")
         : (answersObj?.wbRq?.[id] ?? answersObj?.oe?.[id] ?? "")
     ),
-    (d) => (isQuiz ? d.questionId : d.id)
+    (d) => (isQuiz ? (d?.questionId ?? d?.id) : (d?.id ?? d?.questionId))
+  );
+  const isTeacherValidated = Boolean(submission.Convalida_Docente_At);
+  const isRetouchedByTeacher = Boolean(
+    submission.Voto_Originale_IA &&
+      String(submission.Voto_Originale_IA).trim() !== "" &&
+      String(submission.Voto_Originale_IA).trim() !== String(submission.Voto_Suggerito || "").trim()
   );
 
   const handlePrint = () => {
@@ -182,7 +188,9 @@ export default function PrintableReportModal({
               <div className="p-4 bg-indigo-50 border border-indigo-200 rounded-xl flex items-center justify-between sm:col-span-2">
                 <div>
                   <span className="text-[10px] uppercase font-bold text-indigo-900 tracking-wider block">
-                    Voto della Prova (Scala Docimologica Decimale)
+                    {isTeacherValidated
+                      ? "Voto Convalidato dal Docente (Scala Docimologica Decimale)"
+                      : "Voto della Prova (Scala Docimologica Decimale)"}
                   </span>
                   <div className="flex items-baseline gap-2 mt-1">
                     <span className="text-3xl font-black text-indigo-700 font-serif">
@@ -193,6 +201,10 @@ export default function PrintableReportModal({
                   <p className="text-[10px] text-indigo-800 mt-1">
                     {pendingEvaluation
                       ? "Valutazione sospesa: nessun voto assegnato finché le domande aperte non saranno corrette."
+                      : isRetouchedByTeacher
+                      ? `Voto rettificato dal docente (proposta originale IA: ${submission.Voto_Originale_IA}).`
+                      : isTeacherValidated
+                      ? "Valutazione verificata e convalidata ufficialmente dal docente."
                       : "Valutazione pesata secondo i criteri didattici stabiliti dal docente."}
                   </p>
                 </div>
@@ -263,12 +275,14 @@ export default function PrintableReportModal({
                     Dettaglio Valutazione Quesiti Aperti e Argomentazioni:
                   </h3>
                   <div className="space-y-2">
-                    {subjectiveEntries.map((entry, idx) => (
+                    {subjectiveEntries.map((entry, idx) => {
+                      const hasValidScore = Boolean(entry.detail && isValidNumericScore(entry.detail.score));
+                      return (
                       <div key={entry.id || idx} className="p-3 bg-white border border-slate-200 rounded-xl space-y-1">
                         <div className="flex items-center justify-between text-xs font-bold text-slate-900">
                           <span>{isQuiz ? `Quesito Aperto ${idx + 1}` : `Riflessione Critica ${idx + 1}`}</span>
-                          <span className={`px-2 py-0.5 rounded font-mono ${entry.detail ? "bg-indigo-100 text-indigo-800" : "bg-amber-100 text-amber-800"}`}>
-                            Punteggio: {entry.detail ? `${entry.detail.score ?? 0}/10` : "N.V. (in attesa)"}
+                          <span className={`px-2 py-0.5 rounded font-mono ${hasValidScore ? "bg-indigo-100 text-indigo-800" : "bg-amber-100 text-amber-800"}`}>
+                            Punteggio: {hasValidScore ? `${entry.detail.score}/10` : "N.V. (in attesa)"}
                           </span>
                         </div>
                         {entry.question?.question && (
@@ -278,12 +292,13 @@ export default function PrintableReportModal({
                           Risposta: &ldquo;{entry.answer === "[VUOTO]" ? "[Nessuna risposta valida]" : (entry.answer || "Assente")}&rdquo;
                         </p>
                         <p className="text-slate-700 text-[11px] leading-relaxed">
-                          {entry.detail
+                          {hasValidScore
                             ? entry.detail.feedback
                             : "Valutazione IA non disponibile: la risposta è stata consegnata e richiede la correzione del docente."}
                         </p>
                       </div>
-                    ))}
+                      );
+                    })}
                   </div>
                 </div>
               )}

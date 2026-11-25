@@ -112,7 +112,7 @@ import SubmissionDetailModal from "./SubmissionDetailModal";
 import TeacherBulkGradingModal, { BulkValidationUpdate } from "./TeacherBulkGradingModal";
 import ExamPreviewModal from "./ExamPreviewModal";
 import { isDeferredUnlockedForStudent, addMinutesToExpiryIso } from "../utils/deferredSolutions";
-import { stripExamAnswers, restoreExamFromTeacherSources } from "../utils/examSecurity";
+import { stripExamAnswers, restoreExamFromTeacherSources, validateExamKeysForLaunch } from "../utils/examSecurity";
 import { extractReusableExamFromSubmissions } from "../utils/examPreview";
 
 interface TeacherDashboardProps {
@@ -1403,40 +1403,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             setCanAutoRepair(true);
             return null;
           }
-          if (Array.isArray(data.sections[i].multipleChoice)) {
-            for (let m = 0; m < data.sections[i].multipleChoice.length; m++) {
-              const q = data.sections[i].multipleChoice[m];
-              if (!q || !q.question || !Array.isArray(q.options) || q.options.length < 2 || !evaluateMcSelection(q, 0).hasCorrectKey) {
-                setValidationError(`Errore Sezione ${i + 1}, Crocetta ${m + 1}: Domanda a scelta multipla incompleta o chiave corretta non valida.`);
-                setCanAutoRepair(true);
-                return null;
-              }
-            }
-          }
         }
       }
 
-      if (Array.isArray(data.multipleChoice)) {
-        for (let i = 0; i < data.multipleChoice.length; i++) {
-          const q = data.multipleChoice[i];
-          if (!q || !q.question || !Array.isArray(q.options) || q.options.length < 2 || !evaluateMcSelection(q, 0).hasCorrectKey) {
-            setValidationError(`Errore Crocetta ${i + 1}: Domanda a scelta multipla incompleta (manca testo, almeno 2 opzioni, o chiave corretta valida).`);
-            setCanAutoRepair(true);
-            return null;
-          }
-        }
-      }
-
-      if (isQuiz) {
-        if (data.openEnded) {
-          for (let i = 0; i < data.openEnded.length; i++) {
-            if (!data.openEnded[i].question) {
-              setValidationError(`Errore Domanda Aperta ${i + 1}: Manca il testo quesito.`);
-              setCanAutoRepair(true);
-              return null;
-            }
-          }
-        }
+      const launchCheck = validateExamKeysForLaunch(data);
+      if (!launchCheck.valid) {
+        setValidationError(launchCheck.errors.slice(0, 2).join(" • "));
+        setCanAutoRepair(true);
+        return null;
       }
 
       setValidationOk(true);
@@ -1838,6 +1812,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (repairResult.success) {
         setJsonText(repairResult.correctedJson);
         setAutoCorrectionNotice(repairResult);
+        if (repairResult.missingAnswerKeysCount && repairResult.missingAnswerKeysCount > 0) {
+          validateExamJSON(repairResult.correctedJson);
+          setAppAlert({
+            msg: `⚠️ Attivazione sospesa per verifica chiavi: ${repairResult.missingAnswerKeysCount} domanda/e erano prive di chiave corretta e sono state impostate temporaneamente su opzione A (indice 0). Controlla il JSON riparato nell'editor prima di attivare la sessione.`,
+          });
+          return;
+        }
         examObj = validateExamJSON(repairResult.correctedJson);
       }
     }
@@ -1889,6 +1870,13 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (!filaBExamObj && canAutoCorrectStructure(filaBExamJson)) {
         const repairedB = autoCorrectExamJSON(filaBExamJson, (filaBTitle || `${examObj.title || "Verifica"} (Fila B)`).trim());
         if (repairedB.success) {
+          if (repairedB.missingAnswerKeysCount && repairedB.missingAnswerKeysCount > 0) {
+            setFilaBExamJson(repairedB.correctedJson);
+            setAppAlert({
+              msg: `⚠️ Fila B: ${repairedB.missingAnswerKeysCount} domanda/e erano prive di chiave corretta (impostate temporaneamente su opzione A). Verifica le risposte corrette della Fila B prima di attivare la sessione.`,
+            });
+            return;
+          }
           filaBExamObj = validateExamJSON(repairedB.correctedJson);
         }
       }
@@ -2401,9 +2389,16 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       }
       updatedPunteggioMC = correctCount;
 
-      const mcAnsNorm: Record<string, number> = {};
-      for (const [k, v] of Object.entries(ansObj.mc || {})) mcAnsNorm[k] = Number(v);
-      const mcs = mcWeightedScore(mcList, mcAnsNorm);
+      const isDeferredLocked = Boolean(sub.Soluzioni_Differite);
+      const deferredNotice = "Soluzioni e dettagli degli errori nascosti fino al rilascio da parte del docente.";
+      const clearPendingEvalFlags = (obj: any) => {
+        obj.evaluationMode = "ai";
+        delete obj.requiresManualReview;
+        delete obj.manualReviewReason;
+        delete obj.objectiveKeysMissing;
+      };
+
+      const mcs = mcWeightedScore(mcList, ansObj.mc || {});
 
       if (oeList.length === 0) {
         const breakdown = computeGradeBreakdown({
@@ -2413,18 +2408,26 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           punteggioMC: correctCount
         });
         newGrade = breakdown.finalGradeFormatted;
+        clearPendingEvalFlags(evalObj);
         evalObj.openEndedDetails = [];
         evalObj.suggestedGrade = newGrade;
-        evalObj.gradeBreakdown = breakdown;
         evalObj.openEndedEvaluation = `Valutazione corretta della prova a scelta multipla: l'alunno ha conseguito il risultato di ${correctCount} risposte esatte su ${mcList.length} (voto matematico: ${newGrade}). L'autovalutazione indicata dallo studente (${sub.Autovalutazione || "—"}/10) è stata considerata nell'analisi complessiva.`;
         newFeedback = evalObj.openEndedEvaluation;
 
-        if (wrongQuestions.length > 0) {
-          evalObj.mainErrors = `Errori riscontrati nella prova a scelta multipla (${wrongQuestions.length} su ${mcList.length}): ${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}"`).join(", ")}.`;
-          newErrors = evalObj.mainErrors;
+        if (isDeferredLocked) {
+          evalObj.deferredSolutionsLocked = true;
+          delete evalObj.gradeBreakdown;
+          evalObj.mainErrors = deferredNotice;
+          newErrors = deferredNotice;
         } else {
-          evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
-          newErrors = evalObj.mainErrors;
+          evalObj.gradeBreakdown = breakdown;
+          if (wrongQuestions.length > 0) {
+            evalObj.mainErrors = `Errori riscontrati nella prova a scelta multipla (${wrongQuestions.length} su ${mcList.length}): ${wrongQuestions.map(w => `Domanda ${w.number}: "${w.question}"`).join(", ")}.`;
+            newErrors = evalObj.mainErrors;
+          } else {
+            evalObj.mainErrors = `Nessun errore: tutte le ${mcList.length} domande a risposta multipla sono esatte.`;
+            newErrors = evalObj.mainErrors;
+          }
         }
       } else {
         const sanitizedAnswers = { ...(ansObj || {}), oe: { ...(ansObj?.oe || {}) } };
@@ -2448,6 +2451,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const evaluation = await requestAiReevaluation({
           tipo: "Quiz",
           forceReevaluation: true,
+          deferSolutions: isDeferredLocked,
           prompt:
             "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
           studentPseudoId,
@@ -2472,7 +2476,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           questions: oeList,
           details: evaluation?.openEndedDetails || [],
           getAnswer: (id) => String(sanitizedAnswers.oe?.[id] ?? ""),
-          getDetailId: (d) => d?.questionId,
+          getDetailId: (d) => d?.questionId ?? d?.id,
         });
         if (!audit.complete) {
           throw new Error(
@@ -2485,6 +2489,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         evaluation.openEndedDetails = audit.details;
 
         evalObj = { ...evalObj, ...evaluation };
+        clearPendingEvalFlags(evalObj);
         evalObj.openEndedDetails = Array.isArray(evaluation.openEndedDetails) ? evaluation.openEndedDetails : [];
         const breakdown = computeGradeBreakdown({
           tipo: "Quiz",
@@ -2495,8 +2500,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         });
         newGrade = breakdown.finalGradeFormatted;
         evalObj.suggestedGrade = newGrade;
-        evalObj.gradeBreakdown = breakdown;
-        newErrors = evaluation.mainErrors || newErrors;
+        if (isDeferredLocked) {
+          evalObj.deferredSolutionsLocked = true;
+          delete evalObj.gradeBreakdown;
+          evalObj.mainErrors = deferredNotice;
+          newErrors = deferredNotice;
+        } else {
+          evalObj.gradeBreakdown = breakdown;
+          newErrors = evaluation.mainErrors || newErrors;
+        }
         newFeedback = evaluation.openEndedEvaluation || evaluation.overallFeedback || newFeedback;
       }
     } else if (sub.Tipo === "Workbook") {
@@ -2538,6 +2550,14 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       if (hasFibAnswers) breakdownAnswers.wbFib = fibAnswersMap;
       if (hasWbMcAnswers) breakdownAnswers.mc = ansObj.mc;
 
+      const isDeferredLocked = Boolean(sub.Soluzioni_Differite);
+      const clearPendingEvalFlags = (obj: any) => {
+        obj.evaluationMode = "ai";
+        delete obj.requiresManualReview;
+        delete obj.manualReviewReason;
+        delete obj.objectiveKeysMissing;
+      };
+
       if (rqList.length === 0) {
         const breakdown = computeGradeBreakdown({
           tipo: "Workbook",
@@ -2547,12 +2567,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           punteggioMC: correctMc
         });
         newGrade = breakdown.finalGradeFormatted;
+        clearPendingEvalFlags(evalObj);
         evalObj.reflectionDetails = [];
         evalObj.fibScore = correctFib;
         evalObj.fibTotal = fibList.length;
         evalObj.totalFIB = fibList.length;
         evalObj.suggestedGrade = newGrade;
-        evalObj.gradeBreakdown = breakdown;
+        if (isDeferredLocked) {
+          evalObj.deferredSolutionsLocked = true;
+          delete evalObj.gradeBreakdown;
+          newErrors = "";
+        } else {
+          evalObj.gradeBreakdown = breakdown;
+        }
         evalObj.overallFeedback = wbMcList.length > 0
           ? `Valutazione completata del quaderno di lavoro: l'alunno ha conseguito ${correctFib}/${fibList.length} termini FIB e ${correctMc}/${wbMcList.length} risposte a scelta multipla (voto matematico: ${newGrade}).`
           : `Valutazione completata del quaderno di lavoro (completamento del testo): l'alunno ha inserito correttamente ${correctFib} risposte su ${fibList.length} termini da individuare (voto matematico: ${newGrade}).`;
@@ -2579,6 +2606,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         const evaluation = await requestAiReevaluation({
           tipo: "Workbook",
           forceReevaluation: true,
+          deferSolutions: isDeferredLocked,
           prompt:
             "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
           studentPseudoId,
@@ -2605,7 +2633,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           questions: rqList,
           details: evaluation?.reflectionDetails || [],
           getAnswer: (id) => String(sanitizedAnswers.wbRq?.[id] ?? sanitizedAnswers.oe?.[id] ?? ""),
-          getDetailId: (d) => d?.id,
+          getDetailId: (d) => d?.id ?? d?.questionId,
         });
         if (!audit.complete) {
           throw new Error(
@@ -2618,6 +2646,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         evaluation.reflectionDetails = audit.details;
 
         evalObj = { ...evalObj, ...evaluation };
+        clearPendingEvalFlags(evalObj);
         evalObj.reflectionDetails = Array.isArray(evaluation.reflectionDetails) ? evaluation.reflectionDetails : [];
         evalObj.fibScore = correctFib;
         evalObj.fibTotal = fibList.length;
@@ -2632,13 +2661,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         });
         newGrade = breakdown.finalGradeFormatted;
         evalObj.suggestedGrade = newGrade;
-        evalObj.gradeBreakdown = breakdown;
-        newFeedback = evaluation.overallFeedback || newFeedback;
-        if (!newErrors) {
-          newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
-            ? "Alcune riflessioni risultano senza risposta o non pertinenti."
-            : "Nessun errore grave rilevato nelle riflessioni critiche.";
+        if (isDeferredLocked) {
+          evalObj.deferredSolutionsLocked = true;
+          delete evalObj.gradeBreakdown;
+          newErrors = "";
+        } else {
+          evalObj.gradeBreakdown = breakdown;
+          if (!newErrors) {
+            newErrors = (evaluation.reflectionDetails || []).some((d: any) => Number(d.score) === 0)
+              ? "Alcune riflessioni risultano senza risposta o non pertinenti."
+              : "Nessun errore grave rilevato nelle riflessioni critiche.";
+          }
         }
+        newFeedback = evaluation.overallFeedback || newFeedback;
       }
     }
 
@@ -2737,8 +2772,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       return;
     }
     const num = parseSubmissionNumericGrade(newGradeValue);
-    if (isNaN(num) || num < 1 || num > 10.5) {
-      setAppAlert({ msg: "⚠️ Inserisci un voto valido (es. 6, 6+, 7½, 8)." });
+    if (isNaN(num) || num < 0 || num > 10.5) {
+      setAppAlert({ msg: "⚠️ Inserisci un voto valido tra 0 e 10 (es. 0, 5½, 6, 6+, 7½, 8)." });
       return;
     }
     try {
@@ -4537,63 +4572,133 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                 )}
 
                 {/* Auto-Correction Applied Notice Banner */}
-                {autoCorrectionNotice && (
-                  <div className="p-3.5 bg-teal-950/40 border border-teal-500/30 rounded-xl text-left space-y-2.5 shadow-md">
-                    <div className="flex items-start justify-between gap-2 border-b border-teal-500/15 pb-2">
-                      <div className="flex items-center gap-2">
-                        <div className="p-1 bg-teal-500/20 rounded-md text-teal-400">
-                          <CheckCircle className="w-4 h-4" />
-                        </div>
-                        <div>
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <span className="text-xs font-bold text-teal-300">
-                              Avviso: Correzione Automatica Effettuata con Successo
-                            </span>
-                            <span className="text-[9px] font-mono px-1.5 py-0.5 rounded bg-teal-500/20 text-teal-200 border border-teal-500/30 font-bold">
-                              Formato {autoCorrectionNotice.detectedType}
-                            </span>
+                {autoCorrectionNotice && (() => {
+                  const hasKeyWarnings =
+                    Array.isArray(autoCorrectionNotice.warnings) && autoCorrectionNotice.warnings.length > 0;
+                  return (
+                    <div
+                      className={`p-3.5 rounded-xl text-left space-y-2.5 shadow-md border ${
+                        hasKeyWarnings
+                          ? "bg-amber-950/40 border-amber-500/40"
+                          : "bg-teal-950/40 border-teal-500/30"
+                      }`}
+                    >
+                      <div
+                        className={`flex items-start justify-between gap-2 pb-2 border-b ${
+                          hasKeyWarnings ? "border-amber-500/20" : "border-teal-500/15"
+                        }`}
+                      >
+                        <div className="flex items-center gap-2">
+                          <div
+                            className={`p-1 rounded-md ${
+                              hasKeyWarnings
+                                ? "bg-amber-500/20 text-amber-300"
+                                : "bg-teal-500/20 text-teal-400"
+                            }`}
+                          >
+                            {hasKeyWarnings ? (
+                              <AlertCircle className="w-4 h-4" />
+                            ) : (
+                              <CheckCircle className="w-4 h-4" />
+                            )}
                           </div>
-                          <p className="text-[11px] text-slate-300 mt-0.5">
-                            {autoCorrectionNotice.summaryNotice}
-                          </p>
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <span
+                                className={`text-xs font-bold ${
+                                  hasKeyWarnings ? "text-amber-300" : "text-teal-300"
+                                }`}
+                              >
+                                {hasKeyWarnings
+                                  ? "Correzione Applicata — Verifica Chiavi Richiesta"
+                                  : "Avviso: Correzione Automatica Effettuata con Successo"}
+                              </span>
+                              <span
+                                className={`text-[9px] font-mono px-1.5 py-0.5 rounded border font-bold ${
+                                  hasKeyWarnings
+                                    ? "bg-amber-500/20 text-amber-200 border-amber-500/30"
+                                    : "bg-teal-500/20 text-teal-200 border-teal-500/30"
+                                }`}
+                              >
+                                Formato {autoCorrectionNotice.detectedType}
+                              </span>
+                            </div>
+                            <p className="text-[11px] text-slate-300 mt-0.5">
+                              {autoCorrectionNotice.summaryNotice}
+                            </p>
+                          </div>
                         </div>
+                        <button
+                          type="button"
+                          onClick={() => setAutoCorrectionNotice(null)}
+                          className="text-slate-400 hover:text-white text-xs p-1"
+                          title="Chiudi avviso"
+                        >
+                          <X className="w-3.5 h-3.5" />
+                        </button>
                       </div>
-                      <button
-                        type="button"
-                        onClick={() => setAutoCorrectionNotice(null)}
-                        className="text-slate-400 hover:text-white text-xs p-1"
-                        title="Chiudi avviso"
-                      >
-                        <X className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
 
-                    {autoCorrectionNotice.changes && autoCorrectionNotice.changes.length > 0 && (
-                      <div className="space-y-1">
-                        <p className="text-[10px] uppercase font-bold text-teal-400/80">Modifiche di Adattamento Applicate:</p>
-                        <ul className="space-y-1 text-[11px] text-slate-300 pl-1">
-                          {autoCorrectionNotice.changes.map((change, cIdx) => (
-                            <li key={cIdx} className="flex items-start gap-1.5">
-                              <span className="text-teal-400 font-bold">✓</span>
-                              <span>{change}</span>
-                            </li>
-                          ))}
-                        </ul>
+                      {hasKeyWarnings && (
+                        <div className="p-2.5 rounded-lg bg-amber-500/10 border border-amber-500/30 space-y-1">
+                          <p className="text-[10px] uppercase font-bold text-amber-300">
+                            ⚠️ Chiavi Mancanti da Controllare ({autoCorrectionNotice.warnings!.length}):
+                          </p>
+                          <ul className="space-y-1 text-[11px] text-amber-100/90 pl-1">
+                            {autoCorrectionNotice.warnings!.map((w, wIdx) => (
+                              <li key={wIdx} className="flex items-start gap-1.5">
+                                <span className="text-amber-400 font-bold">!</span>
+                                <span>{w}</span>
+                              </li>
+                            ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      {autoCorrectionNotice.changes && autoCorrectionNotice.changes.length > 0 && (
+                        <div className="space-y-1">
+                          <p
+                            className={`text-[10px] uppercase font-bold ${
+                              hasKeyWarnings ? "text-amber-400/80" : "text-teal-400/80"
+                            }`}
+                          >
+                            Modifiche di Adattamento Applicate:
+                          </p>
+                          <ul className="space-y-1 text-[11px] text-slate-300 pl-1">
+                            {autoCorrectionNotice.changes
+                              .filter((c) => !c.startsWith("⚠️"))
+                              .map((change, cIdx) => (
+                                <li key={cIdx} className="flex items-start gap-1.5">
+                                  <span className="text-teal-400 font-bold">✓</span>
+                                  <span>{change}</span>
+                                </li>
+                              ))}
+                          </ul>
+                        </div>
+                      )}
+
+                      <div
+                        className={`pt-1.5 border-t flex items-center justify-between text-[10px] text-slate-400 ${
+                          hasKeyWarnings ? "border-amber-500/15" : "border-teal-500/10"
+                        }`}
+                      >
+                        <span>
+                          {hasKeyWarnings
+                            ? "Controlla i campi 'correctIndex' evidenziati prima di attivare la sessione."
+                            : "Struttura esame convalidata e pronta per l'attivazione."}
+                        </span>
+                        <button
+                          type="button"
+                          onClick={() => setAutoCorrectionNotice(null)}
+                          className={`${
+                            hasKeyWarnings ? "text-amber-300" : "text-teal-400"
+                          } hover:underline font-semibold`}
+                        >
+                          Nascondi avviso
+                        </button>
                       </div>
-                    )}
-
-                    <div className="pt-1.5 border-t border-teal-500/10 flex items-center justify-between text-[10px] text-slate-400">
-                      <span>Struttura esame convalidata e pronta per l'attivazione.</span>
-                      <button
-                        type="button"
-                        onClick={() => setAutoCorrectionNotice(null)}
-                        className="text-teal-400 hover:underline font-semibold"
-                      >
-                        Nascondi avviso
-                      </button>
                     </div>
-                  </div>
-                )}
+                  );
+                })()}
 
                 {/* Undo / Changes Applied Notice Banner */}
                 {(lastExtensionResult || previousJsonBackup) && (

@@ -828,18 +828,22 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
     if (!it || typeof it.examJson !== "string" || !it.examJson.trim()) {
       throw new Error(`Voce ${idx + 1} del backup senza esame valido.`);
     }
+    let parsedExam: any;
     try {
-      JSON.parse(it.examJson);
+      parsedExam = JSON.parse(it.examJson);
     } catch {
       throw new Error(`Voce ${idx + 1} ("${it.title || "?"}") con JSON esame non valido.`);
     }
+    const sanitizedJson = sanitizeWorkbookExamJson(it.examJson);
+    const detected = countLibraryQuestions(parsedExam);
+    const resolvedCount = Number(it.questionCount) > 0 ? Number(it.questionCount) : detected.count;
     return {
       teacherEmail,
-      title: String(it.title || `Verifica importata ${idx + 1}`),
-      examType: it.examType === "Workbook" ? "Workbook" : "Quiz",
-      examJson: it.examJson,
+      title: String(it.title || parsedExam?.title || `Verifica importata ${idx + 1}`),
+      examType: it.examType === "Workbook" || detected.type === "Workbook" ? "Workbook" : "Quiz",
+      examJson: sanitizedJson,
       source: String(it.source || "Backup importato"),
-      questionCount: Number(it.questionCount) || 0,
+      questionCount: resolvedCount,
     } as NewLibraryExam;
   });
 }
@@ -847,9 +851,19 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
 // ---- Cross-teacher Exam Sharing via Short Code (Firestore 'shared_exams') ----
 
 function generateShareCode(): string {
-  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // unambiguous characters
+  const alphabet = "ABCDEFGHJKLMNPQRSTUVWXYZ23456789"; // 32 unambiguous chars (power of 2 -> zero modulo bias)
+  const len = 8;
   let code = "";
-  for (let i = 0; i < 8; i++) {
+  const cryptoObj = typeof globalThis !== "undefined" ? (globalThis as any).crypto : undefined;
+  if (cryptoObj && typeof cryptoObj.getRandomValues === "function") {
+    const bytes = new Uint8Array(len);
+    cryptoObj.getRandomValues(bytes);
+    for (let i = 0; i < len; i++) {
+      code += alphabet[bytes[i] & 31];
+    }
+    return code;
+  }
+  for (let i = 0; i < len; i++) {
     code += alphabet[Math.floor(Math.random() * alphabet.length)];
   }
   return code;

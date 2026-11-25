@@ -100,6 +100,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const [itemFeedbackInput, setItemFeedbackInput] = useState("");
   const [savingItemKey, setSavingItemKey] = useState<string | null>(null);
   const [unlockedDomandeMap, setUnlockedDomandeMap] = useState<Record<string, any>>({});
+  const [integrityStatus, setIntegrityStatus] = useState<"idle" | "verified" | "teacher_adjusted" | "tampered" | "legacy_unsigned">("idle");
   const attemptedVaultIdsRef = useRef<Set<string>>(new Set());
 
   useEffect(() => {
@@ -112,7 +113,60 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     setItemScoreInput("");
     setItemFeedbackInput("");
     setSavingItemKey(null);
+    setIntegrityStatus("idle");
   }, [submission?.id]);
+
+  useEffect(() => {
+    if (!submission?.id) return;
+    const parsedEval = safeParseJson(submission.Full_Evaluation);
+    if (!parsedEval?.serverIntegrity?.sig) {
+      setIntegrityStatus("legacy_unsigned");
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      try {
+        const authHeaders = await resolveAuthHeaders();
+        const resp = await fetch("/api/submissions/verify-integrity", {
+          method: "POST",
+          headers: { "Content-Type": "application/json", ...authHeaders },
+          body: JSON.stringify({
+            submission: {
+              id: submission.id,
+              Tipo: submission.Tipo,
+              Voto_Suggerito: submission.Voto_Suggerito,
+              Voto_Originale_IA: submission.Voto_Originale_IA,
+              Punteggio_MC: submission.Punteggio_MC,
+              Punteggio_FIB: submission.Punteggio_FIB,
+              Pin: submission.Pin,
+              Session_Id: submission.Session_Id,
+              Pseudo_Id: submission.Pseudo_Id,
+              Email: submission.Email,
+              Nome: submission.Nome,
+              Full_Evaluation: submission.Full_Evaluation,
+            },
+          }),
+        });
+        const data = resp.ok ? await resp.json().catch(() => null) : null;
+        if (!cancelled && data?.status) {
+          setIntegrityStatus(data.status);
+        }
+      } catch {
+        // Non-blocking: ignore transient network errors during badge check
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    submission?.id,
+    submission?.Voto_Suggerito,
+    submission?.Voto_Originale_IA,
+    submission?.Punteggio_MC,
+    submission?.Punteggio_FIB,
+    submission?.Full_Evaluation,
+    resolveAuthHeaders,
+  ]);
 
   useEffect(() => {
     if (!submission?.id) return;
@@ -539,6 +593,20 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             </div>
           )}
 
+          {integrityStatus === "tampered" && (
+            <div className="p-3.5 bg-rose-500/10 border border-rose-500/40 rounded-xl flex items-start gap-2.5 text-rose-200 animate-fadeIn">
+              <AlertCircle className="w-4 h-4 text-rose-400 shrink-0 mt-0.5" />
+              <div className="text-[11px] leading-relaxed">
+                <p className="font-bold text-rose-300">
+                  Anomalia sul sigillo crittografico del server
+                </p>
+                <p className="text-rose-100/80 mt-0.5">
+                  Il voto o i punteggi salvati non coincidono con il sigillo emesso dal server al momento della correzione. Verifica i dettagli delle risposte o avvia un <b>Ricalcola Voto</b>.
+                </p>
+              </div>
+            </div>
+          )}
+
           <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2.5 rounded-xl bg-slate-950/70 border border-white/10 text-[11px]">
             <div className="flex flex-wrap items-center gap-3 text-slate-300">
               <span>
@@ -548,6 +616,24 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>
                 PII filtrate al prompt: <b className="text-teal-300">{Number(submission.PII_Oscurate_Count || 0)}</b>
               </span>
+              {integrityStatus === "verified" && (
+                <>
+                  <span className="text-slate-600">·</span>
+                  <span className="inline-flex items-center gap-1 text-emerald-300 font-semibold">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Sigillo server verificato
+                  </span>
+                </>
+              )}
+              {integrityStatus === "teacher_adjusted" && (
+                <>
+                  <span className="text-slate-600">·</span>
+                  <span className="inline-flex items-center gap-1 text-indigo-300 font-semibold">
+                    <ShieldCheck className="w-3.5 h-3.5" />
+                    Sigillo originale verificato · voto ritoccato
+                  </span>
+                </>
+              )}
               {Number(submission.Oral_Answers_Count || 0) > 0 && (
                 <>
                   <span className="text-slate-600">·</span>

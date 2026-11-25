@@ -234,7 +234,7 @@ export default function TeacherBulkGradingModal({
       const typedRaw = overrides[sub.id];
       if (typedRaw !== undefined && typedRaw.trim() !== "") {
         const parsedOverride = parseItalianGrade(typedRaw);
-        if (!Number.isFinite(parsedOverride) || parsedOverride < 1 || parsedOverride > 10.5) {
+        if (!Number.isFinite(parsedOverride) || parsedOverride < 0 || parsedOverride > 10.5) {
           const label = blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Studente");
           invalidRows.push(`${label} ("${typedRaw.trim()}")`);
           continue;
@@ -255,7 +255,7 @@ export default function TeacherBulkGradingModal({
 
     if (invalidRows.length > 0) {
       setStatusMsg(
-        `⚠️ Voto manuale non valido per: ${invalidRows.slice(0, 3).join(", ")}${invalidRows.length > 3 ? "…" : ""}. Inserisci un voto tra 1 e 10 (es. 6+, 7½, 8).`
+        `⚠️ Voto manuale non valido per: ${invalidRows.slice(0, 3).join(", ")}${invalidRows.length > 3 ? "…" : ""}. Inserisci un voto tra 0 e 10 (es. 0, 6+, 7½, 8).`
       );
       return;
     }
@@ -624,7 +624,7 @@ export default function TeacherBulkGradingModal({
                             const parsedTyped = trimmedTyped ? parseItalianGrade(trimmedTyped) : NaN;
                             const isInvalidTyped =
                               trimmedTyped !== "" &&
-                              (!Number.isFinite(parsedTyped) || parsedTyped < 1 || parsedTyped > 10.5);
+                              (!Number.isFinite(parsedTyped) || parsedTyped < 0 || parsedTyped > 10.5);
                             return (
                               <input
                                 type="text"
@@ -642,7 +642,7 @@ export default function TeacherBulkGradingModal({
                                     setSelectedIds((prev) => new Set(prev).add(sub.id));
                                   }
                                 }}
-                                title={isInvalidTyped ? "Valore non valido (usa 1–10, es. 6+, 7½)" : "Inserisci voto manuale"}
+                                title={isInvalidTyped ? "Valore non valido (usa 0–10, es. 0, 6+, 7½)" : "Inserisci voto manuale"}
                                 className={`w-20 px-2 py-1 text-center bg-slate-950 border rounded-lg font-mono text-xs outline-none ${
                                   isInvalidTyped
                                     ? "border-rose-500 text-rose-300 focus:border-rose-400"

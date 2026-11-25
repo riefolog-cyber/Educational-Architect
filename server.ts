@@ -7,7 +7,7 @@ import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
 import firebaseConfig from "./firebase-applet-config.json";
 import { computeGradeBreakdown, detectGibberish, evaluateMcSelection, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, isWorkbookExamData } from "./src/utils";
-import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder } from "./src/utils/examSecurity";
+import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder, validateExamKeysForLaunch } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "./src/utils/googleFormsApi";
@@ -61,13 +61,20 @@ const RELIABLE_FALLBACK_MODELS = [
 
 // Per-attempt timeout so a hung upstream request can never trap a queue
 // worker forever (would leak 1 of 5 slots until restart).
-const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> =>
-  Promise.race([
+const withAttemptTimeout = <T>(p: Promise<T>, ms: number): Promise<T> => {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  return Promise.race([
     p,
-    new Promise<T>((_, reject) =>
-      setTimeout(() => reject(new Error(`Timeout IA (${ms / 1000}s): risposta non arrivata in tempo dal modello.`)), ms)
-    ),
-  ]);
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`Timeout IA (${ms / 1000}s): risposta non arrivata in tempo dal modello.`)),
+        ms
+      );
+    }),
+  ]).finally(() => {
+    if (timer !== undefined) clearTimeout(timer);
+  });
+};
 
 // Automatic per-task model selection: ordered preference per task type.
 // The wrapper tries the first model and automatically falls through the
@@ -90,12 +97,20 @@ const buildModelRequestOptions = (baseOptions: any) => {
   const opts = { ...baseOptions };
   if (opts.config) {
     const cfg = { ...opts.config };
-    // Gemini 4 series rejects or deprecates sampling params (temperature/topP/topK/candidateCount)
+    // Gemini 4 series rejects or deprecates sampling params, thinkingBudget, and ThinkingLevel.MINIMAL
     if (String(opts.model || "").startsWith("gemini-4-")) {
       delete cfg.temperature;
       delete cfg.topP;
       delete cfg.topK;
       delete cfg.candidateCount;
+      if (cfg.thinkingConfig && typeof cfg.thinkingConfig === "object") {
+        const tc = { ...cfg.thinkingConfig };
+        delete tc.thinkingBudget;
+        if (tc.thinkingLevel === ThinkingLevel.MINIMAL || String(tc.thinkingLevel || "").toUpperCase() === "MINIMAL") {
+          tc.thinkingLevel = ThinkingLevel.LOW;
+        }
+        cfg.thinkingConfig = tc;
+      }
     }
     opts.config = cfg;
   }
@@ -876,6 +891,72 @@ export function encryptAnswerKey(answerKey: any): string {
   return `${iv.toString("base64url")}.${tag.toString("base64url")}.${encrypted.toString("base64url")}`;
 }
 
+export interface EvaluationIntegrityClaim {
+  v: 1;
+  tipo: string;
+  suggestedGrade: string;
+  calculatedMCScore: number | null;
+  calculatedFIBScore: number | null;
+  totalFIB: number | null;
+  sessionPin: string;
+  sessionId: string;
+  studentPseudoId: string;
+}
+
+export function buildEvaluationIntegrityClaim(input: {
+  tipo: string;
+  suggestedGrade: unknown;
+  calculatedMCScore?: unknown;
+  calculatedFIBScore?: unknown;
+  totalFIB?: unknown;
+  sessionPin?: unknown;
+  sessionId?: unknown;
+  studentPseudoId?: unknown;
+}): EvaluationIntegrityClaim {
+  return {
+    v: 1,
+    tipo: String(input.tipo || "").toLowerCase(),
+    suggestedGrade: String(input.suggestedGrade ?? ""),
+    calculatedMCScore:
+      typeof input.calculatedMCScore === "number" && Number.isFinite(input.calculatedMCScore)
+        ? input.calculatedMCScore
+        : null,
+    calculatedFIBScore:
+      typeof input.calculatedFIBScore === "number" && Number.isFinite(input.calculatedFIBScore)
+        ? input.calculatedFIBScore
+        : null,
+    totalFIB:
+      typeof input.totalFIB === "number" && Number.isFinite(input.totalFIB)
+        ? input.totalFIB
+        : null,
+    sessionPin: String(input.sessionPin || "").trim().toUpperCase(),
+    sessionId: String(input.sessionId || "").trim(),
+    studentPseudoId: String(input.studentPseudoId || "").trim(),
+  };
+}
+
+export function signEvaluationIntegrity(claim: EvaluationIntegrityClaim): string {
+  const key = getSessionVaultKey();
+  const payload = JSON.stringify(claim);
+  return crypto.createHmac("sha256", key).update(payload, "utf8").digest("base64url");
+}
+
+export function verifyEvaluationIntegrity(claim: EvaluationIntegrityClaim, sig: unknown): boolean {
+  if (typeof sig !== "string" || !sig.trim()) return false;
+  const candidate = Buffer.from(sig.trim(), "utf8");
+  const payload = JSON.stringify(claim);
+  for (const key of getCandidateVaultKeys()) {
+    const expected = Buffer.from(
+      crypto.createHmac("sha256", key).update(payload, "utf8").digest("base64url"),
+      "utf8"
+    );
+    if (expected.length === candidate.length && crypto.timingSafeEqual(expected, candidate)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function decryptWithKey(iv: Buffer, tag: Buffer, encrypted: Buffer, key: Buffer): any {
   const decipher = crypto.createDecipheriv("aes-256-gcm", key, iv);
   decipher.setAuthTag(tag);
@@ -1151,6 +1232,21 @@ async function runEvaluationCore(reqBody: any) {
     if (report.totaleFIB !== undefined) {
       resObj.totalFIB = Number(report.totaleFIB || 0);
     }
+    const integrityClaim = buildEvaluationIntegrityClaim({
+      tipo: normalizedTipo,
+      suggestedGrade: resObj.suggestedGrade,
+      calculatedMCScore: resObj.calculatedMCScore,
+      calculatedFIBScore: resObj.calculatedFIBScore,
+      totalFIB: resObj.totalFIB,
+      sessionPin: cleanSessionPin,
+      sessionId: resolvedSessionId,
+      studentPseudoId: reqBody?.studentPseudoId,
+    });
+    resObj.serverIntegrity = {
+      v: 1,
+      sig: signEvaluationIntegrity(integrityClaim),
+      issuedAt: new Date().toISOString(),
+    };
     return resObj;
   };
 
@@ -2800,13 +2896,35 @@ REGOLE ESSENZIALI:
     }
     const generatedData = normalizeExamStructure(parsedRaw);
 
+    const hasGeneratedSections = Array.isArray(generatedData.sections) && generatedData.sections.length > 0;
     const examObj = {
       title: generatedData.title || (sourceFileName ? sourceFileName.replace(/\.pdf$/i, "") : effectiveTopicText.substring(0, 40)),
-      ...(isWorkbook ? { sections: generatedData.sections || [] } : {
-        multipleChoice: generatedData.multipleChoice || [],
-        openEnded: generatedData.openEnded || []
-      })
+      ...(isWorkbook
+        ? {
+            sections: generatedData.sections || [],
+            ...(Array.isArray(generatedData.multipleChoice) && generatedData.multipleChoice.length > 0
+              ? { multipleChoice: generatedData.multipleChoice }
+              : {}),
+            ...(Array.isArray(generatedData.fillInTheBlank) && generatedData.fillInTheBlank.length > 0
+              ? { fillInTheBlank: generatedData.fillInTheBlank }
+              : {}),
+            ...(Array.isArray(generatedData.reflectionQuestions) && generatedData.reflectionQuestions.length > 0
+              ? { reflectionQuestions: generatedData.reflectionQuestions }
+              : {}),
+          }
+        : hasGeneratedSections && (!Array.isArray(generatedData.multipleChoice) || generatedData.multipleChoice.length === 0)
+        ? {
+            sections: generatedData.sections,
+            ...(Array.isArray(generatedData.openEnded) && generatedData.openEnded.length > 0
+              ? { openEnded: generatedData.openEnded }
+              : {}),
+          }
+        : {
+            multipleChoice: collectExamMultipleChoice(generatedData),
+            openEnded: collectQuizOpenEnded(generatedData),
+          }),
     };
+    const keyAudit = validateExamKeysForLaunch(examObj);
     const formattedJson = JSON.stringify(examObj, null, 2);
 
     return res.json({
@@ -2816,6 +2934,7 @@ REGOLE ESSENZIALI:
       recommendedDurationMinutes: generatedData.recommendedDurationMinutes || 45,
       summaryDescription: generatedData.summaryDescription || "",
       modelUsed,
+      keyAudit,
       examObj,
       formattedJson
     });
@@ -2839,6 +2958,13 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
       return res.status(400).json({ error: "Dati della prova non validi o mancanti." });
     }
     const normalized = normalizeExamStructure(JSON.parse(JSON.stringify(rawExam)));
+    const checkA = validateExamKeysForLaunch(normalized);
+    if (!checkA.valid) {
+      return res.status(400).json({
+        error: `Prova non pronta per l'attivazione: ${checkA.errors.slice(0, 3).join(" | ")}`,
+        validationErrors: checkA.errors,
+      });
+    }
     const { sanitizedExam, answerKey } = stripExamAnswers(normalized, { reduceDistractors });
     const encryptedAnswerKey = encryptAnswerKey(answerKey);
 
@@ -2846,6 +2972,13 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
     let encryptedFilaBAnswerKey: string | undefined = undefined;
     if (rawFilaB && typeof rawFilaB === "object") {
       const normalizedB = normalizeExamStructure(JSON.parse(JSON.stringify(rawFilaB)));
+      const checkB = validateExamKeysForLaunch(normalizedB);
+      if (!checkB.valid) {
+        return res.status(400).json({
+          error: `Variante Fila B non pronta per l'attivazione: ${checkB.errors.slice(0, 3).join(" | ")}`,
+          validationErrors: checkB.errors,
+        });
+      }
       const strippedB = stripExamAnswers(normalizedB, { reduceDistractors });
       sanitizedFilaBExam = strippedB.sanitizedExam;
       encryptedFilaBAnswerKey = encryptAnswerKey(strippedB.answerKey);
@@ -2861,6 +2994,99 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
   } catch (err: any) {
     console.error("[session/prepare] Failed:", err);
     return res.status(500).json({ error: "Impossibile preparare la sessione protetta." });
+  }
+});
+
+// Teacher-only endpoint: verifies the HMAC-SHA256 serverIntegrity seal stored in a submission
+app.post("/api/submissions/verify-integrity", teacherAiRateLimiter, requireTeacherAuth, (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  try {
+    const sub = req.body?.submission;
+    if (!sub || typeof sub !== "object") {
+      return res.status(400).json({ error: "Dati consegna mancanti." });
+    }
+    let evalObj: any = null;
+    if (sub.Full_Evaluation && typeof sub.Full_Evaluation === "object") {
+      evalObj = sub.Full_Evaluation;
+    } else if (typeof sub.Full_Evaluation === "string" && sub.Full_Evaluation.trim()) {
+      try {
+        evalObj = JSON.parse(sub.Full_Evaluation);
+      } catch {
+        evalObj = null;
+      }
+    }
+
+    const sig = evalObj?.serverIntegrity?.sig;
+    const issuedAt = typeof evalObj?.serverIntegrity?.issuedAt === "string" ? evalObj.serverIntegrity.issuedAt : undefined;
+    if (typeof sig !== "string" || !sig.trim()) {
+      return res.json({ status: "legacy_unsigned" });
+    }
+
+    const pin = String(sub.Pin || "").trim().toUpperCase();
+    const sessionId = String(sub.Session_Id || "").trim();
+    const tipo = String(sub.Tipo || "Quiz").toLowerCase();
+    const pseudoCandidates = Array.from(
+      new Set(
+        [
+          String(sub.Pseudo_Id || "").trim(),
+          deriveStudentPseudonym(sub.Email || sub.id || sub.Nome || "anonimo", sessionId || pin),
+          deriveStudentPseudonym(sub.Email || sub.id || sub.Nome || "anonimo", pin || ""),
+          "",
+        ].filter((v, idx, arr) => arr.indexOf(v) === idx)
+      )
+    );
+    const sessionIdCandidates = Array.from(new Set([sessionId, ""]));
+
+    const mcScore =
+      typeof evalObj?.calculatedMCScore === "number"
+        ? evalObj.calculatedMCScore
+        : typeof sub.Punteggio_MC === "number"
+          ? sub.Punteggio_MC
+          : null;
+    const fibScore =
+      typeof evalObj?.calculatedFIBScore === "number"
+        ? evalObj.calculatedFIBScore
+        : typeof sub.Punteggio_FIB === "number"
+          ? sub.Punteggio_FIB
+          : null;
+    const totalFib =
+      typeof evalObj?.totalFIB === "number"
+        ? evalObj.totalFIB
+        : typeof evalObj?.fibTotal === "number"
+          ? evalObj.fibTotal
+          : null;
+
+    const matchesGrade = (gradeCandidate: unknown): boolean => {
+      const g = String(gradeCandidate ?? "").trim();
+      if (!g) return false;
+      for (const pseudo of pseudoCandidates) {
+        for (const sid of sessionIdCandidates) {
+          const claim = buildEvaluationIntegrityClaim({
+            tipo,
+            suggestedGrade: g,
+            calculatedMCScore: mcScore,
+            calculatedFIBScore: fibScore,
+            totalFIB: totalFib,
+            sessionPin: pin,
+            sessionId: sid,
+            studentPseudoId: pseudo,
+          });
+          if (verifyEvaluationIntegrity(claim, sig)) return true;
+        }
+      }
+      return false;
+    };
+
+    if (matchesGrade(sub.Voto_Suggerito)) {
+      return res.json({ status: "verified", issuedAt });
+    }
+    if (sub.Voto_Originale_IA && matchesGrade(sub.Voto_Originale_IA)) {
+      return res.json({ status: "teacher_adjusted", issuedAt });
+    }
+    return res.json({ status: "tampered", issuedAt });
+  } catch (err: any) {
+    console.error("[submissions/verify-integrity] Failed:", err);
+    return res.status(500).json({ error: "Verifica integrità non riuscita." });
   }
 });
 
@@ -3155,7 +3381,18 @@ REGOLE TASSATIVAMENTE RIGOROSE:
     const examObj = {
       title: variantTitle,
       ...(isWorkbook
-        ? { sections: normalized.sections || [] }
+        ? {
+            sections: normalized.sections || [],
+            ...(Array.isArray(normalized.multipleChoice) && normalized.multipleChoice.length > 0
+              ? { multipleChoice: normalized.multipleChoice }
+              : {}),
+            ...(Array.isArray(normalized.fillInTheBlank) && normalized.fillInTheBlank.length > 0
+              ? { fillInTheBlank: normalized.fillInTheBlank }
+              : {}),
+            ...(Array.isArray(normalized.reflectionQuestions) && normalized.reflectionQuestions.length > 0
+              ? { reflectionQuestions: normalized.reflectionQuestions }
+              : {}),
+          }
         : hasNormalizedSections
         ? {
             sections: normalized.sections,
@@ -3171,12 +3408,14 @@ REGOLE TASSATIVAMENTE RIGOROSE:
             openEnded: collectQuizOpenEnded(normalized),
           }),
     };
+    const keyAudit = validateExamKeysForLaunch(examObj);
     return res.json({
       status: "success",
       title: examObj.title,
       examType: isWorkbook ? "workbook" : "quiz",
       recommendedDurationMinutes: Number(parsedSource.recommendedDurationMinutes || normalized.recommendedDurationMinutes || 45),
       modelUsed,
+      keyAudit,
       examObj,
       formattedJson: JSON.stringify(examObj, null, 2),
     });
@@ -4069,6 +4308,15 @@ async function startServer() {
         : "MISSING (set GEMINI_API_KEY): AI corrections will fail"
     }`
   );
+  const vaultSource =
+    splitSecretCandidates(process.env.SESSION_SECRET).length > 0
+      ? "SESSION_SECRET (dedicated)"
+      : splitSecretCandidates(process.env.VAULT_SECRET).length > 0
+        ? "VAULT_SECRET (dedicated)"
+        : getCandidateApiKeys().length > 0
+          ? "fallback to GEMINI_API_KEY (recommend setting dedicated SESSION_SECRET for key rotation isolation)"
+          : "ephemeral /tmp secret file (WARNING: encrypted answer keys will not survive container restarts — set SESSION_SECRET)";
+  console.log(` - Session vault key source: ${vaultSource}`);
 
   // Guarantee that unhandled /api/* requests never return HTML
   app.all("/api/*", (req, res) => {

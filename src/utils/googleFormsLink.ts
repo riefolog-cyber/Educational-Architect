@@ -624,7 +624,7 @@ function optionLetter(index: number): string {
  */
 export function buildExamFromLinkedForm(
   form: LinkedFormPayload,
-  correctIndexById: Record<string, number> = {},
+  correctIndexById: Record<string, number | null> = {},
   options: { fallbackTitle?: string } = {}
 ): GoogleFormsImportResult {
   const title = (options.fallbackTitle || "").trim() || form.title || "Attività importata da Google Moduli";
@@ -642,10 +642,16 @@ export function buildExamFromLinkedForm(
     // vedere "12. 12. …" nella prova dello studente.
     const questionText = stripQuestionNumbering(q.question);
     const shortName = questionText.length > 60 ? `${questionText.slice(0, 60)}...` : questionText;
-    // Teacher override wins; the automatically read key is the fallback.
-    const chosen = correctIndexById[q.id] ?? q.correctIndex;
+    // Teacher override wins, including explicit clear (-1 or null); auto-read key is fallback only when untouched.
+    const hasTeacherDecision = Object.prototype.hasOwnProperty.call(correctIndexById, q.id);
+    const overrideVal = hasTeacherDecision ? correctIndexById[q.id] : undefined;
+    const chosen = hasTeacherDecision
+      ? typeof overrideVal === "number" && overrideVal >= 0
+        ? overrideVal
+        : undefined
+      : q.correctIndex;
     const hasOptions = q.options.length >= 2;
-    const hasAnswer = typeof chosen === "number" && chosen >= 0 && chosen < q.options.length;
+    const hasAnswer = typeof chosen === "number" && Number.isInteger(chosen) && chosen >= 0 && chosen < q.options.length;
 
     if ((q.kind === "mc" || q.kind === "checkbox") && hasOptions && hasAnswer) {
       const id = `gf_mc_${multipleChoice.length + 1}`;

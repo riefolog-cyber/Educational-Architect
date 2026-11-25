@@ -3,19 +3,26 @@
  */
 
 // Simple markup formatter supporting bold (**text**), italics (*text*), backticks (`code`), line breaks, headings, and list bullets
-export function formatMarkdown(text: string | undefined): string {
-  if (!text) return "";
-  
-  // Escape HTML to prevent injection and raw tag confusion
-  let formatted = text
+export function formatMarkdown(text: unknown): string {
+  if (text === null || text === undefined) return "";
+  const raw = typeof text === "string" ? text : String(text);
+  if (!raw) return "";
+
+  // Escape HTML special chars to prevent injection and raw tag confusion
+  let formatted = raw
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&#39;");
 
   // Support simple Markdown headers: ### Heading, ## Heading, # Heading
   formatted = formatted.replace(/^\s*###\s+(.*?)$/gm, "<h4 class='text-sm font-bold text-indigo-300 mt-3 mb-1'>$1</h4>");
   formatted = formatted.replace(/^\s*##\s+(.*?)$/gm, "<h3 class='text-base font-bold text-indigo-400 mt-4 mb-1.5'>$1</h3>");
   formatted = formatted.replace(/^\s*#\s+(.*?)$/gm, "<h2 class='text-lg font-bold text-white mt-5 mb-2'>$1</h2>");
+
+  // Bullet points BEFORE italics so lines starting with `* item` are never mangled into <em>
+  formatted = formatted.replace(/^\s*[-*]\s+(.*?)$/gm, "<li class='ml-4 list-disc text-slate-200'>$1</li>");
 
   // Bold
   formatted = formatted.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
@@ -25,9 +32,6 @@ export function formatMarkdown(text: string | undefined): string {
 
   // Code backticks
   formatted = formatted.replace(/`(.*?)`/g, "<code class='font-mono bg-white/10 px-1 py-0.5 rounded text-teal-300'>$1</code>");
-
-  // Bullet points
-  formatted = formatted.replace(/^\s*[-*]\s+(.*?)$/gm, "<li class='ml-4 list-disc text-slate-200'>$1</li>");
 
   // Line breaks
   formatted = formatted.replace(/\n/g, "<br />");
@@ -995,6 +999,20 @@ export interface SubjectiveEvaluationAudit {
  * call failed, the evaluation contained no details at all, yet the grade was
  * still computed and every open question effectively became 0.
  */
+export function isValidNumericScore(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") {
+    const trimmed = value.trim().replace(",", ".");
+    return trimmed !== "" && Number.isFinite(Number(trimmed));
+  }
+  return false;
+}
+
+function parseNumericScore(value: unknown): number {
+  if (typeof value === "number") return value;
+  return Number(String(value).trim().replace(",", "."));
+}
+
 export function auditSubjectiveEvaluation(params: {
   questions: any[];
   details: any[];
@@ -1019,11 +1037,11 @@ export function auditSubjectiveEvaluation(params: {
     const hasDetail =
       entry.detail !== null &&
       entry.detail !== undefined &&
-      Number.isFinite(Number(entry.detail.score));
+      isValidNumericScore(entry.detail.score);
     if (hasDetail) {
       details.push({
         ...entry.detail,
-        score: Math.min(10, Math.max(0, Number(entry.detail.score))),
+        score: Math.min(10, Math.max(0, parseNumericScore(entry.detail.score))),
       });
       return;
     }
@@ -1071,16 +1089,14 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
   const options = Array.isArray(q?.options) ? q.options : [];
   const rawCorrect = q?.correctIndex;
   const correctIsBlank =
-    rawCorrect === undefined ||
-    rawCorrect === null ||
+    (typeof rawCorrect !== "number" && typeof rawCorrect !== "string") ||
     (typeof rawCorrect === "string" && rawCorrect.trim() === "");
   const correctIdx = correctIsBlank ? NaN : Number(rawCorrect);
   const hasCorrectKey = Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length;
   const correctText = hasCorrectKey ? String(options[correctIdx] ?? "") : "";
 
   const isBlank =
-    rawSelected === undefined ||
-    rawSelected === null ||
+    (typeof rawSelected !== "number" && typeof rawSelected !== "string") ||
     (typeof rawSelected === "string" && rawSelected.trim() === "");
 
   if (isBlank) {
@@ -1371,16 +1387,36 @@ function itemWeight(it: any): number {
 /** Multiple-choice: count-based + weight-based score in one pass. */
 export function mcWeightedScore(
   mcList: any[],
-  answersMc: Record<string, number>
+  answersMc: Record<string, any>
 ): { correct: number; total: number; weightedCorrect: number; weightedTotal: number } {
   let correct = 0;
   let weightedCorrect = 0;
   let weightedTotal = 0;
+  const parseStrictNonNegInt = (val: unknown): number | null => {
+    if (typeof val === "number") {
+      return Number.isInteger(val) && val >= 0 ? val : null;
+    }
+    if (typeof val === "string") {
+      const trimmed = val.trim();
+      if (!/^\d+$/.test(trimmed)) return null;
+      const n = Number(trimmed);
+      return Number.isInteger(n) && n >= 0 ? n : null;
+    }
+    return null;
+  };
   for (const q of mcList || []) {
     const w = itemWeight(q);
     weightedTotal += w;
     const userAns = answersMc?.[q.id];
-    if (userAns !== undefined && userAns !== null && Number(userAns) === Number(q.correctIndex)) {
+    let isRight = false;
+    if (Array.isArray(q?.options) && q.options.length > 0) {
+      isRight = evaluateMcSelection(q, userAns).isCorrect;
+    } else {
+      const parsedAns = parseStrictNonNegInt(userAns);
+      const parsedKey = parseStrictNonNegInt(q?.correctIndex);
+      isRight = parsedAns !== null && parsedKey !== null && parsedAns === parsedKey;
+    }
+    if (isRight) {
       correct++;
       weightedCorrect += w;
     }
@@ -2040,3 +2076,36 @@ export function sanitizeAiHtml(rawHtml: string): string {
   });
 }
 
+/**
+ * Copies text to the clipboard with an iframe-safe textarea + execCommand fallback
+ * when navigator.clipboard.writeText is blocked by Permissions-Policy.
+ */
+export async function copyTextToClipboard(text: string): Promise<boolean> {
+  if (!text) return false;
+  try {
+    if (typeof navigator !== "undefined" && navigator.clipboard && typeof navigator.clipboard.writeText === "function") {
+      await navigator.clipboard.writeText(text);
+      return true;
+    }
+  } catch {
+    // Fallback below for sandboxed iframes / non-focused documents
+  }
+  if (typeof document === "undefined") return false;
+  try {
+    const ta = document.createElement("textarea");
+    ta.value = text;
+    ta.setAttribute("readonly", "");
+    ta.style.position = "fixed";
+    ta.style.top = "-9999px";
+    ta.style.left = "-9999px";
+    ta.style.opacity = "0";
+    document.body.appendChild(ta);
+    ta.focus();
+    ta.select();
+    const ok = document.execCommand("copy");
+    document.body.removeChild(ta);
+    return ok;
+  } catch {
+    return false;
+  }
+}

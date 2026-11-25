@@ -15,8 +15,8 @@ export interface ParsedTranscript {
   notice: string | null;
 }
 
-/** Max characters forwarded to the AI generator (covers 5-6+ hours of speech while staying well within Gemini context). */
-export const MAX_TRANSCRIPT_CHARS = 350000;
+/** Max characters forwarded to the AI generator (aligned with server /api/generate-exam 120k cap). */
+export const MAX_TRANSCRIPT_CHARS = 120000;
 
 const TIMESTAMP_LINE =
   /^\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3}\s*-->\s*\d{1,2}:\d{2}(?::\d{2})?[,.]\d{1,3}.*$/;
@@ -60,32 +60,39 @@ export function parseTranscriptFile(fileName: string, rawText: string): ParsedTr
     const lines = normalized.split("\n");
     const spoken: string[] = [];
     let skipBlock = false; // STYLE / REGION / NOTE blocks in VTT
+    let inCue = false;
 
     for (const rawLine of lines) {
       const line = rawLine.trim();
       if (!line) {
         skipBlock = false;
+        inCue = false;
         continue;
       }
-      const upper = line.toUpperCase();
-      if (
-        upper === "WEBVTT" ||
-        upper.startsWith("WEBVTT ") ||
-        upper.startsWith("NOTE") ||
-        upper === "STYLE" ||
-        upper === "REGION"
-      ) {
-        skipBlock = upper === "STYLE" || upper === "REGION";
-        continue;
+      if (!inCue) {
+        const upper = line.toUpperCase();
+        const isVttNoteBlock =
+          format === "vtt" && (upper === "NOTE" || upper.startsWith("NOTE ") || upper.startsWith("NOTE\t"));
+        if (
+          upper === "WEBVTT" ||
+          upper.startsWith("WEBVTT ") ||
+          isVttNoteBlock ||
+          upper === "STYLE" ||
+          upper === "REGION"
+        ) {
+          skipBlock = upper === "STYLE" || upper === "REGION" || isVttNoteBlock;
+          continue;
+        }
       }
       if (skipBlock) continue;
       if (TIMESTAMP_LINE.test(line)) {
         cues++;
+        inCue = true;
         continue;
       }
-      if (SEQUENCE_LINE.test(line)) continue;
+      if (!inCue && SEQUENCE_LINE.test(line)) continue;
       // Cue identifiers / settings lines in VTT (e.g. "cue-1", "align:start position:0%")
-      if (format === "vtt" && /^(cue-|align:|position:|line:|size:)/i.test(line)) continue;
+      if (!inCue && format === "vtt" && /^(cue-|align:|position:|line:|size:)/i.test(line)) continue;
 
       let cleaned = line.replace(HTML_TAG, " ");
       // Sound-effect cues like [Musica] or [Applausi]: short bracketed
@@ -112,8 +119,8 @@ export function parseTranscriptFile(fileName: string, rawText: string): ParsedTr
     text = text.slice(0, MAX_TRANSCRIPT_CHARS).trim();
     truncated = true;
     notice =
-      `Trascrizione straordinariamente estesa (oltre 5-6 ore di parlato): inviati all'IA i primi ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri in un unico test. ` +
-      `Se il file supera persino questa soglia, puoi dividere la parte eccedente in un secondo file per una seconda verifica.`;
+      `Trascrizione molto estesa (oltre ~2 ore di parlato): inviati all'IA i primi ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri in un unico test. ` +
+      `Se il file supera questa soglia, puoi dividere la parte eccedente in un secondo file per una seconda verifica.`;
   }
   if (!text) {
     notice =

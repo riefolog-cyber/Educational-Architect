@@ -558,10 +558,11 @@ export default function ClassroomLiveMonitor({
     if (lockedStudents.length === 0) return;
 
     setUnlockingAll(true);
+    setNoticeError(null);
     try {
       const nowIso = new Date().toISOString();
       const baseUnlockId = `u_all_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-      await Promise.all(
+      const results = await Promise.allSettled(
         lockedStudents.map((s) =>
           updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", s.id), {
             remoteUnlockId: `${baseUnlockId}_${s.id}`,
@@ -571,10 +572,25 @@ export default function ClassroomLiveMonitor({
           })
         )
       );
-      setUnlockAllSuccess(true);
-      scheduleTimer(() => setUnlockAllSuccess(false), 3500);
+      const succeeded = results.filter((r) => r.status === "fulfilled").length;
+      const failed = results.length - succeeded;
+      if (succeeded > 0) {
+        setUnlockAllSuccess(true);
+        scheduleTimer(() => setUnlockAllSuccess(false), 3500);
+      }
+      if (failed > 0) {
+        console.warn("Sblocco cumulativo parziale o fallito:", results.filter((r) => r.status === "rejected"));
+        setNoticeError(
+          succeeded > 0
+            ? `Sbloccati ${succeeded} studenti su ${results.length}. ${failed} postazioni non erano più raggiungibili.`
+            : "Impossibile sbloccare le postazioni selezionate. Riprova tra qualche istante."
+        );
+        scheduleTimer(() => setNoticeError(null), 5000);
+      }
     } catch (err) {
       console.warn("Sblocco cumulativo aula non riuscito:", err);
+      setNoticeError("Impossibile completare lo sblocco cumulativo.");
+      scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
       setUnlockingAll(false);
     }

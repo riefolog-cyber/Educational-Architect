@@ -196,23 +196,43 @@ function resolveOptionIndex(options: string[], rawAnswer: string): number {
   const raw = (rawAnswer || "").trim();
   if (!raw || options.length === 0) return -1;
 
-  const letters = /^(?:opzione|option|risposta|answer)?\s*([a-h])(?:[).\-\s].*)?$/i.exec(raw);
-  if (letters) {
-    const idx = letters[1].toLowerCase().charCodeAt(0) - 97;
-    if (idx >= 0 && idx < options.length) return idx;
-  }
-
-  const digits = /^(?:opzione|option|risposta|answer)?\s*([1-9])(?:[).\-\s].*)?$/i.exec(raw);
-  if (digits) {
-    const idx = parseInt(digits[1], 10) - 1;
-    if (idx >= 0 && idx < options.length) return idx;
-  }
-
+  // 1. Exact option-text match always wins before shorthand letter/digit parsing,
+  //    so answers like "1 guerra mondiale", "4 tempi", or "A piedi" match the
+  //    actual option instead of being misread as option index 1/4/A.
   const target = compact(raw);
   if (target) {
     const exact = options.findIndex((o) => compact(o) === target);
     if (exact !== -1) return exact;
-    const partial = options.findIndex((o) => compact(o).startsWith(target) || target.startsWith(compact(o)));
+  }
+
+  // 2. Explicit letter shorthand: "A", "B)", "C.", "D - testo", "Opzione B"
+  const letters =
+    /^(?:(?:opzione|option|risposta|answer)\s+([a-h])(?:\s*$|[).:\-\s].*)|([a-h])(?:\s*$|\s*[).:\-].*))$/i.exec(
+      raw
+    );
+  if (letters) {
+    const letterToken = letters[1] || letters[2];
+    const idx = letterToken.toLowerCase().charCodeAt(0) - 97;
+    if (idx >= 0 && idx < options.length) return idx;
+  }
+
+  // 3. Explicit 1-based digit shorthand: "1", "2)", "3.", "4 - testo", "Opzione 2"
+  const digits =
+    /^(?:(?:opzione|option|risposta|answer)\s+([1-9])(?:\s*$|[).:\-\s].*)|([1-9])(?:\s*$|\s*[).:\-].*))$/i.exec(
+      raw
+    );
+  if (digits) {
+    const digitToken = digits[1] || digits[2];
+    const idx = parseInt(digitToken, 10) - 1;
+    if (idx >= 0 && idx < options.length) return idx;
+  }
+
+  // 4. Partial prefix match fallback
+  if (target) {
+    const partial = options.findIndex((o) => {
+      const optCompact = compact(o);
+      return Boolean(optCompact) && (optCompact.startsWith(target) || target.startsWith(optCompact));
+    });
     if (partial !== -1) return partial;
   }
 
@@ -508,12 +528,15 @@ function buildWorkbook(rows: ParsedRow[], title: string): {
 
   for (const row of rows) {
     const bucket = ensure(row.section || "Attività");
-    if (row.kind === "fib" && row.answer) {
+    const cleanedQuestion = stripQuestionNumbering(row.question);
+    const bracketAnswer = cleanedQuestion.match(/\[([^\]]+)\]/)?.[1]?.trim() || "";
+    const resolvedFibAnswer = (row.answer || bracketAnswer).trim();
+    if (row.kind === "fib" && resolvedFibAnswer) {
       blanks++;
       const item: Record<string, unknown> = {
         id: `gf_fib_${blanks}`,
-        sentence: row.question,
-        answer: row.answer,
+        sentence: cleanedQuestion,
+        answer: resolvedFibAnswer,
       };
       if (row.weight && row.weight !== 1) item.weight = row.weight;
       bucket.blanks.push(item);
@@ -521,7 +544,7 @@ function buildWorkbook(rows: ParsedRow[], title: string): {
       reflections++;
       const item: Record<string, unknown> = {
         id: `gf_rq_${reflections}`,
-        question: row.question,
+        question: cleanedQuestion,
       };
       if (row.criteria) item.criteria = row.criteria;
       if (row.weight && row.weight !== 1) item.weight = row.weight;
@@ -589,7 +612,9 @@ export function parseGoogleFormsImport(
   const title = fallbackTitle || DEFAULT_TITLE;
 
   const hasMc = rows.some((r) => r.kind === "mc" && r.options.length >= 2);
-  const hasFib = rows.some((r) => r.kind === "fib" && r.answer);
+  const hasFib = rows.some(
+    (r) => r.kind === "fib" && (Boolean(r.answer.trim()) || /\[[^\]]+\]/.test(r.question))
+  );
   const hasSections = rows.some((r) => !!r.section);
   const useWorkbook = !hasMc && (hasFib || hasSections);
 

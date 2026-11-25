@@ -345,9 +345,17 @@ service cloud.firestore {
 
     // Collection for exam submissions and evaluations
     match /valutazioni/{valId} {
-      allow get: if isValidId(valId);
-      allow list: if isTeacher() || (resource.data.Email is string && resource.data.Email.size() > 0);
-      allow create: if isValidId(valId) && isValidSubmissionCreate(incoming());
+      allow get: if isValidId(valId) && (
+        isTeacher() ||
+        !isSignedIn() ||
+        (resource.data.Email is string && resource.data.Email.lower() == request.auth.token.email.lower())
+      );
+      allow list: if isTeacher() ||
+        (isSignedIn() && resource.data.Email == request.auth.token.email) ||
+        (!isSignedIn() && resource.data.Email is string && resource.data.Email.size() > 0);
+      allow create: if isValidId(valId) &&
+        isValidSubmissionCreate(incoming()) &&
+        (!isSignedIn() || isTeacher() || incoming().Email.lower() == request.auth.token.email.lower());
       allow update: if isValidId(valId) && (
         (isTeacher() && isValidSubmissionPayload(incoming()) && isOwnerOrPrimaryTeacher(existing().get('Docente_Email', ''))) ||
         (isValidSubmissionPayload(incoming()) && isStudentRecoveryPlanUpdate())

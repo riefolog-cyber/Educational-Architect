@@ -1,5 +1,11 @@
 import type { SavedSubmission } from "../types";
-import { parseItalianGrade, formatItalianScholasticGrade } from "../utils";
+import {
+  parseItalianGrade,
+  formatItalianScholasticGrade,
+  isEvaluationPending,
+  getPendingSubjectiveCount,
+  safeParseJson,
+} from "../utils";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping";
 
@@ -7,11 +13,11 @@ export type RoundingMode = "exact" | "quarters" | "halves" | "integers";
 export type GradebookExportPreset = "argo_didup" | "axios" | "classeviva" | "standard";
 
 /**
- * Rounds a raw Italian numeric grade (1..10) according to teacher-chosen electronic register policy.
+ * Rounds a raw Italian numeric grade (0..10) according to teacher-chosen electronic register policy.
  */
 export function roundScholasticGrade(value: number, mode: RoundingMode): number {
   if (!Number.isFinite(value)) return NaN;
-  const clamped = Math.max(1, Math.min(10, value));
+  const clamped = Math.max(0, Math.min(10, value));
   if (mode === "exact") {
     return Math.round(clamped * 100) / 100;
   }
@@ -25,15 +31,15 @@ export function roundScholasticGrade(value: number, mode: RoundingMode): number 
 }
 
 /**
- * Formats a rounded grade both as Italian decimal for electronic registers (e.g. "7,5")
- * and traditional scholastic notation (e.g. "7½", "7-", "7+").
+ * Formats a rounded grade both as Italian decimal for electronic registers (e.g. "7,5", "0")
+ * and traditional scholastic notation (e.g. "7½", "7-", "7+", "0.0").
  */
 export function formatGradeForRegister(
   rawGrade: string | number | undefined | null,
   mode: RoundingMode
 ): { numeric: number | null; registerDecimal: string; scholasticLabel: string } {
-  const num = typeof rawGrade === "number" ? rawGrade : parseItalianGrade(String(rawGrade || ""));
-  if (!Number.isFinite(num) || num < 1) {
+  const num = typeof rawGrade === "number" ? rawGrade : parseItalianGrade(String(rawGrade ?? ""));
+  if (!Number.isFinite(num) || num < 0) {
     return { numeric: null, registerDecimal: "N.V.", scholasticLabel: "N.V." };
   }
   const rounded = roundScholasticGrade(num, mode);
@@ -131,11 +137,20 @@ export function buildElectronicRegisterCsv(
       "Risposte Orali",
       "Uscite Pagina",
       "Tentativi Incolla",
+      "Schermo Diviso",
     ];
   }
 
   const rows = filtered.map((sub) => {
-    const rawGrade = gradeOverrides[sub.id] ?? sub.Voto_Suggerito;
+    const overrideRaw = gradeOverrides[sub.id];
+    const hasExplicitOverride = typeof overrideRaw === "string" && overrideRaw.trim() !== "";
+    const parsedEval = safeParseJson(sub.Full_Evaluation);
+    const isPending =
+      !hasExplicitOverride &&
+      (isEvaluationPending(parsedEval) ||
+        getPendingSubjectiveCount(sub) > 0 ||
+        String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V."));
+    const rawGrade = hasExplicitOverride ? overrideRaw : isPending ? "N.V." : sub.Voto_Suggerito;
     const formatted = formatGradeForRegister(rawGrade, roundingMode);
     const blindCode = getSubmissionBlindCode(sub);
     const displayName = blindMode ? `Studente ${blindCode}` : (sub.Nome || "Studente");
@@ -169,6 +184,7 @@ export function buildElectronicRegisterCsv(
       const notes: string[] = [];
       if (classLabel && classLabel !== UNSPECIFIED_CLASS_LABEL) notes.push(classLabel);
       if (sub.Assigned_Fila) notes.push(`Fila ${sub.Assigned_Fila}`);
+      if (isPending) notes.push("In attesa di correzione");
       if (oralCount > 0) notes.push(`${oralCount} risp. orali BES`);
       if (violationsCount > 0) notes.push(`${violationsCount} segnalazioni anti-copia`);
       return [
@@ -179,19 +195,24 @@ export function buildElectronicRegisterCsv(
         examTitle,
         formatted.registerDecimal,
         formatted.scholasticLabel,
-        sub.Convalida_Docente_At ? "Convalidata" : "Bozza IA",
+        isPending ? "In attesa" : sub.Convalida_Docente_At ? "Convalidata" : "Bozza IA",
         notes.length > 0 ? notes.join(" · ") : "Regolare",
       ];
     }
 
     if (preset === "classeviva") {
+      const safeAnnotation = isPending
+        ? "Valutazione in attesa di correzione del docente"
+        : sub.Soluzioni_Differite
+        ? `${sub.Feedback_Generale || "Soluzioni differite attive"}`
+        : `${sub.Feedback_Generale || sub.Errori_Principali || ""}`;
       return [
         displayName,
         formatted.registerDecimal,
         dateStr,
         `${examTitle} (${sub.Tipo || "Verifica"})`,
-        sub.Convalida_Docente_At ? "Definitivo" : "Proposto IA",
-        `${sub.Feedback_Generale || sub.Errori_Principali || ""}`.slice(0, 180),
+        isPending ? "In attesa" : sub.Convalida_Docente_At ? "Definitivo" : "Proposto IA",
+        safeAnnotation.slice(0, 180),
       ];
     }
 
@@ -206,12 +227,13 @@ export function buildElectronicRegisterCsv(
       displayId,
       formatted.registerDecimal,
       formatted.scholasticLabel,
-      sub.Voto_Originale_IA || sub.Voto_Suggerito || "",
+      isPending ? "N.V." : (sub.Voto_Originale_IA || sub.Voto_Suggerito || ""),
       validatedLabel,
       sub.Autovalutazione || "",
       String(oralCount),
       String(sub.AntiCopia_TabSwitch || 0),
       String(sub.AntiCopia_IncollaBloccato || 0),
+      String(sub.AntiCopia_SchermoDiviso || 0),
     ];
   });
 

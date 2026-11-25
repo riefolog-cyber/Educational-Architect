@@ -573,3 +573,152 @@ export function restoreExamFromTeacherSources(
   return { restoredExam: strippedExam, restored: false, matchedCount: 0 };
 }
 
+export interface ExamLaunchValidationResult {
+  valid: boolean;
+  errors: string[];
+  stats: {
+    mcCount: number;
+    fibCount: number;
+    oeCount: number;
+    rqCount: number;
+  };
+}
+
+/**
+ * Single-source-of-truth pre-flight validation used by both the Teacher editor
+ * and POST /api/session/prepare before stripping keys and publishing a session.
+ * Rejects missing/out-of-bounds MC keys, missing FIB answers, empty questions,
+ * and duplicate question IDs within the same category.
+ */
+export function validateExamKeysForLaunch(examData: any): ExamLaunchValidationResult {
+  const errors: string[] = [];
+  const stats = { mcCount: 0, fibCount: 0, oeCount: 0, rqCount: 0 };
+
+  if (!examData || typeof examData !== "object" || Array.isArray(examData)) {
+    return { valid: false, errors: ["Struttura della prova non valida o vuota."], stats };
+  }
+
+  const seenMcIds = new Set<string>();
+  const seenFibIds = new Set<string>();
+  const seenOeIds = new Set<string>();
+  const seenRqIds = new Set<string>();
+
+  const checkMc = (list: any[], scope: string) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((q: any, idx: number) => {
+      stats.mcCount++;
+      const label = `${scope}Crocetta ${idx + 1}`;
+      if (!q || typeof q !== "object") {
+        errors.push(`${label}: oggetto domanda non valido.`);
+        return;
+      }
+      const qText = String(q.question || "").trim();
+      if (!qText) {
+        errors.push(`${label}: manca il testo della domanda.`);
+      }
+      const opts = Array.isArray(q.options) ? q.options : [];
+      if (opts.length < 2) {
+        errors.push(`${label}: servono almeno 2 opzioni di risposta.`);
+      } else if (opts.some((o: any) => !String(o ?? "").trim())) {
+        errors.push(`${label}: contiene un'opzione di risposta vuota.`);
+      }
+      const rawIdx = q.correctIndex;
+      const isValidType =
+        (typeof rawIdx === "number" && Number.isInteger(rawIdx)) ||
+        (typeof rawIdx === "string" && /^\d+$/.test(rawIdx.trim()));
+      const parsedIdx = isValidType ? Number(rawIdx) : NaN;
+      if (!Number.isInteger(parsedIdx) || parsedIdx < 0 || (opts.length > 0 && parsedIdx >= opts.length)) {
+        errors.push(`${label}: chiave corretta ('correctIndex') mancante o fuori intervallo.`);
+      }
+      const qId = String(q.id || "").trim();
+      if (qId) {
+        if (seenMcIds.has(qId)) {
+          errors.push(`${label}: ID duplicato "${qId}" tra le domande a scelta multipla.`);
+        } else {
+          seenMcIds.add(qId);
+        }
+      }
+    });
+  };
+
+  const checkFib = (list: any[], scope: string) => {
+    if (!Array.isArray(list)) return;
+    list.forEach((f: any, idx: number) => {
+      stats.fibCount++;
+      const label = `${scope}Completamento ${idx + 1}`;
+      if (!f || typeof f !== "object") {
+        errors.push(`${label}: oggetto completamento non valido.`);
+        return;
+      }
+      const sentence = String(f.sentence || "").trim();
+      if (!sentence) {
+        errors.push(`${label}: manca la frase da completare ('sentence').`);
+      }
+      const ans = String(f.answer || "").trim();
+      const hasBracket = /\[([^\]]+)\]/.test(sentence);
+      if (!ans && !hasBracket) {
+        errors.push(`${label}: manca la parola chiave attesa ('answer' o token tra [parentesi]).`);
+      }
+      const fId = String(f.id || "").trim();
+      if (fId) {
+        if (seenFibIds.has(fId)) {
+          errors.push(`${label}: ID duplicato "${fId}" tra i completamenti.`);
+        } else {
+          seenFibIds.add(fId);
+        }
+      }
+    });
+  };
+
+  const checkOpen = (list: any[], scope: string, kind: "oe" | "rq") => {
+    if (!Array.isArray(list)) return;
+    const seen = kind === "oe" ? seenOeIds : seenRqIds;
+    const noun = kind === "oe" ? "Domanda aperta" : "Riflessione critica";
+    list.forEach((q: any, idx: number) => {
+      if (kind === "oe") stats.oeCount++;
+      else stats.rqCount++;
+      const label = `${scope}${noun} ${idx + 1}`;
+      if (!q || typeof q !== "object" || !String(q.question || "").trim()) {
+        errors.push(`${label}: manca il testo del quesito.`);
+        return;
+      }
+      const qId = String(q.id || "").trim();
+      if (qId) {
+        if (seen.has(qId)) {
+          errors.push(`${label}: ID duplicato "${qId}".`);
+        } else {
+          seen.add(qId);
+        }
+      }
+    });
+  };
+
+  checkMc(examData.multipleChoice, "");
+  checkFib(examData.fillInTheBlank, "");
+  checkOpen(examData.openEnded, "", "oe");
+  checkOpen(examData.reflectionQuestions, "", "rq");
+
+  if (Array.isArray(examData.sections)) {
+    examData.sections.forEach((sec: any, sIdx: number) => {
+      if (!sec || typeof sec !== "object") return;
+      const scope = `Sezione ${sIdx + 1}, `;
+      checkMc(sec.multipleChoice, scope);
+      checkFib(sec.fillInTheBlank, scope);
+      checkOpen(sec.openEnded, scope, "oe");
+      checkOpen(sec.reflectionQuestions, scope, "rq");
+    });
+  }
+
+  const totalQuestions = stats.mcCount + stats.fibCount + stats.oeCount + stats.rqCount;
+  if (totalQuestions === 0) {
+    errors.push("La prova non contiene alcun quesito valutabile.");
+  }
+
+  return {
+    valid: errors.length === 0,
+    errors,
+    stats,
+  };
+}
+
+

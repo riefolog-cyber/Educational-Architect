@@ -1,6 +1,8 @@
 import React, { useState, useRef, useEffect } from "react";
 import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2, ShieldCheck, CopyPlus } from "lucide-react";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS, type TranscriptFormat } from "../utils/transcriptParser";
+import { validateExamKeysForLaunch } from "../utils/examSecurity";
+import { collectExamMultipleChoice, safeParseJson } from "../utils";
 import { getAuthHeaders } from "../firebase";
 import { AiModalPrefill } from "../types";
 
@@ -23,7 +25,7 @@ export default function AiExamGeneratorModal({
   initialPrefill = null
 }: AiExamGeneratorModalProps) {
   const [topic, setTopic] = useState("");
-  const [gradeLevel, setGradeLevel] = useState("Scuola Secondaria di II Grado (Superiori - 3°/4° anno)");
+  const [gradeLevel, setGradeLevel] = useState("Scuola Secondaria di II Grado (Superiori - Triennio)");
   const [examType, setExamType] = useState<"quiz" | "workbook">("quiz");
   const [difficulty, setDifficulty] = useState<"base" | "intermedio" | "avanzato">("intermedio");
   const [numQuestions, setNumQuestions] = useState<number>(8);
@@ -703,33 +705,96 @@ export default function AiExamGeneratorModal({
                 </div>
               </div>
 
-              <div className="space-y-1.5">
-                <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
-                  <span>Anteprima Quesiti Generati ({examType === "quiz" ? `${generatedResult.examObj?.multipleChoice?.length || 0} crocette` : `${generatedResult.examObj?.sections?.length || 0} sezioni`}):</span>
-                  <span className="text-emerald-400 font-mono">100% conforme allo standard</span>
-                </div>
-                <div className="p-3 bg-slate-950/80 rounded-2xl border border-white/10 max-h-56 overflow-y-auto space-y-2.5 font-mono text-[11px] text-slate-300">
-                  {examType === "quiz" ? (
-                    generatedResult.examObj?.multipleChoice?.map((mc: any, idx: number) => (
-                      <div key={idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
-                        <p className="text-white font-sans font-bold">
-                          {idx + 1}. {mc.question}
+              {(() => {
+                const primaryAudit = validateExamKeysForLaunch(
+                  generatedResult.examObj || safeParseJson(generatedResult.formattedJson)
+                );
+                const variantAudit = generatedResult.parallelVariant
+                  ? validateExamKeysForLaunch(safeParseJson(generatedResult.parallelVariant.formattedJson))
+                  : null;
+                const allIssues = [
+                  ...primaryAudit.errors,
+                  ...(variantAudit && !variantAudit.valid
+                    ? variantAudit.errors.map((iss) => `[Fila B] ${iss}`)
+                    : []),
+                ];
+                const allKeysValid = primaryAudit.valid && (!variantAudit || variantAudit.valid);
+                const previewMc = collectExamMultipleChoice(generatedResult.examObj);
+
+                return (
+                  <div className="space-y-2.5">
+                    {!allKeysValid && (
+                      <div className="p-3 bg-amber-500/10 border border-amber-500/35 rounded-2xl text-amber-200 text-[11px] space-y-1">
+                        <p className="font-bold">
+                          ⚠️ Controlla le chiavi prima di avviare la sessione ({allIssues.length}{" "}
+                          {allIssues.length === 1 ? "anomalia rilevata" : "anomalie rilevate"}):
                         </p>
-                        <p className="text-teal-400 text-[10px]">
-                          ✓ Risposta corretta: {mc.options?.[mc.correctIndex]}
-                        </p>
+                        <ul className="list-disc pl-5 space-y-0.5">
+                          {allIssues.slice(0, 5).map((iss, i) => (
+                            <li key={i}>{iss}</li>
+                          ))}
+                        </ul>
                       </div>
-                    ))
-                  ) : (
-                    generatedResult.examObj?.sections?.map((sec: any, idx: number) => (
-                      <div key={idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
-                        <p className="text-white font-sans font-bold">{sec.title}</p>
-                        <p className="text-slate-400 text-[10px] font-sans line-clamp-2">{sec.sintesi}</p>
+                    )}
+
+                    <div className="space-y-1.5">
+                      <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
+                        <span>
+                          Anteprima Quesiti Generati (
+                          {examType === "quiz"
+                            ? `${previewMc.length} crocette`
+                            : `${generatedResult.examObj?.sections?.length || 0} sezioni`}
+                          ):
+                        </span>
+                        <span
+                          className={`font-mono ${
+                            allKeysValid ? "text-emerald-400" : "text-amber-300"
+                          }`}
+                        >
+                          {allKeysValid
+                            ? "✓ Chiavi di correzione verificate"
+                            : "⚠ Revisione chiavi richiesta"}
+                        </span>
                       </div>
-                    ))
-                  )}
-                </div>
-              </div>
+                      <div className="p-3 bg-slate-950/80 rounded-2xl border border-white/10 max-h-56 overflow-y-auto space-y-2.5 font-mono text-[11px] text-slate-300">
+                        {examType === "quiz" ? (
+                          previewMc.map((mc: any, idx: number) => {
+                            const hasKey =
+                              typeof mc?.correctIndex === "number" &&
+                              Number.isInteger(mc.correctIndex) &&
+                              Array.isArray(mc?.options) &&
+                              mc.correctIndex >= 0 &&
+                              mc.correctIndex < mc.options.length;
+                            return (
+                              <div key={mc?.id || idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
+                                <p className="text-white font-sans font-bold">
+                                  {idx + 1}. {mc.question}
+                                </p>
+                                {hasKey ? (
+                                  <p className="text-teal-400 text-[10px]">
+                                    ✓ Risposta corretta: {mc.options[mc.correctIndex]}
+                                  </p>
+                                ) : (
+                                  <p className="text-amber-300 text-[10px]">
+                                    ⚠ Chiave mancante o fuori intervallo: completa nell'Editor
+                                  </p>
+                                )}
+                              </div>
+                            );
+                          })
+                        ) : (
+                          generatedResult.examObj?.sections?.map((sec: any, idx: number) => (
+                            <div key={idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
+                              <p className="text-white font-sans font-bold">{sec.title}</p>
+                              <p className="text-slate-400 text-[10px] font-sans line-clamp-2">{sec.sintesi}</p>
+                            </div>
+                          ))
+                        )}
+                      </div>
+                    </div>
+                  </div>
+                );
+              })()}
             </div>
           )}
         </div>

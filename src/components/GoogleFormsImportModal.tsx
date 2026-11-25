@@ -19,6 +19,8 @@ import {
   type LinkedFormQuestion
 } from "../utils/googleFormsLink";
 import { compressImageSource, fileToExamImage } from "../utils/imageData";
+import { validateExamKeysForLaunch } from "../utils/examSecurity";
+import { safeParseJson } from "../utils";
 import { getAuthHeaders } from "../firebase";
 
 interface GoogleFormsImportModalProps {
@@ -56,7 +58,7 @@ export default function GoogleFormsImportModal({
 
   const [link, setLink] = useState("");
   const [linked, setLinked] = useState<LinkedFormPayload | null>(null);
-  const [answers, setAnswers] = useState<Record<string, number>>({});
+  const [answers, setAnswers] = useState<Record<string, number | null>>({});
   const [loadingLink, setLoadingLink] = useState(false);
 
   const [scriptUrl, setScriptUrl] = useState(() => {
@@ -286,7 +288,7 @@ export default function GoogleFormsImportModal({
     setResult(null);
     setAnswers((prev) => {
       const next = { ...prev };
-      if (next[questionId] === optionIndex) delete next[questionId];
+      if (next[questionId] === optionIndex) next[questionId] = -1;
       else next[questionId] = optionIndex;
       return next;
     });
@@ -294,12 +296,15 @@ export default function GoogleFormsImportModal({
 
   const clearAnswer = (questionId: string) => {
     setResult(null);
-    setAnswers((prev) => {
-      const next = { ...prev };
-      delete next[questionId];
-      return next;
-    });
+    setAnswers((prev) => ({
+      ...prev,
+      [questionId]: -1,
+    }));
   };
+
+  const resultKeyAudit = result
+    ? validateExamKeysForLaunch(safeParseJson(result.examJson))
+    : null;
 
   const hasInput = !!linked || !!rawText.trim();
 
@@ -525,7 +530,11 @@ export default function GoogleFormsImportModal({
                           <button
                             type="button"
                             onClick={() => clearAnswer(q.id)}
-                            className="text-[10px] px-1.5 py-1 rounded-lg border border-white/10 text-slate-400 hover:text-amber-200 hover:border-amber-500/40 cursor-pointer"
+                            className={`text-[10px] px-1.5 py-1 rounded-lg border transition-colors cursor-pointer ${
+                              typeof answers[q.id] !== "number" || (answers[q.id] as number) < 0
+                                ? "bg-amber-500/20 text-amber-200 border-amber-400/50 font-bold"
+                                : "border-white/10 text-slate-400 hover:text-amber-200 hover:border-amber-500/40"
+                            }`}
                           >
                             Nessuna (aperta)
                           </button>
@@ -724,6 +733,16 @@ export default function GoogleFormsImportModal({
                   Il quiz con le immagini pesa circa {Math.round(result.examJson.length / 1024)} KB: se l'avvio
                   sessione dà errore, togli qualche figura dal riepilogo (le immagini sono già compresse).
                 </p>
+              )}
+              {resultKeyAudit && !resultKeyAudit.valid && (
+                <div className="space-y-1 text-[11px] text-amber-200 bg-amber-500/15 border border-amber-500/35 rounded-xl p-2.5">
+                  <p className="font-bold">⚠️ Controllo chiavi di correzione prima dell'avvio:</p>
+                  <ul className="list-disc pl-5 space-y-0.5">
+                    {resultKeyAudit.errors.slice(0, 5).map((issue, idx) => (
+                      <li key={idx}>{issue}</li>
+                    ))}
+                  </ul>
+                </div>
               )}
               {result.warnings.length > 0 && (
                 <ul className="space-y-1 text-[11px] text-amber-200 bg-amber-500/10 border border-amber-500/20 rounded-xl p-2.5 list-disc pl-6">

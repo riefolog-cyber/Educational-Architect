@@ -97,6 +97,17 @@ async function main() {
         headers: { "Content-Type": "application/json" },
       });
     }
+    if (url.includes("identitytoolkit.googleapis.com") && url.includes("accounts:lookup")) {
+      const bodyStr = typeof init?.body === "string" ? init.body : "";
+      if (bodyStr.includes("test-primary-teacher-token")) {
+        return new Response(
+          JSON.stringify({
+            users: [{ localId: "uid_teacher_1", email: "riefolog@gmail.com", emailVerified: true }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } }
+        );
+      }
+    }
     return originalFetch(input, init);
   }) as typeof fetch;
 
@@ -863,6 +874,200 @@ async function main() {
         if (prevSessionOld === undefined) delete process.env.SESSION_SECRET_OLD;
         else process.env.SESSION_SECRET_OLD = prevSessionOld;
       }
+    });
+
+    await runTest("ServerIntegrity & Deferred Recalc: sigillo HMAC valido e mascheratura Soluzioni_Differite anche su forceReevaluation", async () => {
+      const { buildEvaluationIntegrityClaim, verifyEvaluationIntegrity } = await import("../server");
+
+      // Unauthenticated forceReevaluation must be rejected (401)
+      const unauth = await httpJsonRequest(port, "POST", "/api/evaluate/enqueue", {
+        tipo: "Quiz",
+        forceReevaluation: true,
+        deferSolutions: true,
+        sessionPin: "DEF99",
+        sessionId: "run_def99",
+        studentPseudoId: "STU-TEST1",
+        report: {
+          domande: sampleRawExam,
+          risposte: { mc: { mc1: 0 } },
+          punteggioMC: 0,
+        },
+      });
+      assert.equal(unauth.status, 401);
+
+      // Authenticated teacher forceReevaluation with deferSolutions=true keeps solutions masked & signs serverIntegrity
+      const enq = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/evaluate/enqueue",
+        {
+          tipo: "Quiz",
+          forceReevaluation: true,
+          deferSolutions: true,
+          sessionPin: "DEF99",
+          sessionId: "run_def99",
+          studentPseudoId: "STU-TEST1",
+          report: {
+            domande: sampleRawExam,
+            risposte: { mc: { mc1: 0 } },
+            punteggioMC: 0,
+          },
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(enq.status, 200);
+      assert.ok(enq.data?.jobId);
+
+      let statusRes: any = null;
+      for (let i = 0; i < 20; i++) {
+        statusRes = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/evaluate/status/${encodeURIComponent(enq.data.jobId)}?token=${encodeURIComponent(enq.data.jobToken || "")}`,
+          undefined,
+          enq.data.jobToken ? { "x-job-token": enq.data.jobToken } : undefined
+        );
+        if (statusRes.data?.status === "completed" || statusRes.data?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+
+      assert.equal(statusRes?.status, 200);
+      assert.equal(statusRes?.data?.status, "completed");
+      const ev = statusRes.data.evaluation;
+      assert.equal(ev.deferredSolutionsLocked, true);
+      assert.equal(ev.gradeBreakdown, undefined);
+      assert.ok(String(ev.mainErrors || "").includes("nascosti"));
+      assert.equal(ev.serverIntegrity?.v, 1);
+      assert.ok(typeof ev.serverIntegrity?.sig === "string" && ev.serverIntegrity.sig.length >= 20);
+
+      const claim = buildEvaluationIntegrityClaim({
+        tipo: "quiz",
+        suggestedGrade: ev.suggestedGrade,
+        calculatedMCScore: ev.calculatedMCScore,
+        calculatedFIBScore: ev.calculatedFIBScore,
+        totalFIB: ev.totalFIB,
+        sessionPin: "DEF99",
+        sessionId: "run_def99",
+        studentPseudoId: "STU-TEST1",
+      });
+      assert.equal(verifyEvaluationIntegrity(claim, ev.serverIntegrity.sig), true);
+
+      // Tampering with suggestedGrade must fail HMAC verification
+      const tamperedClaim = { ...claim, suggestedGrade: "10.0 (10)" };
+      assert.equal(verifyEvaluationIntegrity(tamperedClaim, ev.serverIntegrity.sig), false);
+
+      // End-to-end teacher verification endpoint: requires auth (401)
+      const unauthVerify = await httpJsonRequest(port, "POST", "/api/submissions/verify-integrity", {
+        submission: {
+          Tipo: "Quiz",
+          Voto_Suggerito: ev.suggestedGrade,
+          Punteggio_MC: ev.calculatedMCScore,
+          Pin: "DEF99",
+          Session_Id: "run_def99",
+          Pseudo_Id: "STU-TEST1",
+          Full_Evaluation: JSON.stringify(ev),
+        },
+      });
+      assert.equal(unauthVerify.status, 401);
+
+      const baseSub = {
+        Tipo: "Quiz",
+        Voto_Suggerito: ev.suggestedGrade,
+        Punteggio_MC: ev.calculatedMCScore,
+        Pin: "DEF99",
+        Session_Id: "run_def99",
+        Pseudo_Id: "STU-TEST1",
+        Full_Evaluation: JSON.stringify(ev),
+      };
+
+      // 1. Untouched evaluation -> verified
+      const verifiedRes = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/submissions/verify-integrity",
+        { submission: baseSub },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(verifiedRes.status, 200);
+      assert.equal(verifiedRes.data.status, "verified");
+
+      // 2. Teacher manually retouches grade while preserving Voto_Originale_IA -> teacher_adjusted
+      const adjustedRes = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/submissions/verify-integrity",
+        {
+          submission: {
+            ...baseSub,
+            Voto_Suggerito: "6.0 (6)",
+            Voto_Originale_IA: ev.suggestedGrade,
+          },
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(adjustedRes.status, 200);
+      assert.equal(adjustedRes.data.status, "teacher_adjusted");
+
+      // 3. Altered grade without matching original -> tampered
+      const tamperedRes = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/submissions/verify-integrity",
+        {
+          submission: {
+            ...baseSub,
+            Voto_Suggerito: "10.0 (10)",
+          },
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(tamperedRes.status, 200);
+      assert.equal(tamperedRes.data.status, "tampered");
+
+      // 4. Legacy unsigned submission -> legacy_unsigned
+      const legacyRes = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/submissions/verify-integrity",
+        {
+          submission: {
+            ...baseSub,
+            Full_Evaluation: JSON.stringify({ suggestedGrade: "7.0 (7)" }),
+          },
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(legacyRes.status, 200);
+      assert.equal(legacyRes.data.status, "legacy_unsigned");
+    });
+
+    await runTest("session/prepare: rifiuta con 400 prove prive di chiavi MC/FIB o con ID duplicati prima dell'attivazione", async () => {
+      const badPrepare = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/session/prepare",
+        {
+          examData: {
+            title: "Verifica con chiave mancante",
+            multipleChoice: [
+              { id: "mc1", question: "Domanda senza chiave", options: ["A", "B", "C"] },
+            ],
+          },
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(badPrepare.status, 400);
+      assert.ok(Array.isArray(badPrepare.data?.validationErrors) && badPrepare.data.validationErrors.length >= 1);
+
+      const okPrepare = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/session/prepare",
+        { examData: sampleRawExam },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(okPrepare.status, 200);
+      assert.ok(typeof okPrepare.data?.encryptedAnswerKey === "string" && okPrepare.data.encryptedAnswerKey.length > 10);
     });
   } finally {
     globalThis.fetch = originalFetch;

@@ -16,6 +16,7 @@ import {
   formatItalianScholasticGrade,
   getPendingSubjectiveCount,
   isEvaluationPending,
+  isValidNumericScore,
   isWorkbookExamData,
   safeParseJson,
 } from "../utils";
@@ -25,6 +26,7 @@ import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping
 
 export interface PdfExportOptions {
   blindMode?: boolean;
+  deferredSolutionsLocked?: boolean;
 }
 
 function resolveDisplayGrade(sub: SavedSubmission): string {
@@ -34,22 +36,44 @@ function resolveDisplayGrade(sub: SavedSubmission): string {
   return sub?.Voto_Suggerito || "N/A";
 }
 
+function parseStrictCorrectIndex(raw: unknown, optionsLength: number): number | null {
+  if (typeof raw === "number") {
+    return Number.isInteger(raw) && raw >= 0 && raw < optionsLength ? raw : null;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return null;
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isInteger(parsed) && parsed >= 0 && parsed < optionsLength ? parsed : null;
+  }
+  return null;
+}
+
 export function sanitizePdfText(text: string): string {
   if (!text) return "";
 
-  let temp = text
+  let temp = String(text)
     .replace(/<[^>]+>/g, "")
-    .replace(/&ldquo;/g, '"')
-    .replace(/&rdquo;/g, '"')
-    .replace(/&mdash;/g, "-")
-    .replace(/&ndash;/g, "-")
-    .replace(/&amp;/g, "&")
-    .replace(/&eacute;/g, "e")
-    .replace(/&agrave;/g, "a")
-    .replace(/&egrave;/g, "e")
-    .replace(/&igrave;/g, "i")
-    .replace(/&ograve;/g, "o")
-    .replace(/&ugrave;/g, "u")
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&ldquo;|&rdquo;|&quot;/gi, '"')
+    .replace(/&lsquo;|&rsquo;|&apos;|&#39;|&#x27;/gi, "'")
+    .replace(/&mdash;|&ndash;/gi, "-")
+    .replace(/&hellip;/gi, "...")
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&")
+    .replace(/&eacute;/g, "é")
+    .replace(/&Eacute;/g, "É")
+    .replace(/&agrave;/g, "à")
+    .replace(/&Agrave;/g, "À")
+    .replace(/&egrave;/g, "è")
+    .replace(/&Egrave;/g, "È")
+    .replace(/&igrave;/g, "ì")
+    .replace(/&Igrave;/g, "Ì")
+    .replace(/&ograve;/g, "ò")
+    .replace(/&Ograve;/g, "Ò")
+    .replace(/&ugrave;/g, "ù")
+    .replace(/&Ugrave;/g, "Ù")
     .replace(/\*\*/g, "")
     .replace(/\*/g, "");
 
@@ -85,6 +109,7 @@ export function createSubmissionPdfDoc(
   options?: PdfExportOptions
 ) {
   const blindMode = Boolean(options?.blindMode);
+  const deferredSolutionsLocked = Boolean(options?.deferredSolutionsLocked);
   const blindCode = getSubmissionBlindCode(sub);
   const displayStudentName = blindMode ? `Studente ${blindCode}` : (sub.Nome || "Anonimo");
   const displayStudentEmail = blindMode
@@ -103,8 +128,8 @@ export function createSubmissionPdfDoc(
       doc.setFontSize(8);
       doc.setTextColor(150, 150, 150);
       doc.text(`Educational Architect | Report Esame - ${sanitizePdfText(displayStudentName)}`, 15, 12);
-      doc.line(15, 14, 195, 14);
       doc.setDrawColor(230, 230, 230);
+      doc.line(15, 14, 195, 14);
       currentY = 22;
     }
   };
@@ -206,13 +231,17 @@ export function createSubmissionPdfDoc(
   doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 24);
 
   const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
-  doc.text(`Tipologia Prova: ${sub.Tipo || "N/D"}`, 110, currentY + 6);
-  doc.text(`Data Svolgimento: ${dateStr}`, 110, currentY + 12);
+  const filaText = sub.Assigned_Fila ? ` (Fila ${sub.Assigned_Fila})` : "";
+  doc.text(sanitizePdfText(`Tipologia Prova: ${sub.Tipo || "N/D"}${filaText}`), 110, currentY + 6);
+  doc.text(sanitizePdfText(`Data Svolgimento: ${dateStr}`), 110, currentY + 12);
   doc.text(
-    blindMode ? `Codice Cieco: ${blindCode}` : `Valutazione ID: ${sub.id || "N/D"}`,
+    sanitizePdfText(blindMode ? `Codice Cieco: ${blindCode}` : `Valutazione ID: ${sub.id || "N/D"}`),
     110,
     currentY + 18
   );
+  if (deferredSolutionsLocked) {
+    doc.text("Stato Soluzioni: Rilascio differito attivo", 110, currentY + 24);
+  }
 
   currentY += 35;
 
@@ -224,26 +253,50 @@ export function createSubmissionPdfDoc(
   currentY += 6;
 
   doc.setFillColor(241, 245, 249);
-  doc.rect(15, currentY, 180, 26, "F");
+  doc.rect(15, currentY, 180, 28, "F");
 
-  const gradeIsPending = resolveDisplayGrade(sub) === "N.V.";
-  const gradeText = gradeIsPending ? "N.V." : `${sub.Voto_Suggerito || "N/A"}/10`;
+  const resolvedGrade = resolveDisplayGrade(sub);
+  const gradeIsPending = resolvedGrade === "N.V.";
+  const isTeacherValidated = Boolean(sub.Convalida_Docente_At);
+  const isRetouchedByTeacher = Boolean(
+    sub.Voto_Originale_IA &&
+      sub.Voto_Originale_IA.trim() !== "" &&
+      sub.Voto_Originale_IA.trim() !== String(sub.Voto_Suggerito || "").trim()
+  );
+  const gradeText = gradeIsPending
+    ? "N.V."
+    : resolvedGrade === "N/A"
+    ? "N/D"
+    : resolvedGrade.includes("/10") || resolvedGrade.includes("(")
+    ? sanitizePdfText(resolvedGrade)
+    : sanitizePdfText(`${resolvedGrade}/10`);
+  const gradeLabel = gradeIsPending
+    ? "VOTO (IN ATTESA DI CORREZIONE)"
+    : isTeacherValidated
+    ? "VOTO CONVALIDATO DOCENTE"
+    : "VOTO CONSIGLIATO IA";
 
   doc.setFont("Helvetica", "bold");
   doc.setFontSize(8);
   doc.setTextColor(71, 85, 105);
-  doc.text(gradeIsPending ? "VOTO (IN ATTESA DI CORREZIONE)" : "VOTO CONSIGLIATO IA", 20, currentY + 8);
-  doc.setFontSize(16);
+  doc.text(gradeLabel, 20, currentY + 8);
+  doc.setFontSize(gradeText.length > 10 ? 12.5 : 16);
   doc.setTextColor(gradeIsPending ? 185 : 13, gradeIsPending ? 28 : 148, gradeIsPending ? 28 : 136);
   doc.text(gradeText, 20, currentY + 18);
+  if (!gradeIsPending && isRetouchedByTeacher) {
+    doc.setFont("Helvetica", "normal");
+    doc.setFontSize(7.5);
+    doc.setTextColor(100, 116, 139);
+    doc.text(sanitizePdfText(`Orig. IA: ${sub.Voto_Originale_IA}`), 20, currentY + 24);
+  }
 
   doc.setFont("Helvetica", "bold");
   doc.setFontSize(8);
   doc.setTextColor(71, 85, 105);
-  doc.text("AUTOVALUTAZIONE META.", 85, currentY + 8);
+  doc.text("AUTOVALUTAZIONE META.", 88, currentY + 8);
   doc.setFontSize(16);
   doc.setTextColor(79, 70, 229);
-  doc.text(`${sub.Autovalutazione || "—"}/10`, 85, currentY + 18);
+  doc.text(sanitizePdfText(sub.Autovalutazione ? `${sub.Autovalutazione}/10` : "- / 10"), 88, currentY + 18);
 
   doc.setFont("Helvetica", "bold");
   doc.setFontSize(8);
@@ -262,10 +315,10 @@ export function createSubmissionPdfDoc(
     doc.text("Ottima (0 anomalie)", 150, currentY + 18);
   }
 
-  currentY += 34;
+  currentY += 36;
 
   // 3.5 FORMULA E DETTAGLIO CALCOLO VOTO
-  const breakdown = extractBreakdownFromSubmission(sub);
+  const breakdown = deferredSolutionsLocked ? null : extractBreakdownFromSubmission(sub);
   if (breakdown) {
     doc.setFont("Courier", "bold");
     doc.setFontSize(8.5);
@@ -324,8 +377,8 @@ export function createSubmissionPdfDoc(
     currentY += 6;
   }
 
-  // 5. ERRORI PRINCIPALI
-  const mainErrors = sub.Errori_Principali || evalObj?.mainErrors;
+  // 5. ERRORI PRINCIPALI (mascherati se soluzioni differite attive)
+  const mainErrors = deferredSolutionsLocked ? "" : (sub.Errori_Principali || evalObj?.mainErrors);
   if (mainErrors) {
     checkPageBreak(15);
     doc.setFont("Helvetica", "bold");
@@ -400,7 +453,7 @@ export function createSubmissionPdfDoc(
           } catch {}
         }
 
-        if (!sel.hasCorrectKey) {
+        if (deferredSolutionsLocked || !sel.hasCorrectKey) {
           writeText(
             sel.hasSelection
               ? `[?] Selezione studente: "${selectedOptText}" (Chiave soluzioni differita / protetta)`
@@ -426,7 +479,7 @@ export function createSubmissionPdfDoc(
       oeList,
       details,
       (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
-      (d) => d.questionId
+      (d) => d?.questionId ?? d?.id
     );
     if (oeEntries.length > 0) {
       checkPageBreak(15);
@@ -462,9 +515,9 @@ export function createSubmissionPdfDoc(
         writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
         currentY += 1.5;
 
-        if (entry.detail) {
+        if (entry.detail && isValidNumericScore(entry.detail.score)) {
           checkPageBreak(12);
-          writeText(`Analisi Correttiva Tutor IA (Voto: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
+          writeText(`Analisi Correttiva Tutor IA (Voto: ${entry.detail.score}/10):`, 8.5, true, [79, 70, 229], 15);
           currentY += 1;
           writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
         } else {
@@ -511,7 +564,7 @@ export function createSubmissionPdfDoc(
           } catch {}
         }
 
-        if (!sel.hasCorrectKey) {
+        if (deferredSolutionsLocked || !sel.hasCorrectKey) {
           writeText(
             sel.hasSelection
               ? `[?] Selezione studente: "${selectedOptText}" (Chiave soluzioni differita / protetta)`
@@ -562,7 +615,7 @@ export function createSubmissionPdfDoc(
         const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
         const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
         const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-        const hasKey = Boolean(String(expected || "").trim());
+        const hasKey = !deferredSolutionsLocked && Boolean(String(expected || "").trim());
         const isCorrect = hasKey && isFibAnswerCorrect(val, expected, fib.sentence);
         const { before, after } = getFibSentenceParts(fib.sentence, expected);
         const statusLabel = !hasKey ? "Chiave protetta" : isCorrect ? "Corretto" : "Errato";
@@ -605,7 +658,7 @@ export function createSubmissionPdfDoc(
       rqList,
       details,
       (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
-      (d) => d.id
+      (d) => d?.id ?? d?.questionId
     );
     if (rqEntries.length > 0) {
       checkPageBreak(15);
@@ -641,9 +694,9 @@ export function createSubmissionPdfDoc(
         writeText(`"Risposta dello studente: ${displayAnsText}"`, 8.5, false, [71, 85, 105], 15);
         currentY += 1.5;
 
-        if (entry.detail) {
+        if (entry.detail && isValidNumericScore(entry.detail.score)) {
           checkPageBreak(12);
-          writeText(`Feedback Didattico Customizzato (Punteggio: ${entry.detail.score ?? 0}/10):`, 8.5, true, [79, 70, 229], 15);
+          writeText(`Feedback Didattico Customizzato (Punteggio: ${entry.detail.score}/10):`, 8.5, true, [79, 70, 229], 15);
           currentY += 1;
           writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
         } else {
@@ -688,7 +741,10 @@ export async function exportSubmissionPdf(
 ): Promise<void> {
   const { jsPDF } = await import("jspdf");
   const blindMode = Boolean(options?.blindMode);
-  const doc = createSubmissionPdfDoc(sub, jsPDF, { blindMode });
+  const doc = createSubmissionPdfDoc(sub, jsPDF, {
+    blindMode,
+    deferredSolutionsLocked: Boolean(options?.deferredSolutionsLocked),
+  });
   const blindSlug = getSubmissionBlindCode(sub).toLowerCase().replace(/[^a-z0-9_-]/g, "_");
   const formattedName = blindMode
     ? blindSlug
@@ -709,6 +765,7 @@ export async function exportSubmissionsZip(
   const JSZip = (JSZipModule as any).default || JSZipModule;
   const zip = new JSZip();
   const blindMode = Boolean(options?.blindMode);
+  const deferredSolutionsLocked = Boolean(options?.deferredSolutionsLocked);
 
   const usedFilenames = new Map<string, number>();
 
@@ -720,7 +777,7 @@ export async function exportSubmissionsZip(
       await new Promise((r) => setTimeout(r, 15));
     }
 
-    const doc = createSubmissionPdfDoc(sub, jsPDF, { blindMode });
+    const doc = createSubmissionPdfDoc(sub, jsPDF, { blindMode, deferredSolutionsLocked });
     const arrayBuffer = doc.output("arraybuffer");
 
     const rawName = blindMode
@@ -894,8 +951,8 @@ export async function exportBlankExamPaperPdf(
         const letter = String.fromCharCode(65 + oIdx);
         writeWrapped(`[  ] ${letter}) ${String(opt)}`, 9.5, false, [51, 65, 85], 20, 4.6);
       });
-      const correctIdx = Number(q?.correctIndex);
-      if (Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < opts.length) {
+      const correctIdx = parseStrictCorrectIndex(q?.correctIndex, opts.length);
+      if (correctIdx !== null) {
         mcKeyEntries.push({
           num: mcCounter,
           question: String(q?.question || ""),

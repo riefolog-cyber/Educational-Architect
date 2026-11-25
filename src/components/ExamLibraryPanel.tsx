@@ -22,6 +22,7 @@ import {
   SharedExamSummary,
   formatLibraryDate,
 } from "../utils/examLibrary";
+import { copyTextToClipboard } from "../utils";
 
 interface ExamLibraryPanelProps {
   library: ExamLibraryItem[];
@@ -105,11 +106,11 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
   const [revokingCode, setRevokingCode] = useState<string | null>(null);
 
   const handleCopyShareCode = async (code: string) => {
-    try {
-      await navigator.clipboard.writeText(code);
+    const ok = await copyTextToClipboard(code);
+    if (ok) {
       setCopiedCode(code);
       setTimeout(() => setCopiedCode((prev) => (prev === code ? null : prev)), 2500);
-    } catch {}
+    }
   };
 
   const handleShareClick = async (item: ExamLibraryItem) => {

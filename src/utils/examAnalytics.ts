@@ -22,6 +22,7 @@ import {
   getPendingSubjectiveCount,
   isEvaluationPending,
   isFibAnswerCorrect,
+  isValidNumericScore,
   parseItalianGrade,
   safeParseJson,
 } from "../utils";
@@ -243,8 +244,8 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
       if (!ansText || ansText === "[VUOTO]") blankCount++;
 
       const detail = matchedEntry?.detail || null;
-      if (detail && Number.isFinite(Number(detail.score))) {
-        scoreSum += Number(detail.score);
+      if (detail && isValidNumericScore(detail.score)) {
+        scoreSum += Number(String(detail.score).trim().replace(",", "."));
         evaluatedCount++;
       } else {
         pendingCount++;
@@ -442,7 +443,7 @@ export function computeExamItemAnalysisByFila(submissions: SavedSubmission[]): F
   };
 }
 
-export type ExamOutcomeCellStatus = "correct" | "wrong" | "blank" | "scored" | "pending" | "unkeyed";
+export type ExamOutcomeCellStatus = "correct" | "wrong" | "blank" | "scored" | "pending" | "unkeyed" | "na";
 
 export interface ExamOutcomeMatrixColumn {
   key: string;
@@ -482,43 +483,77 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
   }
 
   let referenceExam: any = null;
+  const mcQuestions: any[] = [];
+  const fibQuestions: any[] = [];
+  const oeQuestions: any[] = [];
+  const rqQuestions: any[] = [];
+  const seenMc = new Set<string>();
+  const seenFib = new Set<string>();
+  const seenOe = new Set<string>();
+  const seenRq = new Set<string>();
+
   for (const sub of submissions) {
     const parsed = safeParseJson(sub.Domande_Esame);
-    if (parsed && typeof parsed === "object") {
-      referenceExam = parsed;
-      break;
-    }
+    if (!parsed || typeof parsed !== "object") continue;
+    if (!referenceExam) referenceExam = parsed;
+
+    collectExamMultipleChoice(parsed).forEach((q: any, idx: number) => {
+      const qId = String(q?.id || `mc_${idx}`);
+      if (!seenMc.has(qId)) {
+        seenMc.add(qId);
+        mcQuestions.push({ ...q, __matrixId: qId });
+      }
+    });
+    collectWorkbookFillInTheBlank(parsed).forEach((f: any, idx: number) => {
+      const fId = String(f?.id || `fib_${idx}`);
+      if (!seenFib.has(fId)) {
+        seenFib.add(fId);
+        fibQuestions.push({ ...f, __matrixId: fId });
+      }
+    });
+    collectQuizOpenEnded(parsed).forEach((q: any, idx: number) => {
+      const hasExplicitId = q?.id !== undefined && q?.id !== null && String(q.id) !== "";
+      const qId = hasExplicitId ? String(q.id) : `open_ended_${idx + 1}`;
+      if (!seenOe.has(qId)) {
+        seenOe.add(qId);
+        oeQuestions.push({ ...q, __matrixId: qId, __hasExplicitId: hasExplicitId, __origIdx: idx });
+      }
+    });
+    collectWorkbookReflections(parsed).forEach((q: any, idx: number) => {
+      const hasExplicitId = q?.id !== undefined && q?.id !== null && String(q.id) !== "";
+      const qId = hasExplicitId ? String(q.id) : `reflection_${idx + 1}`;
+      if (!seenRq.has(qId)) {
+        seenRq.add(qId);
+        rqQuestions.push({ ...q, __matrixId: qId, __hasExplicitId: hasExplicitId, __origIdx: idx });
+      }
+    });
   }
+
   if (!referenceExam) {
     return { columns: [], rows: [] };
   }
 
-  const mcQuestions: any[] = collectExamMultipleChoice(referenceExam);
-  const fibQuestions: any[] = collectWorkbookFillInTheBlank(referenceExam);
-  const oeQuestions: any[] = collectQuizOpenEnded(referenceExam);
-  const rqQuestions: any[] = collectWorkbookReflections(referenceExam);
-
   const columns: ExamOutcomeMatrixColumn[] = [
     ...mcQuestions.map((q, idx) => ({
-      key: `mc:${String(q?.id || `mc_${idx}`)}`,
+      key: `mc:${String(q.__matrixId)}`,
       code: `D${idx + 1}`,
       kind: "mc" as const,
       label: String(q?.question || `Domanda ${idx + 1}`),
     })),
     ...fibQuestions.map((f, idx) => ({
-      key: `fib:${String(f?.id || `fib_${idx}`)}`,
+      key: `fib:${String(f.__matrixId)}`,
       code: `F${idx + 1}`,
       kind: "fib" as const,
       label: String(f?.sentence || `Completamento ${idx + 1}`),
     })),
     ...oeQuestions.map((q, idx) => ({
-      key: `oe:${String(q?.id || `open_ended_${idx + 1}`)}`,
+      key: `oe:${String(q.__matrixId)}`,
       code: `A${idx + 1}`,
       kind: "open_ended" as const,
       label: String(q?.question || `Domanda aperta ${idx + 1}`),
     })),
     ...rqQuestions.map((q, idx) => ({
-      key: `rq:${String(q?.id || `reflection_${idx + 1}`)}`,
+      key: `rq:${String(q.__matrixId)}`,
       code: `R${idx + 1}`,
       kind: "reflection" as const,
       label: String(q?.question || `Riflessione ${idx + 1}`),
@@ -526,7 +561,9 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
   ];
 
   const rows: ExamOutcomeMatrixRow[] = submissions.map((sub) => {
-    const domande = safeParseJson(sub.Domande_Esame) || referenceExam;
+    const parsedOwnExam = safeParseJson(sub.Domande_Esame);
+    const hasOwnExam = Boolean(parsedOwnExam && typeof parsedOwnExam === "object");
+    const domande = hasOwnExam ? parsedOwnExam : referenceExam;
     const answers = safeParseJson(sub.Risposte_Studente) || {};
     const evaluation = safeParseJson(sub.Full_Evaluation) || {};
 
@@ -534,6 +571,15 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
     const studentFibList = collectWorkbookFillInTheBlank(domande);
     const studentOeList = collectQuizOpenEnded(domande);
     const studentRqList = collectWorkbookReflections(domande);
+
+    const studentMcById = new Map<string, any>();
+    studentMcList.forEach((sq: any, i: number) => {
+      studentMcById.set(String(sq?.id || `mc_${i}`), sq);
+    });
+    const studentFibById = new Map<string, any>();
+    studentFibList.forEach((sf: any, i: number) => {
+      studentFibById.set(String(sf?.id || `fib_${i}`), sf);
+    });
 
     const oeEntries = buildSubjectiveReviewEntries(
       studentOeList,
@@ -550,9 +596,13 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
 
     const cells: ExamOutcomeMatrixCell[] = [];
 
-    mcQuestions.forEach((q, idx) => {
-      const qId = String(q?.id || `mc_${idx}`);
-      const studentQ = studentMcList.find((sq: any) => String(sq?.id) === qId) || q;
+    mcQuestions.forEach((q) => {
+      const qId = String(q.__matrixId);
+      const studentQ = studentMcById.get(qId);
+      if (!studentQ) {
+        cells.push({ columnKey: `mc:${qId}`, status: "na" });
+        return;
+      }
       const sel = evaluateMcSelection(studentQ, answers?.mc?.[qId]);
       if (!sel.hasSelection) {
         cells.push({ columnKey: `mc:${qId}`, status: "blank" });
@@ -577,9 +627,13 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       }
     });
 
-    fibQuestions.forEach((fib, idx) => {
-      const fId = String(fib?.id || `fib_${idx}`);
-      const studentFib = studentFibList.find((sf: any) => String(sf?.id) === fId) || fib;
+    fibQuestions.forEach((fib) => {
+      const fId = String(fib.__matrixId);
+      const studentFib = studentFibById.get(fId);
+      if (!studentFib) {
+        cells.push({ columnKey: `fib:${fId}`, status: "na" });
+        return;
+      }
       const rawVal = answers?.wbFib?.[fId] ?? answers?.fib?.[fId];
       const val = typeof rawVal === "string" ? rawVal : String(rawVal?.[0] || "");
       const trimmed = val.trim();
@@ -594,21 +648,23 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       }
     });
 
-    oeQuestions.forEach((q, idx) => {
-      const hasExplicitId = q?.id !== undefined && q?.id !== null && String(q.id) !== "";
-      const qId = hasExplicitId ? String(q.id) : `open_ended_${idx + 1}`;
+    oeQuestions.forEach((q) => {
+      const hasExplicitId = Boolean(q.__hasExplicitId);
+      const qId = String(q.__matrixId);
       const matched = hasExplicitId
-        ? oeEntries.find((e) => e.id === qId) || oeEntries[idx]
-        : oeEntries[idx];
-      const ansText = matched
-        ? String(matched.answer ?? "").trim()
-        : String(answers?.oe?.[qId] ?? answers?.openEnded?.[qId] ?? "").trim();
-      const detail = matched?.detail || null;
-      if (detail && Number.isFinite(Number(detail.score))) {
+        ? oeEntries.find((e) => e.id === qId)
+        : oeEntries[q.__origIdx];
+      if (!matched) {
+        cells.push({ columnKey: `oe:${qId}`, status: "na" });
+        return;
+      }
+      const ansText = String(matched.answer ?? "").trim();
+      const detail = matched.detail || null;
+      if (detail && isValidNumericScore(detail.score)) {
         cells.push({
           columnKey: `oe:${qId}`,
           status: "scored",
-          score: Number(detail.score),
+          score: Number(String(detail.score).trim().replace(",", ".")),
           detailText: ansText || undefined,
         });
       } else if (!ansText || ansText === "[VUOTO]") {
@@ -622,21 +678,23 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       }
     });
 
-    rqQuestions.forEach((q, idx) => {
-      const hasExplicitId = q?.id !== undefined && q?.id !== null && String(q.id) !== "";
-      const qId = hasExplicitId ? String(q.id) : `reflection_${idx + 1}`;
+    rqQuestions.forEach((q) => {
+      const hasExplicitId = Boolean(q.__hasExplicitId);
+      const qId = String(q.__matrixId);
       const matched = hasExplicitId
-        ? rqEntries.find((e) => e.id === qId) || rqEntries[idx]
-        : rqEntries[idx];
-      const ansText = matched
-        ? String(matched.answer ?? "").trim()
-        : String(answers?.wbRq?.[qId] ?? answers?.oe?.[qId] ?? "").trim();
-      const detail = matched?.detail || null;
-      if (detail && Number.isFinite(Number(detail.score))) {
+        ? rqEntries.find((e) => e.id === qId)
+        : rqEntries[q.__origIdx];
+      if (!matched) {
+        cells.push({ columnKey: `rq:${qId}`, status: "na" });
+        return;
+      }
+      const ansText = String(matched.answer ?? "").trim();
+      const detail = matched.detail || null;
+      if (detail && isValidNumericScore(detail.score)) {
         cells.push({
           columnKey: `rq:${qId}`,
           status: "scored",
-          score: Number(detail.score),
+          score: Number(String(detail.score).trim().replace(",", ".")),
           detailText: ansText || undefined,
         });
       } else if (!ansText || ansText === "[VUOTO]") {
@@ -774,6 +832,7 @@ export function buildExamItemAnalysisCsv(
         if (c.status === "blank") return "VUOTO";
         if (c.status === "unkeyed") return "PROTETTO";
         if (c.status === "pending") return "N.V.";
+        if (c.status === "na") return "—";
         return c.score !== undefined ? String(c.score).replace(".", ",") : "";
       });
       lines.push([

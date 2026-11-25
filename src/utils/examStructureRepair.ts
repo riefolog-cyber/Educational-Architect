@@ -7,6 +7,8 @@ export interface ExamCorrectionResult {
   detectedType: "Quiz" | "Workbook";
   title: string;
   changes: string[];
+  warnings?: string[];
+  missingAnswerKeysCount?: number;
   summaryNotice: string;
   originalError?: string;
 }
@@ -748,6 +750,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       : parsed.sections || parsed.sezioni || parsed.capitoli || parsed.parts || [];
 
     const correctedSections: any[] = [];
+    const wbMissingKeyWarnings: string[] = [];
 
     rawSections.forEach((sec: any, sIdx: number) => {
       const secTitle = sec.title || sec.titolo || sec.nome || `Sezione ${sIdx + 1}`;
@@ -785,11 +788,25 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
             const opts = Array.isArray(item.options || item.opzioni)
               ? (item.options || item.opzioni).map((o: any) => String(o || ""))
               : [];
-            let cIdx = Number(item.correctIndex ?? item.rispostaCorretta ?? item.indiceCorretta ?? 0);
-            if (isNaN(cIdx) || cIdx < 0 || (opts.length > 0 && cIdx >= opts.length)) cIdx = 0;
+            const rawCorrectVal = item.correctIndex ?? item.rispostaCorretta ?? item.indiceCorretta;
+            const parsedCIdx =
+              rawCorrectVal !== undefined && rawCorrectVal !== null && String(rawCorrectVal).trim() !== ""
+                ? Number(rawCorrectVal)
+                : NaN;
+            const validCIdx =
+              Number.isInteger(parsedCIdx) &&
+              parsedCIdx >= 0 &&
+              (opts.length === 0 || parsedCIdx < opts.length);
+            const cIdx = validCIdx ? parsedCIdx : 0;
+            const qLabel = String(item.question || item.domanda || `Domanda ${mIdx + 1}`);
+            if (!validCIdx) {
+              wbMissingKeyWarnings.push(
+                `Sezione "${secTitle}", domanda "${qLabel.slice(0, 45)}": chiave corretta mancante o non valida, impostata temporaneamente su opzione A (indice 0).`
+              );
+            }
             return {
               id: item.id || `q_mc_${sIdx + 1}_${mIdx + 1}`,
-              question: String(item.question || item.domanda || `Domanda ${mIdx + 1}`),
+              question: qLabel,
               options: opts.length > 0 ? opts : ["Opzione A", "Opzione B", "Opzione C", "Opzione D"],
               correctIndex: cIdx,
               ...preservedDidacticFields(item),
@@ -809,6 +826,9 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     });
 
     changes.push(`Riorganizzate ${correctedSections.length} sezioni didattiche con 'sintesi', 'fillInTheBlank', 'multipleChoice' e 'reflectionQuestions'.`);
+    if (wbMissingKeyWarnings.length > 0) {
+      changes.push(...wbMissingKeyWarnings.map((w) => `⚠️ ${w}`));
+    }
 
     const finalWorkbook: WorkbookExam = {
       title,
@@ -822,6 +842,10 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     normalizeExamStructure(finalWorkbook);
 
     const formattedJson = JSON.stringify(finalWorkbook, null, 2);
+    const wbWarningSuffix =
+      wbMissingKeyWarnings.length > 0
+        ? ` ⚠️ Attenzione: ${wbMissingKeyWarnings.length} domanda/e a scelta multipla prive di chiave corretta sono state impostate temporaneamente su opzione A (indice 0): verifica le risposte corrette prima di attivare la sessione.`
+        : "";
     return {
       success: true,
       correctedJson: formattedJson,
@@ -829,7 +853,10 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       detectedType: "Workbook",
       title,
       changes,
-      summaryNotice: `Struttura Workbook corretta automaticamente con successo! Riorganizzate ${correctedSections.length} sezioni conformi al modello standard.`,
+      ...(wbMissingKeyWarnings.length > 0
+        ? { warnings: wbMissingKeyWarnings, missingAnswerKeysCount: wbMissingKeyWarnings.length }
+        : {}),
+      summaryNotice: `Struttura Workbook corretta automaticamente con successo! Riorganizzate ${correctedSections.length} sezioni conformi al modello standard.${wbWarningSuffix}`,
     };
   }
 
@@ -855,6 +882,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
   const mcList: any[] = [];
   const openList: any[] = [];
+  const quizMissingKeyWarnings: string[] = [];
   let vfCount = 0;
   let mcCount = 0;
   let openCount = 0;
@@ -957,19 +985,37 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
       // Determine correctIndex
       let correctIdx = 0;
+      let hasResolvedKey = false;
       const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
 
       if (rawCorrect === false || (typeof rawCorrect === "string" && ["falso", "false", "f", "no"].includes(rawCorrect.toLowerCase().trim()))) {
         const falseIdx = optionsArray.findIndex((o) => /^(falso|false|f|no)$/i.test(o.trim()));
         correctIdx = falseIdx >= 0 ? falseIdx : 1;
+        hasResolvedKey = true;
       } else if (rawCorrect === true || (typeof rawCorrect === "string" && ["vero", "true", "v", "si", "sì"].includes(rawCorrect.toLowerCase().trim()))) {
         const trueIdx = optionsArray.findIndex((o) => /^(vero|true|v|s[iì])$/i.test(o.trim()));
         correctIdx = trueIdx >= 0 ? trueIdx : 0;
-      } else if (typeof rawCorrect === "number") {
-        correctIdx = rawCorrect >= 0 && rawCorrect < optionsArray.length ? rawCorrect : (rawCorrect === optionsArray.length && rawCorrect > 0 ? rawCorrect - 1 : 0);
-      } else if (typeof rawCorrect === "string") {
+        hasResolvedKey = true;
+      } else if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
+        if (rawCorrect >= 0 && rawCorrect < optionsArray.length) {
+          correctIdx = rawCorrect;
+          hasResolvedKey = true;
+        } else if (rawCorrect === optionsArray.length && rawCorrect > 0) {
+          correctIdx = rawCorrect - 1;
+          hasResolvedKey = true;
+        }
+      } else if (typeof rawCorrect === "string" && rawCorrect.trim() !== "") {
         const matchIdx = optionsArray.findIndex((o) => o.trim().toLowerCase() === rawCorrect.trim().toLowerCase());
-        if (matchIdx >= 0) correctIdx = matchIdx;
+        if (matchIdx >= 0) {
+          correctIdx = matchIdx;
+          hasResolvedKey = true;
+        }
+      }
+
+      if (!hasResolvedKey) {
+        quizMissingKeyWarnings.push(
+          `Domanda Vero/Falso "${questionText.slice(0, 45)}": chiave corretta mancante o non valida, impostata temporaneamente su "${optionsArray[0] || "Vero"}" (indice 0).`
+        );
       }
 
       mcList.push({
@@ -994,38 +1040,57 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
 
       // Determine correctIndex
       let correctIdx = 0;
+      let hasResolvedKey = false;
       const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
 
-      if (typeof rawCorrect === "number") {
+      if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
         if (rawCorrect >= 0 && rawCorrect < optionsArray.length) {
           correctIdx = rawCorrect;
+          hasResolvedKey = true;
         } else if (rawCorrect === optionsArray.length && rawCorrect > 0) {
           // 1-based index adjustment
           correctIdx = rawCorrect - 1;
+          hasResolvedKey = true;
           changes.push(`Convertito indice risposta 1-based (${rawCorrect}) in indice 0-based (${correctIdx}) per domanda '${questionText.slice(0, 30)}...'`);
         }
-      } else if (typeof rawCorrect === "string") {
+      } else if (typeof rawCorrect === "string" && rawCorrect.trim() !== "") {
         const trimmed = rawCorrect.trim();
         // Check letters A, B, C, D...
         if (/^[A-E]$/i.test(trimmed)) {
           const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
           if (letterIdx < optionsArray.length) {
             correctIdx = letterIdx;
+            hasResolvedKey = true;
           }
         } else {
           // Check matching option text
           const foundIdx = optionsArray.findIndex((opt) => opt.trim().toLowerCase() === trimmed.toLowerCase());
           if (foundIdx >= 0) {
             correctIdx = foundIdx;
-          } else if (!isNaN(parseInt(trimmed, 10))) {
+            hasResolvedKey = true;
+          } else if (/^\d+$/.test(trimmed)) {
             const num = parseInt(trimmed, 10);
-            correctIdx = num >= 0 && num < optionsArray.length ? num : (num === optionsArray.length && num > 0 ? num - 1 : 0);
+            if (num >= 0 && num < optionsArray.length) {
+              correctIdx = num;
+              hasResolvedKey = true;
+            } else if (num === optionsArray.length && num > 0) {
+              correctIdx = num - 1;
+              hasResolvedKey = true;
+            }
           }
         }
       } else if (rawCorrect === false) {
         correctIdx = 1;
+        hasResolvedKey = true;
       } else if (rawCorrect === true) {
         correctIdx = 0;
+        hasResolvedKey = true;
+      }
+
+      if (!hasResolvedKey) {
+        quizMissingKeyWarnings.push(
+          `Domanda "${questionText.slice(0, 45)}": chiave corretta mancante o non valida, impostata temporaneamente su opzione A (indice 0).`
+        );
       }
 
       mcList.push({
@@ -1115,6 +1180,9 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
   }
 
   changes.push("Assegnati identificatori 'id' e normalizzate le chiavi in formato standard conforme ('question', 'options', 'correctIndex').");
+  if (quizMissingKeyWarnings.length > 0) {
+    changes.push(...quizMissingKeyWarnings.map((w) => `⚠️ ${w}`));
+  }
 
   const finalQuiz: QuizExam = {
     title,
@@ -1129,6 +1197,10 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
   if (vfCount > 0) breakdownParts.push(`${vfCount} Vero/Falso`);
   if (mcCount > 0) breakdownParts.push(`${mcCount} Scelta Multipla`);
   const mcDesc = breakdownParts.length > 0 ? breakdownParts.join(" e ") : `${mcList.length} domande a scelta multipla`;
+  const quizWarningSuffix =
+    quizMissingKeyWarnings.length > 0
+      ? ` ⚠️ Attenzione: ${quizMissingKeyWarnings.length} domanda/e prive di chiave corretta sono state impostate temporaneamente su opzione A (indice 0): verifica le risposte corrette prima di attivare la sessione.`
+      : "";
 
   return {
     success: true,
@@ -1137,6 +1209,9 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     detectedType: "Quiz",
     title,
     changes,
-    summaryNotice: `Struttura Quiz corretta automaticamente! Configurate ${mcList.length} domande a risposta chiusa (${mcDesc}) e ${openList.length} domande a risposta aperta.`,
+    ...(quizMissingKeyWarnings.length > 0
+      ? { warnings: quizMissingKeyWarnings, missingAnswerKeysCount: quizMissingKeyWarnings.length }
+      : {}),
+    summaryNotice: `Struttura Quiz corretta automaticamente! Configurate ${mcList.length} domande a risposta chiusa (${mcDesc}) e ${openList.length} domande a risposta aperta.${quizWarningSuffix}`,
   };
 }

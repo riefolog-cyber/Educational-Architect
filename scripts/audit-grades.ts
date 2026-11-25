@@ -14,10 +14,15 @@ import path from "node:path";
 import { initializeApp } from "firebase/app";
 import { getFirestore, collection, getDocs } from "firebase/firestore";
 import {
+  collectExamMultipleChoice,
+  collectQuizOpenEnded,
+  collectWorkbookFillInTheBlank,
+  collectWorkbookReflections,
   detectGibberish,
   extractBreakdownFromSubmission,
   fibWeightedScore,
   isFibAnswerCorrect,
+  isValidNumericScore,
   mcWeightedScore,
   weightedOpenAverage,
 } from "../src/utils";
@@ -63,13 +68,11 @@ const clamp10 = (n: number) => Math.min(10, Math.max(0, n));
 
 /** Canonical expected grade, independent from the app helpers (so bugs in the app cannot hide themselves). */
 function recomputeQuiz(domande: AnyObj, risposte: AnyObj, evaluation: AnyObj) {
-  const mcList: AnyObj[] = Array.isArray(domande?.multipleChoice) ? domande.multipleChoice : [];
-  const oeList: AnyObj[] = Array.isArray(domande?.openEnded) ? domande.openEnded : [];
+  const mcList: AnyObj[] = collectExamMultipleChoice(domande);
+  const oeList: AnyObj[] = collectQuizOpenEnded(domande);
   const mcAnswers = risposte?.mc && typeof risposte.mc === "object" ? risposte.mc : {};
-  const normalizedMc: Record<string, number> = {};
-  for (const [k, v] of Object.entries(mcAnswers)) normalizedMc[k] = Number(v);
 
-  const mc = mcWeightedScore(mcList, normalizedMc);
+  const mc = mcWeightedScore(mcList, mcAnswers);
   const mcFraction = mc.weightedTotal > 0 ? mc.weightedCorrect / mc.weightedTotal : 0;
 
   const details: AnyObj[] = Array.isArray(evaluation?.openEndedDetails) ? evaluation.openEndedDetails : [];
@@ -100,16 +103,14 @@ function recomputeQuiz(domande: AnyObj, risposte: AnyObj, evaluation: AnyObj) {
 }
 
 function recomputeWorkbook(domande: AnyObj, risposte: AnyObj, evaluation: AnyObj) {
-  const sections: AnyObj[] = Array.isArray(domande?.sections) ? domande.sections : [];
-  const fibList: AnyObj[] = sections.flatMap((s) => (Array.isArray(s?.fillInTheBlank) ? s.fillInTheBlank : []));
-  const rqList: AnyObj[] = sections.flatMap((s) => (Array.isArray(s?.reflectionQuestions) ? s.reflectionQuestions : []));
-  const wbMcList: AnyObj[] = [];
-  if (Array.isArray(domande?.multipleChoice)) wbMcList.push(...domande.multipleChoice);
-  sections.forEach((s) => {
-    if (Array.isArray(s?.multipleChoice)) wbMcList.push(...s.multipleChoice);
-  });
+  const fibList: AnyObj[] = collectWorkbookFillInTheBlank(domande);
+  const rqList: AnyObj[] = collectWorkbookReflections(domande);
+  const wbMcList: AnyObj[] = collectExamMultipleChoice(domande);
 
-  const fibAnswers = risposte?.wbFib && typeof risposte.wbFib === "object" ? risposte.wbFib : {};
+  const fibAnswers = {
+    ...(risposte?.fib && typeof risposte.fib === "object" ? risposte.fib : {}),
+    ...(risposte?.wbFib && typeof risposte.wbFib === "object" ? risposte.wbFib : {}),
+  };
   const mcAnswers = risposte?.mc && typeof risposte.mc === "object" ? risposte.mc : {};
 
   const fib = fibWeightedScore(fibList, fibAnswers, isFibAnswerCorrect);
@@ -207,7 +208,15 @@ function auditDetails(
     }
     if (id) seen.add(id);
 
-    const score = Number(det?.score);
+    if (!isValidNumericScore(det?.score)) {
+      issues.push({
+        severity: "error",
+        code: "detail_score_out_of_range",
+        message: `Voto non valido (${String(det?.score)}) per ${id || `dettaglio #${idx + 1}`}.`,
+      });
+      return;
+    }
+    const score = Number(String(det.score).trim().replace(",", "."));
     if (!Number.isFinite(score) || score < 0 || score > 10) {
       issues.push({
         severity: "error",

@@ -3455,7 +3455,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       // never publish a grade when a written open answer has no numeric score.
       const openQuestions = rescue.examType === "quiz"
         ? collectQuizOpenEnded(rescue.examData)
-        : (rescue.examData?.sections || []).flatMap((s: any) => s.reflectionQuestions || []);
+        : collectWorkbookReflections(rescue.examData);
       if (openQuestions.length > 0) {
         const audit = auditSubjectiveEvaluation({
           questions: openQuestions,
@@ -3467,7 +3467,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
               ? (rescue.answers?.oe?.[id] ?? "")
               : (rescue.answers?.wbRq?.[id] ?? rescue.answers?.oe?.[id] ?? "")
           ),
-          getDetailId: (d) => (rescue.examType === "quiz" ? d?.questionId : d?.id),
+          getDetailId: (d) =>
+            rescue.examType === "quiz" ? (d?.questionId ?? d?.id) : (d?.id ?? d?.questionId),
         });
         if (!audit.complete) {
           finalEval.evaluationMode = "pending";
@@ -7069,6 +7070,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           Autovalutazione: studentSelfGrade,
           AntiCopia_TabSwitch: behavior.tabSwitches,
           AntiCopia_IncollaBloccato: behavior.pasteAttempts,
+          AntiCopia_SchermoDiviso: behavior.splitScreenAttempts || 0,
           Full_Evaluation: evaluation,
           Risposte_Studente: answers,
           Domande_Esame: examData,

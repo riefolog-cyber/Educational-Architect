@@ -11,9 +11,10 @@ import {
   KeyRound,
   Accessibility,
   CheckSquare,
+  AlertTriangle,
 } from "lucide-react";
 import { buildExamPreviewSummary } from "../utils/examPreview";
-import { stripExamAnswers, restoreExamAnswers } from "../utils/examSecurity";
+import { stripExamAnswers, restoreExamAnswers, validateExamKeysForLaunch } from "../utils/examSecurity";
 import { collectExamMultipleChoice, collectQuizOpenEnded } from "../utils";
 
 interface ExamPreviewModalProps {
@@ -46,6 +47,7 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
   const [simulateBes, setSimulateBes] = useState(false);
 
   const summary = useMemo(() => buildExamPreviewSummary(examData), [examData]);
+  const keyAudit = useMemo(() => validateExamKeysForLaunch(examData), [examData]);
 
   const displayData = useMemo(() => {
     if (!examData || typeof examData !== "object") return null;
@@ -90,8 +92,16 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
 
   const renderMcCard = (q: any, idx: number, prefixLabel: string) => {
     const opts: string[] = Array.isArray(q?.options) ? q.options : [];
-    const correctIdx =
-      q?.correctIndex !== undefined && q?.correctIndex !== null ? Number(q.correctIndex) : -1;
+    let correctIdx = -1;
+    const rawCorrect = q?.correctIndex;
+    if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
+      correctIdx = rawCorrect;
+    } else if (typeof rawCorrect === "string" && /^\d+$/.test(rawCorrect.trim())) {
+      correctIdx = Number(rawCorrect.trim());
+    }
+    if (correctIdx < 0 || correctIdx >= opts.length) {
+      correctIdx = -1;
+    }
     return (
       <div
         key={q?.id || `${prefixLabel}_${idx}`}
@@ -269,6 +279,23 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
                 {summary.reflectionCount} riflessioni
               </span>
             )}
+            {keyAudit.valid ? (
+              <span
+                className="px-2 py-1 rounded-lg bg-emerald-500/15 text-emerald-300 border border-emerald-500/30 flex items-center gap-1 font-semibold"
+                title="Tutte le chiavi di correzione risultano valide prima del lancio"
+              >
+                <CheckCircle className="w-3 h-3" />
+                Chiavi OK
+              </span>
+            ) : (
+              <span
+                className="px-2 py-1 rounded-lg bg-amber-500/15 text-amber-300 border border-amber-500/35 flex items-center gap-1 font-semibold"
+                title={keyAudit.errors.join(" • ")}
+              >
+                <AlertTriangle className="w-3 h-3" />
+                {keyAudit.errors.length} {keyAudit.errors.length === 1 ? "anomalia chiavi" : "anomalie chiavi"}
+              </span>
+            )}
           </div>
 
           <div className="flex flex-wrap items-center gap-2">
@@ -306,6 +333,24 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
 
         {/* Scrollable Content */}
         <div className="p-5 overflow-y-auto space-y-5 flex-1">
+          {!keyAudit.valid && (
+            <div className="p-3.5 rounded-2xl bg-amber-500/10 border border-amber-500/30 text-amber-200 space-y-1.5">
+              <div className="flex items-center gap-2 text-xs font-bold text-amber-300">
+                <AlertTriangle className="w-4 h-4 shrink-0" />
+                <span>Controllo pre-lancio: rilevate {keyAudit.errors.length} anomalie nelle chiavi di correzione</span>
+              </div>
+              <ul className="list-disc pl-5 text-[11px] space-y-0.5 text-amber-100/90">
+                {keyAudit.errors.slice(0, 6).map((errMsg, errIdx) => (
+                  <li key={errIdx}>{errMsg}</li>
+                ))}
+                {keyAudit.errors.length > 6 && (
+                  <li className="italic text-amber-300/90">
+                    ...e altre {keyAudit.errors.length - 6} segnalazioni da correggere nell'editor prima del lancio.
+                  </li>
+                )}
+              </ul>
+            </div>
+          )}
           {rootMc.length > 0 && (
             <div className="space-y-2.5">
               <p className="text-[11px] font-bold uppercase tracking-wider text-teal-300 flex items-center gap-1.5">

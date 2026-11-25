@@ -8,6 +8,23 @@ import {
   safeParseJson,
 } from "../utils";
 
+function hasStrictValidMcKey(q: any): boolean {
+  if (!q || typeof q !== "object") return false;
+  const optsLen = Array.isArray(q.options) ? q.options.length : 0;
+  if (optsLen < 2) return false;
+  const raw = q.correctIndex;
+  if (typeof raw === "number") {
+    return Number.isInteger(raw) && raw >= 0 && raw < optsLen;
+  }
+  if (typeof raw === "string") {
+    const trimmed = raw.trim();
+    if (!/^\d+$/.test(trimmed)) return false;
+    const parsed = Number.parseInt(trimmed, 10);
+    return Number.isInteger(parsed) && parsed >= 0 && parsed < optsLen;
+  }
+  return false;
+}
+
 export interface ExamPreviewSummary {
   title: string;
   examType: "Quiz" | "Workbook";
@@ -68,9 +85,7 @@ export function buildExamPreviewSummary(examData: any): ExamPreviewSummary {
       q &&
       Array.isArray(q.options) &&
       q.options.length >= 4 &&
-      q.correctIndex !== undefined &&
-      q.correctIndex !== null &&
-      !Number.isNaN(Number(q.correctIndex))
+      hasStrictValidMcKey(q)
   ).length;
 
   const title =
@@ -121,14 +136,8 @@ export function extractReusableExamFromSubmissions(
     const totalQuestions = mcList.length + fibList.length + oeList.length + rqList.length;
     if (totalQuestions === 0) continue;
 
-    // Ensure objective answer keys are present (not stripped)
-    const allMcHaveKeys = mcList.every(
-      (q: any) =>
-        q &&
-        q.correctIndex !== undefined &&
-        q.correctIndex !== null &&
-        !Number.isNaN(Number(q.correctIndex))
-    );
+    // Ensure objective answer keys are present, strictly integer, and in-bounds
+    const allMcHaveKeys = mcList.every((q: any) => hasStrictValidMcKey(q));
     if (!allMcHaveKeys) continue;
 
     const allFibHaveKeys = fibList.every((f: any) => {
