@@ -131,7 +131,7 @@ export default function ClassroomLiveMonitor({
   const [classNoticeFeedback, setClassNoticeFeedback] = useState<{ type: "success" | "error"; msg: string } | null>(null);
   const [blindLimMode, setBlindLimMode] = useState(false);
   const [extendingId, setExtendingId] = useState<string | null>(null);
-  const [extendedOkId, setExtendedOkId] = useState<string | null>(null);
+  const [extendedOk, setExtendedOk] = useState<{ id: string; minutes: number } | null>(null);
   const progressChangedAtRef = useRef<Record<string, { answered: number; changedAt: number }>>({});
 
   const CLASS_NOTICE_PRESETS = [
@@ -185,6 +185,9 @@ export default function ClassroomLiveMonitor({
     setClassNoticeFeedback(null);
     setClassNoticeTargetClass("ALL");
     setClassFilter("ALL");
+    setConfirmClear(false);
+    setConfirmingPin(null);
+    setSearch("");
     if (!dbFirestore || !cleanPin) {
       setActiveClassNotice(null);
       setClassNoticeInput("");
@@ -322,7 +325,7 @@ export default function ClassroomLiveMonitor({
   const waitingCount = resolvedStudents.filter(s => s.status === "waiting").length;
   const lockedCount = resolvedStudents.filter(s => s.locked).length;
   const alertsCount = resolvedStudents.filter(
-    s => isSendingSignal(s.lastHeartbeat) && (s.tabSwitches > 0 || s.pasteAttempts > 0)
+    s => (s.status !== "offline" || s.locked) && (s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0)
   ).length;
   const isStudentStuck = (s: LiveStudentData) => {
     if (s.status === "offline" || s.status === "submitted" || s.locked) return false;
@@ -432,7 +435,7 @@ export default function ClassroomLiveMonitor({
     });
 
   const handleExportLiveCsv = () => {
-    if (!cleanPin || resolvedStudents.length === 0) return;
+    if (!cleanPin || filteredStudents.length === 0) return;
     const rows = [
       [
         "Studente",
@@ -477,8 +480,8 @@ export default function ClassroomLiveMonitor({
         String(s.pasteAttempts),
         s.locked ? "SI" : "NO",
         sanitizeCsvCell(blindLimMode ? (s.locked ? "Modalita LIM cieca" : "") : s.lockReason || ""),
-        sanitizeCsvCell(s.joinedAt ? new Date(s.joinedAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) : ""),
-        sanitizeCsvCell(s.lastHeartbeat ? new Date(s.lastHeartbeat).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""),
+        sanitizeCsvCell(s.joinedAt && Number.isFinite(Date.parse(s.joinedAt)) ? new Date(s.joinedAt).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" }) : ""),
+        sanitizeCsvCell(s.lastHeartbeat && Number.isFinite(Date.parse(s.lastHeartbeat)) ? new Date(s.lastHeartbeat).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit", second: "2-digit" }) : ""),
       ]),
     ];
     const csvContent = "\uFEFF" + rows.map((r) => r.join(";")).join("\r\n");
@@ -490,11 +493,10 @@ export default function ClassroomLiveMonitor({
     document.body.appendChild(a);
     a.click();
     document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    scheduleTimer(() => URL.revokeObjectURL(url), 1000);
   };
 
   const handleClearRoom = async () => {
-    const cleanPin = pin?.trim().toUpperCase();
     if (!dbFirestore || !cleanPin || clearing) return;
 
     setClearing(true);
@@ -544,8 +546,10 @@ export default function ClassroomLiveMonitor({
       });
       setUnlockSuccessId(studentId);
       scheduleTimer(() => setUnlockSuccessId(null), 3500);
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Sblocco remoto non riuscito:", err);
+      setNoticeError(err?.message || "Impossibile sbloccare la postazione dello studente. Riprova tra poco.");
+      scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
       setUnlockingId(null);
     }
@@ -603,8 +607,10 @@ export default function ClassroomLiveMonitor({
     setRemovingId(studentId);
     try {
       await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId));
-    } catch (err) {
+    } catch (err: any) {
       console.warn("Rimozione studente non riuscita:", err);
+      setNoticeError(err?.message || "Impossibile rimuovere la postazione dall'aula live.");
+      scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
       setRemovingId(null);
     }
@@ -637,8 +643,14 @@ export default function ClassroomLiveMonitor({
           console.warn("Aggiornamento maxExtendedExpiry sessione non riuscito (non bloccante):", syncMaxErr);
         }
       }
-      setExtendedOkId(student.id);
-      scheduleTimer(() => setExtendedOkId((prev) => (prev === student.id ? null : prev)), 3500);
+      setExtendedOk({ id: student.id, minutes: minutesToAdd });
+      scheduleTimer(
+        () =>
+          setExtendedOk((prev) =>
+            prev && prev.id === student.id && prev.minutes === minutesToAdd ? null : prev
+          ),
+        3500
+      );
     } catch (err: any) {
       console.warn("Estensione tempo studente non riuscita:", err);
       const errMsg = `Impossibile concedere +${minutesToAdd} min: ${err?.message || "errore"}`;
@@ -851,7 +863,7 @@ export default function ClassroomLiveMonitor({
         ) : (
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             {liveSessions.map((s) => {
-              const selected = s.pin === pin;
+              const selected = (s.pin || "").trim().toUpperCase() === cleanPin;
               const isTerminating = terminatingPin === s.pin;
               return (
                 <div key={s.pin} className="relative group">
@@ -872,7 +884,7 @@ export default function ClassroomLiveMonitor({
                             {s.targetClass}
                           </span>
                         )}
-                        {(s.pin || "").trim().toUpperCase() === cleanPin && (
+                        {selected && (
                           <span className="text-[9px] px-1.5 py-0.2 rounded bg-indigo-500/25 text-indigo-200 font-bold uppercase">
                             In monitoraggio
                           </span>
@@ -880,14 +892,15 @@ export default function ClassroomLiveMonitor({
                       </div>
                     </div>
                     <p className="text-[11px] text-slate-300 truncate">{s.title}</p>
-                    {s.expiry && (
+                    {s.expiry && Number.isFinite(Date.parse(s.expiry)) && (
                       <p className="text-[10px] text-slate-500 font-mono">
                         Scadenza: {new Date(s.expiry).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })}
                       </p>
                     )}
                     {s.maxExtendedExpiry &&
+                      Number.isFinite(Date.parse(s.maxExtendedExpiry)) &&
                       Date.parse(s.maxExtendedExpiry) > currentTime &&
-                      (!s.expiry || Date.parse(s.maxExtendedExpiry) > Date.parse(s.expiry) + 30_000) && (
+                      (!s.expiry || !Number.isFinite(Date.parse(s.expiry)) || Date.parse(s.maxExtendedExpiry) > Date.parse(s.expiry) + 30_000) && (
                         <p className="text-[10px] text-sky-300 font-mono font-semibold">
                           ⏱️ Estesa fino alle{" "}
                           {new Date(s.maxExtendedExpiry).toLocaleTimeString("it-IT", {
@@ -1901,7 +1914,7 @@ export default function ClassroomLiveMonitor({
                                 Fila {student.assignedFila}
                               </span>
                             )}
-                            {student.extendedExpiryIso && (() => {
+                            {student.extendedExpiryIso && Number.isFinite(Date.parse(student.extendedExpiryIso)) && (() => {
                               const baseRef = student.besExpiryIso || activeMonitoredSession?.expiry || "";
                               const baseMs = baseRef ? Date.parse(baseRef) : NaN;
                               const extMs = Date.parse(student.extendedExpiryIso);
@@ -1911,7 +1924,7 @@ export default function ClassroomLiveMonitor({
                               return (
                                 <span
                                   className="text-[9px] font-mono font-bold px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-200 border border-indigo-400/35"
-                                  title={`Scadenza individuale estesa alle ${new Date(student.extendedExpiryIso).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}`}
+                                  title={`Scadenza individuale estesa alle ${new Date(extMs).toLocaleTimeString("it-IT", { hour: "2-digit", minute: "2-digit" })}`}
                                 >
                                   {extraMins ? `+${extraMins}m extra` : "Tempo extra"}
                                 </span>
@@ -2113,21 +2126,25 @@ export default function ClassroomLiveMonitor({
                             disabled={extendingId === student.id}
                             title={`Concedi +5 minuti extra individuali a ${getMonitorName(student)}`}
                             className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition-colors border disabled:opacity-50 ${
-                              extendedOkId === student.id
+                              extendedOk?.id === student.id && extendedOk.minutes === 5
                                 ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
                                 : "bg-white/5 hover:bg-teal-500/20 text-slate-300 hover:text-teal-200 border-white/10 hover:border-teal-500/40"
                             }`}
                           >
-                            {extendedOkId === student.id ? "+5m ✓" : "+5m"}
+                            {extendedOk?.id === student.id && extendedOk.minutes === 5 ? "+5m ✓" : "+5m"}
                           </button>
                           <button
                             type="button"
                             onClick={() => handleExtendStudentTime(student, 10)}
                             disabled={extendingId === student.id}
                             title={`Concedi +10 minuti extra individuali a ${getMonitorName(student)}`}
-                            className="px-2 py-1 rounded-lg text-[10px] font-mono font-bold bg-white/5 hover:bg-teal-500/20 text-slate-300 hover:text-teal-200 border border-white/10 hover:border-teal-500/40 cursor-pointer transition-colors disabled:opacity-50"
+                            className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition-colors border disabled:opacity-50 ${
+                              extendedOk?.id === student.id && extendedOk.minutes === 10
+                                ? "bg-emerald-500/20 text-emerald-300 border-emerald-500/30"
+                                : "bg-white/5 hover:bg-teal-500/20 text-slate-300 hover:text-teal-200 border-white/10 hover:border-teal-500/40"
+                            }`}
                           >
-                            +10m
+                            {extendedOk?.id === student.id && extendedOk.minutes === 10 ? "+10m ✓" : "+10m"}
                           </button>
                           <button
                             type="button"

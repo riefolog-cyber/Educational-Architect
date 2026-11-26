@@ -261,9 +261,32 @@ async function requestAiReevaluation(
     const statusUrl = jobToken
       ? `/api/evaluate/status/${encodeURIComponent(jobId)}?token=${encodeURIComponent(jobToken)}`
       : `/api/evaluate/status/${encodeURIComponent(jobId)}`;
-    const statusResp = await fetch(statusUrl, {
-      headers: jobToken ? { "x-job-token": jobToken } : undefined,
-    });
+    let statusResp: Response | null = null;
+    let pollNetErr: any = null;
+    for (let rTry = 0; rTry < 3; rTry++) {
+      try {
+        const resp = await fetch(statusUrl, {
+          headers: jobToken ? { "x-job-token": jobToken } : undefined,
+        });
+        if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+          pollNetErr = new Error(`Errore temporaneo del server (HTTP ${resp.status}).`);
+          if (rTry < 2) {
+            await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+            continue;
+          }
+        }
+        statusResp = resp;
+        break;
+      } catch (err) {
+        pollNetErr = err;
+        if (rTry < 2) {
+          await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+        }
+      }
+    }
+    if (!statusResp) {
+      throw pollNetErr || new Error("Errore di rete durante la verifica della correzione IA.");
+    }
     if (statusResp.status === 404) {
       throw new Error("La sessione di correzione IA è scaduta o il server è stato riavviato. Riprova.");
     }
@@ -1704,8 +1727,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   };
 
   const handleRevokeShare = async (shareCode: string): Promise<void> => {
+    const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     try {
-      await revokeSharedExam(shareCode);
+      await revokeSharedExam(shareCode, effectiveEmail);
       setSharedExams((prev) => prev.filter((s) => s.shareCode !== shareCode));
       setLibrary((prev) => prev.map((it) => (it.sharedCode === shareCode ? { ...it, sharedCode: undefined } : it)));
       setLibraryMsg(`🔒 Codice condiviso "${shareCode}" revocato: non è più utilizzabile per nuove importazioni.`);
@@ -2455,6 +2479,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           prompt:
             "Ricalcola la valutazione delle domande aperte di questa prova. Valuta il contenuto reale di ogni risposta con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le risposte vuote o non pertinenti valgono 0.",
           studentPseudoId,
+          assignedFila: sub.Assigned_Fila || "",
           sessionPin: sub.Pin || "",
           sessionId: sub.Session_Id || "",
           studentClass: resolveSubmissionClass(sub),
@@ -2610,6 +2635,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           prompt:
             "Ricalcola la valutazione delle riflessioni critiche di questo quaderno. Valuta il contenuto reale di ogni riflessione con la rubrica docimologica: assegna il voto che la risposta merita, senza voti fissi o di comodo. Solo le riflessioni vuote o non pertinenti valgono 0.",
           studentPseudoId,
+          assignedFila: sub.Assigned_Fila || "",
           sessionPin: sub.Pin || "",
           sessionId: sub.Session_Id || "",
           studentClass: resolveSubmissionClass(sub),

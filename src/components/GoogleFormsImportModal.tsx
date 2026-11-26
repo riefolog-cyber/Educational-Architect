@@ -74,7 +74,8 @@ export default function GoogleFormsImportModal({
   // indicata (serve per le immagini messe DENTRO la domanda su Google Moduli,
   // che lo script non può leggere).
   const [imageTarget, setImageTarget] = useState<string | null>(null);
-  const [imageBusy, setImageBusy] = useState(false);
+  const [uploadingImageId, setUploadingImageId] = useState<string | null>(null);
+  const imageBusy = uploadingImageId !== null;
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
@@ -102,7 +103,7 @@ export default function GoogleFormsImportModal({
     const target = imageTarget;
     setImageTarget(null);
     if (!file || !target) return;
-    setImageBusy(true);
+    setUploadingImageId(target);
     setError(null);
     setResult(null);
     try {
@@ -118,7 +119,7 @@ export default function GoogleFormsImportModal({
     } catch (err: any) {
       setError(err?.message || "Immagine non importata.");
     } finally {
-      setImageBusy(false);
+      setUploadingImageId(null);
     }
   };
 
@@ -185,6 +186,7 @@ export default function GoogleFormsImportModal({
   };
 
   const handleLinkRead = async () => {
+    if (loadingLink || loadingScript) return;
     setError(null);
     setResult(null);
     setLinked(null);
@@ -220,6 +222,7 @@ export default function GoogleFormsImportModal({
   };
 
   const handleScriptRead = async () => {
+    if (loadingLink || loadingScript) return;
     setError(null);
     setResult(null);
     setLinked(null);
@@ -281,6 +284,7 @@ export default function GoogleFormsImportModal({
   const handleApply = () => {
     if (!result) return;
     onApplyExam(result.examJson, result.title);
+    setResult(null);
     onClose();
   };
 
@@ -370,7 +374,7 @@ export default function GoogleFormsImportModal({
               <button
                 type="button"
                 onClick={() => void handleLinkRead()}
-                disabled={loadingLink || !link.trim()}
+                disabled={loadingLink || loadingScript || !link.trim()}
                 className="px-3 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-colors cursor-pointer disabled:opacity-40 flex items-center justify-center gap-1.5"
               >
                 {loadingLink ? (
@@ -497,7 +501,7 @@ export default function GoogleFormsImportModal({
                           title="Allega la figura di questa domanda (pittogramma, schema, immagine)"
                           className="ml-4 inline-flex items-center gap-1 text-[10px] px-1.5 py-1 rounded-lg border border-white/10 text-slate-400 hover:text-teal-300 hover:border-teal-500/40 cursor-pointer disabled:opacity-40"
                         >
-                          {imageBusy && imageTarget === q.id ? (
+                          {uploadingImageId === q.id ? (
                             <Loader2 className="w-3 h-3 animate-spin" />
                           ) : (
                             <ImageIcon className="w-3 h-3" />
@@ -593,7 +597,7 @@ export default function GoogleFormsImportModal({
                 <button
                   type="button"
                   onClick={() => void handleScriptRead()}
-                  disabled={loadingScript || !scriptUrl.trim()}
+                  disabled={loadingScript || loadingLink || !scriptUrl.trim()}
                   className="px-3 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-colors cursor-pointer disabled:opacity-40 flex items-center justify-center gap-1.5"
                 >
                   {loadingScript ? (

@@ -36,15 +36,20 @@ function choiceOptions(question: any): { text: string; correct: boolean }[] {
     .filter((opt: { text: string }) => opt.text.length > 0);
 }
 
-function gradingOf(question: any): { points?: number; expected?: string } {
+function gradingOf(question: any): { points?: number; expected?: string; answers: string[] } {
   const grading = question?.grading;
-  if (!grading || typeof grading !== "object") return {};
-  const answers = Array.isArray(grading.correctAnswers?.answers) ? grading.correctAnswers.answers : [];
-  const expected = answers
+  if (!grading || typeof grading !== "object") return { answers: [] };
+  const rawAnswers = Array.isArray(grading.correctAnswers?.answers) ? grading.correctAnswers.answers : [];
+  const answers = rawAnswers
     .map((answer: any) => cleanFormText(answer?.value))
-    .filter((value: string) => value.length > 0)[0];
+    .filter((value: string) => value.length > 0);
+  const expected = answers[0];
   const points = typeof grading.pointValue === "number" && grading.pointValue > 0 ? grading.pointValue : undefined;
-  return { ...(points !== undefined ? { points } : {}), ...(expected ? { expected } : {}) };
+  return {
+    ...(points !== undefined ? { points } : {}),
+    ...(expected ? { expected } : {}),
+    answers,
+  };
 }
 
 function imageOf(image: any, resolve?: FormsImageResolver): string | undefined {
@@ -166,15 +171,36 @@ export function buildLinkedFormFromApi(
       const list = choiceOptions(question);
       options = list.map((opt) => opt.text);
       const isCheckbox = String(question.choiceQuestion?.type || "").toUpperCase() === "CHECKBOX";
-      kind = isCheckbox ? "checkbox" : "mc";
-      const firstCorrect = list.findIndex((opt) => opt.correct);
-      if (firstCorrect >= 0) {
-        correctIndex = firstCorrect;
-        const allCorrect = list.filter((opt) => opt.correct).map((opt) => opt.text);
-        if (allCorrect.length > 1) note = `Risposte accettate dal modulo: ${allCorrect.join(" · ")}`;
-      }
-      if (isCheckbox && correctIndex !== undefined && !note) {
-        note = `Caselle multiple, uso come corretta solo “${options[correctIndex]}”.`;
+      if (options.length < 2) {
+        kind = "open";
+        skipped.push(`“${shortName(title)}”: opzioni non leggibili, importata come domanda aperta.`);
+      } else {
+        kind = isCheckbox ? "checkbox" : "mc";
+        let firstCorrect = list.findIndex((opt) => opt.correct);
+        let allCorrect = list.filter((opt) => opt.correct).map((opt) => opt.text);
+
+        // Google Forms API v1 stores quiz keys inside grading.correctAnswers.answers[].value
+        if (firstCorrect < 0 && grading.answers.length > 0) {
+          const normalizedAnswers = new Set(grading.answers.map((a) => a.toLowerCase()));
+          const matchedIndices: number[] = [];
+          options.forEach((optText, optIdx) => {
+            if (normalizedAnswers.has(optText.toLowerCase())) {
+              matchedIndices.push(optIdx);
+            }
+          });
+          if (matchedIndices.length > 0) {
+            firstCorrect = matchedIndices[0];
+            allCorrect = matchedIndices.map((optIdx) => options[optIdx]);
+          }
+        }
+
+        if (firstCorrect >= 0) {
+          correctIndex = firstCorrect;
+          if (allCorrect.length > 1) note = `Risposte accettate dal modulo: ${allCorrect.join(" · ")}`;
+        }
+        if (isCheckbox && correctIndex !== undefined && !note) {
+          note = `Caselle multiple, uso come corretta solo “${options[correctIndex]}”.`;
+        }
       }
     } else if (question.scaleQuestion) {
       kind = "scale";
@@ -203,7 +229,7 @@ export function buildLinkedFormFromApi(
       note = `Domanda di griglia, riga “${cleanFormText(question.rowQuestion?.title) || title}”.`;
     }
 
-    if (grading.expected) {
+    if (grading.expected && !(question.choiceQuestion && correctIndex !== undefined)) {
       note = note
         ? `${note} Risposta attesa dal modulo: ${grading.expected}.`
         : `Risposta breve attesa dal modulo: ${grading.expected}`;
@@ -232,10 +258,6 @@ export function buildLinkedFormFromApi(
       ...(image ? { image } : {}),
       ...(note ? { note } : {}),
     });
-
-    if (question.choiceQuestion && options.length < 2) {
-      skipped.push(`“${shortName(title)}”: opzioni non leggibili, importata come domanda aperta.`);
-    }
   });
 
   if (questions.length === 0) return null;

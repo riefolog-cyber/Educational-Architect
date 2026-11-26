@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   X,
   CheckCircle2,
@@ -77,6 +77,18 @@ export default function TeacherBulkGradingModal({
   const [isSaving, setIsSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
 
+  useEffect(() => {
+    if (!isOpen) {
+      setStatusMsg(null);
+      return;
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isSaving) onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, isSaving, onClose]);
+
   const uniquePins = useMemo(() => {
     const pins = new Set<string>();
     for (const s of submissions) {
@@ -85,6 +97,12 @@ export default function TeacherBulkGradingModal({
     }
     return Array.from(pins).sort();
   }, [submissions]);
+
+  useEffect(() => {
+    if (selectedPin !== "ALL" && !uniquePins.includes(selectedPin)) {
+      setSelectedPin("ALL");
+    }
+  }, [selectedPin, uniquePins]);
 
   const pinFiltered = useMemo(() => {
     return submissions.filter((s) => {
@@ -100,6 +118,12 @@ export default function TeacherBulkGradingModal({
     }
     return Array.from(classes).sort(compareClassLabels);
   }, [pinFiltered]);
+
+  useEffect(() => {
+    if (selectedClass !== "ALL" && !uniqueClasses.includes(selectedClass)) {
+      setSelectedClass("ALL");
+    }
+  }, [selectedClass, uniqueClasses]);
 
   const classFiltered = useMemo(() => {
     return pinFiltered.filter((s) => {
@@ -177,7 +201,9 @@ export default function TeacherBulkGradingModal({
         const cmp = nameA.localeCompare(nameB);
         if (cmp !== 0) return cmp;
       }
-      return Date.parse(b.Timestamp || "") - Date.parse(a.Timestamp || "");
+      const tb = Date.parse(b.Timestamp || "");
+      const ta = Date.parse(a.Timestamp || "");
+      return (Number.isFinite(tb) ? tb : 0) - (Number.isFinite(ta) ? ta : 0);
     });
     return sorted;
   }, [classFiltered, quickFilter, searchTerm, sortOrder, blindGradingMode, overrides]);
@@ -202,7 +228,8 @@ export default function TeacherBulkGradingModal({
     }
   };
 
-  const allSelected = rows.length > 0 && rows.every((r) => selectedIds.has(r.id));
+  const visibleSelectedRows = rows.filter((r) => selectedIds.has(r.id));
+  const allSelected = rows.length > 0 && visibleSelectedRows.length === rows.length;
 
   const toggleSelectAll = () => {
     if (allSelected) {
@@ -222,7 +249,7 @@ export default function TeacherBulkGradingModal({
   };
 
   const handleBulkValidate = async () => {
-    const targetRows = rows.filter((r) => selectedIds.has(r.id));
+    const targetRows = visibleSelectedRows;
     if (targetRows.length === 0) {
       setStatusMsg("⚠️ Seleziona almeno uno studente dall'elenco per procedere alla convalida.");
       return;
@@ -230,6 +257,7 @@ export default function TeacherBulkGradingModal({
 
     const invalidRows: string[] = [];
     const updates: BulkValidationUpdate[] = [];
+    let skippedNvCount = 0;
     for (const sub of targetRows) {
       const typedRaw = overrides[sub.id];
       if (typedRaw !== undefined && typedRaw.trim() !== "") {
@@ -241,7 +269,10 @@ export default function TeacherBulkGradingModal({
         }
       }
       const raw = typedRaw && typedRaw.trim() !== "" ? typedRaw : sub.Voto_Suggerito;
-      if (!raw || raw === "N.V.") continue;
+      if (!raw || String(raw).trim().toUpperCase().includes("N.V.")) {
+        skippedNvCount++;
+        continue;
+      }
       if (applyRoundingOnValidate || (typedRaw !== undefined && typedRaw.trim() !== "")) {
         const formatted = formatGradeForRegister(raw, applyRoundingOnValidate ? roundingMode : "exact");
         updates.push({
@@ -269,7 +300,17 @@ export default function TeacherBulkGradingModal({
     setStatusMsg(null);
     try {
       await onSaveBulkValidation(updates);
-      setStatusMsg(`✅ Convalidati e salvati ${updates.length} voti ufficiali dal docente.`);
+      const savedIdSet = new Set(updates.map((u) => u.id));
+      setOverrides((prev) => {
+        const next = { ...prev };
+        for (const savedId of savedIdSet) delete next[savedId];
+        return next;
+      });
+      setStatusMsg(
+        skippedNvCount > 0
+          ? `✅ Convalidati e salvati ${updates.length} voti ufficiali dal docente (${skippedNvCount} N.V. saltati).`
+          : `✅ Convalidati e salvati ${updates.length} voti ufficiali dal docente.`
+      );
       setSelectedIds(new Set());
     } catch (err: any) {
       setStatusMsg(`❌ Errore salvataggio: ${err?.message || "riprova tra poco."}`);
@@ -279,6 +320,37 @@ export default function TeacherBulkGradingModal({
   };
 
   const handleDownloadPreset = () => {
+    const exportPool = onlyValidatedExport
+      ? rows.filter((r) => Boolean(r.Convalida_Docente_At))
+      : rows;
+    if (exportPool.length === 0) {
+      setStatusMsg(
+        onlyValidatedExport
+          ? "⚠️ Nessun elaborato convalidato da esportare con i filtri attuali."
+          : "⚠️ Nessun elaborato disponibile da esportare."
+      );
+      return;
+    }
+    const invalidOverrides: string[] = [];
+    for (const sub of exportPool) {
+      const typedRaw = overrides[sub.id];
+      if (typedRaw !== undefined && typedRaw.trim() !== "") {
+        const parsed = parseItalianGrade(typedRaw);
+        if (!Number.isFinite(parsed) || parsed < 0 || parsed > 10.5) {
+          const label = blindGradingMode
+            ? `Studente ${getSubmissionBlindCode(sub)}`
+            : sub.Nome || "Studente";
+          invalidOverrides.push(`${label} ("${typedRaw.trim()}")`);
+        }
+      }
+    }
+    if (invalidOverrides.length > 0) {
+      setStatusMsg(
+        `⚠️ Correggi il voto manuale prima dell'esportazione: ${invalidOverrides.slice(0, 3).join(", ")}${invalidOverrides.length > 3 ? "…" : ""}.`
+      );
+      return;
+    }
+
     const csv = buildElectronicRegisterCsv(rows, {
       preset,
       roundingMode,
@@ -292,7 +364,7 @@ export default function TeacherBulkGradingModal({
         ? ""
         : `_${selectedClass.replace(/[^a-zA-Z0-9_-]+/g, "_")}`;
     downloadTextFile(`registro_${preset}_${pinSuffix}${classSuffix}_${new Date().toISOString().slice(0, 10)}.csv`, csv, "text/csv;charset=utf-8");
-    setStatusMsg(`📥 Esportato file CSV compatibile ${REGISTER_PRESETS.find((p) => p.id === preset)?.label}.`);
+    setStatusMsg(`📥 Esportato file CSV compatibile ${REGISTER_PRESETS.find((p) => p.id === preset)?.label} (${exportPool.length} righe).`);
   };
 
   return (
@@ -324,7 +396,8 @@ export default function TeacherBulkGradingModal({
           <button
             type="button"
             onClick={onClose}
-            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer"
+            disabled={isSaving}
+            className="p-2 rounded-xl text-slate-400 hover:text-white hover:bg-white/5 transition-colors cursor-pointer disabled:opacity-40"
           >
             <X className="w-5 h-5" />
           </button>
@@ -637,7 +710,14 @@ export default function TeacherBulkGradingModal({
                                 value={typedVal}
                                 onChange={(e) => {
                                   const val = e.target.value;
-                                  setOverrides((prev) => ({ ...prev, [sub.id]: val }));
+                                  setOverrides((prev) => {
+                                    if (!val.trim()) {
+                                      const next = { ...prev };
+                                      delete next[sub.id];
+                                      return next;
+                                    }
+                                    return { ...prev, [sub.id]: val };
+                                  });
                                   if (val.trim()) {
                                     setSelectedIds((prev) => new Set(prev).add(sub.id));
                                   }
@@ -686,20 +766,21 @@ export default function TeacherBulkGradingModal({
         {/* Footer */}
         <div className="p-4 sm:p-5 border-t border-white/10 bg-slate-950/70 flex flex-col sm:flex-row items-center justify-between gap-3">
           <p className="text-[11px] text-slate-400">
-            Selezionati: <b className="text-white">{selectedIds.size}</b> di {rows.length} elaborati visibili.
+            Selezionati: <b className="text-white">{visibleSelectedRows.length}</b> di {rows.length} elaborati visibili.
           </p>
           <div className="flex items-center gap-2.5 w-full sm:w-auto justify-end">
             <button
               type="button"
               onClick={onClose}
-              className="px-4 py-2 rounded-xl border border-white/10 text-slate-300 hover:text-white text-xs font-semibold cursor-pointer"
+              disabled={isSaving}
+              className="px-4 py-2 rounded-xl border border-white/10 text-slate-300 hover:text-white text-xs font-semibold cursor-pointer disabled:opacity-40"
             >
               Chiudi
             </button>
             <button
               type="button"
               onClick={handleBulkValidate}
-              disabled={isSaving || selectedIds.size === 0}
+              disabled={isSaving || visibleSelectedRows.length === 0}
               className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 cursor-pointer shadow-lg transition-all"
             >
               {isSaving ? (
@@ -710,7 +791,7 @@ export default function TeacherBulkGradingModal({
               ) : (
                 <>
                   <ShieldCheck className="w-4 h-4" />
-                  <span>Convalida Selezionati ({selectedIds.size})</span>
+                  <span>Convalida Selezionati ({visibleSelectedRows.length})</span>
                 </>
               )}
             </button>

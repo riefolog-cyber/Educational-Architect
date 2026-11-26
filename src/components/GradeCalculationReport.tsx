@@ -1,6 +1,6 @@
 import React, { useEffect, useRef, useState } from "react";
 import { Calculator, Check, Copy, Info } from "lucide-react";
-import { GradeBreakdownResult } from "../utils";
+import { copyTextToClipboard, GradeBreakdownResult } from "../utils";
 
 interface GradeCalculationReportProps {
   breakdown: GradeBreakdownResult;
@@ -35,22 +35,8 @@ export default function GradeCalculationReport({
       ...breakdown.explanationLines,
     ].join("\n");
 
-    try {
-      await navigator.clipboard.writeText(text);
-    } catch {
-      // Fallback for non-secure contexts or denied clipboard permission.
-      const area = document.createElement("textarea");
-      area.value = text;
-      area.style.position = "fixed";
-      area.style.opacity = "0";
-      document.body.appendChild(area);
-      area.select();
-      try {
-        document.execCommand("copy");
-      } finally {
-        document.body.removeChild(area);
-      }
-    }
+    const ok = await copyTextToClipboard(text);
+    if (!ok) return;
 
     setCopied(true);
     if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);

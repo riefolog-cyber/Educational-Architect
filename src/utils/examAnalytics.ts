@@ -48,13 +48,26 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     };
   }
 
-  // Pick the richest Domande_Esame schema present among submissions
+  // Pick the richest Domande_Esame schema present among submissions, prioritizing
+  // hydrated/keyed copies (so a stripped first submission never hides keys or expected answers).
   let referenceExam: any = null;
+  let bestRefScore = -1;
   for (const sub of submissions) {
     const parsed = safeParseJson(sub.Domande_Esame);
-    if (parsed && typeof parsed === "object") {
+    if (!parsed || typeof parsed !== "object") continue;
+    const mcItems = collectExamMultipleChoice(parsed);
+    const fibItems = collectWorkbookFillInTheBlank(parsed);
+    const keyedMc = mcItems.filter((q: any) => evaluateMcSelection(q, undefined).hasCorrectKey).length;
+    const keyedFib = fibItems.filter((f: any) => hasFibKey(f)).length;
+    const totalCount =
+      mcItems.length +
+      fibItems.length +
+      collectQuizOpenEnded(parsed).length +
+      collectWorkbookReflections(parsed).length;
+    const score = (keyedMc + keyedFib) * 1000 + totalCount;
+    if (score > bestRefScore) {
+      bestRefScore = score;
       referenceExam = parsed;
-      break;
     }
   }
   if (!referenceExam) {
@@ -72,8 +85,21 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     const answers = safeParseJson(sub.Risposte_Studente) || {};
     const evaluation = safeParseJson(sub.Full_Evaluation) || {};
 
+    const recMcQuestions = collectExamMultipleChoice(domande);
+    const recFibQuestions = collectWorkbookFillInTheBlank(domande);
     const recOeQuestions = collectQuizOpenEnded(domande);
     const recRqQuestions = collectWorkbookReflections(domande);
+
+    const mcById = new Map<string, any>();
+    for (const mq of recMcQuestions) {
+      const id = String(mq?.id || "");
+      if (id && !mcById.has(id)) mcById.set(id, mq);
+    }
+    const fibById = new Map<string, any>();
+    for (const fq of recFibQuestions) {
+      const id = String(fq?.id || "");
+      if (id && !fibById.has(id)) fibById.set(id, fq);
+    }
 
     const oeEntries = buildSubjectiveReviewEntries(
       recOeQuestions,
@@ -93,6 +119,8 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
       domande,
       answers,
       evaluation,
+      mcById,
+      fibById,
       oeEntries,
       rqEntries,
     };
@@ -112,8 +140,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
 
     for (const rec of parsedRecords) {
       // If exam was randomized for a student, resolve the question inside that student's Domande_Esame by id first
-      const studentMcList = collectExamMultipleChoice(rec.domande);
-      const studentQ = studentMcList.find((sq: any) => String(sq?.id) === qId) || q;
+      const studentQ = rec.mcById.get(qId) || q;
       const sel = evaluateMcSelection(studentQ, rec.answers?.mc?.[qId]);
       if (!sel.hasCorrectKey) {
         unkeyedResponses++;
@@ -171,8 +198,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
     const wrongAnswers = new Map<string, number>();
 
     for (const rec of parsedRecords) {
-      const studentFibList = collectWorkbookFillInTheBlank(rec.domande);
-      const studentFib = studentFibList.find((sf: any) => String(sf?.id) === fId) || fib;
+      const studentFib = rec.fibById.get(fId) || fib;
       const rawVal = rec.answers?.wbFib?.[fId] ?? rec.answers?.fib?.[fId];
       const val = typeof rawVal === "string" ? rawVal : String(rawVal?.[0] || "");
       if (!hasFibKey(studentFib)) {
@@ -1036,7 +1062,11 @@ export function buildExamLedgerSummary(
     if (sub.Convalida_Docente_At) validatedCount++;
 
     const notesParts: string[] = [];
-    if (sub.Voto_Originale_IA) notesParts.push(`Ritoccato (orig. ${sub.Voto_Originale_IA})`);
+    const origGradeTrim = String(sub.Voto_Originale_IA || "").trim();
+    const curGradeTrim = String(sub.Voto_Suggerito || "").trim();
+    if (origGradeTrim && origGradeTrim !== curGradeTrim) {
+      notesParts.push(`Ritoccato (orig. ${origGradeTrim})`);
+    }
     if (sub.Soluzioni_Differite) notesParts.push("Soluzioni differite");
     if (violationsCount > 0) notesParts.push(`${violationsCount} segnalaz.`);
 

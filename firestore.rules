@@ -53,7 +53,7 @@ service cloud.firestore {
     function isValidExamLibraryItem(data) {
       return data is map &&
         data.keys().hasAll(['id', 'title', 'examJson']) &&
-        data.keys().hasOnly(['id', 'teacherEmail', 'title', 'examType', 'examJson', 'source', 'questionCount', 'createdAt', 'updatedAt']) &&
+        data.keys().hasOnly(['id', 'teacherEmail', 'title', 'examType', 'examJson', 'source', 'questionCount', 'sharedCode', 'createdAt', 'updatedAt']) &&
         data.id is string && data.id.size() > 0 && data.id.size() <= 120 &&
         data.title is string && data.title.size() > 0 && data.title.size() <= 300 &&
         data.examJson is string && data.examJson.size() > 2 && data.examJson.size() <= 900000 &&
@@ -61,6 +61,7 @@ service cloud.firestore {
         (!('examType' in data) || data.examType in ['Quiz', 'Workbook']) &&
         (!('source' in data) || (data.source is string && data.source.size() <= 120)) &&
         (!('questionCount' in data) || data.questionCount is int) &&
+        (!('sharedCode' in data) || (data.sharedCode is string && data.sharedCode.size() <= 16)) &&
         (!('createdAt' in data) || (data.createdAt is string && data.createdAt.size() <= 64)) &&
         (!('updatedAt' in data) || (data.updatedAt is string && data.updatedAt.size() <= 64));
     }

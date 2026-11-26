@@ -92,12 +92,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 }) => {
   const [gradeEditOpen, setGradeEditOpen] = useState(false);
   const [gradeEditValue, setGradeEditValue] = useState("");
+  const [gradeEditError, setGradeEditError] = useState<string | null>(null);
+  const [savingGradeEdit, setSavingGradeEdit] = useState(false);
   const [classEditOpen, setClassEditOpen] = useState(false);
   const [classEditValue, setClassEditValue] = useState("");
   const [savingClass, setSavingClass] = useState(false);
   const [editingItemKey, setEditingItemKey] = useState<string | null>(null);
   const [itemScoreInput, setItemScoreInput] = useState("");
   const [itemFeedbackInput, setItemFeedbackInput] = useState("");
+  const [itemRetouchError, setItemRetouchError] = useState<string | null>(null);
   const [savingItemKey, setSavingItemKey] = useState<string | null>(null);
   const [unlockedDomandeMap, setUnlockedDomandeMap] = useState<Record<string, any>>({});
   const [integrityStatus, setIntegrityStatus] = useState<"idle" | "verified" | "teacher_adjusted" | "tampered" | "legacy_unsigned">("idle");
@@ -106,12 +109,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   useEffect(() => {
     setGradeEditOpen(false);
     setGradeEditValue("");
+    setGradeEditError(null);
+    setSavingGradeEdit(false);
     setClassEditOpen(false);
     setClassEditValue("");
     setSavingClass(false);
     setEditingItemKey(null);
     setItemScoreInput("");
     setItemFeedbackInput("");
+    setItemRetouchError(null);
     setSavingItemKey(null);
     setIntegrityStatus("idle");
   }, [submission?.id]);
@@ -290,6 +296,11 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
   if (!submission) return null;
 
+  const unlockedDomande = unlockedDomandeMap[submission.id];
+  const effectiveSubmission = unlockedDomande
+    ? { ...submission, Domande_Esame: JSON.stringify(unlockedDomande) }
+    : submission;
+
   const startItemRetouch = (
     key: string,
     currentScore: number | null,
@@ -298,6 +309,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     setEditingItemKey(key);
     setItemScoreInput(currentScore !== null ? String(currentScore) : "6");
     setItemFeedbackInput(currentFeedback || "");
+    setItemRetouchError(null);
   };
 
   const handleSaveItemRetouch = async (
@@ -305,29 +317,29 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     questionId: string,
     key: string
   ) => {
-    const parsedScore = Number(itemScoreInput.replace(",", "."));
+    const trimmedScore = itemScoreInput.trim().replace(",", ".");
+    const parsedScore = trimmedScore === "" ? NaN : Number(trimmedScore);
     if (!Number.isFinite(parsedScore) || parsedScore < 0 || parsedScore > 10) {
+      setItemRetouchError("Inserisci un punteggio valido compreso tra 0 e 10.");
       return;
     }
+    setItemRetouchError(null);
     setSavingItemKey(key);
     try {
       await onRetouchSubjectiveItem(
-        submission,
+        effectiveSubmission,
         kind,
         questionId,
         Math.round(parsedScore * 100) / 100,
         itemFeedbackInput.trim()
       );
       setEditingItemKey(null);
+    } catch (err: any) {
+      setItemRetouchError(err?.message || "Salvataggio non riuscito: riprova.");
     } finally {
       setSavingItemKey(null);
     }
   };
-
-  const unlockedDomande = unlockedDomandeMap[submission.id];
-  const effectiveSubmission = unlockedDomande
-    ? { ...submission, Domande_Esame: JSON.stringify(unlockedDomande) }
-    : submission;
   const evalObj = safeParseJson(submission.Full_Evaluation);
   const blindCode = getSubmissionBlindCode(submission);
   const resolvedClass = resolveSubmissionClass(submission);
@@ -469,7 +481,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>{recalculatingId === submission.id ? "Ricalcolo..." : "Ricalcola Voto"}</span>
             </button>
             <button
-              onClick={() => onExportPDF(submission)}
+              onClick={() => onExportPDF(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600/10 hover:bg-teal-600 text-teal-400 hover:text-white border border-teal-500/20 hover:border-teal-500 text-[11px] font-bold rounded-xl transition-all cursor-pointer"
               title="Esporta valutazione studente in PDF"
             >
@@ -672,6 +684,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 onClick={() => {
                   const cur = String(submission.Voto_Suggerito || "").trim();
                   setGradeEditValue(cur.toUpperCase().includes("N.V.") ? "" : cur);
+                  setGradeEditError(null);
                   setGradeEditOpen(true);
                 }}
                 className="px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl text-xs cursor-pointer transition-colors"
@@ -706,32 +719,58 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               )}
             </div>
           ) : (
-            <div className="flex items-center gap-2 p-3 bg-slate-950/60 border border-white/10 rounded-xl">
-              <input
-                type="text"
-                value={gradeEditValue}
-                onChange={(e) => setGradeEditValue(e.target.value)}
-                placeholder="es. 6, 6+, 7½"
-                className="flex-1 px-3 py-2 bg-slate-900 border border-white/10 rounded-lg text-white text-sm font-mono outline-none focus:border-amber-400"
-              />
-              <button
-                type="button"
-                onClick={async () => {
-                  await onManualGradeSave(submission, gradeEditValue);
-                  setGradeEditOpen(false);
-                  setGradeEditValue("");
-                }}
-                className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs cursor-pointer transition-colors"
-              >
-                Salva
-              </button>
-              <button
-                type="button"
-                onClick={() => setGradeEditOpen(false)}
-                className="px-3 py-2 text-slate-400 hover:text-white text-xs cursor-pointer transition-colors"
-              >
-                Annulla
-              </button>
+            <div className="p-3 bg-slate-950/60 border border-white/10 rounded-xl space-y-2">
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={gradeEditValue}
+                  onChange={(e) => {
+                    setGradeEditValue(e.target.value);
+                    if (gradeEditError) setGradeEditError(null);
+                  }}
+                  placeholder="es. 6, 6+, 7½"
+                  className="flex-1 px-3 py-2 bg-slate-900 border border-white/10 rounded-lg text-white text-sm font-mono outline-none focus:border-amber-400"
+                />
+                <button
+                  type="button"
+                  disabled={savingGradeEdit}
+                  onClick={async () => {
+                    const cleanVal = gradeEditValue.trim();
+                    if (!cleanVal) {
+                      setGradeEditError("Inserisci un voto valido (es. 6, 6+, 7½).");
+                      return;
+                    }
+                    setGradeEditError(null);
+                    setSavingGradeEdit(true);
+                    try {
+                      await onManualGradeSave(submission, cleanVal);
+                      setGradeEditOpen(false);
+                      setGradeEditValue("");
+                    } catch (err: any) {
+                      setGradeEditError(err?.message || "Impossibile salvare il voto: riprova.");
+                    } finally {
+                      setSavingGradeEdit(false);
+                    }
+                  }}
+                  className="px-3 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg text-xs cursor-pointer transition-colors"
+                >
+                  {savingGradeEdit ? "Salvo..." : "Salva"}
+                </button>
+                <button
+                  type="button"
+                  disabled={savingGradeEdit}
+                  onClick={() => {
+                    setGradeEditOpen(false);
+                    setGradeEditError(null);
+                  }}
+                  className="px-3 py-2 text-slate-400 hover:text-white text-xs cursor-pointer transition-colors"
+                >
+                  Annulla
+                </button>
+              </div>
+              {gradeEditError && (
+                <p className="text-[11px] text-rose-300 font-medium">{gradeEditError}</p>
+              )}
             </div>
           )}
 
@@ -907,7 +946,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                       oeList,
                       details,
                       (id) => String(ansObj.oe?.[id] ?? ansObj.openEnded?.[id] ?? ""),
-                      (d) => d.questionId
+                      (d) => d?.questionId ?? d?.id
                     );
 
                     return (
@@ -1021,7 +1060,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                           max={10}
                                           step={0.5}
                                           value={itemScoreInput}
-                                          onChange={(e) => setItemScoreInput(e.target.value)}
+                                          onChange={(e) => {
+                                            setItemScoreInput(e.target.value);
+                                            if (itemRetouchError) setItemRetouchError(null);
+                                          }}
                                           className="w-20 px-2 py-1 bg-slate-950 border border-white/15 rounded-lg text-white font-mono text-xs outline-none focus:border-amber-400"
                                         />
                                       </div>
@@ -1032,6 +1074,9 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                         placeholder="Nota didattica per lo studente (opzionale)..."
                                         className="w-full px-2.5 py-1.5 bg-slate-950 border border-white/15 rounded-lg text-xs text-slate-200 outline-none focus:border-amber-400"
                                       />
+                                      {itemRetouchError && (
+                                        <p className="text-[11px] text-rose-300 font-medium">{itemRetouchError}</p>
+                                      )}
                                       <div className="flex items-center gap-2">
                                         <button
                                           type="button"
@@ -1044,7 +1089,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                         </button>
                                         <button
                                           type="button"
-                                          onClick={() => setEditingItemKey(null)}
+                                          onClick={() => {
+                                            setEditingItemKey(null);
+                                            setItemRetouchError(null);
+                                          }}
                                           className="px-2 py-1 text-slate-400 hover:text-white text-[11px] cursor-pointer"
                                         >
                                           Annulla
@@ -1091,7 +1139,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                     rqList,
                     details,
                     (id) => String(ansObj.wbRq?.[id] ?? ansObj.oe?.[id] ?? ""),
-                    (d) => d.id
+                    (d) => d?.id ?? d?.questionId
                   );
 
                   const renderFibItems = (fibList: any[]) =>
@@ -1278,7 +1326,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                         max={10}
                                         step={0.5}
                                         value={itemScoreInput}
-                                        onChange={(e) => setItemScoreInput(e.target.value)}
+                                        onChange={(e) => {
+                                          setItemScoreInput(e.target.value);
+                                          if (itemRetouchError) setItemRetouchError(null);
+                                        }}
                                         className="w-20 px-2 py-1 bg-slate-950 border border-white/15 rounded-lg text-white font-mono text-xs outline-none focus:border-amber-400"
                                       />
                                     </div>
@@ -1289,6 +1340,9 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                       placeholder="Nota didattica per lo studente (opzionale)..."
                                       className="w-full px-2.5 py-1.5 bg-slate-950 border border-white/15 rounded-lg text-xs text-slate-200 outline-none focus:border-amber-400"
                                     />
+                                    {itemRetouchError && (
+                                      <p className="text-[11px] text-rose-300 font-medium">{itemRetouchError}</p>
+                                    )}
                                     <div className="flex items-center gap-2">
                                       <button
                                         type="button"
@@ -1301,7 +1355,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                                       </button>
                                       <button
                                         type="button"
-                                        onClick={() => setEditingItemKey(null)}
+                                        onClick={() => {
+                                          setEditingItemKey(null);
+                                          setItemRetouchError(null);
+                                        }}
                                         className="px-2 py-1 text-slate-400 hover:text-white text-[11px] cursor-pointer"
                                       >
                                         Annulla
@@ -1341,7 +1398,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
           <span className="text-[10px] text-slate-500">ID record: {submission.id}</span>
           <div className="flex items-center gap-2 flex-wrap">
             <button
-              onClick={() => onOpenPrintModal(submission)}
+              onClick={() => onOpenPrintModal(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl transition-colors cursor-pointer text-xs"
               title="Stampa Scheda Valutazione Didattica Ufficiale"
             >
@@ -1349,7 +1406,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>Stampa Scheda A4</span>
             </button>
             <button
-              onClick={() => onExportPDF(submission)}
+              onClick={() => onExportPDF(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
             >
               <Download className="w-4 h-4" />

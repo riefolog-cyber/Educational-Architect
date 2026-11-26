@@ -564,12 +564,17 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
     const id = rawId && !usedIds.has(rawId) ? rawId : `item_${index}`;
     usedIds.add(id);
 
+    const rawCorrect = q.correctIndex;
+    const hasStrictIndex =
+      (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) ||
+      (typeof rawCorrect === "string" && /^\d+$/.test(rawCorrect.trim()));
+    const parsedCorrect = hasStrictIndex ? Number(rawCorrect) : NaN;
     const correctIndex =
       (kind === "mc" || kind === "checkbox") &&
-      Number.isInteger(Number(q.correctIndex)) &&
-      Number(q.correctIndex) >= 0 &&
-      Number(q.correctIndex) < options.length
-        ? Number(q.correctIndex)
+      Number.isInteger(parsedCorrect) &&
+      parsedCorrect >= 0 &&
+      parsedCorrect < options.length
+        ? parsedCorrect
         : undefined;
     if (correctIndex !== undefined) keyed++;
 
@@ -695,6 +700,7 @@ export function buildExamFromLinkedForm(
       id: openId,
       question: questionText,
       ...(criteria ? { criteria } : {}),
+      ...(q.points !== undefined && q.points !== 1 ? { weight: q.points } : {}),
     });
   });
 

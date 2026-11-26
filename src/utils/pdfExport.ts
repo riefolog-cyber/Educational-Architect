@@ -164,18 +164,20 @@ export function createSubmissionPdfDoc(
     if (!rawText) return;
     const blocks = rawText.split(/\n+/);
     for (const block of blocks) {
-      if (!block.trim()) continue;
+      const trimmed = block.trim();
+      if (!trimmed) continue;
 
       const isListItem =
-        block.trim().startsWith("-") ||
-        block.trim().startsWith("*") ||
-        /^\d+\./.test(block.trim());
+        trimmed.startsWith("-") ||
+        trimmed.startsWith("*") ||
+        trimmed.startsWith("•") ||
+        /^\d+[.)]\s+/.test(trimmed);
       if (isListItem) {
         doc.setFont("Helvetica", "normal");
         doc.setFontSize(fontSize);
         doc.setTextColor(color[0], color[1], color[2]);
 
-        const cleanBlock = sanitizePdfText(block.replace(/^[\s-*•\d+.]\s*/, ""));
+        const cleanBlock = sanitizePdfText(stripPdfListMarker(trimmed));
         const lines: string[] = doc.splitTextToSize("-  " + cleanBlock, 195 - (xPos + 4));
         for (let j = 0; j < lines.length; j++) {
           checkPageBreak(5);
@@ -367,6 +369,7 @@ export function createSubmissionPdfDoc(
   // 4. GIUDIZIO DIDATTICO COMPLESSIVO
   const generalFeedback = sub.Feedback_Generale || evalObj?.overallFeedback || evalObj?.openEndedEvaluation;
   if (generalFeedback) {
+    checkPageBreak(15);
     doc.setFont("Helvetica", "bold");
     doc.setFontSize(11);
     doc.setTextColor(15, 23, 42);
@@ -443,12 +446,7 @@ export function createSubmissionPdfDoc(
         if (mcImg) {
           checkPageBreak(70);
           try {
-            const mfmt = mcImg.includes("image/png")
-              ? "PNG"
-              : mcImg.includes("image/jpeg") || mcImg.includes("image/jpg")
-              ? "JPEG"
-              : "PNG";
-            doc.addImage(mcImg, mfmt, 18, currentY, 80, 60);
+            doc.addImage(mcImg, resolveJsPdfImageFormat(mcImg), 18, currentY, 80, 60);
             currentY += 65;
           } catch {}
         }
@@ -501,12 +499,7 @@ export function createSubmissionPdfDoc(
         if (oeImg) {
           checkPageBreak(70);
           try {
-            const ofmt = oeImg.includes("image/png")
-              ? "PNG"
-              : oeImg.includes("image/jpeg") || oeImg.includes("image/jpg")
-              ? "JPEG"
-              : "PNG";
-            doc.addImage(oeImg, ofmt, 18, currentY, 80, 60);
+            doc.addImage(oeImg, resolveJsPdfImageFormat(oeImg), 18, currentY, 80, 60);
             currentY += 65;
           } catch {}
         }
@@ -554,12 +547,7 @@ export function createSubmissionPdfDoc(
         if (wbMcImg) {
           checkPageBreak(70);
           try {
-            const mfmt = wbMcImg.includes("image/png")
-              ? "PNG"
-              : wbMcImg.includes("image/jpeg") || wbMcImg.includes("image/jpg")
-              ? "JPEG"
-              : "PNG";
-            doc.addImage(wbMcImg, mfmt, 18, currentY, 80, 60);
+            doc.addImage(wbMcImg, resolveJsPdfImageFormat(wbMcImg), 18, currentY, 80, 60);
             currentY += 65;
           } catch {}
         }
@@ -629,12 +617,7 @@ export function createSubmissionPdfDoc(
         if (fibImg) {
           checkPageBreak(70);
           try {
-            const ffmt = fibImg.includes("image/png")
-              ? "PNG"
-              : fibImg.includes("image/jpeg") || fibImg.includes("image/jpg")
-              ? "JPEG"
-              : "PNG";
-            doc.addImage(fibImg, ffmt, 18, currentY, 80, 60);
+            doc.addImage(fibImg, resolveJsPdfImageFormat(fibImg), 18, currentY, 80, 60);
             currentY += 65;
           } catch {}
         }
@@ -680,12 +663,7 @@ export function createSubmissionPdfDoc(
         if (reflImg) {
           checkPageBreak(70);
           try {
-            const rfmt = reflImg.includes("image/png")
-              ? "PNG"
-              : reflImg.includes("image/jpeg") || reflImg.includes("image/jpg")
-              ? "JPEG"
-              : "PNG";
-            doc.addImage(reflImg, rfmt, 18, currentY, 80, 60);
+            doc.addImage(reflImg, resolveJsPdfImageFormat(reflImg), 18, currentY, 80, 60);
             currentY += 65;
           } catch {}
         }
@@ -885,12 +863,7 @@ export async function exportBlankExamPaperPdf(
     if (!imgData || typeof imgData !== "string") return;
     checkBreak(58);
     try {
-      const fmt = imgData.includes("image/png")
-        ? "PNG"
-        : imgData.includes("image/jpeg") || imgData.includes("image/jpg")
-        ? "JPEG"
-        : "PNG";
-      doc.addImage(imgData, fmt, 18, currentY, 72, 52);
+      doc.addImage(imgData, resolveJsPdfImageFormat(imgData), 18, currentY, 72, 52);
       currentY += 56;
     } catch {
       // Ignore malformed data URLs during PDF export
@@ -1117,6 +1090,33 @@ export interface ExamLedgerPdfOptions {
 }
 
 /**
+ * Shared vertical geometry (in mm) for every class ledger ("Tabellone") PDF table.
+ * Keeping `firstRowBaselineOffsetMm - rowTopPaddingMm >= headerHeightMm + 1.0`
+ * guarantees that row #1 on page 1 and after every page break sits cleanly below
+ * the dark header bar with comfortable whitespace.
+ */
+export function resolveJsPdfImageFormat(src: string): "PNG" | "JPEG" | "WEBP" {
+  const lower = String(src || "").toLowerCase();
+  if (lower.includes("image/webp")) return "WEBP";
+  if (lower.includes("image/jpeg") || lower.includes("image/jpg")) return "JPEG";
+  return "PNG";
+}
+
+export function stripPdfListMarker(line: string): string {
+  return String(line || "")
+    .trim()
+    .replace(/^(?:[-*•]|\d+[.)])\s+/, "");
+}
+
+export const CLASS_LEDGER_TABLE_LAYOUT = {
+  headerHeightMm: 7.5,
+  headerTextOffsetMm: 5.1,
+  firstRowBaselineOffsetMm: 13.0,
+  rowHeightMm: 6.2,
+  rowTopPaddingMm: 3.8,
+} as const;
+
+/**
  * Generates an official A4 printable class council ledger ("Tabellone / Verbale della Prova")
  * summarizing mean, median, pass rate, grade distribution, Fila A/B equity, and student rows.
  */
@@ -1254,34 +1254,44 @@ export async function exportExamLedgerPdf(
     currentY += 3;
   }
 
-  // Table header
+  // Table header (layout constants ensure row #1 never overlaps the dark header bar on any page)
+  const {
+    headerHeightMm,
+    headerTextOffsetMm,
+    firstRowBaselineOffsetMm,
+    rowHeightMm,
+    rowTopPaddingMm,
+  } = CLASS_LEDGER_TABLE_LAYOUT;
+
   const drawTableHeader = () => {
     doc.setFillColor(30, 41, 59);
-    doc.rect(14, currentY, 182, 7, "F");
+    doc.rect(14, currentY, 182, headerHeightMm, "F");
     doc.setFont("Helvetica", "bold");
     doc.setFontSize(7.5);
     doc.setTextColor(255, 255, 255);
-    doc.text("#", 16, currentY + 4.8);
-    doc.text(summary.blindMode ? "CODICE CIECO" : "STUDENTE", 23, currentY + 4.8);
-    doc.text("CLASSE", 79, currentY + 4.8);
-    doc.text("FILA", 96, currentY + 4.8);
-    doc.text("VOTO", 110, currentY + 4.8);
-    doc.text("AUTOV.", 135, currentY + 4.8);
-    doc.text("STATO", 150, currentY + 4.8);
-    doc.text("NOTE", 172, currentY + 4.8);
-    currentY += 8.5;
+    const headerBaselineY = currentY + headerTextOffsetMm;
+    doc.text("#", 16, headerBaselineY);
+    doc.text(summary.blindMode ? "CODICE CIECO" : "STUDENTE", 23, headerBaselineY);
+    doc.text("CLASSE", 79, headerBaselineY);
+    doc.text("FILA", 96, headerBaselineY);
+    doc.text("VOTO", 110, headerBaselineY);
+    doc.text("AUTOV.", 135, headerBaselineY);
+    doc.text("STATO", 150, headerBaselineY);
+    doc.text("NOTE", 172, headerBaselineY);
+    currentY += firstRowBaselineOffsetMm;
   };
 
+  checkBreak(firstRowBaselineOffsetMm + rowHeightMm + 2);
   drawTableHeader();
 
   summary.rows.forEach((row, idx) => {
-    if (currentY + 8 > pageHeight) {
-      checkBreak(16);
+    if (currentY + rowHeightMm + 2 > pageHeight) {
+      checkBreak(firstRowBaselineOffsetMm + rowHeightMm + 2);
       drawTableHeader();
     }
     if (idx % 2 === 1) {
       doc.setFillColor(248, 250, 252);
-      doc.rect(14, currentY - 3.8, 182, 6.2, "F");
+      doc.rect(14, currentY - rowTopPaddingMm, 182, rowHeightMm, "F");
     }
     doc.setFont("Helvetica", "normal");
     doc.setFontSize(8);
@@ -1310,7 +1320,7 @@ export async function exportExamLedgerPdf(
     doc.text(sanitizePdfText(row.selfGrade).slice(0, 7), 135, currentY);
     doc.text(sanitizePdfText(row.validatedLabel).slice(0, 11), 150, currentY);
     doc.text(sanitizePdfText(row.notes).slice(0, 14), 172, currentY);
-    currentY += 6.2;
+    currentY += rowHeightMm;
   });
 
   const slug = (summary.examTitle || "tabellone")

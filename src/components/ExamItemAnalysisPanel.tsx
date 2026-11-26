@@ -17,6 +17,7 @@ import {
   collectWorkbookFillInTheBlank,
   copyTextToClipboard,
   evaluateMcSelection,
+  isValidNumericScore,
   safeParseJson,
   sanitizeAiHtml,
 } from "../utils";
@@ -67,6 +68,39 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   const [generatingSheet, setGeneratingSheet] = useState(false);
   const [reviewSheet, setReviewSheet] = useState<MiniReviewSheetResult | null>(null);
   const [copiedSheet, setCopiedSheet] = useState(false);
+  const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const synthesisAbortRef = useRef<AbortController | null>(null);
+  const sheetAbortRef = useRef<AbortController | null>(null);
+
+  const cohortSignature = useMemo(
+    () =>
+      `${examTitle || ""}::${submissions
+        .map((s) => s.id)
+        .sort()
+        .join(",")}`,
+    [examTitle, submissions]
+  );
+
+  useEffect(() => {
+    synthesisAbortRef.current?.abort();
+    synthesisAbortRef.current = null;
+    sheetAbortRef.current?.abort();
+    sheetAbortRef.current = null;
+    setErrorSynthesis(null);
+    setReviewSheet(null);
+    setSynthesisError(null);
+    setGradeBandFilter(null);
+    setSynthesizingErrors(false);
+    setGeneratingSheet(false);
+  }, [cohortSignature]);
+
+  useEffect(() => {
+    return () => {
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      synthesisAbortRef.current?.abort();
+      sheetAbortRef.current?.abort();
+    };
+  }, []);
 
   // Hydrate stripped/deferred exam solutions on-demand when teacher opens the panel
   useEffect(() => {
@@ -248,6 +282,9 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
 
   const handleSynthesizeClassErrors = async () => {
     if (synthesizingErrors) return;
+    synthesisAbortRef.current?.abort();
+    const controller = new AbortController();
+    synthesisAbortRef.current = controller;
     setSynthesizingErrors(true);
     setSynthesisError(null);
     try {
@@ -309,8 +346,11 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                 : Array.isArray(ev?.reflectionDetails)
                 ? ev.reflectionDetails
                 : [];
-            const detail = details.find((d: any) => String(s.kind === "open_ended" ? d?.questionId : d?.id) === String(s.id));
-            if (detail && Number(detail.score) >= 6) continue;
+            const detail = details.find(
+              (d: any) => String(s.kind === "open_ended" ? (d?.questionId ?? d?.id) : (d?.id ?? d?.questionId)) === String(s.id)
+            );
+            // Only collect genuinely low-scoring evaluated answers; never misclassify ungraded pending answers as errors
+            if (!detail || !isValidNumericScore(detail.score) || Number(detail.score) >= 6) continue;
             const scrubbed = scrubPromptPii(rawAns, { fullName: sub.Nome, email: sub.Email }).scrubbedText.trim();
             if (scrubbed) sampleErrors.push(scrubbed.slice(0, 220));
           }
@@ -329,6 +369,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         "Verifica di classe";
 
       const authHeaders = await resolveAuthHeaders();
+      if (controller.signal.aborted) return;
       const resp = await fetch("/api/class-error-summary", {
         method: "POST",
         headers: {
@@ -341,21 +382,40 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
           totalSubmissions: analysis.totalSubmissions,
           weakItems: weakItemsPayload,
         }),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       const data = await resp.json().catch(() => ({}));
-      if (!resp.ok || data.error) {
+      if (!resp.ok || data.error || !data.summary) {
         throw new Error(data.details || data.error || "Sintesi errori non disponibile.");
       }
-      setErrorSynthesis(data.summary);
+      setErrorSynthesis({
+        summaryHtml: typeof data.summary.summaryHtml === "string" ? data.summary.summaryHtml : "",
+        keyMisconceptions: Array.isArray(data.summary.keyMisconceptions)
+          ? data.summary.keyMisconceptions.map(String)
+          : [],
+        lessonPlan15Min: Array.isArray(data.summary.lessonPlan15Min)
+          ? data.summary.lessonPlan15Min.map(String)
+          : [],
+      });
     } catch (err: any) {
+      if (err?.name === "AbortError" || controller.signal.aborted) return;
       setSynthesisError(err?.message || "Impossibile generare la sintesi errori della classe.");
     } finally {
-      setSynthesizingErrors(false);
+      if (synthesisAbortRef.current === controller) {
+        synthesisAbortRef.current = null;
+      }
+      if (!controller.signal.aborted) {
+        setSynthesizingErrors(false);
+      }
     }
   };
 
   const handleGenerateReviewSheet = async () => {
     if (generatingSheet) return;
+    sheetAbortRef.current?.abort();
+    const controller = new AbortController();
+    sheetAbortRef.current = controller;
     setGeneratingSheet(true);
     setSynthesisError(null);
     try {
@@ -391,6 +451,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         "Verifica di classe";
 
       const authHeaders = await resolveAuthHeaders();
+      if (controller.signal.aborted) return;
       const resp = await fetch("/api/teacher/generate-review-sheet", {
         method: "POST",
         headers: {
@@ -403,16 +464,29 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
           filaLabel: effectiveFila !== "all" ? `Fila ${effectiveFila}` : "",
           weakItems: weakItemsPayload,
         }),
+        signal: controller.signal,
       });
+      if (controller.signal.aborted) return;
       const data = await resp.json().catch(() => ({}));
       if (!resp.ok || !data?.sheet) {
         throw new Error(data?.details || data?.error || "Generazione scheda di ripasso non riuscita.");
       }
-      setReviewSheet(data.sheet);
+      setReviewSheet({
+        title: typeof data.sheet.title === "string" ? data.sheet.title : "Scheda di ripasso",
+        intro: typeof data.sheet.intro === "string" ? data.sheet.intro : "",
+        recapPoints: Array.isArray(data.sheet.recapPoints) ? data.sheet.recapPoints : [],
+        quickExercises: Array.isArray(data.sheet.quickExercises) ? data.sheet.quickExercises : [],
+      });
     } catch (err: any) {
+      if (err?.name === "AbortError" || controller.signal.aborted) return;
       setSynthesisError(err?.message || "Impossibile generare la mini-scheda di ripasso.");
     } finally {
-      setGeneratingSheet(false);
+      if (sheetAbortRef.current === controller) {
+        sheetAbortRef.current = null;
+      }
+      if (!controller.signal.aborted) {
+        setGeneratingSheet(false);
+      }
     }
   };
 
@@ -431,7 +505,8 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     const ok = await copyTextToClipboard(text);
     if (ok) {
       setCopiedSheet(true);
-      setTimeout(() => setCopiedSheet(false), 2000);
+      if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
+      copiedTimerRef.current = setTimeout(() => setCopiedSheet(false), 2000);
     }
   };
 
@@ -643,7 +718,6 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                         almost: "bg-amber-400",
                         insufficient: "bg-rose-500",
                       };
-                      const wPct = Math.max(4, Math.round((b.count / gradeDistribution.gradedCount) * 100));
                       return (
                         <button
                           key={b.key}
@@ -655,7 +729,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                           }}
                           title={`${b.label}: ${b.count} (${b.percent}%) — Clicca per filtrare la Matrice Classe`}
                           className={`h-full ${barColors[b.key] || "bg-slate-500"} hover:brightness-110 transition-all cursor-pointer`}
-                          style={{ width: `${wPct}%` }}
+                          style={{ flex: `${b.count} 0 0%`, minWidth: "4px" }}
                         />
                       );
                     })}

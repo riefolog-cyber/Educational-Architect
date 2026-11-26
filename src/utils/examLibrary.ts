@@ -7,7 +7,7 @@
  */
 
 import { dbFirestore, handleFirestoreError, OperationType } from "../firebase";
-import { collection, getDocs, doc, getDoc, setDoc, deleteDoc, onSnapshot } from "firebase/firestore";
+import { collection, getDocs, doc, getDoc, setDoc, deleteDoc, deleteField, onSnapshot, query, where } from "firebase/firestore";
 import { sanitizeFibQuestion } from "./examStructureRepair";
 import { isWorkbookExamData } from "../utils";
 
@@ -25,6 +25,8 @@ export interface ExamLibraryItem {
   questionCount: number;
   createdAt: string;
   updatedAt: string;
+  /** Optional short code when shared with colleagues via shared_exams. */
+  sharedCode?: string;
   /** True when confirmed written/read from Cloud Firestore; false if awaiting upload. */
   syncedToCloud?: boolean;
 }
@@ -304,6 +306,11 @@ function firestoreDocToItem(id: string, data: any, fallbackEmail: string): ExamL
     } catch {}
   }
 
+  const cleanSharedCode =
+    typeof data.sharedCode === "string" && data.sharedCode.trim()
+      ? data.sharedCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, "")
+      : "";
+
   return {
     id,
     teacherEmail: normalizeEmail(data.teacherEmail) || normalizeEmail(fallbackEmail) || "anon",
@@ -312,6 +319,7 @@ function firestoreDocToItem(id: string, data: any, fallbackEmail: string): ExamL
     examJson: sanitizeWorkbookExamJson(data.examJson),
     source: normalizeLibrarySource(data.source),
     questionCount,
+    ...(cleanSharedCode ? { sharedCode: cleanSharedCode } : {}),
     createdAt: data.createdAt || data.updatedAt || new Date().toISOString(),
     updatedAt: data.updatedAt || data.createdAt || new Date().toISOString(),
     syncedToCloud: true,
@@ -349,6 +357,10 @@ function deduplicateAndSort(items: ExamLibraryItem[]): ExamLibraryItem[] {
 }
 
 function buildFirestorePayload(item: ExamLibraryItem) {
+  const cleanSharedCode =
+    typeof item.sharedCode === "string" && item.sharedCode.trim()
+      ? item.sharedCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 16)
+      : "";
   return {
     id: String(item.id),
     teacherEmail: normalizeEmail(item.teacherEmail) || "anon",
@@ -357,6 +369,7 @@ function buildFirestorePayload(item: ExamLibraryItem) {
     examJson: String(item.examJson || ""),
     source: normalizeLibrarySource(item.source),
     questionCount: Number.isFinite(Number(item.questionCount)) ? Number(item.questionCount) : 0,
+    ...(cleanSharedCode ? { sharedCode: cleanSharedCode } : {}),
     createdAt: String(item.createdAt || new Date().toISOString()),
     updatedAt: String(item.updatedAt || new Date().toISOString()),
   };
@@ -901,13 +914,25 @@ export async function publishSharedExam(
       questionCount: Number(item.questionCount) || 0,
       createdAt: nowIso,
     });
-    // Persist sharedCode on the library item when possible so future clicks reuse it
+    // Persist sharedCode on the library item (cloud + local cache) so reloads reuse it
     try {
       await setDoc(
         doc(dbFirestore, "exam_library", item.id),
         { sharedCode: cleanCode, updatedAt: nowIso },
         { merge: true }
       );
+    } catch {}
+    try {
+      const localItems = readLocalAll(normEmail);
+      let changed = false;
+      const updatedLocal = localItems.map((it) => {
+        if (it.id === item.id) {
+          changed = true;
+          return { ...it, sharedCode: cleanCode, updatedAt: nowIso };
+        }
+        return it;
+      });
+      if (changed) writeLocalAll(normEmail, updatedLocal);
     } catch {}
     return cleanCode;
   } catch (err) {
@@ -922,8 +947,7 @@ export async function listMySharedExams(teacherEmail: string): Promise<SharedExa
   if (!dbFirestore || !teacherEmail) return [];
   const normEmail = normalizeEmail(teacherEmail);
   try {
-    const { query: fsQuery, where: fsWhere } = await import("firebase/firestore");
-    const q = fsQuery(collection(dbFirestore, "shared_exams"), fsWhere("teacherEmail", "==", normEmail));
+    const q = query(collection(dbFirestore, "shared_exams"), where("teacherEmail", "==", normEmail));
     const snap = await getDocs(q);
     return snap.docs
       .map((d) => {
@@ -942,7 +966,7 @@ export async function listMySharedExams(teacherEmail: string): Promise<SharedExa
   }
 }
 
-export async function revokeSharedExam(shareCode: string): Promise<void> {
+export async function revokeSharedExam(shareCode: string, teacherEmail?: string): Promise<void> {
   if (!dbFirestore) return;
   const cleanCode = String(shareCode || "")
     .trim()
@@ -956,6 +980,36 @@ export async function revokeSharedExam(shareCode: string): Promise<void> {
       handleFirestoreError(err, OperationType.DELETE, `shared_exams/${cleanCode}`);
     }
     throw err;
+  }
+
+  // Clear revoked sharedCode from matching exam_library docs and local cache (best-effort)
+  try {
+    const q = query(collection(dbFirestore, "exam_library"), where("sharedCode", "==", cleanCode));
+    const snap = await getDocs(q);
+    await Promise.all(
+      snap.docs.map((d) =>
+        setDoc(
+          doc(dbFirestore, "exam_library", d.id),
+          { sharedCode: deleteField(), updatedAt: new Date().toISOString() },
+          { merge: true }
+        ).catch(() => {})
+      )
+    );
+  } catch {}
+  if (teacherEmail) {
+    try {
+      const localItems = readLocalAll(teacherEmail);
+      let changed = false;
+      const updated = localItems.map((it) => {
+        if (it.sharedCode === cleanCode) {
+          changed = true;
+          const { sharedCode: _removed, ...rest } = it;
+          return rest as ExamLibraryItem;
+        }
+        return it;
+      });
+      if (changed) writeLocalAll(teacherEmail, updated);
+    } catch {}
   }
 }
 
@@ -989,11 +1043,20 @@ export async function importSharedExamByCode(
   }
 
   const data = snap.data() as any;
-  if (!data?.examJson) {
+  if (!data?.examJson || typeof data.examJson !== "string") {
     throw new Error("La verifica condivisa non contiene dati validi.");
   }
 
-  const parsed = JSON.parse(data.examJson);
+  let parsed: any;
+  try {
+    parsed = JSON.parse(data.examJson);
+  } catch {
+    throw new Error("La verifica condivisa contiene dati danneggiati e non può essere importata.");
+  }
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("La verifica condivisa non ha una struttura valida.");
+  }
+
   const { type, count } = countLibraryQuestions(parsed);
   const title = String(data.title || parsed?.title || `Verifica condivisa (${cleanCode})`);
   const saveResult = await saveLibraryExam({

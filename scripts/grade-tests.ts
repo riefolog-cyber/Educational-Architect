@@ -26,7 +26,13 @@ import {
   collectWorkbookReflections,
   isValidNumericScore,
   mcWeightedScore,
+  snapHalfPointScore,
 } from "../src/utils";
+import {
+  CLASS_LEDGER_TABLE_LAYOUT,
+  resolveJsPdfImageFormat,
+  stripPdfListMarker,
+} from "../src/utils/pdfExport";
 import {
   computeExamItemAnalysis,
   computeExamItemAnalysisByFila,
@@ -52,6 +58,11 @@ import {
   reconstructExamMcOrder,
   validateExamKeysForLaunch,
 } from "../src/utils/examSecurity";
+import {
+  isAllowedExamImageFile,
+  isBlockedSvgDataUrl,
+  MAX_RAW_IMAGE_BYTES,
+} from "../src/utils/imageData";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -91,7 +102,8 @@ import {
   computeEffectiveDeferredDeadlineMs,
   addMinutesToExpiryIso,
 } from "../src/utils/deferredSolutions";
-import { buildExamFromLinkedForm } from "../src/utils/googleFormsLink";
+import { buildExamFromLinkedForm, normalizeLinkedFormPayload } from "../src/utils/googleFormsLink";
+import { buildLinkedFormFromApi } from "../src/utils/googleFormsApi";
 import { sanitizePdfText, createSubmissionPdfDoc } from "../src/utils/pdfExport";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS } from "../src/utils/transcriptParser";
 import { parseGoogleFormsImport } from "../src/utils/googleFormsImport";
@@ -2740,6 +2752,363 @@ test("Round 4 Fix: parseLibraryBackup recomputes missing questionCount, detects 
   assert.equal(parsedExam.sections[0].fillInTheBlank[0].answer, "mitocondrio");
   assert.ok(!parsedExam.sections[0].fillInTheBlank[0].sentence.includes("[mitocondrio]"));
   assert.ok(parsedExam.sections[0].fillInTheBlank[0].sentence.includes("________"));
+});
+
+test("Round 5 Fix: detectGibberish accetta risposte numeriche, date, frazioni e percentuali ma blocca spam e punteggiatura", () => {
+  const validNumericAnswers = [
+    "1789",
+    "42",
+    "3,14",
+    "9.81",
+    "-5",
+    "2/3",
+    "100%",
+    "0",
+    "25/04/1945",
+    "1914-1918",
+  ];
+  for (const ans of validNumericAnswers) {
+    assert.equal(detectGibberish(ans), false, `Risposta numerica legittima erroneamente scartata: ${ans}`);
+  }
+
+  const invalidSpamAnswers = [
+    "....",
+    "???",
+    "---",
+    "11111111",
+    "0000000",
+    "12345678901234567890123",
+    "boh",
+    "",
+  ];
+  for (const spam of invalidSpamAnswers) {
+    assert.equal(detectGibberish(spam), true, `Spam/vuoto non rilevato: ${spam}`);
+  }
+});
+
+test("Round 5 Fix: snapHalfPointScore allinea i punteggi IA ai mezzi punti (0.5) entro 0..10", () => {
+  assert.equal(snapHalfPointScore(6.37), 6.5);
+  assert.equal(snapHalfPointScore(6.74), 6.5);
+  assert.equal(snapHalfPointScore(6.76), 7);
+  assert.equal(snapHalfPointScore(7.5), 7.5);
+  assert.equal(snapHalfPointScore("5,5"), 5.5);
+  assert.equal(snapHalfPointScore(-2), 0);
+  assert.equal(snapHalfPointScore(12), 10);
+  assert.equal(snapHalfPointScore("non-un-numero"), 0);
+});
+
+test("Round 5 Fix: computeGradeBreakdown risolve ID canonici incrociati (id vs questionId) su Quiz e Workbook", () => {
+  const quizBreakdown = computeGradeBreakdown({
+    tipo: "Quiz",
+    examData: {
+      multipleChoice: [{ id: "mc1", correctIndex: 0 }],
+      openEnded: [{ id: "oe1", question: "Spiega." }],
+    },
+    answers: { mc: { mc1: 0 }, oe: { oe1: "Risposta completa e corretta." } },
+    evaluation: {
+      openEndedDetails: [{ id: "oe1", score: 8.5, feedback: "Molto bene." }],
+    },
+    punteggioMC: 1,
+    votoSuggerito: "9.3 (9+)",
+  });
+  assert.equal(quizBreakdown.subjectivePart?.averageScore, 8.5);
+  assert.equal(quizBreakdown.pendingSubjectiveCount, 0);
+
+  const wbBreakdown = computeGradeBreakdown({
+    tipo: "Workbook",
+    examData: {
+      sections: [
+        {
+          title: "S1",
+          fillInTheBlank: [{ id: "f1", sentence: "___", answer: "Roma" }],
+          reflectionQuestions: [{ id: "r1", question: "Rifletti." }],
+        },
+      ],
+    },
+    answers: { wbFib: { f1: "Roma" }, wbRq: { r1: "Riflessione argomentata." } },
+    evaluation: {
+      reflectionDetails: [{ questionId: "r1", score: 7.5, feedback: "Buona riflessione." }],
+    },
+    punteggioMC: 0,
+    votoSuggerito: "8.8 (9-)",
+  });
+  assert.equal(wbBreakdown.subjectivePart?.averageScore, 7.5);
+  assert.equal(wbBreakdown.pendingSubjectiveCount, 0);
+});
+
+test("Round 5 Fix: tabellone PDF garantisce margine verticale pulito tra intestazione scura e prima riga alunno", () => {
+  const row1TopEdgeMm =
+    CLASS_LEDGER_TABLE_LAYOUT.firstRowBaselineOffsetMm -
+    CLASS_LEDGER_TABLE_LAYOUT.rowTopPaddingMm;
+  assert.ok(
+    row1TopEdgeMm >= CLASS_LEDGER_TABLE_LAYOUT.headerHeightMm + 1.0,
+    `La prima riga (${row1TopEdgeMm}mm) deve iniziare almeno 1mm sotto l'intestazione (${CLASS_LEDGER_TABLE_LAYOUT.headerHeightMm}mm)`
+  );
+  assert.ok(
+    CLASS_LEDGER_TABLE_LAYOUT.headerTextOffsetMm < CLASS_LEDGER_TABLE_LAYOUT.headerHeightMm,
+    "Il testo dell'intestazione deve rimanere centrato all'interno della barra scura"
+  );
+});
+
+test("Round 6 Fix: resolveJsPdfImageFormat riconosce WEBP, JPEG e PNG senza scartare immagini compresse", () => {
+  assert.equal(resolveJsPdfImageFormat("data:image/webp;base64,UklGRh4AAABXRUJQ"), "WEBP");
+  assert.equal(resolveJsPdfImageFormat("data:image/WEBP;base64,AAAA"), "WEBP");
+  assert.equal(resolveJsPdfImageFormat("data:image/jpeg;base64,/9j/4AAQ"), "JPEG");
+  assert.equal(resolveJsPdfImageFormat("data:image/jpg;base64,/9j/4AAQ"), "JPEG");
+  assert.equal(resolveJsPdfImageFormat("data:image/png;base64,iVBORw0KGgo="), "PNG");
+  assert.equal(resolveJsPdfImageFormat(""), "PNG");
+});
+
+test("Round 6 Fix: stripPdfListMarker rimuove elenchi multi-cifra e bullet senza corrompere virgolette o testo", () => {
+  assert.equal(stripPdfListMarker("- Primo punto"), "Primo punto");
+  assert.equal(stripPdfListMarker("* Secondo punto"), "Secondo punto");
+  assert.equal(stripPdfListMarker("• Terzo punto"), "Terzo punto");
+  assert.equal(stripPdfListMarker("12. Dodicesimo punto"), "Dodicesimo punto");
+  assert.equal(stripPdfListMarker("3) Terza voce"), "Terza voce");
+  assert.equal(stripPdfListMarker('"Citazione preservata"'), '"Citazione preservata"');
+  assert.equal(stripPdfListMarker("(Nota importante) testo"), "(Nota importante) testo");
+});
+
+test("Round 7 Fix: normalizeLinkedFormPayload rifiuta correctIndex null, stringa vuota o booleano (mai 0 implicito)", () => {
+  const payload = normalizeLinkedFormPayload({
+    title: "Verifica Storia",
+    questions: [
+      { id: "q1", kind: "mc", question: "Domanda con null", options: ["A", "B"], correctIndex: null },
+      { id: "q2", kind: "mc", question: "Domanda con vuoto", options: ["A", "B"], correctIndex: "" },
+      { id: "q3", kind: "mc", question: "Domanda con booleano", options: ["A", "B"], correctIndex: false },
+      { id: "q4", kind: "mc", question: "Domanda con chiave valida 0", options: ["A", "B"], correctIndex: 0 },
+      { id: "q5", kind: "mc", question: "Domanda con chiave valida stringa", options: ["A", "B", "C"], correctIndex: "2" },
+    ],
+  });
+  assert.ok(payload, "Payload valido deve essere normalizzato");
+  assert.equal(payload.questions[0].correctIndex, undefined);
+  assert.equal(payload.questions[1].correctIndex, undefined);
+  assert.equal(payload.questions[2].correctIndex, undefined);
+  assert.equal(payload.questions[3].correctIndex, 0);
+  assert.equal(payload.questions[4].correctIndex, 2);
+  assert.equal(payload.keyedCount, 2);
+});
+
+test("Round 7 Fix: buildExamFromLinkedForm preserva weight (punti) anche sulle domande aperte", () => {
+  const built = buildExamFromLinkedForm({
+    title: "Verifica Fisica",
+    questions: [
+      { id: "q1", kind: "mc", question: "Unità di misura forza?", options: ["Newton", "Joule"], required: true, correctIndex: 0, points: 2 },
+      { id: "q2", kind: "open", question: "Enuncia il secondo principio.", options: [], required: true, points: 3 },
+      { id: "q3", kind: "open", question: "Nota breve.", options: [], required: false, points: 1 },
+    ],
+    skipped: [],
+    importedVia: "script",
+    sourceUrl: "",
+  });
+  const parsed = JSON.parse(built.examJson);
+  assert.equal(parsed.multipleChoice[0].weight, 2);
+  assert.equal(parsed.openEnded[0].weight, 3);
+  assert.equal(parsed.openEnded[1].weight, undefined);
+});
+
+test("Round 7 Fix: buildLinkedFormFromApi risolve grading.correctAnswers.answers su choiceQuestion e degrada <2 opzioni ad aperta", () => {
+  const form = buildLinkedFormFromApi({
+    info: { title: "Quiz API Google" },
+    items: [
+      {
+        itemId: "i1",
+        title: "Capitale d'Italia?",
+        questionItem: {
+          question: {
+            required: true,
+            choiceQuestion: {
+              type: "RADIO",
+              options: [{ value: "Milano" }, { value: "Roma" }, { value: "Napoli" }],
+            },
+            grading: {
+              pointValue: 2,
+              correctAnswers: { answers: [{ value: "Roma" }] },
+            },
+          },
+        },
+      },
+      {
+        itemId: "i2",
+        title: "Scelta rotta con una sola opzione",
+        questionItem: {
+          question: {
+            choiceQuestion: {
+              type: "RADIO",
+              options: [{ value: "Solo una" }],
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.ok(form);
+  assert.equal(form.questions[0].kind, "mc");
+  assert.equal(form.questions[0].correctIndex, 1);
+  assert.equal(form.questions[0].points, 2);
+  assert.equal(form.keyedCount, 1);
+  assert.equal(form.questions[0].note, undefined);
+  assert.equal(form.questions[1].kind, "open");
+  assert.deepEqual(form.questions[1].options, []);
+});
+
+test("Round 7 Fix: parseGoogleFormsImport maschera subito [risposta] in ________ nei completamenti Workbook", () => {
+  const csv = [
+    "Tipo,Sezione,Domanda,Risposta,Punti",
+    'FIB,Modulo 1,"La capitale della Francia è [Parigi].","",2',
+  ].join("\n");
+  const imported = parseGoogleFormsImport(csv, { fallbackTitle: "Geografia" });
+  assert.equal(imported.examType, "Workbook");
+  const parsed = JSON.parse(imported.examJson);
+  const fib = parsed.sections[0].fillInTheBlank[0];
+  assert.equal(fib.sentence, "La capitale della Francia è ________.");
+  assert.equal(fib.answer, "Parigi");
+  assert.equal(fib.weight, 2);
+});
+
+test("Round 7 Fix: stripExamAnswers rifiuta correctIndex booleano e autoCorrectExamJSON decodifica lettere A-Z nei Workbook", () => {
+  const stripped = stripExamAnswers({
+    title: "Test Booleani",
+    multipleChoice: [
+      { id: "mc_bool", question: "Domanda", options: ["A", "B"], correctIndex: false },
+      { id: "mc_ok", question: "Domanda 2", options: ["A", "B"], correctIndex: "B" },
+    ],
+  });
+  assert.equal(stripped.answerKey.mc.mc_bool, undefined);
+  assert.equal(stripped.answerKey.mc.mc_ok, 1);
+
+  const repaired = autoCorrectExamJSON(
+    JSON.stringify({
+      title: "Workbook Lettere",
+      sections: [
+        {
+          title: "Sez 1",
+          sintesi: "Testo",
+          multipleChoice: [
+            { id: "wm1", question: "Q1", options: ["Uno", "Due", "Tre"], correctIndex: "C" },
+            { id: "wm2", question: "Q2", options: ["Uno", "Due"], correctIndex: false },
+          ],
+          fillInTheBlank: [],
+          reflectionQuestions: [],
+        },
+      ],
+    })
+  );
+  assert.equal(repaired.success, true);
+  const wb: any = repaired.correctedObj;
+  assert.equal(wb.sections[0].multipleChoice[0].correctIndex, 2);
+  assert.equal(repaired.missingAnswerKeysCount, 1);
+});
+
+test("Round 7 Fix: computeExamItemAnalysis seleziona referenceExam con chiavi e buildExamLedgerSummary evita falsi 'Ritoccato'", () => {
+  const strippedExam = JSON.stringify({
+    title: "Workbook Verifica",
+    sections: [
+      {
+        title: "Sez 1",
+        fillInTheBlank: [{ id: "f1", sentence: "La fotosintesi produce ________." }],
+        multipleChoice: [{ id: "m1", question: "2+2?", options: ["3", "4"] }],
+        reflectionQuestions: [],
+      },
+    ],
+  });
+  const hydratedExam = JSON.stringify({
+    title: "Workbook Verifica",
+    sections: [
+      {
+        title: "Sez 1",
+        fillInTheBlank: [{ id: "f1", sentence: "La fotosintesi produce ________.", answer: "ossigeno" }],
+        multipleChoice: [{ id: "m1", question: "2+2?", options: ["3", "4"], correctIndex: 1 }],
+        reflectionQuestions: [],
+      },
+    ],
+  });
+
+  const subs: any[] = [
+    {
+      id: "s1",
+      Timestamp: "2026-11-26T09:00:00Z",
+      Tipo: "Workbook",
+      Nome: "Alice",
+      Email: "alice@scuola.it",
+      Classe: "3A",
+      Voto_Suggerito: "8.0 (8)",
+      Voto_Originale_IA: "8.0 (8)",
+      Domande_Esame: strippedExam,
+      Risposte_Studente: JSON.stringify({ mc: { m1: 1 }, wbFib: { f1: "ossigeno" } }),
+      Full_Evaluation: JSON.stringify({}),
+    },
+    {
+      id: "s2",
+      Timestamp: "2026-11-26T09:05:00Z",
+      Tipo: "Workbook",
+      Nome: "Bruno",
+      Email: "bruno@scuola.it",
+      Classe: "3A",
+      Voto_Suggerito: "7.0 (7)",
+      Voto_Originale_IA: "6.5 (6½)",
+      Domande_Esame: hydratedExam,
+      Risposte_Studente: JSON.stringify({ mc: { m1: 1 }, wbFib: { f1: "ossigeno" } }),
+      Full_Evaluation: JSON.stringify({}),
+    },
+  ];
+
+  const analysis = computeExamItemAnalysis(subs);
+  assert.equal(analysis.fibStats.length, 1);
+  assert.equal(analysis.fibStats[0].expectedAnswer, "ossigeno");
+  assert.equal(analysis.mcStats[0].keyedResponses, 1);
+  assert.equal(analysis.mcStats[0].unkeyedResponses, 1);
+
+  const ledger = buildExamLedgerSummary(subs);
+  const aliceRow = ledger.rows.find((r) => r.submissionId === "s1");
+  const brunoRow = ledger.rows.find((r) => r.submissionId === "s2");
+  assert.ok(aliceRow && !aliceRow.notes.includes("Ritoccato"), "Non deve mostrare Ritoccato se il voto è identico all'originale");
+  assert.ok(brunoRow && brunoRow.notes.includes("Ritoccato (orig. 6.5 (6½))"));
+});
+
+test("Round 8 Fix: imageData blocca SVG e file oltre 12 MB, accetta PNG/JPG/WebP/GIF validi", () => {
+  assert.equal(isBlockedSvgDataUrl("data:image/svg+xml;base64,PHN2Zz48c2NyaXB0Lz48L3N2Zz4="), true);
+  assert.equal(isBlockedSvgDataUrl("  DATA:IMAGE/SVG+XML;utf8,<svg/>"), true);
+  assert.equal(isBlockedSvgDataUrl("data:image/png;base64,iVBORw0KGgo="), false);
+
+  const svgMime = isAllowedExamImageFile({ type: "image/svg+xml", name: "schema.svg", size: 2048 });
+  assert.equal(svgMime.allowed, false);
+  assert.ok(svgMime.reason?.includes("SVG"));
+
+  const svgExt = isAllowedExamImageFile({ type: "image/png", name: "tricky.svg", size: 2048 });
+  assert.equal(svgExt.allowed, false);
+
+  const nonImage = isAllowedExamImageFile({ type: "application/pdf", name: "doc.pdf", size: 1024 });
+  assert.equal(nonImage.allowed, false);
+
+  const oversized = isAllowedExamImageFile({ type: "image/png", name: "huge.png", size: MAX_RAW_IMAGE_BYTES + 1 });
+  assert.equal(oversized.allowed, false);
+  assert.ok(oversized.reason?.includes("12 MB"));
+
+  const okPng = isAllowedExamImageFile({ type: "image/png", name: "grafico.png", size: 120_000 });
+  assert.equal(okPng.allowed, true);
+});
+
+test("Round 8 Fix: evaluateMcSelection riconosce chiavi lettera (es. 'B') usate in ExamPreviewModal e formatMarkdown pulisce XSS con variante stampa", () => {
+  const qLetter = {
+    id: "q_let",
+    question: "Qual è l'opzione corretta?",
+    options: ["Prima", "Seconda", "Terza"],
+    correctIndex: "B",
+  };
+  assert.equal(evaluateMcSelection(qLetter, 0).isCorrect, false);
+  assert.equal(evaluateMcSelection(qLetter, 1).hasCorrectKey, true);
+  assert.equal(evaluateMcSelection(qLetter, 1).isCorrect, true);
+
+  const rendered = formatMarkdown(
+    "- Ottima risposta su **Costituzione** <img src=x onerror=alert(1)>",
+    "print"
+  );
+  assert.ok(rendered.includes("<strong>Costituzione</strong>"));
+  assert.ok(rendered.includes("text-slate-800"), "Variante stampa deve usare testo scuro leggibile su foglio bianco");
+  assert.ok(!rendered.includes("text-slate-200"), "Variante stampa non deve usare testo chiaro invisibile su A4");
+  assert.ok(!rendered.includes("<img"));
+  assert.ok(rendered.includes("&lt;img"));
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

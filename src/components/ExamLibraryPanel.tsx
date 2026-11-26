@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   BookOpen,
   PlusCircle,
@@ -104,12 +104,27 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
   const [importingCode, setImportingCode] = useState(false);
   const [showSharedDrawer, setShowSharedDrawer] = useState(false);
   const [revokingCode, setRevokingCode] = useState<string | null>(null);
+  const copyTimerRef = useRef<number | null>(null);
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+    };
+  }, []);
 
   const handleCopyShareCode = async (code: string) => {
     const ok = await copyTextToClipboard(code);
     if (ok) {
       setCopiedCode(code);
-      setTimeout(() => setCopiedCode((prev) => (prev === code ? null : prev)), 2500);
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current);
+      }
+      copyTimerRef.current = window.setTimeout(() => {
+        setCopiedCode((prev) => (prev === code ? null : prev));
+        copyTimerRef.current = null;
+      }, 2500);
     }
   };
 
@@ -119,6 +134,8 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
       const code = await onShareItem(item);
       setSharedCodesById((prev) => ({ ...prev, [item.id]: code }));
       await handleCopyShareCode(code);
+    } catch {
+      // Parent handler already reports the error message in libraryMsg.
     } finally {
       setSharingItemId(null);
     }
@@ -132,6 +149,8 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
       await onImportByShareCode(shareCodeInput.trim());
       setShareCodeInput("");
       setShowCodeImport(false);
+    } catch {
+      // Parent handler already reports the error message in libraryMsg.
     } finally {
       setImportingCode(false);
     }
@@ -598,6 +617,15 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                           setRevokingCode(sh.shareCode);
                           try {
                             await onRevokeShare(sh.shareCode);
+                            setSharedCodesById((prev) => {
+                              const next: Record<string, string> = {};
+                              for (const k of Object.keys(prev)) {
+                                if (prev[k] !== sh.shareCode) next[k] = prev[k];
+                              }
+                              return next;
+                            });
+                          } catch {
+                            // Parent handler already reports the error message in libraryMsg.
                           } finally {
                             setRevokingCode(null);
                           }

@@ -1,4 +1,4 @@
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import {
   Eye,
   X,
@@ -15,7 +15,7 @@ import {
 } from "lucide-react";
 import { buildExamPreviewSummary } from "../utils/examPreview";
 import { stripExamAnswers, restoreExamAnswers, validateExamKeysForLaunch } from "../utils/examSecurity";
-import { collectExamMultipleChoice, collectQuizOpenEnded } from "../utils";
+import { collectExamMultipleChoice, collectQuizOpenEnded, evaluateMcSelection } from "../utils";
 
 interface ExamPreviewModalProps {
   isOpen: boolean;
@@ -34,7 +34,7 @@ function maskFibSentence(sentence: unknown, reveal: boolean, expectedAnswer?: st
     return s;
   }
   if (/_{2,}|\.{3,}/.test(s)) return s;
-  return s.replace(/\[[^\]]+\]/, "___");
+  return s.replace(/\[[^\]]+\]/g, "___");
 }
 
 const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
@@ -45,6 +45,19 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
 }) => {
   const [showTeacherKey, setShowTeacherKey] = useState(false);
   const [simulateBes, setSimulateBes] = useState(false);
+
+  useEffect(() => {
+    if (!isOpen) {
+      setShowTeacherKey(false);
+      setSimulateBes(false);
+      return;
+    }
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
 
   const summary = useMemo(() => buildExamPreviewSummary(examData), [examData]);
   const keyAudit = useMemo(() => validateExamKeysForLaunch(examData), [examData]);
@@ -92,16 +105,6 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
 
   const renderMcCard = (q: any, idx: number, prefixLabel: string) => {
     const opts: string[] = Array.isArray(q?.options) ? q.options : [];
-    let correctIdx = -1;
-    const rawCorrect = q?.correctIndex;
-    if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
-      correctIdx = rawCorrect;
-    } else if (typeof rawCorrect === "string" && /^\d+$/.test(rawCorrect.trim())) {
-      correctIdx = Number(rawCorrect.trim());
-    }
-    if (correctIdx < 0 || correctIdx >= opts.length) {
-      correctIdx = -1;
-    }
     return (
       <div
         key={q?.id || `${prefixLabel}_${idx}`}
@@ -121,7 +124,8 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
         {renderImageBlock(q?.id)}
         <div className="grid grid-cols-1 sm:grid-cols-2 gap-1.5">
           {opts.map((opt, oIdx) => {
-            const isCorrect = showTeacherKey && oIdx === correctIdx;
+            const evalRes = showTeacherKey ? evaluateMcSelection(q, oIdx) : null;
+            const isCorrect = Boolean(evalRes?.hasCorrectKey && evalRes.isCorrect);
             return (
               <div
                 key={oIdx}

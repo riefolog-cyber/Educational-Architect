@@ -49,6 +49,7 @@ export default function AiExamGeneratorModal({
   const [pdfBase64, setPdfBase64] = useState<string | null>(null);
   const [strictSourceOnly, setStrictSourceOnly] = useState<boolean>(true);
   const [generateParallelVariant, setGenerateParallelVariant] = useState<boolean>(false);
+  const abortControllerRef = useRef<AbortController | null>(null);
   const [generatedResult, setGeneratedResult] = useState<{
     title: string;
     formattedJson: string;
@@ -57,19 +58,66 @@ export default function AiExamGeneratorModal({
     modelUsed?: string;
     examObj: any;
     parallelVariant?: ParallelVariantOutput | null;
+    variantWarning?: string | null;
   } | null>(null);
 
+  const abortInFlight = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  };
+
+  const handleCloseModal = () => {
+    abortInFlight();
+    setIsLoading(false);
+    setLoadingStatus("");
+    setError(null);
+    setGeneratedResult(null);
+    onClose();
+  };
+
   useEffect(() => {
-    if (isOpen && initialPrefill) {
+    if (!isOpen) {
+      abortInFlight();
+      setIsLoading(false);
+      setLoadingStatus("");
+      setGeneratedResult(null);
+      return;
+    }
+    if (initialPrefill) {
       setTopic(initialPrefill.topic);
       setExamType(initialPrefill.examType);
       if (initialPrefill.difficulty) setDifficulty(initialPrefill.difficulty);
       if (typeof initialPrefill.numQuestions === "number") setNumQuestions(initialPrefill.numQuestions);
       setSourceTab("topic");
+      setPdfBase64(null);
+      setPdfFileName(null);
+      setPdfSizeKb(0);
+      setTranscriptFileName(null);
+      setTranscriptMeta(null);
+      setTranscriptNotice(null);
       setGeneratedResult(null);
       setError(null);
     }
   }, [isOpen, initialPrefill]);
+
+  useEffect(() => {
+    return () => {
+      abortInFlight();
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape" && !isLoading) {
+        handleCloseModal();
+      }
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, isLoading]);
 
   if (!isOpen) return null;
 
@@ -170,8 +218,10 @@ export default function AiExamGeneratorModal({
   };
 
   const handleGenerate = async () => {
+    if (isLoading) return;
     const hasPdf = Boolean(pdfBase64);
-    if (!topic.trim() && !hasPdf) {
+    const trimmedTopic = topic.trim().slice(0, MAX_TRANSCRIPT_CHARS);
+    if (!trimmedTopic && !hasPdf) {
       setError(
         sourceTab === "transcript"
           ? "Carica prima un file di trascrizione (.srt, .vtt o .txt) oppure incolla il testo nel campo qui sotto."
@@ -182,6 +232,11 @@ export default function AiExamGeneratorModal({
       return;
     }
 
+    abortInFlight();
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+    const { signal } = controller;
+
     setIsLoading(true);
     setLoadingStatus("Generazione verifica principale (Fila A) con IA...");
     setError(null);
@@ -189,13 +244,14 @@ export default function AiExamGeneratorModal({
 
     try {
       const payload: Record<string, any> = {
-        topic: topic.trim(),
+        topic: trimmedTopic,
         gradeLevel,
         examType,
         numQuestions,
         includeOpenEnded,
         difficulty,
-        strictSourceOnly: sourceTab === "pdf" || sourceTab === "transcript" ? strictSourceOnly : false,
+        strictSourceOnly:
+          sourceTab === "pdf" || sourceTab === "transcript" || hasPdf ? strictSourceOnly : false,
         sourceFileName: pdfFileName || transcriptFileName || undefined,
       };
       if (pdfBase64) {
@@ -204,10 +260,12 @@ export default function AiExamGeneratorModal({
       }
 
       const authHeaders = await getAuthHeaders();
+      if (signal.aborted) return;
 
       try {
-        await fetch("/api/evaluate/warmup");
+        await fetch("/api/evaluate/warmup", { signal });
       } catch {}
+      if (signal.aborted) return;
 
       let resp = await fetch("/api/generate-exam", {
         method: "POST",
@@ -216,18 +274,19 @@ export default function AiExamGeneratorModal({
           "Accept": "application/json",
           ...authHeaders
         },
-        body: JSON.stringify(payload)
+        body: JSON.stringify(payload),
+        signal,
       });
 
       // Allow GET fallback only for short topic-only prompts without PDF
       if (!resp.ok && (resp.status === 404 || resp.status === 405)) {
-        if (pdfBase64 || topic.trim().length > 1500) {
+        if (pdfBase64 || trimmedTopic.length > 1500) {
           throw new Error(
             "La richiesta POST è stata bloccata dalla rete/proxy e la fonte selezionata supera il limite per il fallback URL."
           );
         }
         const queryParams = new URLSearchParams({
-          topic: topic.trim(),
+          topic: trimmedTopic,
           gradeLevel,
           examType,
           numQuestions: String(numQuestions),
@@ -239,16 +298,23 @@ export default function AiExamGeneratorModal({
           headers: {
             "Accept": "application/json",
             ...authHeaders
-          }
+          },
+          signal,
         });
       }
 
-      const data = await resp.json();
-      if (!resp.ok || data.error) {
-        throw new Error(data.details || data.error || "Impossibile generare la verifica con l'IA.");
+      const data = await resp.json().catch(() => null);
+      if (signal.aborted) return;
+      if (!resp.ok || !data || data.error) {
+        throw new Error(
+          data?.details ||
+            data?.error ||
+            `Impossibile generare la verifica con l'IA (HTTP ${resp.status}).`
+        );
       }
 
       let parallelVariant: ParallelVariantOutput | null = null;
+      let variantWarning: string | null = null;
       if (generateParallelVariant && data.formattedJson) {
         setLoadingStatus("Generazione variante parallela (Fila B) per prevenzione copie...");
         try {
@@ -263,7 +329,9 @@ export default function AiExamGeneratorModal({
               examJson: data.formattedJson,
               title: data.title,
             }),
+            signal,
           });
+          if (signal.aborted) return;
           const varData = await varResp.json().catch(() => ({}));
           if (varResp.ok && varData?.formattedJson) {
             parallelVariant = {
@@ -272,12 +340,20 @@ export default function AiExamGeneratorModal({
             };
           } else {
             console.warn("Generazione Fila B non riuscita:", varData?.error);
+            variantWarning =
+              varData?.details ||
+              varData?.error ||
+              "La variante Fila B non è stata generata. Puoi comunque caricare la Fila A e creare la Fila B in seguito dall'Editor.";
           }
-        } catch (varErr) {
+        } catch (varErr: any) {
+          if (varErr?.name === "AbortError" || signal.aborted) return;
           console.warn("Errore generazione Fila B:", varErr);
+          variantWarning =
+            "Errore temporaneo durante la generazione della Fila B. La Fila A è pronta e puoi rigenerare la Fila B dall'Editor.";
         }
       }
 
+      if (signal.aborted) return;
       setGeneratedResult({
         title: data.title,
         formattedJson: data.formattedJson,
@@ -286,19 +362,28 @@ export default function AiExamGeneratorModal({
         modelUsed: data.modelUsed || "",
         examObj: data.examObj,
         parallelVariant,
+        variantWarning,
       });
     } catch (err: any) {
+      if (err?.name === "AbortError" || signal.aborted) return;
       console.error("AI Generation error:", err);
-      setError(err.message || "Si è verificato un errore durante la generazione della verifica.");
+      setError(err?.message || "Si è verificato un errore durante la generazione della verifica.");
     } finally {
-      setIsLoading(false);
-      setLoadingStatus("");
+      if (abortControllerRef.current === controller) {
+        abortControllerRef.current = null;
+      }
+      if (!signal.aborted) {
+        setIsLoading(false);
+        setLoadingStatus("");
+      }
     }
   };
 
   const handleConfirmAndApply = () => {
     if (!generatedResult) return;
-    onApplyExam(generatedResult.formattedJson, generatedResult.title, generatedResult.parallelVariant || null);
+    const applied = generatedResult;
+    setGeneratedResult(null);
+    onApplyExam(applied.formattedJson, applied.title, applied.parallelVariant || null);
     onClose();
   };
 
@@ -324,7 +409,9 @@ export default function AiExamGeneratorModal({
             </div>
           </div>
           <button
-            onClick={onClose}
+            type="button"
+            onClick={handleCloseModal}
+            title={isLoading ? "Interrompi generazione e chiudi" : "Chiudi"}
             className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
           >
             <X className="w-5 h-5" />
@@ -508,7 +595,7 @@ export default function AiExamGeneratorModal({
               <div className="space-y-1.5">
                 <label className="font-bold uppercase tracking-wider text-slate-400 text-[10px] flex items-center justify-between">
                   <span>{sourceTab === "transcript" ? "Testo della trascrizione (modificabile) *" : "Argomento della Verifica o Testo Didattico *"}</span>
-                  <span className="text-slate-400 font-mono text-[10px]">
+                  <span className={`font-mono text-[10px] ${topic.length > MAX_TRANSCRIPT_CHARS ? "text-amber-300 font-bold" : "text-slate-400"}`}>
                     {topic.length > 0
                       ? `${topic.length.toLocaleString("it-IT")} / ${MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri`
                       : "Italiano, Storia, Scienze, Diritto, ecc."}
@@ -521,6 +608,11 @@ export default function AiExamGeneratorModal({
                   placeholder="Es. I primi 12 articoli della Costituzione Italiana: principi di democrazia, sovranità popolare, uguaglianza formale e sostanziale, diritto al lavoro e libertà personale... oppure incolla un riassunto o un capitolo."
                   className="w-full p-3 bg-slate-950/80 border border-white/10 focus:border-indigo-400 rounded-2xl text-white outline-none resize-y leading-relaxed placeholder:text-slate-600 font-sans"
                 />
+                {topic.length > MAX_TRANSCRIPT_CHARS && (
+                  <p className="text-[10px] text-amber-300">
+                    ⚠️ Il testo supera il limite massimo ({MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri): durante la generazione verranno considerati i primi {MAX_TRANSCRIPT_CHARS.toLocaleString("it-IT")} caratteri.
+                  </p>
+                )}
               </div>
 
               {/* Format selection */}
@@ -737,6 +829,13 @@ export default function AiExamGeneratorModal({
                       </div>
                     )}
 
+                    {generatedResult.variantWarning && (
+                      <div className="p-3 bg-amber-500/10 border border-amber-500/35 rounded-2xl text-amber-200 flex items-start gap-2 text-[11px]">
+                        <AlertCircle className="w-4 h-4 shrink-0 mt-0.5 text-amber-400" />
+                        <span>{generatedResult.variantWarning}</span>
+                      </div>
+                    )}
+
                     <div className="space-y-1.5">
                       <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
                         <span>
@@ -805,11 +904,10 @@ export default function AiExamGeneratorModal({
             <>
               <button
                 type="button"
-                onClick={onClose}
-                disabled={isLoading}
+                onClick={handleCloseModal}
                 className="px-4 py-2.5 rounded-xl border border-white/10 text-slate-400 hover:text-white hover:bg-white/5 text-xs font-semibold cursor-pointer transition-colors"
               >
-                Annulla
+                {isLoading ? "Interrompi" : "Annulla"}
               </button>
               <button
                 type="button"

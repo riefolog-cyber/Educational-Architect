@@ -172,18 +172,23 @@ export function stripExamAnswers(
       mcSeq++;
       const qId = ensureUniqueItemId(q, seenMcIds, "mc", mcSeq);
       let effectiveCorrect: number | undefined;
-      if (q.correctIndex !== undefined && q.correctIndex !== null && String(q.correctIndex).trim() !== "") {
+      if (
+        q.correctIndex !== undefined &&
+        q.correctIndex !== null &&
+        typeof q.correctIndex !== "boolean" &&
+        String(q.correctIndex).trim() !== ""
+      ) {
         const rawC = typeof q.correctIndex === "string" ? q.correctIndex.trim() : q.correctIndex;
         if (typeof rawC === "string" && /^[a-z]$/i.test(rawC)) {
           const letterIdx = rawC.toUpperCase().charCodeAt(0) - 65;
           if (Array.isArray(q.options) && letterIdx >= 0 && letterIdx < q.options.length) {
             effectiveCorrect = letterIdx;
           }
-        } else {
-          const numC = Number(rawC);
-          if (Number.isInteger(numC)) {
-            effectiveCorrect = numC;
-          }
+        } else if (
+          (typeof rawC === "number" && Number.isInteger(rawC)) ||
+          (typeof rawC === "string" && /^\d+$/.test(rawC))
+        ) {
+          effectiveCorrect = Number(rawC);
         }
       }
 
@@ -349,13 +354,16 @@ function collectRefFibItems(examObj: any): any[] {
 function resolveRefMcCorrectIndex(q: any): number | null {
   if (!q || !Array.isArray(q.options) || q.options.length === 0) return null;
   const raw = q.correctIndex;
-  if (raw === undefined || raw === null || String(raw).trim() === "") return null;
+  if (raw === undefined || raw === null || typeof raw === "boolean" || String(raw).trim() === "") return null;
   if (typeof raw === "string" && /^[a-z]$/i.test(raw.trim())) {
     const idx = raw.trim().toUpperCase().charCodeAt(0) - 65;
     return idx >= 0 && idx < q.options.length ? idx : null;
   }
-  const num = Number(raw);
-  return Number.isInteger(num) && num >= 0 && num < q.options.length ? num : null;
+  if (typeof raw === "number" || (typeof raw === "string" && /^\d+$/.test(raw.trim()))) {
+    const num = Number(raw);
+    return Number.isInteger(num) && num >= 0 && num < q.options.length ? num : null;
+  }
+  return null;
 }
 
 function resolveRefFibAnswer(fib: any): string {

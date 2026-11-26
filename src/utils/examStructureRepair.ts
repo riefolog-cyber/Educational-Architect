@@ -789,10 +789,17 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
               ? (item.options || item.opzioni).map((o: any) => String(o || ""))
               : [];
             const rawCorrectVal = item.correctIndex ?? item.rispostaCorretta ?? item.indiceCorretta;
-            const parsedCIdx =
-              rawCorrectVal !== undefined && rawCorrectVal !== null && String(rawCorrectVal).trim() !== ""
-                ? Number(rawCorrectVal)
-                : NaN;
+            let parsedCIdx = NaN;
+            if (typeof rawCorrectVal === "number" && Number.isInteger(rawCorrectVal)) {
+              parsedCIdx = rawCorrectVal;
+            } else if (typeof rawCorrectVal === "string") {
+              const trimmed = rawCorrectVal.trim();
+              if (/^\d+$/.test(trimmed)) {
+                parsedCIdx = Number(trimmed);
+              } else if (/^[a-z]$/i.test(trimmed)) {
+                parsedCIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+              }
+            }
             const validCIdx =
               Number.isInteger(parsedCIdx) &&
               parsedCIdx >= 0 &&

@@ -1,6 +1,6 @@
-import React from "react";
+import React, { useEffect } from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, isEvaluationPending, getPendingSubjectiveCount, isValidNumericScore, safeParseJson } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, formatMarkdown, isEvaluationPending, getPendingSubjectiveCount, isValidNumericScore, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
@@ -47,6 +47,15 @@ export default function PrintableReportModal({
   blindGradingMode = false,
   deferredSolutionsLocked = false,
 }: PrintableReportModalProps) {
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
+
   if (!isOpen || !submission) return null;
 
   const blindCode = getSubmissionBlindCode(submission);
@@ -93,8 +102,9 @@ export default function PrintableReportModal({
     window.print();
   };
 
-  const formattedDate = submission.Timestamp
-    ? new Date(submission.Timestamp).toLocaleString("it-IT", {
+  const parsedTimestampMs = submission.Timestamp ? Date.parse(submission.Timestamp) : NaN;
+  const formattedDate = Number.isFinite(parsedTimestampMs)
+    ? new Date(parsedTimestampMs).toLocaleString("it-IT", {
         day: "2-digit",
         month: "2-digit",
         year: "numeric",
@@ -102,6 +112,20 @@ export default function PrintableReportModal({
         minute: "2-digit"
       })
     : new Date().toLocaleDateString("it-IT");
+
+  const parsedValidatedMs = submission.Convalida_Docente_At
+    ? Date.parse(submission.Convalida_Docente_At)
+    : NaN;
+  const formattedValidatedDate = Number.isFinite(parsedValidatedMs)
+    ? new Date(parsedValidatedMs).toLocaleString("it-IT")
+    : null;
+
+  const effectiveExamImages: Record<string, string> | undefined =
+    examImages && Object.keys(examImages).length > 0
+      ? examImages
+      : examObj?.images && typeof examObj.images === "object"
+      ? examObj.images
+      : undefined;
 
   const tabSwitches = Number(submission.AntiCopia_TabSwitch) || 0;
   const pasteBlocked = Number(submission.AntiCopia_IncollaBloccato) || 0;
@@ -249,9 +273,20 @@ export default function PrintableReportModal({
                   <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800 flex items-center gap-1.5">
                     <span>📋 Giudizio Didattico Complessivo & Analisi Metacognitiva</span>
                   </h3>
-                  <div className="text-xs text-slate-700 leading-relaxed space-y-1.5">
-                    <p>{evaluationObj?.overallFeedback || evaluationObj?.openEndedEvaluation || submission.Feedback_Generale}</p>
-                  </div>
+                  <div
+                    className="text-xs text-slate-700 leading-relaxed space-y-1.5 [&_strong]:text-slate-900 [&_strong]:font-bold"
+                    dangerouslySetInnerHTML={{
+                      __html: formatMarkdown(
+                        String(
+                          evaluationObj?.overallFeedback ||
+                            evaluationObj?.openEndedEvaluation ||
+                            submission.Feedback_Generale ||
+                            ""
+                        ),
+                        "print"
+                      ),
+                    }}
+                  />
                 </div>
               )}
 
@@ -261,9 +296,15 @@ export default function PrintableReportModal({
                   <h3 className="text-xs font-bold uppercase tracking-wider text-red-900 flex items-center gap-1.5">
                     <span>⚠️ Nodi Concettuali da Consolidare</span>
                   </h3>
-                  <p className="text-xs text-red-950 leading-relaxed">
-                    {evaluationObj?.mainErrors || submission.Errori_Principali}
-                  </p>
+                  <div
+                    className="text-xs text-red-950 leading-relaxed space-y-1 [&_strong]:font-bold"
+                    dangerouslySetInnerHTML={{
+                      __html: formatMarkdown(
+                        String(evaluationObj?.mainErrors || submission.Errori_Principali || ""),
+                        "print"
+                      ),
+                    }}
+                  />
                 </div>
               )}
 
@@ -291,11 +332,20 @@ export default function PrintableReportModal({
                         <p className="text-slate-700 text-[11px] leading-relaxed italic">
                           Risposta: &ldquo;{entry.answer === "[VUOTO]" ? "[Nessuna risposta valida]" : (entry.answer || "Assente")}&rdquo;
                         </p>
-                        <p className="text-slate-700 text-[11px] leading-relaxed">
-                          {hasValidScore
-                            ? entry.detail.feedback
-                            : "Valutazione IA non disponibile: la risposta è stata consegnata e richiede la correzione del docente."}
-                        </p>
+                        {hasValidScore && entry.detail?.feedback ? (
+                          <div
+                            className="text-slate-700 text-[11px] leading-relaxed [&_strong]:text-slate-900 [&_strong]:font-bold"
+                            dangerouslySetInnerHTML={{
+                              __html: formatMarkdown(String(entry.detail.feedback), "print"),
+                            }}
+                          />
+                        ) : (
+                          <p className="text-slate-700 text-[11px] leading-relaxed">
+                            {hasValidScore
+                              ? "Valutazione registrata senza note aggiuntive."
+                              : "Valutazione IA non disponibile: la risposta è stata consegnata e richiede la correzione del docente."}
+                          </p>
+                        )}
                       </div>
                       );
                     })}
@@ -305,13 +355,13 @@ export default function PrintableReportModal({
             </div>
 
             {/* Figure della prova */}
-            {examImages && Object.keys(examImages).length > 0 && (
+            {effectiveExamImages && Object.keys(effectiveExamImages).length > 0 && (
               <div className="space-y-2.5">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
                   Figure della Prova
                 </h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {Object.entries(examImages).map(([qid, src]) => (
+                  {Object.entries(effectiveExamImages).map(([qid, src]) => (
                     <div key={qid} className="border border-slate-200 rounded-xl p-2 bg-white">
                       <img src={src} alt={`Figura ${qid}`} className="max-h-48 w-auto max-w-full object-contain mx-auto" />
                     </div>
@@ -364,7 +414,9 @@ export default function PrintableReportModal({
               </span>
               <span>
                 {submission.Convalida_Docente_At
-                  ? `Convalidato dal docente il ${new Date(submission.Convalida_Docente_At).toLocaleString("it-IT")}`
+                  ? formattedValidatedDate
+                    ? `Convalidato dal docente il ${formattedValidatedDate}`
+                    : "Convalidato ufficialmente dal docente"
                   : "Valutazione IA in attesa di convalida docente"}
               </span>
             </div>

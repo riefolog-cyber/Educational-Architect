@@ -3,10 +3,19 @@
  */
 
 // Simple markup formatter supporting bold (**text**), italics (*text*), backticks (`code`), line breaks, headings, and list bullets
-export function formatMarkdown(text: unknown): string {
+export function formatMarkdown(text: unknown, variant: "dark" | "print" = "dark"): string {
   if (text === null || text === undefined) return "";
   const raw = typeof text === "string" ? text : String(text);
   if (!raw) return "";
+
+  const isPrint = variant === "print";
+  const h4Class = isPrint ? "text-xs font-bold text-indigo-900 mt-2.5 mb-1" : "text-sm font-bold text-indigo-300 mt-3 mb-1";
+  const h3Class = isPrint ? "text-sm font-bold text-indigo-950 mt-3 mb-1" : "text-base font-bold text-indigo-400 mt-4 mb-1.5";
+  const h2Class = isPrint ? "text-base font-bold text-slate-900 mt-3.5 mb-1.5" : "text-lg font-bold text-white mt-5 mb-2";
+  const liClass = isPrint ? "ml-4 list-disc text-slate-800" : "ml-4 list-disc text-slate-200";
+  const codeClass = isPrint
+    ? "font-mono bg-slate-200 px-1 py-0.5 rounded text-slate-900"
+    : "font-mono bg-white/10 px-1 py-0.5 rounded text-teal-300";
 
   // Escape HTML special chars to prevent injection and raw tag confusion
   let formatted = raw
@@ -17,12 +26,12 @@ export function formatMarkdown(text: unknown): string {
     .replace(/'/g, "&#39;");
 
   // Support simple Markdown headers: ### Heading, ## Heading, # Heading
-  formatted = formatted.replace(/^\s*###\s+(.*?)$/gm, "<h4 class='text-sm font-bold text-indigo-300 mt-3 mb-1'>$1</h4>");
-  formatted = formatted.replace(/^\s*##\s+(.*?)$/gm, "<h3 class='text-base font-bold text-indigo-400 mt-4 mb-1.5'>$1</h3>");
-  formatted = formatted.replace(/^\s*#\s+(.*?)$/gm, "<h2 class='text-lg font-bold text-white mt-5 mb-2'>$1</h2>");
+  formatted = formatted.replace(/^\s*###\s+(.*?)$/gm, `<h4 class='${h4Class}'>$1</h4>`);
+  formatted = formatted.replace(/^\s*##\s+(.*?)$/gm, `<h3 class='${h3Class}'>$1</h3>`);
+  formatted = formatted.replace(/^\s*#\s+(.*?)$/gm, `<h2 class='${h2Class}'>$1</h2>`);
 
   // Bullet points BEFORE italics so lines starting with `* item` are never mangled into <em>
-  formatted = formatted.replace(/^\s*[-*]\s+(.*?)$/gm, "<li class='ml-4 list-disc text-slate-200'>$1</li>");
+  formatted = formatted.replace(/^\s*[-*]\s+(.*?)$/gm, `<li class='${liClass}'>$1</li>`);
 
   // Bold
   formatted = formatted.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>");
@@ -31,7 +40,7 @@ export function formatMarkdown(text: unknown): string {
   formatted = formatted.replace(/\*(.*?)\*/g, "<em>$1</em>");
 
   // Code backticks
-  formatted = formatted.replace(/`(.*?)`/g, "<code class='font-mono bg-white/10 px-1 py-0.5 rounded text-teal-300'>$1</code>");
+  formatted = formatted.replace(/`(.*?)`/g, `<code class='${codeClass}'>$1</code>`);
 
   // Line breaks
   formatted = formatted.replace(/\n/g, "<br />");
@@ -47,11 +56,22 @@ export function detectGibberish(str: string | undefined): boolean {
 
   // Clean punctuation but PRESERVE SPACES
   const cleanWithSpaces = t.replace(/[.,/#!$%^&*;:{}=\-_`~()?\\/|<>@+='"\s]/g, (match) => /\s/.test(match) ? " " : "").replace(/\s+/g, " ").trim();
-  if (!cleanWithSpaces || cleanWithSpaces.length <= 1) return true;
+  if (!cleanWithSpaces) return true;
 
-  // Check letters
+  // Check letters vs legitimate numeric/date/fraction/percentage answers (e.g. "1789", "42", "3,14", "-5", "2/3", "100%", "0")
   const lettersOnly = cleanWithSpaces.replace(/[^a-zàèéìòù]/gi, "");
-  if (lettersOnly.length === 0) return true;
+  if (lettersOnly.length === 0) {
+    const numericCompact = t.replace(/\s+/g, "");
+    const digitsOnly = numericCompact.replace(/\D/g, "");
+    const looksValidNumeric =
+      /^[+-]?\d+(?:[.,:/-]\d+)*%?$/.test(numericCompact) &&
+      digitsOnly.length >= 1 &&
+      digitsOnly.length <= 20 &&
+      !/^(\d)\1{5,}$/.test(digitsOnly);
+    return !looksValidNumeric;
+  }
+
+  if (cleanWithSpaces.length <= 1) return true;
 
   // Pattern for giving up easily (surrender)
   const rinuncePattern = /^(?:(?:no(n)?|nn)\s*(?:lo\s*)?so|boh+|bho+|bo+|(?:no(n)?|nn)\s*saprei|(?:no(n)?|nn)\s*(?:mi\s*)?ricordo|niente|nessuna|(?:no(n)?|nn)\s*h?o\s*studiato|(?:no(n)?|nn)\s*(?:l')?h?o\s*capit[oa]|(?:no(n)?|nn)\s*capisco|(?:no(n)?|nn)\s*h?o\s*idea|(?:no(n)?|nn)\s*ne\s*ho\s*idea|non\s*saprei\s*proprio|ma\s*che\s*ne\s*so|boh|non\s*lo\s*so\s*proprio|mi\s*sa\s*di\s*cavolata|non\s*serve\s*a\s*niente|non\s*so\s*nulla)$/i;
@@ -607,7 +627,7 @@ export function computeGradeBreakdown(params: {
     const oeItems = buildSubjective(
       oeList,
       oeEvalList,
-      (d) => d.questionId,
+      (d) => d?.questionId ?? d?.id,
       (n) => `Domanda Aperta ${n}`
     );
     oeItems.forEach((item) => {
@@ -645,7 +665,7 @@ export function computeGradeBreakdown(params: {
     const rqItems = buildSubjective(
       rqList,
       rqEvalList,
-      (d) => d.id,
+      (d) => d?.id ?? d?.questionId,
       (n) => `Riflessione ${n}`
     );
     rqItems.forEach((item) => {
@@ -1013,6 +1033,16 @@ function parseNumericScore(value: unknown): number {
   return Number(String(value).trim().replace(",", "."));
 }
 
+/**
+ * Normalizes an AI/teacher open-answer score into the valid Italian 0..10 scale
+ * snapped to half-point increments (e.g. 5.5, 6, 6.5, 7.5).
+ */
+export function snapHalfPointScore(value: unknown): number {
+  if (!isValidNumericScore(value)) return 0;
+  const clamped = Math.min(10, Math.max(0, parseNumericScore(value)));
+  return Math.round(clamped * 2) / 2;
+}
+
 export function auditSubjectiveEvaluation(params: {
   questions: any[];
   details: any[];
@@ -1088,10 +1118,17 @@ export interface McSelectionEvaluation {
 export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEvaluation {
   const options = Array.isArray(q?.options) ? q.options : [];
   const rawCorrect = q?.correctIndex;
-  const correctIsBlank =
-    (typeof rawCorrect !== "number" && typeof rawCorrect !== "string") ||
-    (typeof rawCorrect === "string" && rawCorrect.trim() === "");
-  const correctIdx = correctIsBlank ? NaN : Number(rawCorrect);
+  let correctIdx = NaN;
+  if (typeof rawCorrect === "number") {
+    correctIdx = rawCorrect;
+  } else if (typeof rawCorrect === "string") {
+    const trimmed = rawCorrect.trim();
+    if (/^\d+$/.test(trimmed)) {
+      correctIdx = Number(trimmed);
+    } else if (/^[A-Za-z]$/.test(trimmed)) {
+      correctIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+    }
+  }
   const hasCorrectKey = Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length;
   const correctText = hasCorrectKey ? String(options[correctIdx] ?? "") : "";
 

@@ -133,6 +133,7 @@
         "examJson": { "type": "string" },
         "source": { "type": "string" },
         "questionCount": { "type": "integer" },
+        "sharedCode": { "type": "string", "maxLength": 16 },
         "createdAt": { "type": "string" },
         "updatedAt": { "type": "string" }
       },

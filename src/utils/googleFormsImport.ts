@@ -533,9 +533,12 @@ function buildWorkbook(rows: ParsedRow[], title: string): {
     const resolvedFibAnswer = (row.answer || bracketAnswer).trim();
     if (row.kind === "fib" && resolvedFibAnswer) {
       blanks++;
+      const sanitizedSentence = bracketAnswer
+        ? cleanedQuestion.replace(/\[([^\]]+)\]/g, "________")
+        : cleanedQuestion;
       const item: Record<string, unknown> = {
         id: `gf_fib_${blanks}`,
-        sentence: cleanedQuestion,
+        sentence: sanitizedSentence,
         answer: resolvedFibAnswer,
       };
       if (row.weight && row.weight !== 1) item.weight = row.weight;

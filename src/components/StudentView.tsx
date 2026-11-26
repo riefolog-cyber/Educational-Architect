@@ -3352,12 +3352,35 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         const statusUrl = currentJobToken
           ? `/api/evaluate/status/${encodeURIComponent(currentJobId)}?token=${encodeURIComponent(currentJobToken)}`
           : `/api/evaluate/status/${encodeURIComponent(currentJobId)}`;
-        const statusResp = await fetchWithRetry(
-          statusUrl,
-          currentJobToken ? { headers: { "x-job-token": currentJobToken } } : {},
-          3,
-          1000
-        );
+        // Retry ONLY transient network / 502-504 proxy blips; return 404/403 responses
+        // directly so the 404 server-restart auto-reenqueue path below actually runs!
+        let statusResp: Response | null = null;
+        let pollFetchErr: any = null;
+        for (let rTry = 0; rTry < 3; rTry++) {
+          try {
+            const resp = await fetch(
+              statusUrl,
+              currentJobToken ? { headers: { "x-job-token": currentJobToken } } : {}
+            );
+            if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
+              pollFetchErr = new Error(`Servizio temporaneamente non raggiungibile (HTTP ${resp.status})`);
+              if (rTry < 2) {
+                await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+                continue;
+              }
+            }
+            statusResp = resp;
+            break;
+          } catch (netErr) {
+            pollFetchErr = netErr;
+            if (rTry < 2) {
+              await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+            }
+          }
+        }
+        if (!statusResp) {
+          throw pollFetchErr || new Error("Errore di rete durante la verifica dello stato della correzione.");
+        }
         if (!statusResp.ok) {
           if (statusResp.status === 404 && rescue.payload && reenqueues < MAX_REENQUEUES) {
             // Job lost (server restarted): re-enqueue the same payload automatically
