@@ -55,7 +55,8 @@ export function normalizeQuestionImage(value: unknown): string {
   if (typeof value !== "string") return "";
   const src = value.trim();
   if (!src) return "";
-  if (/^data:image\/[a-z0-9.+-]+;base64,[a-z0-9+/=\s]+$/i.test(src)) {
+  // Allow only safe raster data URLs (never SVG, which can embed scripts/event handlers).
+  if (/^data:image\/(png|jpe?g|webp|gif|avif);base64,[a-z0-9+/=\s]+$/i.test(src)) {
     return src.length <= MAX_IMAGE_CHARS ? src : "";
   }
   if (/^https:\/\/[^\s"'<>]+$/i.test(src)) return src;
@@ -117,14 +118,18 @@ export function buildFormViewUrl(input: string): string {
   const host = parsed.hostname.toLowerCase();
   if (!ALLOWED_FORM_HOSTS.includes(host)) throw new Error(FORM_LINK_ERROR);
 
-  if (host === "forms.gle") return parsed.toString();
+  if (host === "forms.gle") {
+    const cleanPath = parsed.pathname.replace(/\/+$/, "");
+    if (!cleanPath || cleanPath === "/") throw new Error(FORM_LINK_ERROR);
+    return `https://forms.gle${cleanPath}`;
+  }
 
   const path = parsed.pathname;
-  const published = /^\/forms\/d\/e\/([A-Za-z0-9_-]{10,})\//.exec(path);
+  const published = /^\/forms\/d\/e\/([A-Za-z0-9_-]{10,})(?:\/|$)/.exec(path);
   if (published) {
     return `https://docs.google.com/forms/d/e/${published[1]}/viewform`;
   }
-  const direct = /^\/forms\/d\/([A-Za-z0-9_-]{10,})\//.exec(path);
+  const direct = /^\/forms\/d\/([A-Za-z0-9_-]{10,})(?:\/|$)/.exec(path);
   if (direct) {
     return `https://docs.google.com/forms/d/${direct[1]}/viewform`;
   }
@@ -134,21 +139,37 @@ export function buildFormViewUrl(input: string): string {
 
 /** Extracts the form id from any docs.google.com/forms/... URL (published or direct). */
 export function extractFormIdFromUrl(url: string): string | null {
-  const match = /\/forms\/(?:d\/e\/|d\/)([A-Za-z0-9_-]{10,})\//.exec(url || "");
+  const match = /\/forms\/(?:d\/e\/|d\/)([A-Za-z0-9_-]{10,})(?:\/|$|\?|#)/.exec(url || "");
   return match ? match[1] : null;
 }
 
 /** A deployed Apps Script Web App endpoint (exec or dev deployment). Accepts
- *  the "/u/<n>/path segment Google adds when the URL is copied while logged in. */
-const APPS_SCRIPT_EXEC_RE = /\/macros\/(?:u\/\d+\/)?s\/[A-Za-z0-9_-]+\/(?:exec|dev)(?:\/|\?.*)?$/;
+ *  the "/u/<n>/" path segment Google adds when the URL is copied while logged in. */
+const APPS_SCRIPT_EXEC_PATH_RE = /^\/macros\/(?:u\/\d+\/)?s\/[A-Za-z0-9_-]+\/(?:exec|dev)\/?$/;
 
 /** Validates and cleans the Web App URL the teacher pasted; null when unusable. */
 export function normalizeAppsScriptExecUrl(raw: string): string | null {
   const url = (raw || "").trim();
-  if (!/^https:\/\/script\.google\.com/.test(url) || !APPS_SCRIPT_EXEC_RE.test(url)) return null;
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  if (
+    parsed.protocol !== "https:" ||
+    parsed.hostname.toLowerCase() !== "script.google.com" ||
+    parsed.port !== "" ||
+    parsed.username !== "" ||
+    parsed.password !== ""
+  ) {
+    return null;
+  }
+  if (!APPS_SCRIPT_EXEC_PATH_RE.test(parsed.pathname)) return null;
   // Canonical form (no /u/N/, no query): reachable by anyone, no account bias.
-  const canonical = "https://script.google.com" + url.slice(url.indexOf("/macros/")).replace(/\/u\/\d+\//, "/");
-  return canonical.split("?")[0].split("#")[0].replace(/\/$/, "");
+  const canonicalPath = parsed.pathname.replace(/\/u\/\d+\//, "/").replace(/\/$/, "");
+  return `https://script.google.com${canonicalPath}`;
 }
 
 /** Normalized, punctuation-free matching key ("Qual è la capitale?" -> "qualelacapitale"). */
@@ -208,6 +229,15 @@ const NAMED_ENTITIES: Record<string, string> = {
   nbsp: " ",
 };
 
+function safeCodePoint(code: number): string {
+  if (!Number.isInteger(code) || code < 32 || code > 0x10ffff) return " ";
+  try {
+    return String.fromCodePoint(code);
+  } catch {
+    return " ";
+  }
+}
+
 export function cleanFormText(value: unknown): string {
   if (typeof value !== "string" || !value) return "";
   return value
@@ -215,8 +245,8 @@ export function cleanFormText(value: unknown): string {
     .replace(/<[^>]*>/g, " ")
     .replace(/&(#x?[0-9a-f]+|[a-z]+);/gi, (_, token: string) => {
       const key = token.toLowerCase();
-      if (key.startsWith("#x")) return String.fromCodePoint(parseInt(key.slice(2), 16) || 32);
-      if (key.startsWith("#")) return String.fromCodePoint(parseInt(key.slice(1), 10) || 32);
+      if (key.startsWith("#x")) return safeCodePoint(parseInt(key.slice(2), 16));
+      if (key.startsWith("#")) return safeCodePoint(parseInt(key.slice(1), 10));
       return NAMED_ENTITIES[key] ?? `&${token};`;
     })
     .replace(/\s+/g, " ")
@@ -249,13 +279,13 @@ function collectImageUrls(value: unknown, found: string[]): void {
   if (typeof value === "string") {
     const s = value.trim();
     if (!s) return;
-    if (/^data:image\/[a-z0-9.+-]+;base64,/i.test(s)) {
+    if (/^data:image\/(png|jpe?g|webp|gif|avif);base64,/i.test(s)) {
       if (!found.includes(s)) found.push(s);
       return;
     }
     if (/^https?:\/\/[^"\s<>]+$/i.test(s)) {
       const looksLikeImage =
-        /\.(png|jpe?g|gif|webp|svg)(\?|#|$)/i.test(s) ||
+        /\.(png|jpe?g|gif|webp|avif)(\?|#|$)/i.test(s) ||
         /googleusercontent|ggpht|forms\.google.*image/i.test(s);
       if (looksLikeImage && !found.includes(s)) found.push(s);
     }
@@ -438,6 +468,10 @@ export function parseFormsApiForm(apiForm: unknown): {
     let correctValues: string[] | undefined;
     let kindHint: "mc" | "open" = "open";
 
+    const answerValues = Array.isArray(grading.correctAnswers && grading.correctAnswers.answers)
+      ? grading.correctAnswers.answers.map((a: any) => cleanFormText(a && a.value)).filter(Boolean)
+      : [];
+
     if (Array.isArray(optionRaw)) {
       // Track the correct flag on the unfiltered list, then drop empty labels.
       const known = optionRaw
@@ -445,18 +479,31 @@ export function parseFormsApiForm(apiForm: unknown): {
         .filter((o: { text: string; correct: boolean }) => o.text);
       options = known.map((o: { text: string }) => o.text);
       kindHint = "mc";
-      const firstCorrect = known.findIndex((o: { correct: boolean }) => o.correct);
+      let firstCorrect = known.findIndex((o: { correct: boolean }) => o.correct);
+      let allCorrect = known.filter((o: { correct: boolean }) => o.correct).map((o: { text: string }) => o.text);
+
+      // Google Forms API v1 stores quiz keys inside grading.correctAnswers.answers[].value
+      if (firstCorrect < 0 && answerValues.length > 0) {
+        const normalizedAnswers = new Set(answerValues.map((a: string) => a.toLowerCase()));
+        const matchedIndices: number[] = [];
+        options.forEach((optText, optIdx) => {
+          if (normalizedAnswers.has(optText.toLowerCase())) {
+            matchedIndices.push(optIdx);
+          }
+        });
+        if (matchedIndices.length > 0) {
+          firstCorrect = matchedIndices[0];
+          allCorrect = matchedIndices.map((optIdx) => options[optIdx]);
+        }
+      }
+
       if (firstCorrect >= 0) {
         correctIndex = firstCorrect;
-        if (known.filter((o: { correct: boolean }) => o.correct).length > 1) {
-          correctValues = known.filter((o: { correct: boolean; text: string }) => o.correct).map((o) => o.text);
+        if (allCorrect.length > 1) {
+          correctValues = allCorrect;
         }
       }
     }
-
-    const answerValues = Array.isArray(grading.correctAnswers && grading.correctAnswers.answers)
-      ? grading.correctAnswers.answers.map((a: any) => cleanFormText(a && a.value)).filter(Boolean)
-      : [];
 
     items.push({
       id: String(item.itemId ?? `api_${index}`),
@@ -619,7 +666,7 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
 }
 
 function optionLetter(index: number): string {
-  return String.fromCharCode(65 + index);
+  return index >= 0 && index < 26 ? String.fromCharCode(65 + index) : String(index + 1);
 }
 
 /**

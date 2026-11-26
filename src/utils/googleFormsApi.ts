@@ -14,6 +14,7 @@
 
 import {
   cleanFormText,
+  normalizeQuestionImage,
   type LinkedFormPayload,
   type LinkedFormQuestion,
   type LinkedQuestionKind,
@@ -55,7 +56,7 @@ function gradingOf(question: any): { points?: number; expected?: string; answers
 function imageOf(image: any, resolve?: FormsImageResolver): string | undefined {
   const uri = typeof image?.contentUri === "string" ? image.contentUri.trim() : "";
   if (!uri || !resolve) return undefined;
-  const src = resolve(uri);
+  const src = normalizeQuestionImage(resolve(uri));
   return src && src.startsWith("data:image/") ? src : undefined;
 }
 
@@ -126,6 +127,10 @@ export function buildLinkedFormFromApi(
       if (usedIds.has(id)) id = `${id}_${index}`;
       usedIds.add(id);
 
+      const groupOwnImage = imageOf(group?.image, resolveImage);
+      const gridImage = groupOwnImage || pendingImage;
+      if (!groupOwnImage && pendingImage) pendingImage = undefined;
+
       questions.push({
         id,
         kind: "grid",
@@ -133,6 +138,7 @@ export function buildLinkedFormFromApi(
         options: columns,
         required,
         ...(section ? { section } : {}),
+        ...(gridImage ? { image: gridImage } : {}),
         note: rows.length
           ? `Domanda a griglia: righe del modulo → ${rows.join(" · ")}. La valutazione confronta ogni riga con la risposta dello studente.`
           : "Domanda a griglia: la valutazione confronta la risposta con le righe e le colonne del modulo.",

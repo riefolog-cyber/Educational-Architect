@@ -340,8 +340,8 @@ service cloud.firestore {
       allow get: if isTeacher() && isValidId(shareCode);
       allow list: if isTeacher() && (isPrimaryTeacher() || resource.data.teacherEmail == request.auth.token.email);
       allow create: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming());
-      allow update: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming()) && (isPrimaryTeacher() || existing().teacherEmail == request.auth.token.email);
-      allow delete: if isValidId(shareCode) && (isPrimaryTeacher() || (isTeacher() && existing().teacherEmail == request.auth.token.email));
+      allow update: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming()) && (isPrimaryTeacher() || (existing().teacherEmail is string && existing().teacherEmail.lower() == request.auth.token.email.lower()));
+      allow delete: if isValidId(shareCode) && (isPrimaryTeacher() || (isTeacher() && existing().teacherEmail is string && existing().teacherEmail.lower() == request.auth.token.email.lower()));
     }
 
     // Collection for exam submissions and evaluations
@@ -386,7 +386,7 @@ service cloud.firestore {
         allow delete: if isTeacher() && isValidId(sessionId) && isValidId(studentId) && (
           isPrimaryTeacher() ||
           !exists(/databases/$(database)/documents/active_sessions/$(sessionId)) ||
-          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.teacherEmail.lower() == request.auth.token.email.lower()
+          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.get('teacherEmail', '').lower() == request.auth.token.email.lower()
         );
       }
     }

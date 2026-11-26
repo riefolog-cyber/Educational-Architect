@@ -8,6 +8,8 @@ import {
   signOut
 } from "firebase/auth";
 import { 
+  doc,
+  getDoc,
   getDocs, 
   query, 
   collection, 
@@ -33,7 +35,16 @@ import {
 import { motion, AnimatePresence } from "motion/react";
 import { auth, googleProvider, dbFirestore } from "./firebase";
 import { normalizeClassLabel } from "./utils/classGrouping";
-import { saveScopedStudentClass, loadScopedStudentClass, isSharedPcSessionActive, setSharedPcSessionActive } from "./utils/clientStorage";
+import {
+  saveScopedStudentClass,
+  loadScopedStudentClass,
+  isSharedPcSessionActive,
+  setSharedPcSessionActive,
+  wipeSharedPcStudentStorage,
+  validateDirectStudentEmail,
+} from "./utils/clientStorage";
+import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
+import { isAppleMobile } from "./utils";
 // Helper to retry failed dynamic module imports (e.g. transient dev-proxy / stale Vite dep cache)
 function isChunkOrModuleFetchError(err: unknown): boolean {
   const msg = String((err as any)?.message || err || "").toLowerCase();
@@ -87,9 +98,6 @@ function lazyWithRetry<T extends React.ComponentType<any>>(
 // Code splitting: students load only the student bundle, teachers only the (much larger) dashboard bundle.
 const StudentView = lazyWithRetry(() => import("./components/StudentView"), "student");
 const TeacherDashboard = lazyWithRetry(() => import("./components/TeacherDashboard"), "teacher");
-import { PrivacyInfoModal, PrivacyBannerBox } from "./components/PrivacyInfoModal";
-import { isAppleMobile } from "./utils";
-import { wipeSharedPcStudentStorage } from "./utils/clientStorage";
 
 // Helper to detect if user opened the link inside an in-app browser (WebView like WhatsApp, Classroom, etc.)
 function checkIsInAppBrowser(): boolean {
@@ -245,32 +253,77 @@ export default function App() {
 
     if (isHardcodedTeacher) {
       setRole("admin");
+      setRoleError("");
       return;
     }
 
     // Default to student immediately so UI is responsive
     setRole("student");
+    setRoleError("");
 
-    // 2. Background check if teacher is listed in Firestore "docenti"
+    // 2. Background check if teacher is listed in Firestore "docenti" (case-insensitive)
     if (dbFirestore && currentUser?.email) {
       setRoleChecking(true);
       try {
-        const docentiCollectionRef = collection(dbFirestore, "docenti");
-        const q = query(
-          docentiCollectionRef, 
-          where("email", "==", currentUser.email)
-        );
-        const querySnapshot = await getDocs(q);
-        if (!querySnapshot.empty && querySnapshot.docs[0].data().role === "admin") {
+        const normalizedEmail = currentUser.email.trim().toLowerCase();
+        let isAuthorizedTeacher = false;
+
+        const directIds = Array.from(new Set([normalizedEmail, String(currentUser.uid || "").trim()].filter(Boolean)));
+        for (const docId of directIds) {
+          try {
+            const snap = await getDoc(doc(dbFirestore, "docenti", docId));
+            if (snap.exists() && snap.data()?.role === "admin") {
+              isAuthorizedTeacher = true;
+              break;
+            }
+          } catch {
+            // Fall through to query check
+          }
+        }
+
+        if (!isAuthorizedTeacher) {
+          const docentiCollectionRef = collection(dbFirestore, "docenti");
+          const candidates = Array.from(new Set([currentUser.email, normalizedEmail]));
+          for (const emailCandidate of candidates) {
+            const q = query(docentiCollectionRef, where("email", "==", emailCandidate));
+            const querySnapshot = await getDocs(q);
+            if (!querySnapshot.empty && querySnapshot.docs.some((d) => d.data()?.role === "admin")) {
+              isAuthorizedTeacher = true;
+              break;
+            }
+          }
+        }
+
+        if (isAuthorizedTeacher) {
           setRole("admin");
         }
       } catch (e: any) {
         console.warn("Verifica ruolo docente secondario:", e);
+        setRoleError("Verifica temporaneamente non riuscita: se sei un docente abilitato, ricarica la pagina.");
       } finally {
         setRoleChecking(false);
       }
     }
   };
+
+  // Keep activePane aligned with auth & role (prevents stale teacher/student mounts after sign-out or role change)
+  useEffect(() => {
+    if (!user && activePane !== "home") {
+      setActivePane("home");
+    } else if (activePane === "teacher" && role !== "admin") {
+      setActivePane("home");
+    }
+  }, [user, role, activePane]);
+
+  // Close Google Workspace troubleshooting modal with Escape key
+  useEffect(() => {
+    if (!showWorkspaceHelp) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") setShowWorkspaceHelp(false);
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [showWorkspaceHelp]);
 
   // Auth changed listener with redirect support & direct session recovery
   useEffect(() => {
@@ -288,6 +341,7 @@ export default function App() {
         if (parsed?.email) {
           hasSavedDirect = true;
           setUser(parsed);
+          setGoogleStudentClass(normalizeClassLabel(parsed.studentClass));
           setRole("student");
           setAuthLoading(false);
           clearTimeout(safetyTimer);
@@ -463,28 +517,12 @@ export default function App() {
       return;
     }
 
-    // Auto-complete domain if student typed username only (e.g. marco.rossi)
-    if (!email.includes("@")) {
-      email = `${email}@ferrarisfermiclass.it`;
-    }
-
-    if (!email.includes(".") || email.length < 5) {
-      setDirectError("Inserisci un indirizzo email valido (es. nome.cognome@ferrarisfermiclass.it).");
+    const emailCheck = validateDirectStudentEmail(email);
+    if ("error" in emailCheck) {
+      setDirectError(emailCheck.error);
       return;
     }
-
-    // Must be school domain or valid educational/student email
-    const isSchoolOrEdu = 
-      email.endsWith("@ferrarisfermiclass.it") || 
-      email.endsWith("@ferrarisfermi.edu.it") ||
-      email.endsWith(".edu.it") ||
-      email.endsWith(".it") ||
-      email.endsWith("@gmail.com");
-
-    if (!isSchoolOrEdu) {
-      setDirectError("Inserisci l'indirizzo email istituzionale (@ferrarisfermiclass.it).");
-      return;
-    }
+    email = emailCheck.email;
 
     const studentUser = {
       displayName: `${nome} ${cognome} (${classe})`,
@@ -530,6 +568,14 @@ export default function App() {
 
   const handleSignOut = async () => {
     wipeSharedPcStudentStorage();
+    setSharedPcMode(false);
+    setDirectName("");
+    setDirectSurname("");
+    setDirectClass("");
+    setDirectEmail("");
+    setDirectError("");
+    setAuthError("");
+    setRoleError("");
 
     if (auth) {
       try {
@@ -798,8 +844,24 @@ export default function App() {
                               <button
                                 type="button"
                                 onClick={() => {
-                                  const prefix = directEmail.split("@")[0].trim();
-                                  setDirectEmail(prefix ? `${prefix}@ferrarisfermiclass.it` : "@ferrarisfermiclass.it");
+                                  const rawPrefix = directEmail.split("@")[0].replace(/\s+/g, "").toLowerCase();
+                                  if (rawPrefix) {
+                                    setDirectEmail(`${rawPrefix}@ferrarisfermiclass.it`);
+                                    return;
+                                  }
+                                  const slug = (s: string) =>
+                                    s
+                                      .normalize("NFD")
+                                      .replace(/[\u0300-\u036f]/g, "")
+                                      .toLowerCase()
+                                      .replace(/[^a-z0-9]/g, "");
+                                  const n = slug(directName);
+                                  const c = slug(directSurname);
+                                  if (n && c) {
+                                    setDirectEmail(`${n}.${c}@ferrarisfermiclass.it`);
+                                  } else {
+                                    setDirectError("Scrivi prima il tuo nome utente o compila Nome e Cognome, poi clicca il dominio.");
+                                  }
                                 }}
                                 className="px-2.5 py-1 bg-teal-500/10 hover:bg-teal-500/20 text-teal-300 font-mono text-[10px] rounded-lg border border-teal-500/30 transition-colors cursor-pointer flex items-center gap-1"
                               >
@@ -1061,7 +1123,7 @@ export default function App() {
               )}
 
               {/* Context B: Active Student test workspace */}
-              {activePane === "student" && (
+              {activePane === "student" && user && (
                 <motion.div
                   key="student"
                   initial={{ opacity: 0, y: 10 }}
@@ -1085,7 +1147,7 @@ export default function App() {
               )}
 
               {/* Context C: Teacher controls database cockpit */}
-              {activePane === "teacher" && (
+              {activePane === "teacher" && user && role === "admin" && (
                 <motion.div
                   key="teacher"
                   initial={{ opacity: 0, y: 10 }}
@@ -1110,7 +1172,7 @@ export default function App() {
       </div>
 
       <footer className="text-center text-[10px] text-slate-600 mt-10 tracking-wide select-none">
-        Educational Architect Platform &bull; Made with AI Studio Build
+        Educational Architect Platform
       </footer>
 
       {/* Privacy & Blind Grading Explanatory Modal */}
@@ -1121,8 +1183,17 @@ export default function App() {
 
       {/* Google Workspace & Domain Troubleshooting Modal */}
       {showWorkspaceHelp && (
-        <div className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto">
-          <div className="bg-slate-900 border border-white/10 rounded-3xl max-w-xl w-full p-6 sm:p-8 space-y-5 text-left text-slate-200 text-xs shadow-2xl relative my-8">
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label="Diagnostica accesso dominio scolastico"
+          onClick={() => setShowWorkspaceHelp(false)}
+          className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto"
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            className="bg-slate-900 border border-white/10 rounded-3xl max-w-xl w-full p-6 sm:p-8 space-y-5 text-left text-slate-200 text-xs shadow-2xl relative my-8"
+          >
             <div className="flex items-start justify-between gap-3 border-b border-white/10 pb-4">
               <div className="flex items-center gap-3">
                 <div className="p-2.5 bg-teal-500/10 border border-teal-500/20 text-teal-400 rounded-2xl shrink-0">

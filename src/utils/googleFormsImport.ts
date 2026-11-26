@@ -159,13 +159,13 @@ function mapHeaderCell(raw: string): ColumnKey | null {
     return "criteria";
   }
 
-  const opt = /^(?:opzione|opzion|option|opt|scelta|choice|alternativa|risposta)([a-h]|[1-9])$/.exec(c);
+  const opt = /^(?:opzione|opzion|option|opt|scelta|choice|alternativa|risposta)([a-z]|[1-9]\d?)$/.exec(c);
   if (opt) {
     const token = opt[1];
-    const idx = /^[1-9]$/.test(token) ? parseInt(token, 10) - 1 : token.charCodeAt(0) - 97;
-    return `opt:${idx}` as ColumnKey;
+    const idx = /^\d+$/.test(token) ? parseInt(token, 10) - 1 : token.charCodeAt(0) - 97;
+    if (idx >= 0 && idx < 26) return `opt:${idx}` as ColumnKey;
   }
-  const single = /^([a-h])$/.exec(c);
+  const single = /^([a-z])$/.exec(c);
   if (single) return `opt:${single[1].charCodeAt(0) - 97}` as ColumnKey;
 
   return null;
@@ -207,7 +207,7 @@ function resolveOptionIndex(options: string[], rawAnswer: string): number {
 
   // 2. Explicit letter shorthand: "A", "B)", "C.", "D - testo", "Opzione B"
   const letters =
-    /^(?:(?:opzione|option|risposta|answer)\s+([a-h])(?:\s*$|[).:\-\s].*)|([a-h])(?:\s*$|\s*[).:\-].*))$/i.exec(
+    /^(?:(?:opzione|option|risposta|answer)\s+([a-z])(?:\s*$|[).:\-\s].*)|([a-z])(?:\s*$|\s*[).:\-].*))$/i.exec(
       raw
     );
   if (letters) {
@@ -216,9 +216,9 @@ function resolveOptionIndex(options: string[], rawAnswer: string): number {
     if (idx >= 0 && idx < options.length) return idx;
   }
 
-  // 3. Explicit 1-based digit shorthand: "1", "2)", "3.", "4 - testo", "Opzione 2"
+  // 3. Explicit 1-based digit shorthand: "1", "2)", "3.", "10 - testo", "Opzione 2"
   const digits =
-    /^(?:(?:opzione|option|risposta|answer)\s+([1-9])(?:\s*$|[).:\-\s].*)|([1-9])(?:\s*$|\s*[).:\-].*))$/i.exec(
+    /^(?:(?:opzione|option|risposta|answer)\s+([1-9]\d?)(?:\s*$|[).:\-\s].*)|([1-9]\d?)(?:\s*$|\s*[).:\-].*))$/i.exec(
       raw
     );
   if (digits) {
@@ -317,7 +317,7 @@ const MARKDOWN_SECTION_RE = /^#{1,6}\s+(.+)$/;
 const QUESTION_RE = /^(\d{1,3})\s*[.)\-–]\s*(.+)$/;
 const LABELLED_QUESTION_RE = /^(?:domanda|question|quesito)\s*\d*\s*[:.)\-–]\s*(.+)$/i;
 const CORRECT_RE = /^(?:risposta\s+corretta|risposta\s+esatta|risposta\s+giusta|correct\s+answer|answer|corretta|soluzione|chiave)\s*[:\-=]\s*(.+)$/i;
-const OPTION_LETTER_RE = /^([A-Ha-h])\s*[).\-–]\s+(.+)$/;
+const OPTION_LETTER_RE = /^([A-Za-z])\s*[).\-–]\s+(.+)$/;
 const OPTION_BULLET_RE = /^[-•·*]\s+(.+)$/;
 const OPTION_GLYPH_RE = /^[\u2610\u2611\u25a1\u25a0\u25cb\u25cf\u2b1c\u2705\u2713]\s*(.+)$/;
 
@@ -358,7 +358,9 @@ function rowsFromPaste(text: string, warnings: string[]): ParsedRow[] {
     }
     if (current.options.length > 0 && !current.answer) {
       const marked = current.markedOption;
-      if (marked !== undefined && marked >= 0) current.answer = String.fromCharCode(65 + marked);
+      if (marked !== undefined && marked >= 0 && marked < current.options.length) {
+        current.answer = current.options[marked] || (marked < 26 ? String.fromCharCode(65 + marked) : String(marked + 1));
+      }
     }
     rows.push(current);
     current = null;

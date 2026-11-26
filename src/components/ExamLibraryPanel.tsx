@@ -107,6 +107,12 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
   const copyTimerRef = useRef<number | null>(null);
 
   useEffect(() => {
+    if (renamingLibraryId) {
+      setConfirmDeleteLibraryId(null);
+    }
+  }, [renamingLibraryId]);
+
+  useEffect(() => {
     return () => {
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
@@ -129,6 +135,7 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
   };
 
   const handleShareClick = async (item: ExamLibraryItem) => {
+    if (sharingItemId) return;
     setSharingItemId(item.id);
     try {
       const code = await onShareItem(item);
@@ -141,9 +148,11 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
     }
   };
 
+  const normalizedShareCodeLen = shareCodeInput.replace(/[^A-Za-z0-9]/g, "").length;
+
   const handleSubmitShareCode = async (e: React.FormEvent) => {
     e.preventDefault();
-    if (!shareCodeInput.trim() || importingCode) return;
+    if (normalizedShareCodeLen < 6 || importingCode) return;
     setImportingCode(true);
     try {
       await onImportByShareCode(shareCodeInput.trim());
@@ -262,7 +271,7 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
           <div className="flex items-center gap-1.5">
             <button
               type="submit"
-              disabled={importingCode || shareCodeInput.trim().length < 6}
+              disabled={importingCode || normalizedShareCodeLen < 6}
               className="px-3 py-1.5 text-[11px] font-semibold bg-indigo-500 hover:bg-indigo-400 text-white rounded-lg cursor-pointer transition-colors disabled:opacity-50 whitespace-nowrap"
             >
               {importingCode ? "Importazione..." : "Importa nella libreria"}
@@ -494,7 +503,7 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                         <button
                           type="button"
                           onClick={() => handleShareClick(item)}
-                          disabled={sharingItemId === item.id}
+                          disabled={!!sharingItemId}
                           title={`Condividi "${item.title}" con un collega tramite codice`}
                           className="p-1.5 text-slate-400 hover:text-indigo-300 hover:bg-indigo-500/10 rounded-lg cursor-pointer transition-colors shrink-0 disabled:opacity-50"
                         >
@@ -506,7 +515,10 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                         </button>
                         <button
                           type="button"
-                          onClick={() => onStartRename(item)}
+                          onClick={() => {
+                            setConfirmDeleteLibraryId(null);
+                            onStartRename(item);
+                          }}
                           title={`Rinomina "${item.title}"`}
                           className="p-1.5 text-slate-400 hover:text-teal-300 hover:bg-white/5 rounded-lg cursor-pointer transition-colors shrink-0"
                         >
@@ -527,6 +539,12 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                               onClick={() => {
                                 onDeleteItem(item);
                                 setConfirmDeleteLibraryId(null);
+                                setSharedCodesById((prev) => {
+                                  if (!(item.id in prev)) return prev;
+                                  const next = { ...prev };
+                                  delete next[item.id];
+                                  return next;
+                                });
                               }}
                               className="px-2 py-1 bg-rose-600 hover:bg-rose-500 text-white font-semibold text-[10px] rounded-lg cursor-pointer transition-colors whitespace-nowrap"
                             >

@@ -132,6 +132,12 @@ function defaultExamTitle(sub: SavedSubmission): string {
   return sub.Tipo || "Verifica";
 }
 
+function safeTimestampMs(ts: unknown): number {
+  if (!ts) return 0;
+  const ms = new Date(String(ts)).getTime();
+  return Number.isFinite(ms) ? ms : 0;
+}
+
 /**
  * Aggregates submissions into per-class summary cards sorted cleanly by class code.
  */
@@ -158,7 +164,7 @@ export function buildClassSummaries(
 
   map.forEach((classSubs, className) => {
     const sortedChrono = [...classSubs].sort(
-      (a, b) => new Date(b.Timestamp || 0).getTime() - new Date(a.Timestamp || 0).getTime()
+      (a, b) => safeTimestampMs(b.Timestamp) - safeTimestampMs(a.Timestamp)
     );
     const latestSub = sortedChrono[0];
     const oldestSub = sortedChrono[sortedChrono.length - 1];
@@ -202,19 +208,20 @@ export function buildClassSummaries(
         (sub.AntiCopia_SchermoDiviso || 0);
 
       const num = getGradeNum(sub);
-      if (num >= 1 && num <= 10.5) {
+      if (Number.isFinite(num) && num >= 0 && num <= 10.5) {
         numericGradesSum += num;
         numericGradesCount++;
         if (num >= 6) passedCount++;
         else failedCount++;
 
+        const rawVoto = String(sub.Voto_Suggerito ?? "").trim();
         if (num > highestNumeric) {
           highestNumeric = num;
-          highestGrade = String(sub.Voto_Suggerito || num);
+          highestGrade = rawVoto || String(num);
         }
         if (num < lowestNumeric) {
           lowestNumeric = num;
-          lowestGrade = String(sub.Voto_Suggerito || num);
+          lowestGrade = rawVoto || String(num);
         }
       }
     });

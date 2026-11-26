@@ -1,3 +1,4 @@
+import { useEffect } from "react";
 import {
   ShieldCheck,
   Lock,
@@ -16,11 +17,24 @@ interface PrivacyInfoModalProps {
 }
 
 export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") onClose();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    return () => window.removeEventListener("keydown", onKeyDown);
+  }, [isOpen, onClose]);
+
   return (
     <AnimatePresence>
       {isOpen && (
       <div 
-        id="privacy-modal-overlay" 
+        id="privacy-modal-overlay"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Informativa privacy e correzione in cieco"
+        onClick={onClose}
         className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-5 bg-slate-950/80 backdrop-blur-md overflow-y-auto"
       >
         <motion.div
@@ -29,6 +43,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
           animate={{ opacity: 1, scale: 1, y: 0 }}
           exit={{ opacity: 0, scale: 0.95, y: 15 }}
           transition={{ duration: 0.2 }}
+          onClick={(e) => e.stopPropagation()}
           className="bg-slate-900 border border-white/10 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden my-auto max-h-[90vh] flex flex-col text-left"
         >
           {/* Header */}
@@ -53,6 +68,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
               </div>
             </div>
             <button
+              type="button"
               id="close-privacy-modal-btn"
               onClick={onClose}
               className="p-2 text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 rounded-xl transition-colors cursor-pointer shrink-0"
@@ -237,6 +253,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
               GDPR (UE 2016/679) &bull; Linee Guida MIM / Parere Garante n. 787/2026
             </p>
             <button
+              type="button"
               id="privacy-modal-confirm-btn"
               onClick={onClose}
               className="w-full sm:w-auto px-5 py-2.5 bg-teal-500 hover:bg-teal-400 text-slate-950 font-bold text-xs rounded-xl transition-all cursor-pointer shadow-md active:scale-95"

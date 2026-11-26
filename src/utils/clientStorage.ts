@@ -317,11 +317,13 @@ export function saveScopedStudentClass(
     return;
   }
   const targetStore = localStore !== undefined ? localStore : getDefaultLocalStorage();
-  if (!targetStore) return;
-  try {
-    if (clean) targetStore.setItem(key, clean);
-    else targetStore.removeItem(key);
-  } catch {}
+  for (const store of [targetStore, sessionStore]) {
+    if (!store) continue;
+    try {
+      if (clean) store.setItem(key, clean);
+      else store.removeItem(key);
+    } catch {}
+  }
 }
 
 export function loadScopedStudentClass(
@@ -376,11 +378,73 @@ const SHARED_PC_PREFIXES = [
   "ea_draft_",
   "ea_mc_order_",
   "exam_lock_",
+  "exam_joined_",
   "ea_exam_lock_",
   "ea_active_exam_lock_",
   "ea_bes_expiry_",
   "ea_student_class_",
 ];
+
+const DIRECT_EMAIL_REGEX = /^[^\s@]{2,}@[^\s@]+\.[^\s@]{2,}$/;
+
+export type DirectStudentEmailResult =
+  | { ok: true; email: string }
+  | { ok: false; error: string };
+
+/**
+ * Normalizes and validates an institutional/student email entered in Direct Student Access.
+ * Auto-completes bare usernames (e.g. "mario.rossi") with "@ferrarisfermiclass.it" while
+ * rejecting empty local parts (e.g. "@ferrarisfermiclass.it"), spaces, or malformed domains.
+ */
+export function validateDirectStudentEmail(rawInput: string): DirectStudentEmailResult {
+  let email = String(rawInput || "").trim().toLowerCase();
+  if (!email) {
+    return {
+      ok: false,
+      error: "Inserisci il tuo indirizzo email scolastico (es. nome.cognome@ferrarisfermiclass.it).",
+    };
+  }
+
+  if (!email.includes("@")) {
+    email = `${email}@ferrarisfermiclass.it`;
+  }
+
+  const parts = email.split("@");
+  const localPart = parts[0] || "";
+  const domainPart = parts[1] || "";
+
+  if (
+    parts.length !== 2 ||
+    !DIRECT_EMAIL_REGEX.test(email) ||
+    localPart.startsWith(".") ||
+    localPart.endsWith(".") ||
+    localPart.includes("..") ||
+    domainPart.startsWith(".") ||
+    domainPart.endsWith(".") ||
+    domainPart.includes("..")
+  ) {
+    return {
+      ok: false,
+      error: "Inserisci un indirizzo email valido completo prima della @ (es. nome.cognome@ferrarisfermiclass.it).",
+    };
+  }
+
+  const isSchoolOrEdu =
+    email.endsWith("@ferrarisfermiclass.it") ||
+    email.endsWith("@ferrarisfermi.edu.it") ||
+    email.endsWith(".edu.it") ||
+    email.endsWith(".it") ||
+    email.endsWith("@gmail.com");
+
+  if (!isSchoolOrEdu) {
+    return {
+      ok: false,
+      error: "Inserisci l'indirizzo email istituzionale (@ferrarisfermiclass.it).",
+    };
+  }
+
+  return { ok: true, email };
+}
 
 /**
  * Removes all student session, identity, draft, and exam-lock entries from local/session storage

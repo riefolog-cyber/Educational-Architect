@@ -130,12 +130,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
       return;
     }
     let cancelled = false;
+    const controller = new AbortController();
     (async () => {
       try {
         const authHeaders = await resolveAuthHeaders();
+        if (cancelled) return;
         const resp = await fetch("/api/submissions/verify-integrity", {
           method: "POST",
           headers: { "Content-Type": "application/json", ...authHeaders },
+          signal: controller.signal,
           body: JSON.stringify({
             submission: {
               id: submission.id,
@@ -158,11 +161,12 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
           setIntegrityStatus(data.status);
         }
       } catch {
-        // Non-blocking: ignore transient network errors during badge check
+        // Non-blocking: ignore transient or aborted network errors during badge check
       }
     })();
     return () => {
       cancelled = true;
+      controller.abort();
     };
   }, [
     submission?.id,
@@ -174,9 +178,13 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     resolveAuthHeaders,
   ]);
 
+  const domandeCacheKey = submission?.id
+    ? `${submission.id}:${(submission.Domande_Esame || "").length}`
+    : "";
+
   useEffect(() => {
-    if (!submission?.id) return;
-    if (unlockedDomandeMap[submission.id]) return;
+    if (!submission?.id || !domandeCacheKey) return;
+    if (unlockedDomandeMap[domandeCacheKey]) return;
 
     const rawDomande = safeParseJson(submission.Domande_Esame);
     if (!rawDomande || typeof rawDomande !== "object") return;
@@ -204,22 +212,24 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         mcOptionOrder: parsedMcOrder,
       });
       if (libRes.restored) {
-        setUnlockedDomandeMap((prev) => ({ ...prev, [submission.id]: libRes.restoredExam }));
+        setUnlockedDomandeMap((prev) => ({ ...prev, [domandeCacheKey]: libRes.restoredExam }));
         return true;
       }
       return false;
     };
 
-    if (!submission.Pin || attemptedVaultIdsRef.current.has(submission.id)) {
+    if (!submission.Pin || attemptedVaultIdsRef.current.has(domandeCacheKey)) {
       applyLibraryFallback();
       return;
     }
 
-    attemptedVaultIdsRef.current.add(submission.id);
+    attemptedVaultIdsRef.current.add(domandeCacheKey);
     let cancelled = false;
+    const controller = new AbortController();
     (async () => {
       try {
         const authHeaders = await resolveAuthHeaders();
+        if (cancelled) return;
         const subClass = resolveSubmissionClass(submission);
         const resp = await fetch("/api/session/unlock-solutions", {
           method: "POST",
@@ -227,6 +237,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             "Content-Type": "application/json",
             ...authHeaders,
           },
+          signal: controller.signal,
           body: JSON.stringify({
             pin: String(submission.Pin).trim().toUpperCase(),
             sessionId: String(submission.Session_Id || "").trim(),
@@ -242,19 +253,21 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         const data = resp.ok ? await resp.json().catch(() => null) : null;
         if (cancelled) return;
         if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
-          setUnlockedDomandeMap((prev) => ({ ...prev, [submission.id]: data.resolvedDomande }));
+          setUnlockedDomandeMap((prev) => ({ ...prev, [domandeCacheKey]: data.resolvedDomande }));
         } else {
           applyLibraryFallback();
         }
-      } catch {
-        if (!cancelled) applyLibraryFallback();
+      } catch (err: any) {
+        if (cancelled || err?.name === "AbortError") return;
+        applyLibraryFallback();
       }
     })();
 
     return () => {
       cancelled = true;
+      controller.abort();
     };
-  }, [submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders, libraryExams]);
+  }, [domandeCacheKey, submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders, libraryExams]);
 
   useEffect(() => {
     if (!submission) return;
@@ -296,7 +309,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
   if (!submission) return null;
 
-  const unlockedDomande = unlockedDomandeMap[submission.id];
+  const unlockedDomande = unlockedDomandeMap[domandeCacheKey];
   const effectiveSubmission = unlockedDomande
     ? { ...submission, Domande_Esame: JSON.stringify(unlockedDomande) }
     : submission;
@@ -359,8 +372,17 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   };
 
   return (
-    <div className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-      <div className="bg-slate-900 border border-white/10 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Verbalizzazione Esame Corretto"
+      onClick={onClose}
+      className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="bg-slate-900 border border-white/10 w-full max-w-2xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[90vh]"
+      >
         {/* Modal Header */}
         <div className="flex justify-between items-center bg-slate-950 p-5 border-b border-white/5">
           <div className="text-left">
@@ -472,6 +494,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               </div>
             )}
             <button
+              type="button"
               onClick={() => onRecalculateGrade(submission)}
               disabled={recalculatingId === submission.id}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-amber-500/15 hover:bg-amber-500/25 text-amber-300 hover:text-amber-200 border border-amber-500/30 text-[11px] font-bold rounded-xl transition-all cursor-pointer disabled:opacity-50"
@@ -481,6 +504,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>{recalculatingId === submission.id ? "Ricalcolo..." : "Ricalcola Voto"}</span>
             </button>
             <button
+              type="button"
               onClick={() => onExportPDF(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-1.5 bg-teal-600/10 hover:bg-teal-600 text-teal-400 hover:text-white border border-teal-500/20 hover:border-teal-500 text-[11px] font-bold rounded-xl transition-all cursor-pointer"
               title="Esporta valutazione studente in PDF"
@@ -489,8 +513,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>Esporta PDF</span>
             </button>
             <button
+              type="button"
               onClick={onClose}
-              className="p-1.5 hover:bg-white/5 rounded-xl transition-colors text-slate-400 hover:text-white"
+              aria-label="Chiudi dettaglio consegna"
+              className="p-1.5 hover:bg-white/5 rounded-xl transition-colors text-slate-400 hover:text-white cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -533,6 +559,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 </div>
               </div>
               <button
+                type="button"
                 onClick={() => onRecalculateGrade(submission)}
                 disabled={recalculatingId === submission.id}
                 className="px-3 py-2 bg-amber-500 hover:bg-amber-400 text-slate-950 font-bold rounded-lg text-xs shrink-0 cursor-pointer transition-colors shadow-md"
@@ -660,13 +687,16 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-semibold">
                   <ShieldCheck className="w-3.5 h-3.5" />
                   <span>
-                    Convalidato dal docente il{" "}
-                    {new Date(submission.Convalida_Docente_At).toLocaleString("it-IT", {
-                      day: "2-digit",
-                      month: "2-digit",
-                      hour: "2-digit",
-                      minute: "2-digit",
-                    })}
+                    {(() => {
+                      const d = new Date(submission.Convalida_Docente_At);
+                      if (Number.isNaN(d.getTime())) return "Convalidato dal docente";
+                      return `Convalidato dal docente il ${d.toLocaleString("it-IT", {
+                        day: "2-digit",
+                        month: "2-digit",
+                        hour: "2-digit",
+                        minute: "2-digit",
+                      })}`;
+                    })()}
                   </span>
                 </span>
               ) : (
@@ -1398,6 +1428,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
           <span className="text-[10px] text-slate-500">ID record: {submission.id}</span>
           <div className="flex items-center gap-2 flex-wrap">
             <button
+              type="button"
               onClick={() => onOpenPrintModal(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-2 bg-slate-800 hover:bg-slate-700 text-slate-200 border border-white/10 font-bold rounded-xl transition-colors cursor-pointer text-xs"
               title="Stampa Scheda Valutazione Didattica Ufficiale"
@@ -1406,6 +1437,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>Stampa Scheda A4</span>
             </button>
             <button
+              type="button"
               onClick={() => onExportPDF(effectiveSubmission)}
               className="flex items-center gap-1.5 px-3 py-2 bg-teal-600 hover:bg-teal-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
             >
@@ -1413,6 +1445,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               <span>Scarica PDF Report</span>
             </button>
             <button
+              type="button"
               onClick={onClose}
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
             >

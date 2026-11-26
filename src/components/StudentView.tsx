@@ -216,9 +216,30 @@ function serializeExamForSubmission(examData: any): string {
  * l'IA e senza rubare posti alle correzioni degli elaborati. `onProgress`
  * aggiorna il pulsante con la posizione in coda.
  */
+function abortableDelay(ms: number, signal?: AbortSignal): Promise<void> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new DOMException("Richiesta annullata", "AbortError"));
+      return;
+    }
+    const timer = setTimeout(() => {
+      if (signal) signal.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      reject(new DOMException("Richiesta annullata", "AbortError"));
+    };
+    if (signal) {
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
+  });
+}
+
 async function requestRecoveryPlan(
   payload: Record<string, unknown>,
-  onProgress?: (progress: RecoveryProgress) => void
+  onProgress?: (progress: RecoveryProgress) => void,
+  signal?: AbortSignal
 ): Promise<string> {
   const deadline = Date.now() + 8 * 60 * 1000;
   let attempt = 0;
@@ -227,11 +248,15 @@ async function requestRecoveryPlan(
   let jobToken = "";
 
   while (Date.now() < deadline) {
+    if (signal?.aborted) {
+      throw new DOMException("Richiesta annullata", "AbortError");
+    }
     if (!jobId) {
       const response = await fetchWithRetry("/api/generate-recovery-plan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify(payload),
+        signal,
       });
       const data = await response.json().catch(() => null);
       if (!response.ok) {
@@ -252,7 +277,7 @@ async function requestRecoveryPlan(
       continue;
     }
 
-    await new Promise((resolve) => setTimeout(resolve, Math.min(900 + attempt * 150, 2500)));
+    await abortableDelay(Math.min(900 + attempt * 150, 2500), signal);
     attempt++;
 
     const statusUrl = jobToken
@@ -260,6 +285,7 @@ async function requestRecoveryPlan(
       : `/api/evaluate/status/${encodeURIComponent(jobId)}`;
     const statusResponse = await fetch(statusUrl, {
       headers: jobToken ? { "x-job-token": jobToken } : undefined,
+      signal,
     });
     if (statusResponse.status === 404) {
       // Server riavviato: il job non esiste più, si riaccoda (max 3 volte).
@@ -314,6 +340,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [selectedPastSub, setSelectedPastSub] = useState<any | null>(null);
   const [generatingPlan, setGeneratingPlan] = useState(false);
   const [recoveryProgress, setRecoveryProgress] = useState<RecoveryProgress | null>(null);
+  const recoveryAbortRef = useRef<AbortController | null>(null);
+  const submittingEvalRef = useRef<boolean>(false);
+
+  useEffect(() => {
+    return () => {
+      recoveryAbortRef.current?.abort();
+      recoveryAbortRef.current = null;
+    };
+  }, []);
   
   // Current session definition
   const [sessionPin, setSessionPin] = useState("");
@@ -1623,6 +1658,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   const handleGenerateRecoveryPlan = async (subId: string, submission: any) => {
     if (generatingPlan) return;
+    recoveryAbortRef.current?.abort();
+    const controller = new AbortController();
+    recoveryAbortRef.current = controller;
     setGeneratingPlan(true);
     setRecoveryProgress(null);
     try {
@@ -1655,8 +1693,11 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           answers: safeRecoveryAnswers,
           examData: parsedExamData
         },
-        setRecoveryProgress
+        setRecoveryProgress,
+        controller.signal
       );
+
+      if (controller.signal.aborted) return;
 
       // Save back to Firestore permanently
       if (dbFirestore) {
@@ -1666,6 +1707,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         });
       }
 
+      if (controller.signal.aborted) return;
+
       // Update local state objects
       const updatedSub = { ...submission, Piano_Recupero: planHtml };
       setSelectedPastSub(updatedSub);
@@ -1673,11 +1716,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       // Update selection in list
       setHistoryList(prev => prev.map(item => item.id === subId ? updatedSub : item));
     } catch (err: any) {
+      if (err?.name === "AbortError" || controller.signal.aborted) return;
       console.error("Generazione piano fallita:", err);
       setAppAlert({ msg: `⚠️ Errore durante la generazione del piano di recupero tramite IA: ${err.message}` });
     } finally {
-      setGeneratingPlan(false);
-      setRecoveryProgress(null);
+      if (recoveryAbortRef.current === controller) {
+        recoveryAbortRef.current = null;
+        setGeneratingPlan(false);
+        setRecoveryProgress(null);
+      }
     }
   };
 
@@ -3704,11 +3751,13 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   // Real submission routine to Backend APIs
   const handleFinalSubmit = async () => {
+    if (submittingEvalRef.current) return;
     if (!studentSelfGrade) {
       setAppAlert({ msg: "⚠️ Scegli un voto di autovalutazione prima di procedere." });
       return;
     }
 
+    submittingEvalRef.current = true;
     setIsExamActive(false); // Disable timers & monitoring
     setActiveScreen("evaluating");
     setSavingStatus("Generazione della valutazione tramite IA e registrazione sessione...");
@@ -3961,11 +4010,19 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     } catch (err: any) {
       console.error("Submission failed:", err);
       setAppAlert({ msg: `Errore critico durante la valutazione: ${err.message}.\n\n(Suggerimento: Se i server dell'IA sono momentaneamente carichi, le tue risposte non sono andate perse!)` });
+      setIsExamActive(true);
       setActiveScreen("exam-space");
+    } finally {
+      submittingEvalRef.current = false;
     }
   };
 
   const handleRestart = () => {
+    recoveryAbortRef.current?.abort();
+    recoveryAbortRef.current = null;
+    submittingEvalRef.current = false;
+    setGeneratingPlan(false);
+    setRecoveryProgress(null);
     stopSpeech();
     if (audioTimerRef.current) {
       clearInterval(audioTimerRef.current);
@@ -6284,8 +6341,12 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                 </div>
                 {!activePlanHtml && !isEvaluationPending(evaluation) && (!deferSolutionsSession || solutionsReleased) && (
                   <button
+                    type="button"
                     onClick={async () => {
                       if (generatingPlan) return;
+                      recoveryAbortRef.current?.abort();
+                      const controller = new AbortController();
+                      recoveryAbortRef.current = controller;
                       setGeneratingPlan(true);
                       setRecoveryProgress(null);
                       try {
@@ -6313,8 +6374,11 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                             answers: safeRecoveryAnswers,
                             examData: examData
                           },
-                          setRecoveryProgress
+                          setRecoveryProgress,
+                          controller.signal
                         );
+
+                        if (controller.signal.aborted) return;
 
                         setActivePlanHtml(planHtml);
 
@@ -6329,11 +6393,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         // Reload student history cache
                         loadHistory();
                       } catch (err: any) {
+                        if (err?.name === "AbortError" || controller.signal.aborted) return;
                         console.error("Generazione piano immediato fallita:", err);
                         setAppAlert({ msg: `⚠️ Errore di generazione: ${err.message}` });
                       } finally {
-                        setGeneratingPlan(false);
-                        setRecoveryProgress(null);
+                        if (recoveryAbortRef.current === controller) {
+                          recoveryAbortRef.current = null;
+                          setGeneratingPlan(false);
+                          setRecoveryProgress(null);
+                        }
                       }
                     }}
                     disabled={generatingPlan}

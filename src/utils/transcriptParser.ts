@@ -23,6 +23,29 @@ const TIMESTAMP_LINE =
 const SEQUENCE_LINE = /^\d{1,6}$/;
 const HTML_TAG = /<[^>]*>/g;
 
+function safeCodePoint(cp: number): string {
+  if (!Number.isInteger(cp) || cp < 32 || cp > 0x10ffff) return " ";
+  try {
+    return String.fromCodePoint(cp);
+  } catch {
+    return " ";
+  }
+}
+
+function decodeSubtitleEntities(text: string): string {
+  return text
+    .replace(/&nbsp;/gi, " ")
+    .replace(/&quot;/gi, '"')
+    .replace(/&apos;/gi, "'")
+    .replace(/&#39;/g, "'")
+    .replace(/&#x27;/gi, "'")
+    .replace(/&#(\d+);/g, (_, n) => safeCodePoint(parseInt(n, 10)))
+    .replace(/&#x([0-9a-f]+);/gi, (_, h) => safeCodePoint(parseInt(h, 16)))
+    .replace(/&lt;/gi, "<")
+    .replace(/&gt;/gi, ">")
+    .replace(/&amp;/gi, "&");
+}
+
 /**
  * Parses an .srt / .vtt subtitle file or a plain .txt transcript into
  * clean flowing text: timestamps, sequence numbers, styling tags and
@@ -94,7 +117,7 @@ export function parseTranscriptFile(fileName: string, rawText: string): ParsedTr
       // Cue identifiers / settings lines in VTT (e.g. "cue-1", "align:start position:0%")
       if (!inCue && format === "vtt" && /^(cue-|align:|position:|line:|size:)/i.test(line)) continue;
 
-      let cleaned = line.replace(HTML_TAG, " ");
+      let cleaned = decodeSubtitleEntities(line.replace(HTML_TAG, " "));
       // Sound-effect cues like [Musica] or [Applausi]: short bracketed
       // segments are almost always non-spoken noise.
       cleaned = cleaned.replace(/\[[^\[\]]{1,30}\]/g, " ");

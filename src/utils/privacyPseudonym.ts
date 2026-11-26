@@ -177,8 +177,10 @@ export function scrubPromptPii(
   // 5. Known student first/last name tokens
   const fullName = String(identity?.fullName || "").trim();
   if (fullName) {
-    const rawTokens = fullName
-      .split(/[\s,'.-]+/)
+    // Strip trailing parenthesized class tags like "(4B INF)" so subject/section codes aren't treated as name tokens
+    const nameWithoutClassTag = fullName.replace(/\s*\([^()]{1,28}\)\s*$/, "").trim();
+    const rawTokens = nameWithoutClassTag
+      .split(/[\s,'.()/-]+/)
       .map((t) => t.trim())
       .filter((t) => t.length >= 3 && !NAME_STOPWORDS.has(t.toLowerCase()));
     const uniqueTokens = Array.from(new Set(rawTokens)).sort((a, b) => b.length - a.length);

@@ -81,8 +81,14 @@ import {
   saveStudentScopedStorageItem,
   loadStudentScopedStorageItem,
   removeStudentScopedStorageItem,
+  validateDirectStudentEmail,
   type StorageLike,
 } from "../src/utils/clientStorage";
+import {
+  recoveryProgressLabel,
+  recoveryProgressHint,
+  recoveryProgressPercent,
+} from "../src/utils/recoveryProgress";
 import {
   roundScholasticGrade,
   formatGradeForRegister,
@@ -102,12 +108,20 @@ import {
   computeEffectiveDeferredDeadlineMs,
   addMinutesToExpiryIso,
 } from "../src/utils/deferredSolutions";
-import { buildExamFromLinkedForm, normalizeLinkedFormPayload } from "../src/utils/googleFormsLink";
+import {
+  buildExamFromLinkedForm,
+  normalizeLinkedFormPayload,
+  normalizeQuestionImage,
+  normalizeAppsScriptExecUrl,
+  cleanFormText,
+  buildFormViewUrl,
+  parseFormsApiForm,
+} from "../src/utils/googleFormsLink";
 import { buildLinkedFormFromApi } from "../src/utils/googleFormsApi";
 import { sanitizePdfText, createSubmissionPdfDoc } from "../src/utils/pdfExport";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS } from "../src/utils/transcriptParser";
 import { parseGoogleFormsImport } from "../src/utils/googleFormsImport";
-import { parseLibraryBackup } from "../src/utils/examLibrary";
+import { buildLibraryBackup, parseLibraryBackup } from "../src/utils/examLibrary";
 import { SavedSubmission } from "../src/types";
 
 let passed = 0;
@@ -3109,6 +3123,305 @@ test("Round 8 Fix: evaluateMcSelection riconosce chiavi lettera (es. 'B') usate 
   assert.ok(!rendered.includes("text-slate-200"), "Variante stampa non deve usare testo chiaro invisibile su A4");
   assert.ok(!rendered.includes("<img"));
   assert.ok(rendered.includes("&lt;img"));
+});
+
+test("Round 9 Fix: validateDirectStudentEmail blocca email senza parte locale o malformate e normalizza username", () => {
+  assert.equal(validateDirectStudentEmail("").ok, false);
+  assert.equal(validateDirectStudentEmail("@ferrarisfermiclass.it").ok, false);
+  assert.equal(validateDirectStudentEmail("a@ferrarisfermiclass.it").ok, false);
+  assert.equal(validateDirectStudentEmail("mario..rossi@ferrarisfermiclass.it").ok, false);
+  assert.equal(validateDirectStudentEmail("mario rossi@ferrarisfermiclass.it").ok, false);
+  assert.equal(validateDirectStudentEmail("mario@esempio.org").ok, false);
+
+  const autoDomain = validateDirectStudentEmail("  Mario.Rossi  ");
+  assert.equal(autoDomain.ok, true);
+  if (autoDomain.ok) assert.equal(autoDomain.email, "mario.rossi@ferrarisfermiclass.it");
+
+  const schoolEmail = validateDirectStudentEmail("GIULIA.BIANCHI@FERRARISFERMI.EDU.IT");
+  assert.equal(schoolEmail.ok, true);
+  if (schoolEmail.ok) assert.equal(schoolEmail.email, "giulia.bianchi@ferrarisfermi.edu.it");
+
+  const gmail = validateDirectStudentEmail("studente.test@gmail.com");
+  assert.equal(gmail.ok, true);
+});
+
+test("Round 9 Fix: saveScopedStudentClass usa sessionStorage come fallback e wipeSharedPcStudentStorage pulisce exam_joined_*", () => {
+  const mem = new Map<string, string>();
+  const mockSession: StorageLike = {
+    get length() {
+      return mem.size;
+    },
+    key(index: number) {
+      return Array.from(mem.keys())[index] ?? null;
+    },
+    getItem(k: string) {
+      return mem.has(k) ? mem.get(k)! : null;
+    },
+    setItem(k: string, v: string) {
+      mem.set(k, v);
+    },
+    removeItem(k: string) {
+      mem.delete(k);
+    },
+  };
+  const throwingLocal: StorageLike = {
+    getItem() {
+      throw new Error("QuotaExceededError");
+    },
+    setItem() {
+      throw new Error("QuotaExceededError");
+    },
+    removeItem() {
+      throw new Error("QuotaExceededError");
+    },
+  };
+
+  // Even when localStorage throws in non-shared mode, class must survive in sessionStorage fallback
+  saveScopedStudentClass("mario@ferrarisfermiclass.it", "4B INF", throwingLocal, mockSession, false);
+  assert.equal(loadScopedStudentClass("mario@ferrarisfermiclass.it", throwingLocal, mockSession, false), "4B INF");
+
+  // Shared-PC wipe must also clear exam_joined_* keys
+  mockSession.setItem("exam_joined_PIN123_abc", "2026-11-26T09:00:00Z");
+  const removed = wipeSharedPcStudentStorage(throwingLocal, mockSession);
+  assert.ok(removed >= 2);
+  assert.equal(mockSession.getItem("exam_joined_PIN123_abc"), null);
+  assert.equal(loadScopedStudentClass("mario@ferrarisfermiclass.it", throwingLocal, mockSession, false), "");
+});
+
+test("Round 9 Fix: recoveryProgress gestisce NaN, Infinity e posizioni non valide senza stampare NaN", () => {
+  for (const badPos of [NaN, Infinity, -Infinity, -3, 0]) {
+    const p = { status: "queued" as const, position: badPos };
+    const label = recoveryProgressLabel(p);
+    const hint = recoveryProgressHint(p);
+    const pct = recoveryProgressPercent(p);
+    assert.ok(!label.includes("NaN"), `Label non deve contenere NaN: ${label}`);
+    assert.ok(!hint.includes("NaN"), `Hint non deve contenere NaN: ${hint}`);
+    assert.equal(Number.isFinite(pct), true);
+    assert.equal(pct, 100);
+  }
+
+  assert.equal(recoveryProgressLabel({ status: "queued", position: 3.8 }), "In coda: 3° posto");
+  assert.equal(recoveryProgressPercent({ status: "queued", position: 3.8 }), 90);
+});
+
+test("Round 10 Fix: googleFormsLink blocca SVG/SSRF, gestisce entità fuori range, URL senza trailing slash e grading.correctAnswers", () => {
+  assert.equal(normalizeQuestionImage("data:image/svg+xml;base64,PHN2Zy8+"), "");
+  assert.equal(normalizeQuestionImage("data:image/png;base64,iVBORw0KGgo="), "data:image/png;base64,iVBORw0KGgo=");
+
+  assert.equal(
+    normalizeAppsScriptExecUrl("https://script.google.com.evil.com/macros/s/AKfycb123456/exec"),
+    null
+  );
+  assert.equal(
+    normalizeAppsScriptExecUrl("http://script.google.com/macros/s/AKfycb123456/exec"),
+    null
+  );
+  assert.equal(
+    normalizeAppsScriptExecUrl("https://script.google.com/macros/u/0/s/AKfycb123456/exec"),
+    "https://script.google.com/macros/s/AKfycb123456/exec"
+  );
+
+  // Out-of-range numeric HTML entity must not throw RangeError
+  assert.doesNotThrow(() => cleanFormText("Test &#99999999; e &#x110000; ok"));
+  assert.equal(cleanFormText("L&#39;Italia &amp; l&#39;Europa"), "L'Italia & l'Europa");
+
+  // Trailing-slash-free Google Form URLs
+  const viewUrl = buildFormViewUrl("https://docs.google.com/forms/d/e/1FAIpQLSeAbCdEfGhIjKlMnOpQrStUv");
+  assert.equal(viewUrl, "https://docs.google.com/forms/d/e/1FAIpQLSeAbCdEfGhIjKlMnOpQrStUv/viewform");
+
+  // parseFormsApiForm matches grading.correctAnswers.answers[].value
+  const parsedApi = parseFormsApiForm({
+    info: { title: "Quiz API" },
+    items: [
+      {
+        itemId: "q1",
+        title: "Pianeta rosso?",
+        questionItem: {
+          question: {
+            choiceQuestion: {
+              type: "RADIO",
+              options: [{ value: "Venere" }, { value: "Marte" }],
+            },
+            grading: {
+              pointValue: 2,
+              correctAnswers: { answers: [{ value: "Marte" }] },
+            },
+          },
+        },
+      },
+    ],
+  });
+  assert.equal(parsedApi.items.length, 1);
+  assert.equal(parsedApi.items[0].correctIndex, 1);
+  assert.equal(parsedApi.items[0].points, 2);
+});
+
+test("Round 10 Fix: googleFormsApi blocca SVG e non fa traboccare pendingImage oltre un questionGroupItem", () => {
+  const pngDataUrl = "data:image/png;base64,iVBORw0KGgo=";
+  const svgDataUrl = "data:image/svg+xml;base64,PHN2Zy8+";
+  const form = buildLinkedFormFromApi(
+    {
+      info: { title: "Modulo con Immagini" },
+      items: [
+        {
+          itemId: "img_svg",
+          imageItem: { image: { contentUri: "uri:svg" } },
+        },
+        {
+          itemId: "q_after_svg",
+          title: "Domanda dopo SVG",
+          questionItem: { question: { textQuestion: {} } },
+        },
+        {
+          itemId: "img_ok",
+          imageItem: { image: { contentUri: "uri:png" } },
+        },
+        {
+          itemId: "grid1",
+          title: "Tabella di corrispondenza",
+          questionGroupItem: {
+            grid: { columns: { options: [{ value: "Vero" }, { value: "Falso" }] } },
+            questions: [{ rowQuestion: { title: "Riga 1" } }],
+          },
+        },
+        {
+          itemId: "q_after_grid",
+          title: "Domanda successiva non correlata",
+          questionItem: { question: { textQuestion: {} } },
+        },
+      ],
+    },
+    {
+      imageFor: (uri) => (uri === "uri:svg" ? svgDataUrl : uri === "uri:png" ? pngDataUrl : undefined),
+    }
+  );
+  assert.ok(form);
+  const qAfterSvg = form.questions.find((q) => q.question.includes("Domanda dopo SVG"));
+  const gridQ = form.questions.find((q) => q.kind === "grid");
+  const qAfterGrid = form.questions.find((q) => q.question.includes("Domanda successiva"));
+  assert.equal(qAfterSvg?.image, undefined);
+  assert.equal(gridQ?.image, pngDataUrl);
+  assert.equal(qAfterGrid?.image, undefined);
+});
+
+test("Round 10 Fix: parseGoogleFormsImport supporta opzioni oltre la H (es. Opzione I)", () => {
+  const csv = [
+    "Domanda;Opzione A;Opzione B;Opzione C;Opzione D;Opzione E;Opzione F;Opzione G;Opzione H;Opzione I;Corretta",
+    "Quale lettera è la nona?;Uno;Due;Tre;Quattro;Cinque;Sei;Sette;Otto;Nove;I",
+  ].join("\n");
+  const res = parseGoogleFormsImport(csv, { fallbackTitle: "Alfabeto" });
+  assert.equal(res.multipleChoiceCount, 1);
+  const parsed = JSON.parse(res.examJson);
+  assert.equal(parsed.multipleChoice[0].options.length, 9);
+  assert.equal(parsed.multipleChoice[0].correctIndex, 8);
+});
+
+test("Round 10 Fix: buildLibraryBackup omette sharedCode e parseLibraryBackup rifiuta JSON null/primitivi/array", () => {
+  const backupStr = buildLibraryBackup([
+    {
+      id: "lib1",
+      teacherEmail: "prof@scuola.it",
+      title: "Verifica Storia",
+      examType: "Quiz",
+      questionCount: 1,
+      source: "manual",
+      examJson: JSON.stringify({
+        title: "Verifica Storia",
+        multipleChoice: [{ id: "m1", question: "Q?", options: ["A", "B"], correctIndex: 0 }],
+      }),
+      createdAt: "2026-11-26T09:00:00Z",
+      updatedAt: "2026-11-26T09:00:00Z",
+      sharedCode: "SECRET99",
+    },
+  ]);
+  const parsedBackup = JSON.parse(backupStr);
+  assert.equal("sharedCode" in parsedBackup.items[0], false);
+
+  assert.throws(() => parseLibraryBackup("null", "prof@scuola.it"), /Nessuna verifica|non valido/i);
+  assert.throws(() => parseLibraryBackup("42", "prof@scuola.it"), /Nessuna verifica|non valido/i);
+  assert.throws(
+    () => parseLibraryBackup(JSON.stringify({ items: [{ title: "Bad", examJson: "[1,2,3]" }] }), "prof@scuola.it"),
+    /struttura esame valida/i
+  );
+  assert.throws(
+    () => parseLibraryBackup(JSON.stringify({ items: [{ title: "Bad2", examJson: "123" }] }), "prof@scuola.it"),
+    /struttura esame valida/i
+  );
+});
+
+test("Round 10 Fix: buildClassSummaries include il voto 0 in media, promossi/insufficienti e minimo, e ordina date malformate", () => {
+  const subs: SavedSubmission[] = [
+    {
+      id: "z1",
+      Timestamp: "invalid-date",
+      Docente_Email: "prof@scuola.it",
+      Tipo: "Quiz",
+      Pin: "P1",
+      Classe: "3A",
+      Nome: "Mario Rossi",
+      Email: "mario@scuola.it",
+      Voto_Suggerito: "0.0",
+      Autovalutazione: "2",
+      AntiCopia_TabSwitch: 0,
+      AntiCopia_IncollaBloccato: 0,
+      AntiCopia_InfractionsLog: "[]",
+      Risposte_Studente: "{}",
+      Full_Evaluation: JSON.stringify({ evaluationMode: "full" }),
+    },
+    {
+      id: "z2",
+      Timestamp: "2026-11-26T10:00:00Z",
+      Docente_Email: "prof@scuola.it",
+      Tipo: "Quiz",
+      Pin: "P1",
+      Classe: "3A",
+      Nome: "Giulia Verdi",
+      Email: "giulia@scuola.it",
+      Voto_Suggerito: "8.0",
+      Autovalutazione: "8",
+      AntiCopia_TabSwitch: 0,
+      AntiCopia_IncollaBloccato: 0,
+      AntiCopia_InfractionsLog: "[]",
+      Risposte_Studente: "{}",
+      Full_Evaluation: JSON.stringify({ evaluationMode: "full" }),
+    },
+  ];
+  const summaries = buildClassSummaries(subs);
+  assert.equal(summaries.length, 1);
+  const s = summaries[0];
+  assert.equal(s.averageGradeNumber, 4);
+  assert.equal(s.passedCount, 1);
+  assert.equal(s.failedCount, 1);
+  assert.equal(s.passRate, 50);
+  assert.equal(s.lowestGrade, "0.0");
+  assert.equal(s.highestGrade, "8.0");
+  assert.equal(s.submissions[0].id, "z2");
+});
+
+test("Round 10 Fix: scrubPromptPii non oscura codici classe tra parentesi come (4B INF) ma oscura nome e cognome", () => {
+  const res = scrubPromptPii(
+    "Nel corso INF abbiamo studiato gli algoritmi; io sono Mario Rossi e studio informatica.",
+    { fullName: "Mario Rossi (4B INF)" }
+  );
+  assert.ok(res.scrubbedText.includes("Nel corso INF"), "Il tag classe (4B INF) non deve causare la censura di 'INF'");
+  assert.ok(!res.scrubbedText.includes("Mario"));
+  assert.ok(!res.scrubbedText.includes("Rossi"));
+  assert.equal(res.redactionsCount, 2);
+});
+
+test("Round 10 Fix: parseTranscriptFile decodifica entità HTML nei sottotitoli YouTube .vtt/.srt", () => {
+  const vtt = [
+    "WEBVTT",
+    "",
+    "00:00:01.000 --> 00:00:04.000",
+    "L&#39;impero romano &amp; l&apos;eredit&agrave; di &quot;Augusto&quot;&nbsp;(&#99999999;).",
+  ].join("\n");
+  const parsed = parseTranscriptFile("yt.vtt", vtt);
+  assert.ok(parsed.text.includes("L'impero romano & l'eredit"));
+  assert.ok(parsed.text.includes('"Augusto"'));
+  assert.ok(!parsed.text.includes("&#39;"));
+  assert.ok(!parsed.text.includes("&quot;"));
+  assert.ok(!parsed.text.includes("&amp;"));
 });
 
 console.log(`\n${passed} test superati, ${failed} falliti.`);

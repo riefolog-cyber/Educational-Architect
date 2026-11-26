@@ -1,4 +1,4 @@
-import React, { useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import {
   X,
   FileUp,
@@ -41,8 +41,11 @@ const KIND_LABEL: Record<LinkedFormQuestion["kind"], string> = {
 /** The Web App /exec URL survives page reloads inside this browser only. */
 const SCRIPT_URL_STORAGE_KEY = "educational-architect.forms-webapp-url";
 
+/** Max CSV/TXT upload size (5 MB) to keep FileReader responsive in the browser. */
+const MAX_CSV_UPLOAD_BYTES = 5 * 1024 * 1024;
+
 function letter(index: number) {
-  return String.fromCharCode(65 + index);
+  return index >= 0 && index < 26 ? String.fromCharCode(65 + index) : String(index + 1);
 }
 
 export default function GoogleFormsImportModal({
@@ -79,6 +82,34 @@ export default function GoogleFormsImportModal({
 
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
+  const fetchAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    if (!isOpen) {
+      fetchAbortRef.current?.abort();
+      fetchAbortRef.current = null;
+      setLoadingLink(false);
+      setLoadingScript(false);
+      return;
+    }
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        e.preventDefault();
+        onClose();
+      }
+    };
+    window.addEventListener("keydown", handleKeyDown);
+    return () => {
+      window.removeEventListener("keydown", handleKeyDown);
+    };
+  }, [isOpen, onClose]);
+
+  useEffect(() => {
+    return () => {
+      fetchAbortRef.current?.abort();
+      fetchAbortRef.current = null;
+    };
+  }, []);
 
   if (!isOpen) return null;
 
@@ -170,6 +201,10 @@ export default function GoogleFormsImportModal({
     if (!file) return;
     setError(null);
     setResult(null);
+    if (file.size > MAX_CSV_UPLOAD_BYTES) {
+      setError("Il file selezionato supera i 5 MB: riduci le dimensioni e riprova.");
+      return;
+    }
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = String(event.target?.result || "");
@@ -198,13 +233,20 @@ export default function GoogleFormsImportModal({
       return;
     }
 
+    fetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+
     setLoadingLink(true);
     try {
       const authHeaders = await getAuthHeaders();
+      if (controller.signal.aborted) return;
       const response = await fetch(`/api/forms-import?url=${encodeURIComponent(value)}`, {
-        headers: { Accept: "application/json", ...authHeaders }
+        headers: { Accept: "application/json", ...authHeaders },
+        signal: controller.signal
       });
       const data = await response.json().catch(() => null);
+      if (controller.signal.aborted) return;
       if (!response.ok) {
         throw new Error(data?.error || `Lettura del modulo non riuscita (errore ${response.status}).`);
       }
@@ -212,12 +254,18 @@ export default function GoogleFormsImportModal({
       if (!form || !Array.isArray(form.questions) || form.questions.length === 0) {
         throw new Error("Il modulo non contiene domande importabili.");
       }
-      setLinked(await withCompressedImages(form));
+      const compressed = await withCompressedImages(form);
+      if (controller.signal.aborted) return;
+      setLinked(compressed);
       setAnswers(answersFromForm(form));
     } catch (e: any) {
+      if (e?.name === "AbortError" || controller.signal.aborted) return;
       setError(e?.message || "Lettura del modulo non riuscita.");
     } finally {
-      setLoadingLink(false);
+      if (fetchAbortRef.current === controller) {
+        fetchAbortRef.current = null;
+        setLoadingLink(false);
+      }
     }
   };
 
@@ -234,17 +282,24 @@ export default function GoogleFormsImportModal({
       return;
     }
 
+    fetchAbortRef.current?.abort();
+    const controller = new AbortController();
+    fetchAbortRef.current = controller;
+
     setLoadingScript(true);
     try {
       const authHeaders = await getAuthHeaders();
+      if (controller.signal.aborted) return;
       // Se il docente ha incollato anche il link del modulo nel campo principale,
       // l'app lo inoltra allo script (?form=ID) così uno standalone legge quel modulo.
       const formParam = link.trim();
       const suffix = formParam ? `&form=${encodeURIComponent(formParam)}` : "";
       const response = await fetch(`/api/forms-script?app=${encodeURIComponent(app)}${suffix}`, {
-        headers: { Accept: "application/json", ...authHeaders }
+        headers: { Accept: "application/json", ...authHeaders },
+        signal: controller.signal
       });
       const data = await response.json().catch(() => null);
+      if (controller.signal.aborted) return;
       if (!response.ok) {
         throw new Error(data?.error || `Lettura dallo script non riuscita (errore ${response.status}).`);
       }
@@ -258,12 +313,18 @@ export default function GoogleFormsImportModal({
       } catch {
         // Navigazione privata senza storage: funziona comunque, solo non memorizza.
       }
-      setLinked(await withCompressedImages(form));
+      const compressed = await withCompressedImages(form);
+      if (controller.signal.aborted) return;
+      setLinked(compressed);
       setAnswers(answersFromForm(form));
     } catch (e: any) {
+      if (e?.name === "AbortError" || controller.signal.aborted) return;
       setError(e?.message || "Lettura dallo script non riuscita.");
     } finally {
-      setLoadingScript(false);
+      if (fetchAbortRef.current === controller) {
+        fetchAbortRef.current = null;
+        setLoadingScript(false);
+      }
     }
   };
 
@@ -313,8 +374,17 @@ export default function GoogleFormsImportModal({
   const hasInput = !!linked || !!rawText.trim();
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn">
-      <div className="w-full max-w-2xl max-h-[92vh] overflow-y-auto bg-slate-900 border border-white/10 rounded-3xl shadow-2xl">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Importa da Google Moduli"
+      onClick={onClose}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn"
+    >
+      <div
+        onClick={(e) => e.stopPropagation()}
+        className="w-full max-w-2xl max-h-[92vh] overflow-y-auto bg-slate-900 border border-white/10 rounded-3xl shadow-2xl"
+      >
         {/* Header */}
         <div className="p-5 border-b border-white/5 flex items-start justify-between gap-3">
           <div>
@@ -328,6 +398,7 @@ export default function GoogleFormsImportModal({
             </p>
           </div>
           <button
+            type="button"
             onClick={onClose}
             className="p-2 rounded-xl bg-slate-950/60 border border-white/10 text-slate-400 hover:text-white transition-colors cursor-pointer"
             title="Chiudi"
@@ -340,7 +411,7 @@ export default function GoogleFormsImportModal({
           <input
             ref={imageInputRef}
             type="file"
-            accept="image/png,image/jpeg,image/webp,image/gif,image/svg+xml"
+            accept="image/png,image/jpeg,image/webp,image/gif"
             onChange={handleImageChosen}
             className="hidden"
           />

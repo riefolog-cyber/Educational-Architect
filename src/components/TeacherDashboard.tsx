@@ -1194,11 +1194,24 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         setSubmissions((prev) =>
           prev.map((s) => (updatedMap.has(s.id) ? { ...s, ...updatedMap.get(s.id)! } : s))
         );
+        setSelectedSub((prev) =>
+          prev && updatedMap.has(prev.id) ? { ...prev, ...updatedMap.get(prev.id)! } : prev
+        );
       }
-      showNotify(
-        "success",
-        `Sbloccate ${updatedMap.size} consegne con soluzioni differite nel registro.`
-      );
+      const failedCount = deferredList.length - updatedMap.size;
+      if (updatedMap.size === 0) {
+        showNotify("error", "Nessuna consegna sbloccata: verifica la connessione o riprova.");
+      } else if (failedCount > 0) {
+        showNotify(
+          "error",
+          `Sbloccate ${updatedMap.size} consegne su ${deferredList.length} (${failedCount} da riprovare).`
+        );
+      } else {
+        showNotify(
+          "success",
+          `Sbloccate ${updatedMap.size} consegne con soluzioni differite nel registro.`
+        );
+      }
     } catch (err: any) {
       showNotify("error", `Errore durante lo sblocco massivo: ${err?.message || "errore"}`);
     } finally {
@@ -2809,7 +2822,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         Convalida_Docente_At: new Date().toISOString(),
         Convalida_Docente_Email: String(user?.email || ""),
       };
-      if (!sub.Voto_Originale_IA) payload.Voto_Originale_IA = sub.Voto_Suggerito;
+      if (!sub.Voto_Originale_IA && sub.Voto_Suggerito && sub.Voto_Suggerito !== "N.V.") {
+        payload.Voto_Originale_IA = sub.Voto_Suggerito;
+      }
       await updateDoc(doc(dbFirestore, "valutazioni", sub.id), payload);
       const updated = { ...sub, ...payload };
       setSubmissions((prev) => prev.map((item) => (item.id === sub.id ? updated : item)));
@@ -2926,6 +2941,11 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
       return;
     }
+    if (!Number.isFinite(newScore) || newScore < 0 || newScore > 10) {
+      setAppAlert({ msg: "⚠️ Inserisci un punteggio valido compreso tra 0 e 10." });
+      return;
+    }
+    const clampedScore = Math.round(Math.max(0, Math.min(10, newScore)) * 10) / 10;
     try {
       const domandeObj = safeParseJson(sub.Domande_Esame) || {};
       const ansObj = safeParseJson(sub.Risposte_Studente) || {};
@@ -2941,7 +2961,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           details: Array.isArray(evalObj.openEndedDetails) ? evalObj.openEndedDetails : [],
           getAnswer: (id) => String(ansObj?.oe?.[id] ?? ansObj?.openEnded?.[id] ?? ""),
           questionId,
-          newScore,
+          newScore: clampedScore,
           newFeedback,
         });
       } else {
@@ -2951,7 +2971,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           details: Array.isArray(evalObj.reflectionDetails) ? evalObj.reflectionDetails : [],
           getAnswer: (id) => String(ansObj?.wbRq?.[id] ?? ansObj?.oe?.[id] ?? ""),
           questionId,
-          newScore,
+          newScore: clampedScore,
           newFeedback,
         });
       }
@@ -3012,8 +3032,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       showNotify(
         "success",
         audit.complete
-          ? `✅ Punteggio quesito aggiornato (${newScore}/10) e voto ricalcolato: ${breakdown.finalGradeFormatted}`
-          : `✅ Punteggio quesito salvato (${newScore}/10). Restano ${audit.missing.length} quesiti aperti da valutare prima del voto finale.`,
+          ? `✅ Punteggio quesito aggiornato (${clampedScore}/10) e voto ricalcolato: ${breakdown.finalGradeFormatted}`
+          : `✅ Punteggio quesito salvato (${clampedScore}/10). Restano ${audit.missing.length} quesiti aperti da valutare prima del voto finale.`,
         5000
       );
     } catch (err: any) {

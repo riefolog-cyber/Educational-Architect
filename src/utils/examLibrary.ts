@@ -564,12 +564,18 @@ export async function saveLibraryExam(
   const sanitizedJson = sanitizeWorkbookExamJson(item.examJson);
   const normalizedSource = normalizeLibrarySource(item.source);
 
+  const preservedSharedCode =
+    existingIndex >= 0 && items[existingIndex].sharedCode
+      ? items[existingIndex].sharedCode
+      : undefined;
+
   const fullItem: ExamLibraryItem = {
     ...item,
     id: finalId,
     teacherEmail: normEmail,
     examJson: sanitizedJson,
     source: normalizedSource,
+    ...(preservedSharedCode ? { sharedCode: preservedSharedCode } : {}),
     createdAt: existingIndex >= 0 ? items[existingIndex].createdAt || now : now,
     updatedAt: now,
     syncedToCloud: false,
@@ -818,7 +824,7 @@ export function buildLibraryBackup(items: ExamLibraryItem[]): string {
       kind: "exam-library-backup",
       version: 1,
       exportedAt: new Date().toISOString(),
-      items: items.map(({ id, syncedToCloud, ...rest }) => rest),
+      items: items.map(({ id, syncedToCloud, sharedCode, ...rest }) => rest),
     },
     null,
     2
@@ -833,7 +839,7 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
   } catch {
     throw new Error("Il file non è un JSON valido.");
   }
-  const arr = Array.isArray(data) ? data : data.items;
+  const arr = Array.isArray(data) ? data : data && typeof data === "object" ? data.items : null;
   if (!Array.isArray(arr) || arr.length === 0) {
     throw new Error("Nessuna verifica trovata nel file di backup.");
   }
@@ -846,6 +852,9 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
       parsedExam = JSON.parse(it.examJson);
     } catch {
       throw new Error(`Voce ${idx + 1} ("${it.title || "?"}") con JSON esame non valido.`);
+    }
+    if (!parsedExam || typeof parsedExam !== "object" || Array.isArray(parsedExam)) {
+      throw new Error(`Voce ${idx + 1} ("${it.title || "?"}") non contiene una struttura esame valida.`);
     }
     const sanitizedJson = sanitizeWorkbookExamJson(it.examJson);
     const detected = countLibraryQuestions(parsedExam);
@@ -945,25 +954,32 @@ export async function publishSharedExam(
 
 export async function listMySharedExams(teacherEmail: string): Promise<SharedExamSummary[]> {
   if (!dbFirestore || !teacherEmail) return [];
-  const normEmail = normalizeEmail(teacherEmail);
-  try {
-    const q = query(collection(dbFirestore, "shared_exams"), where("teacherEmail", "==", normEmail));
-    const snap = await getDocs(q);
-    return snap.docs
-      .map((d) => {
-        const data = d.data() as any;
-        return {
-          shareCode: String(data.shareCode || d.id),
-          title: String(data.title || "Verifica condivisa"),
-          examType: data.examType === "Workbook" ? "Workbook" : "Quiz",
-          questionCount: Number(data.questionCount) || 0,
-          createdAt: String(data.createdAt || ""),
-        } as SharedExamSummary;
-      })
-      .sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
-  } catch {
-    return [];
-  }
+  const aliases = getTeacherAliasEmails(teacherEmail);
+  const byCode = new Map<string, SharedExamSummary>();
+  await Promise.all(
+    aliases.map(async (aliasEmail) => {
+      try {
+        const q = query(collection(dbFirestore, "shared_exams"), where("teacherEmail", "==", aliasEmail));
+        const snap = await getDocs(q);
+        snap.docs.forEach((d) => {
+          const data = d.data() as any;
+          const shareCode = String(data.shareCode || d.id);
+          if (!byCode.has(shareCode)) {
+            byCode.set(shareCode, {
+              shareCode,
+              title: String(data.title || "Verifica condivisa"),
+              examType: data.examType === "Workbook" ? "Workbook" : "Quiz",
+              questionCount: Number(data.questionCount) || 0,
+              createdAt: String(data.createdAt || ""),
+            });
+          }
+        });
+      } catch {
+        // Ignore single-alias permission mismatch for secondary teachers
+      }
+    })
+  );
+  return Array.from(byCode.values()).sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
 }
 
 export async function revokeSharedExam(shareCode: string, teacherEmail?: string): Promise<void> {
