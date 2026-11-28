@@ -18,6 +18,7 @@ import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, normalizeClassLabel, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
 import {
   formatMarkdown,
+  extractFibExpected,
   isFibAnswerCorrect,
   getFibSentenceParts,
   extractBreakdownFromSubmission,
@@ -27,7 +28,8 @@ import {
   collectWorkbookFillInTheBlank,
   collectWorkbookReflections,
   evaluateMcSelection,
-  isEvaluationPending,
+  isSubmissionPendingGrade,
+  isValidNumericScore,
   parseItalianGrade,
   safeParseJson,
 } from "../utils";
@@ -96,6 +98,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const [savingGradeEdit, setSavingGradeEdit] = useState(false);
   const [classEditOpen, setClassEditOpen] = useState(false);
   const [classEditValue, setClassEditValue] = useState("");
+  const [classEditError, setClassEditError] = useState<string | null>(null);
   const [savingClass, setSavingClass] = useState(false);
   const [editingItemKey, setEditingItemKey] = useState<string | null>(null);
   const [itemScoreInput, setItemScoreInput] = useState("");
@@ -105,6 +108,18 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const [unlockedDomandeMap, setUnlockedDomandeMap] = useState<Record<string, any>>({});
   const [integrityStatus, setIntegrityStatus] = useState<"idle" | "verified" | "teacher_adjusted" | "tampered" | "legacy_unsigned">("idle");
   const attemptedVaultIdsRef = useRef<Set<string>>(new Set());
+  const mountedRef = useRef(true);
+  const activeSubIdRef = useRef<string | undefined>(submission?.id);
+  activeSubIdRef.current = submission?.id;
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
+
+  const isBusySaving = savingGradeEdit || savingClass || Boolean(savingItemKey);
 
   useEffect(() => {
     setGradeEditOpen(false);
@@ -113,6 +128,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     setSavingGradeEdit(false);
     setClassEditOpen(false);
     setClassEditValue("");
+    setClassEditError(null);
     setSavingClass(false);
     setEditingItemKey(null);
     setItemScoreInput("");
@@ -195,11 +211,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
       if (!Array.isArray(q?.options) || q.options.length === 0) return false;
       return !evaluateMcSelection(q, 0).hasCorrectKey;
     });
-    const missingFibKey = fibList.some((f: any) => {
-      const ans = String(f?.answer || "").trim();
-      const bracket = typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence);
-      return !ans && !bracket;
-    });
+    const missingFibKey = fibList.some((f: any) => !extractFibExpected(f));
 
     if (!missingMcKey && !missingFibKey) return;
 
@@ -225,6 +237,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
     attemptedVaultIdsRef.current.add(domandeCacheKey);
     let cancelled = false;
+    let completed = false;
     const controller = new AbortController();
     (async () => {
       try {
@@ -252,6 +265,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         });
         const data = resp.ok ? await resp.json().catch(() => null) : null;
         if (cancelled) return;
+        completed = true;
         if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
           setUnlockedDomandeMap((prev) => ({ ...prev, [domandeCacheKey]: data.resolvedDomande }));
         } else {
@@ -259,12 +273,16 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         }
       } catch (err: any) {
         if (cancelled || err?.name === "AbortError") return;
+        completed = true;
         applyLibraryFallback();
       }
     })();
 
     return () => {
       cancelled = true;
+      if (!completed) {
+        attemptedVaultIdsRef.current.delete(domandeCacheKey);
+      }
       controller.abort();
     };
   }, [domandeCacheKey, submission?.id, submission?.Pin, submission?.Soluzioni_Differite, unlockedDomandeMap, resolveAuthHeaders, libraryExams]);
@@ -273,6 +291,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     if (!submission) return;
     const handleKey = (e: KeyboardEvent) => {
       if (e.key === "Escape") {
+        if (isBusySaving) {
+          e.preventDefault();
+          return;
+        }
         if (editingItemKey) {
           e.preventDefault();
           setEditingItemKey(null);
@@ -286,13 +308,14 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         if (classEditOpen) {
           e.preventDefault();
           setClassEditOpen(false);
+          setClassEditError(null);
           return;
         }
         e.preventDefault();
         onClose();
         return;
       }
-      if (!onNavigate || !totalCount || totalCount <= 1) return;
+      if (!onNavigate || !totalCount || totalCount <= 1 || isBusySaving) return;
       const tag = (e.target as HTMLElement | null)?.tagName;
       if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return;
       if (e.key === "ArrowLeft" && (currentIndex ?? 0) > 0) {
@@ -305,7 +328,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
     };
     window.addEventListener("keydown", handleKey);
     return () => window.removeEventListener("keydown", handleKey);
-  }, [submission, onNavigate, onClose, currentIndex, totalCount, editingItemKey, gradeEditOpen, classEditOpen]);
+  }, [submission, onNavigate, onClose, currentIndex, totalCount, editingItemKey, gradeEditOpen, classEditOpen, isBusySaving]);
 
   if (!submission) return null;
 
@@ -336,6 +359,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
       setItemRetouchError("Inserisci un punteggio valido compreso tra 0 e 10.");
       return;
     }
+    const targetSubId = submission.id;
     setItemRetouchError(null);
     setSavingItemKey(key);
     try {
@@ -346,11 +370,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
         Math.round(parsedScore * 100) / 100,
         itemFeedbackInput.trim()
       );
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
       setEditingItemKey(null);
     } catch (err: any) {
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
       setItemRetouchError(err?.message || "Salvataggio non riuscito: riprova.");
     } finally {
-      setSavingItemKey(null);
+      if (mountedRef.current && activeSubIdRef.current === targetSubId) {
+        setSavingItemKey(null);
+      }
     }
   };
   const evalObj = safeParseJson(submission.Full_Evaluation);
@@ -358,16 +386,54 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
   const resolvedClass = resolveSubmissionClass(submission);
   const isClassUnspecified = resolvedClass === UNSPECIFIED_CLASS_LABEL;
 
+  const handleSafeClose = () => {
+    if (isBusySaving) return;
+    onClose();
+  };
+
+  const handleSaveManualGrade = async () => {
+    if (savingGradeEdit) return;
+    const cleanVal = gradeEditValue.trim();
+    if (!cleanVal) {
+      setGradeEditError("Inserisci un voto valido (es. 6, 6+, 7½).");
+      return;
+    }
+    const targetSubId = submission.id;
+    setGradeEditError(null);
+    setSavingGradeEdit(true);
+    try {
+      await onManualGradeSave(submission, cleanVal);
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
+      setGradeEditOpen(false);
+      setGradeEditValue("");
+    } catch (err: any) {
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
+      setGradeEditError(err?.message || "Impossibile salvare il voto: riprova.");
+    } finally {
+      if (mountedRef.current && activeSubIdRef.current === targetSubId) {
+        setSavingGradeEdit(false);
+      }
+    }
+  };
+
   const handleSaveClassEdit = async () => {
-    if (!onUpdateClass) return;
+    if (!onUpdateClass || savingClass) return;
     const norm = normalizeClassLabel(classEditValue);
     if (!norm) return;
+    const targetSubId = submission.id;
+    setClassEditError(null);
     setSavingClass(true);
     try {
       await onUpdateClass(submission, norm);
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
       setClassEditOpen(false);
+    } catch (err: any) {
+      if (!mountedRef.current || activeSubIdRef.current !== targetSubId) return;
+      setClassEditError(err?.message || "Impossibile aggiornare la classe: riprova.");
     } finally {
-      setSavingClass(false);
+      if (mountedRef.current && activeSubIdRef.current === targetSubId) {
+        setSavingClass(false);
+      }
     }
   };
 
@@ -376,7 +442,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
       role="dialog"
       aria-modal="true"
       aria-label="Verbalizzazione Esame Corretto"
-      onClick={onClose}
+      onClick={handleSafeClose}
       className="fixed inset-0 bg-slate-950/80 backdrop-blur-sm z-50 flex items-center justify-center p-4"
     >
       <div
@@ -405,6 +471,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                   type="button"
                   onClick={() => {
                     setClassEditValue(isClassUnspecified ? "" : resolvedClass);
+                    setClassEditError(null);
                     setClassEditOpen(true);
                   }}
                   className="px-1.5 py-0.5 rounded text-[9px] font-semibold bg-white/5 hover:bg-white/10 text-slate-300 hover:text-white border border-white/10 cursor-pointer flex items-center gap-1"
@@ -426,38 +493,50 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
               )}
             </div>
             {classEditOpen && onUpdateClass && (
-              <div className="mt-2 flex items-center gap-1.5 flex-wrap">
-                <input
-                  type="text"
-                  list="sub-detail-class-suggestions"
-                  value={classEditValue}
-                  onChange={(e) => setClassEditValue(e.target.value.slice(0, 40))}
-                  onKeyDown={(e) => e.key === "Enter" && handleSaveClassEdit()}
-                  placeholder="es. 3A, 4B INF"
-                  className="w-32 px-2 py-1 bg-slate-900 border border-teal-400/50 rounded-lg text-white text-xs font-mono uppercase outline-none"
-                  autoFocus
-                />
-                <datalist id="sub-detail-class-suggestions">
-                  {availableClassSuggestions.map((cls) => (
-                    <option key={cls} value={cls} />
-                  ))}
-                </datalist>
-                <button
-                  type="button"
-                  disabled={savingClass || !normalizeClassLabel(classEditValue)}
-                  onClick={handleSaveClassEdit}
-                  className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white text-[10px] font-bold cursor-pointer flex items-center gap-1"
-                >
-                  <Check className="w-3 h-3" />
-                  <span>{savingClass ? "Salvo..." : "Salva"}</span>
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setClassEditOpen(false)}
-                  className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 text-slate-300 text-[10px] cursor-pointer"
-                >
-                  Annulla
-                </button>
+              <div className="mt-2 space-y-1">
+                <div className="flex items-center gap-1.5 flex-wrap">
+                  <input
+                    type="text"
+                    list="sub-detail-class-suggestions"
+                    value={classEditValue}
+                    onChange={(e) => {
+                      setClassEditValue(e.target.value.slice(0, 40));
+                      if (classEditError) setClassEditError(null);
+                    }}
+                    onKeyDown={(e) => e.key === "Enter" && handleSaveClassEdit()}
+                    placeholder="es. 3A, 4B INF"
+                    className="w-32 px-2 py-1 bg-slate-900 border border-teal-400/50 rounded-lg text-white text-xs font-mono uppercase outline-none"
+                    autoFocus
+                  />
+                  <datalist id="sub-detail-class-suggestions">
+                    {availableClassSuggestions.map((cls) => (
+                      <option key={cls} value={cls} />
+                    ))}
+                  </datalist>
+                  <button
+                    type="button"
+                    disabled={savingClass || !normalizeClassLabel(classEditValue)}
+                    onClick={handleSaveClassEdit}
+                    className="px-2.5 py-1 rounded-lg bg-teal-600 hover:bg-teal-500 disabled:opacity-40 text-white text-[10px] font-bold cursor-pointer flex items-center gap-1"
+                  >
+                    <Check className="w-3 h-3" />
+                    <span>{savingClass ? "Salvo..." : "Salva"}</span>
+                  </button>
+                  <button
+                    type="button"
+                    disabled={savingClass}
+                    onClick={() => {
+                      setClassEditOpen(false);
+                      setClassEditError(null);
+                    }}
+                    className="px-2 py-1 rounded-lg bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-slate-300 text-[10px] cursor-pointer"
+                  >
+                    Annulla
+                  </button>
+                </div>
+                {classEditError && (
+                  <p className="text-[10px] text-rose-300 font-medium">{classEditError}</p>
+                )}
               </div>
             )}
             <h3 className="text-base font-semibold text-white mt-0.5">
@@ -473,7 +552,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 <button
                   type="button"
                   onClick={() => onNavigate("prev")}
-                  disabled={currentIndex <= 0}
+                  disabled={isBusySaving || currentIndex <= 0}
                   title="Consegna precedente (←)"
                   className="p-1 rounded-lg text-slate-300 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer transition-colors"
                 >
@@ -485,7 +564,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                 <button
                   type="button"
                   onClick={() => onNavigate("next")}
-                  disabled={currentIndex >= totalCount - 1}
+                  disabled={isBusySaving || currentIndex >= totalCount - 1}
                   title="Consegna successiva (→)"
                   className="p-1 rounded-lg text-slate-300 hover:text-white hover:bg-white/10 disabled:opacity-30 disabled:cursor-not-allowed cursor-pointer transition-colors"
                 >
@@ -514,9 +593,10 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             </button>
             <button
               type="button"
-              onClick={onClose}
+              onClick={handleSafeClose}
+              disabled={isBusySaving}
               aria-label="Chiudi dettaglio consegna"
-              className="p-1.5 hover:bg-white/5 rounded-xl transition-colors text-slate-400 hover:text-white cursor-pointer"
+              className="p-1.5 hover:bg-white/5 disabled:opacity-40 rounded-xl transition-colors text-slate-400 hover:text-white cursor-pointer"
             >
               <X className="w-5 h-5" />
             </button>
@@ -525,7 +605,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
         {/* Modal Body scroll content */}
         <div className="p-6 overflow-y-auto space-y-6 text-slate-100 text-xs leading-relaxed text-left">
-          {isEvaluationPending(evalObj) && (
+          {isSubmissionPendingGrade(submission, evalObj) && (
             <div className="p-4 bg-rose-500/10 border-2 border-rose-500/40 rounded-xl space-y-2 animate-fadeIn">
               <div className="flex items-start gap-2.5">
                 <AlertCircle className="w-5 h-5 text-rose-400 shrink-0 mt-0.5" />
@@ -758,30 +838,19 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                     setGradeEditValue(e.target.value);
                     if (gradeEditError) setGradeEditError(null);
                   }}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") {
+                      e.preventDefault();
+                      void handleSaveManualGrade();
+                    }
+                  }}
                   placeholder="es. 6, 6+, 7½"
                   className="flex-1 px-3 py-2 bg-slate-900 border border-white/10 rounded-lg text-white text-sm font-mono outline-none focus:border-amber-400"
                 />
                 <button
                   type="button"
                   disabled={savingGradeEdit}
-                  onClick={async () => {
-                    const cleanVal = gradeEditValue.trim();
-                    if (!cleanVal) {
-                      setGradeEditError("Inserisci un voto valido (es. 6, 6+, 7½).");
-                      return;
-                    }
-                    setGradeEditError(null);
-                    setSavingGradeEdit(true);
-                    try {
-                      await onManualGradeSave(submission, cleanVal);
-                      setGradeEditOpen(false);
-                      setGradeEditValue("");
-                    } catch (err: any) {
-                      setGradeEditError(err?.message || "Impossibile salvare il voto: riprova.");
-                    } finally {
-                      setSavingGradeEdit(false);
-                    }
-                  }}
+                  onClick={() => void handleSaveManualGrade()}
                   className="px-3 py-2 bg-amber-500 hover:bg-amber-400 disabled:opacity-50 text-slate-950 font-bold rounded-lg text-xs cursor-pointer transition-colors"
                 >
                   {savingGradeEdit ? "Salvo..." : "Salva"}
@@ -994,7 +1063,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
                               return (
                                 <div
-                                  key={q.id || idx}
+                                  key={q.id ?? idx}
                                   className={`p-3 bg-slate-950/60 border ${
                                     !sel.hasCorrectKey
                                       ? "border-amber-500/25"
@@ -1048,13 +1117,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                             </p>
                             {oeEntries.map((entry: any, idx: number) => {
                               const ansText = entry.answer || "Assente";
-                              const hasEvaluation = !!entry.detail;
-                              const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
-                              const itemKey = `oe_${entry.id || idx}`;
+                              const hasEvaluation = Boolean(entry.detail && isValidNumericScore(entry.detail.score));
+                              const score = hasEvaluation
+                                ? Number(String(entry.detail.score).trim().replace(",", "."))
+                                : null;
+                              const itemKey = `oe_${entry.id ?? idx}`;
                               const isEditing = editingItemKey === itemKey;
 
                               return (
-                                <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
+                                <div key={entry.id ?? idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
                                   <div className="flex items-center justify-between gap-2">
                                     <p className="font-bold text-slate-300 font-mono text-[10px]">
                                       DOMANDA APERTA {idx + 1}
@@ -1176,13 +1247,13 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                     fibList.map((fib: any, fIdx: number) => {
                       const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
                       const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
-                      const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                      const expected = extractFibExpected(fib);
                       const hasExpected = String(expected).trim().length > 0;
                       const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
                       const { before, after } = getFibSentenceParts(fib.sentence, expected);
 
                       return (
-                        <div key={fib.id || fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
+                        <div key={fib.id ?? fIdx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-1">
                           <p className="font-bold text-slate-300 font-mono text-[10px]">FIB {fIdx + 1}</p>
                           <p className="text-slate-300 text-[11px] leading-relaxed">
                             <span>{before}</span>
@@ -1230,7 +1301,7 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
 
                             return (
                               <div
-                                key={q.id || idx}
+                                key={q.id ?? idx}
                                 className={`p-3 bg-slate-950/60 border ${
                                   !sel.hasCorrectKey
                                     ? "border-amber-500/25"
@@ -1314,13 +1385,15 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
                         ) : (
                           rqEntries.map((entry: any, idx: number) => {
                             const ansText = entry.answer || "Assente";
-                            const hasEvaluation = !!entry.detail;
-                            const score = hasEvaluation ? Number(entry.detail.score) || 0 : null;
-                            const itemKey = `rq_${entry.id || idx}`;
+                            const hasEvaluation = Boolean(entry.detail && isValidNumericScore(entry.detail.score));
+                            const score = hasEvaluation
+                              ? Number(String(entry.detail.score).trim().replace(",", "."))
+                              : null;
+                            const itemKey = `rq_${entry.id ?? idx}`;
                             const isEditing = editingItemKey === itemKey;
 
                             return (
-                              <div key={entry.id || idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
+                              <div key={entry.id ?? idx} className="p-3 bg-slate-950/60 border border-white/5 rounded-xl space-y-2">
                                 <div className="flex items-center justify-between gap-2">
                                   <p className="font-bold text-slate-300 font-mono text-[10px]">
                                     RIFLESSIONE CRITICA {idx + 1}
@@ -1446,8 +1519,9 @@ const SubmissionDetailModal: React.FC<SubmissionDetailModalProps> = React.memo((
             </button>
             <button
               type="button"
-              onClick={onClose}
-              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
+              onClick={handleSafeClose}
+              disabled={isBusySaving}
+              className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 disabled:opacity-40 text-white font-bold rounded-xl transition-colors cursor-pointer text-xs"
             >
               Chiudi Esame
             </button>

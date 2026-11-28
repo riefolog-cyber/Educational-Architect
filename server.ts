@@ -6,7 +6,7 @@ import crypto from "crypto";
 import { GoogleGenAI, ThinkingLevel, Type } from "@google/genai";
 import dotenv from "dotenv";
 import firebaseConfig from "./firebase-applet-config.json";
-import { computeGradeBreakdown, detectGibberish, evaluateMcSelection, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, snapHalfPointScore, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, isWorkbookExamData } from "./src/utils";
+import { computeGradeBreakdown, detectGibberish, evaluateMcSelection, extractFibExpected, isFibAnswerCorrect, fibWeightedScore, mcWeightedScore, auditSubjectiveEvaluation, snapHalfPointScore, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, isWorkbookExamData, sanitizeAiHtml } from "./src/utils";
 import { stripExamAnswers, restoreExamAnswers, reconstructExamMcOrder, validateExamKeysForLaunch } from "./src/utils/examSecurity";
 import { tolerantJsonParse, normalizeExamStructure } from "./src/utils/examStructureRepair";
 import { buildFormViewUrl, isAllowedFormHost, parseFormHtml, extractFormIdFromUrl, applyFormDataAnswerKey, normalizeAppsScriptExecUrl, normalizeLinkedFormPayload } from "./src/utils/googleFormsLink";
@@ -306,10 +306,20 @@ function createRateLimiter(options: { maxRequests: number; windowMs: number; mes
   }, Math.max(30000, options.windowMs));
   if (typeof timer.unref === "function") timer.unref();
 
+  const HEALTH_PROBE_PATHS = new Set([
+    "/api/evaluate/enqueue",
+    "/api/analyze-exam",
+    "/api/extend-exam-json",
+  ]);
+
   return (req: express.Request, res: express.Response, next: express.NextFunction) => {
-    if (req.method === "OPTIONS" || req.method === "GET") {
-      // Allow lightweight GET warmup/health probes through unless it's /api/generate-exam with topic
-      if (req.path !== "/api/generate-exam" || !req.query?.topic) {
+    if (req.method === "OPTIONS") {
+      return next();
+    }
+    if (req.method === "GET") {
+      // Allow lightweight GET warmup/health probes on POST-primary endpoints,
+      // while still enforcing rate limits on real GET API routes (/api/forms-import, /api/forms-script, /api/google/oauth/*, /api/generate-exam?topic=...)
+      if (HEALTH_PROBE_PATHS.has(req.path) || (req.path === "/api/generate-exam" && !req.query?.topic)) {
         return next();
       }
     }
@@ -347,14 +357,43 @@ const PRIMARY_TEACHER_EMAILS = new Set([
 ]);
 const teacherAuthCache = new Map<string, { email: string; uid: string; isTeacher: boolean; expiresAt: number }>();
 
-async function checkDocentiFirestoreRole(email: string, idToken: string): Promise<boolean> {
+async function checkDocentiFirestoreRole(email: string, idToken: string, uid?: string): Promise<boolean> {
   try {
     const projectId = (firebaseConfig as any).projectId;
     const dbId = (firebaseConfig as any).firestoreDatabaseId || "(default)";
     if (!projectId) return false;
     const cleanEmail = String(email || "").trim();
-    const candidates = Array.from(new Set([cleanEmail, cleanEmail.toLowerCase()].filter(Boolean)));
-    if (candidates.length === 0) return false;
+    const cleanUid = String(uid || "").trim();
+    if (!cleanEmail && !cleanUid) return false;
+
+    // 1. Direct document GET by email/lowercase-email/uid (compatible with owner-only docenti get rules)
+    const docIds = Array.from(new Set([cleanEmail.toLowerCase(), cleanEmail, cleanUid].filter(Boolean)));
+    for (const docId of docIds) {
+      const getUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents/docenti/${encodeURIComponent(docId)}`;
+      const controller = new AbortController();
+      const t = setTimeout(() => controller.abort(), 4000);
+      try {
+        const resp = await fetch(getUrl, {
+          method: "GET",
+          signal: controller.signal,
+          headers: { Authorization: `Bearer ${idToken}` },
+        });
+        if (resp.ok) {
+          const docData = (await resp.json().catch(() => null)) as any;
+          const roleVal = String(docData?.fields?.role?.stringValue || "");
+          if (roleVal === "admin" || roleVal === "teacher") {
+            return true;
+          }
+        }
+      } catch {
+        // Continue to next candidate
+      } finally {
+        clearTimeout(t);
+      }
+    }
+
+    // 2. Fallback: exact EQUAL query matching request.auth.token.email (permitted by docenti list rule)
+    if (!cleanEmail) return false;
     const queryUrl = `https://firestore.googleapis.com/v1/projects/${projectId}/databases/${dbId}/documents:runQuery`;
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 5000);
@@ -372,12 +411,8 @@ async function checkDocentiFirestoreRole(email: string, idToken: string): Promis
             where: {
               fieldFilter: {
                 field: { fieldPath: "email" },
-                op: "IN",
-                value: {
-                  arrayValue: {
-                    values: candidates.map((v) => ({ stringValue: v })),
-                  },
-                },
+                op: "EQUAL",
+                value: { stringValue: cleanEmail },
               },
             },
             limit: 3,
@@ -461,7 +496,7 @@ async function verifyTeacherFromRequest(
     const emailVerified = fbUser.emailVerified === true;
     const isTeacher =
       emailVerified &&
-      (PRIMARY_TEACHER_EMAILS.has(normEmail) || (await checkDocentiFirestoreRole(fbUser.email, idToken)));
+      (PRIMARY_TEACHER_EMAILS.has(normEmail) || (await checkDocentiFirestoreRole(fbUser.email, idToken, String(fbUser.localId || ""))));
 
     teacherAuthCache.set(tokenHash, {
       email: normEmail,
@@ -473,6 +508,11 @@ async function verifyTeacherFromRequest(
       const now = Date.now();
       for (const [k, v] of teacherAuthCache) {
         if (v.expiresAt <= now) teacherAuthCache.delete(k);
+      }
+      while (teacherAuthCache.size > 1000) {
+        const oldestKey = teacherAuthCache.keys().next().value;
+        if (oldestKey !== undefined) teacherAuthCache.delete(oldestKey);
+        else break;
       }
     }
 
@@ -1147,14 +1187,78 @@ async function runEvaluationCore(reqBody: any) {
     return cachedFsResult;
   };
 
+  const isTeacherVerified = reqBody?._teacherVerified === true;
+  let restoredFromVault = false;
+  let answerKey: any = null;
+  let resolvedSessionId = reqSessionId;
+  let fsFieldsForSession: any = cachedFsResult?.fields || null;
+  const rawReqEncryptedKey = String(reqBody?.encryptedAnswerKey || "").trim();
+  const candidateBodyKey = rawReqEncryptedKey ? decryptAnswerKey(rawReqEncryptedKey) : null;
+  const bodyVaultMeta =
+    candidateBodyKey && typeof candidateBodyKey === "object" && candidateBodyKey._vaultMeta && typeof candidateBodyKey._vaultMeta === "object"
+      ? candidateBodyKey._vaultMeta
+      : null;
+
+  let foreignKeyBlocked = false;
+  if (candidateBodyKey) {
+    if (!isTeacherVerified && bodyVaultMeta) {
+      const metaPin = String(bodyVaultMeta.pin || "").trim().toUpperCase();
+      const metaSessionId = String(bodyVaultMeta.sessionId || "").trim();
+      const metaDefer = Boolean(bodyVaultMeta.deferSolutions);
+
+      if (metaPin && metaPin !== cleanSessionPin) {
+        // Cross-PIN or blank-PIN attempt against a session-bound vault key
+        foreignKeyBlocked = true;
+        deferSolutions = true;
+      } else if (metaSessionId && reqSessionId && metaSessionId !== reqSessionId) {
+        foreignKeyBlocked = true;
+        deferSolutions = true;
+      } else {
+        answerKey = candidateBodyKey;
+        if (metaDefer && !deferSolutions) {
+          // Fail-closed: a deferred-bound vault key only unlocks when Firestore explicitly confirms release
+          const fsCheck = await loadSessionDocOnce();
+          let explicitlyUnlocked = false;
+          if (fsCheck.ok && fsCheck.fields) {
+            fsFieldsForSession = fsCheck.fields;
+            const parsedMetaFs = parseSessionDeferredFields(fsCheck.fields);
+            const effectiveRunId = reqSessionId || metaSessionId;
+            const sameMetaRun = !effectiveRunId || !parsedMetaFs.fsSessionId || effectiveRunId === parsedMetaFs.fsSessionId;
+            if (sameMetaRun) {
+              explicitlyUnlocked = isDeferredUnlockedForStudent({
+                deferSolutions: parsedMetaFs.fsDefer,
+                solutionsReleased: parsedMetaFs.fsReleased,
+                releasedClasses: parsedMetaFs.fsReleasedClasses,
+                studentClass: String(reqBody?.studentClass || "").trim(),
+                autoReleaseSolutions: parsedMetaFs.fsAutoRelease,
+                expiry: parsedMetaFs.fsExpiry,
+                createdAt: parsedMetaFs.fsCreatedAt,
+                maxExtendedExpiry: parsedMetaFs.fsMaxExtendedExpiry,
+                besExtraTimePercent: parsedMetaFs.fsBesExtraPct,
+              });
+            }
+          }
+          if (!explicitlyUnlocked) {
+            deferSolutions = true;
+          }
+        }
+      }
+    } else {
+      answerKey = candidateBodyKey;
+    }
+  }
+
   // Server-authoritative guard: a student cannot bypass an active deferred lock
-  // on Firestore by tampering with reqBody.deferSolutions = false.
-  if (!deferSolutions && cleanSessionPin && reqBody?.forceReevaluation !== true) {
+  // on Firestore by tampering with reqBody.deferSolutions = false, nor replay a
+  // legacy encrypted key from another locked session under an unlocked PIN.
+  if (!isTeacherVerified && cleanSessionPin && (!deferSolutions || Boolean(answerKey))) {
     const fsResult = await loadSessionDocOnce();
     if (fsResult.ok && fsResult.fields) {
+      fsFieldsForSession = fsResult.fields;
       const parsedFs = parseSessionDeferredFields(fsResult.fields);
       const sameRun = !reqSessionId || !parsedFs.fsSessionId || reqSessionId === parsedFs.fsSessionId;
-      if (sameRun && parsedFs.fsDefer) {
+      if (!resolvedSessionId && parsedFs.fsSessionId) resolvedSessionId = parsedFs.fsSessionId;
+      if (sameRun && parsedFs.fsDefer && !deferSolutions) {
         const unlockedForStudent = isDeferredUnlockedForStudent({
           deferSolutions: parsedFs.fsDefer,
           solutionsReleased: parsedFs.fsReleased,
@@ -1170,21 +1274,28 @@ async function runEvaluationCore(reqBody: any) {
           deferSolutions = true;
         }
       }
+      // Verify legacy client-supplied key belongs to this session's Firestore vault keys when present
+      if (answerKey && rawReqEncryptedKey) {
+        const sessionKeyA = String(fsResult.fields?.encryptedAnswerKey?.stringValue || "").trim();
+        const sessionKeyB = String(fsResult.fields?.encryptedFilaBAnswerKey?.stringValue || "").trim();
+        const sessionHasVaultKeys = Boolean(sessionKeyA || sessionKeyB);
+        if (sessionHasVaultKeys && rawReqEncryptedKey !== sessionKeyA && rawReqEncryptedKey !== sessionKeyB) {
+          answerKey = null;
+          foreignKeyBlocked = true;
+          deferSolutions = true;
+        }
+      }
     }
   }
 
-  let restoredFromVault = false;
-  let answerKey: any = reqBody.encryptedAnswerKey ? decryptAnswerKey(reqBody.encryptedAnswerKey) : null;
-  let resolvedSessionId = reqSessionId;
-  let fsFieldsForSession: any = cachedFsResult?.fields || null;
-
-  // Fallback: if encryptedAnswerKey was missing or undecryptable, fetch the session's vault key from active_sessions
+  // Fallback: if encryptedAnswerKey was missing or undecryptable (and not blocked as a foreign key),
+  // fetch the session's vault key from active_sessions
   const initialMcList = collectExamMultipleChoice(report.domande);
   const initialFibList = normalizedTipo === "workbook" ? collectWorkbookFillInTheBlank(report.domande) : [];
   const needsVaultKeys =
     !initialMcList.every(hasValidMcCorrectKey) || !initialFibList.every(hasValidFibKey);
 
-  if (!answerKey && cleanSessionPin && (reqBody.encryptedAnswerKey || needsVaultKeys)) {
+  if (!answerKey && !foreignKeyBlocked && cleanSessionPin && (rawReqEncryptedKey || needsVaultKeys)) {
     const fsResult = await loadSessionDocOnce();
     if (fsResult.ok && fsResult.fields) {
       fsFieldsForSession = fsResult.fields;
@@ -1197,7 +1308,7 @@ async function runEvaluationCore(reqBody: any) {
           assignedFila === "B" && fsResult.fields?.encryptedFilaBAnswerKey?.stringValue
             ? String(fsResult.fields.encryptedFilaBAnswerKey.stringValue)
             : String(fsResult.fields?.encryptedAnswerKey?.stringValue || "");
-        if (fsKeySource && fsKeySource !== String(reqBody.encryptedAnswerKey || "").trim()) {
+        if (fsKeySource && fsKeySource !== rawReqEncryptedKey) {
           answerKey = decryptAnswerKey(fsKeySource);
         }
       }
@@ -2183,6 +2294,12 @@ function processQueue() {
   }
 }
 
+// Never cache dynamic API responses (exams, keys, evaluations, teacher AI) in browsers or intermediaries
+app.use("/api", (_req, res, next) => {
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+
 // Queue API Endpoints
 app.get("/api/evaluate/warmup", (_req, res) => {
   res.json({ warmedUp: true, message: "Connection warmed up and cookies verified successfully." });
@@ -2682,10 +2799,7 @@ Fornisci la risposta esclusivamente strutturata in formato JSON con il seguente 
 
     const finalJson = parsedObj ? JSON.stringify(parsedObj, null, 2) : String(data.optimizedJson);
 
-    const safeReviewHtml = String(data.reviewHtml || "")
-      .replace(/<(script|iframe|object|embed|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
-      .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-      .replace(/javascript\s*:/gi, "");
+    const safeReviewHtml = sanitizeAiHtml(String(data.reviewHtml || ""));
 
     return res.json({ 
       status: "success", 
@@ -2751,7 +2865,7 @@ app.all("/api/extend-exam-json", teacherAiRateLimiter, requireTeacherAuth, async
       baseExam.multipleChoice = baseExam.questions;
     }
 
-    const isInputWorkbook = !!(baseExam.sections && Array.isArray(baseExam.sections));
+    const isInputWorkbook = isWorkbookExamData(baseExam);
 
     const safeInstruction = scrubPromptPii(instruction.trim()).scrubbedText;
     const promptBaseJson = stripBase64ImagesForPrompt(baseExam);
@@ -3324,8 +3438,20 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
         validationErrors: checkA.errors,
       });
     }
+    const vaultPin = String(req.body?.pin || "").trim().toUpperCase();
+    const vaultSessionId = String(req.body?.sessionId || "").trim();
+    const vaultDefer = Boolean(req.body?.deferSolutions);
+    const vaultMeta =
+      vaultPin || vaultSessionId || vaultDefer
+        ? {
+            ...(vaultPin ? { pin: vaultPin } : {}),
+            ...(vaultSessionId ? { sessionId: vaultSessionId } : {}),
+            deferSolutions: vaultDefer,
+          }
+        : undefined;
+
     const { sanitizedExam, answerKey } = stripExamAnswers(normalized, { reduceDistractors });
-    const encryptedAnswerKey = encryptAnswerKey(answerKey);
+    const encryptedAnswerKey = encryptAnswerKey(vaultMeta ? { ...answerKey, _vaultMeta: vaultMeta } : answerKey);
 
     let sanitizedFilaBExam: any = undefined;
     let encryptedFilaBAnswerKey: string | undefined = undefined;
@@ -3340,7 +3466,7 @@ app.post("/api/session/prepare", teacherAiRateLimiter, requireTeacherAuth, (req,
       }
       const strippedB = stripExamAnswers(normalizedB, { reduceDistractors });
       sanitizedFilaBExam = strippedB.sanitizedExam;
-      encryptedFilaBAnswerKey = encryptAnswerKey(strippedB.answerKey);
+      encryptedFilaBAnswerKey = encryptAnswerKey(vaultMeta ? { ...strippedB.answerKey, _vaultMeta: vaultMeta } : strippedB.answerKey);
     }
 
     res.setHeader("Cache-Control", "no-store");
@@ -3515,27 +3641,76 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
 
     let resolvedDomande = examData;
     const assignedFila = String(req.body?.assignedFila || "").trim().toUpperCase();
-    let answerKey = encryptedAnswerKey ? decryptAnswerKey(encryptedAnswerKey) : null;
+    let answerKey: any = null;
 
-    if (!cachedFields && (!answerKey || (!(rawMcOptionOrder && typeof rawMcOptionOrder === "object" && Object.keys(rawMcOptionOrder).length > 0) && req.body?.randomizeQuestions === undefined))) {
-      const fsResult = await fetchActiveSessionDoc(cleanPin);
-      if (fsResult.ok && fsResult.fields) {
-        const { fsSessionId } = parseSessionDeferredFields(fsResult.fields);
-        if (!requestedSessionId || !fsSessionId || requestedSessionId === fsSessionId) {
-          cachedFields = fsResult.fields;
-          if (!resolvedSessionId && fsSessionId) {
-            resolvedSessionId = fsSessionId;
+    if (!teacherCheck.ok) {
+      // Non-teacher callers may NEVER use an unlocked PIN to decrypt an answer key from a different session
+      const sessionKeyA = String(cachedFields?.encryptedAnswerKey?.stringValue || "").trim();
+      const sessionKeyB = String(cachedFields?.encryptedFilaBAnswerKey?.stringValue || "").trim();
+      const sessionHasVaultKeys = Boolean(sessionKeyA || sessionKeyB);
+
+      if (encryptedAnswerKey) {
+        if (sessionHasVaultKeys) {
+          if (encryptedAnswerKey === sessionKeyA || encryptedAnswerKey === sessionKeyB) {
+            answerKey = decryptAnswerKey(encryptedAnswerKey);
+          } else {
+            // If the caller sent a valid decryptable vault key belonging to ANOTHER session, reject immediately (403).
+            // Otherwise (corrupted/unreadable local token) fall back cleanly to this session's Firestore key below.
+            const foreignKeyProbe = decryptAnswerKey(encryptedAnswerKey);
+            if (foreignKeyProbe !== null) {
+              return res.status(403).json({ error: "La chiave cifrata non corrisponde alla sessione indicata." });
+            }
+          }
+        } else {
+          answerKey = decryptAnswerKey(encryptedAnswerKey);
+        }
+      }
+
+      if (!answerKey && cachedFields) {
+        const fsKeySource = assignedFila === "B" && sessionKeyB ? sessionKeyB : sessionKeyA;
+        if (fsKeySource) {
+          answerKey = decryptAnswerKey(fsKeySource);
+        }
+      }
+
+      // Enforce cryptographic _vaultMeta binding when present
+      const keyMeta =
+        answerKey && typeof answerKey === "object" && answerKey._vaultMeta && typeof answerKey._vaultMeta === "object"
+          ? answerKey._vaultMeta
+          : null;
+      if (keyMeta) {
+        const metaPin = String(keyMeta.pin || "").trim().toUpperCase();
+        const metaSessionId = String(keyMeta.sessionId || "").trim();
+        if (metaPin && metaPin !== cleanPin) {
+          return res.status(403).json({ error: "La chiave cifrata appartiene a una sessione diversa." });
+        }
+        if (metaSessionId && resolvedSessionId && metaSessionId !== resolvedSessionId) {
+          return res.status(403).json({ error: "La chiave cifrata appartiene a un'esecuzione diversa di questa sessione." });
+        }
+      }
+    } else {
+      answerKey = encryptedAnswerKey ? decryptAnswerKey(encryptedAnswerKey) : null;
+
+      if (!cachedFields && (!answerKey || (!(rawMcOptionOrder && typeof rawMcOptionOrder === "object" && Object.keys(rawMcOptionOrder).length > 0) && req.body?.randomizeQuestions === undefined))) {
+        const fsResult = await fetchActiveSessionDoc(cleanPin);
+        if (fsResult.ok && fsResult.fields) {
+          const { fsSessionId } = parseSessionDeferredFields(fsResult.fields);
+          if (!requestedSessionId || !fsSessionId || requestedSessionId === fsSessionId) {
+            cachedFields = fsResult.fields;
+            if (!resolvedSessionId && fsSessionId) {
+              resolvedSessionId = fsSessionId;
+            }
           }
         }
       }
-    }
 
-    if (!answerKey && cachedFields) {
-      const fsKeySource = assignedFila === "B" && cachedFields?.encryptedFilaBAnswerKey?.stringValue
-        ? String(cachedFields.encryptedFilaBAnswerKey.stringValue)
-        : String(cachedFields?.encryptedAnswerKey?.stringValue || "");
-      if (fsKeySource) {
-        answerKey = decryptAnswerKey(fsKeySource);
+      if (!answerKey && cachedFields) {
+        const fsKeySource = assignedFila === "B" && cachedFields?.encryptedFilaBAnswerKey?.stringValue
+          ? String(cachedFields.encryptedFilaBAnswerKey.stringValue)
+          : String(cachedFields?.encryptedAnswerKey?.stringValue || "");
+        if (fsKeySource) {
+          answerKey = decryptAnswerKey(fsKeySource);
+        }
       }
     }
 
@@ -3581,8 +3756,9 @@ app.post("/api/session/unlock-solutions", evalRateLimiter, async (req, res) => {
     fibLists.forEach((fib: any, idx: number) => {
       const rawVal = answers?.wbFib?.[fib.id] ?? answers?.fib?.[fib.id] ?? "";
       const val = typeof rawVal === "string" ? rawVal.trim() : String(rawVal?.[0] || "").trim();
-      if (fib.answer && !isFibAnswerCorrect(val, fib.answer, fib.sentence)) {
-        wrongList.push(`Completamento ${idx + 1}) ${fib.sentence} (scritto: ${val || "vuoto"} → attesa: ${fib.answer})`);
+      const expectedFib = extractFibExpected(fib);
+      if (expectedFib && !isFibAnswerCorrect(val, expectedFib, fib.sentence)) {
+        wrongList.push(`Completamento ${idx + 1}) ${fib.sentence} (scritto: ${val || "vuoto"} → attesa: ${expectedFib})`);
       }
     });
 
@@ -3624,7 +3800,10 @@ app.post("/api/transcribe-audio", evalRateLimiter, async (req, res) => {
   if (!allowedAudioMimes.has(baseMime)) {
     return res.status(400).json({ error: `Formato audio non supportato (${baseMime}).` });
   }
-  const cleanBase64 = rawAudio.replace(/^data:audio\/[a-z0-9.+-]+(?:;[^;,]+)*;base64,/i, "");
+  const cleanBase64 = rawAudio.replace(/^data:audio\/[a-z0-9.+-]+(?:;[^;,]+)*;base64,/i, "").replace(/\s+/g, "");
+  if (!cleanBase64 || cleanBase64.length < 16 || !/^[A-Za-z0-9+/]+={0,2}$/.test(cleanBase64)) {
+    return res.status(400).json({ error: "Dati audio vuoti o non validi." });
+  }
   if (cleanBase64.length > 6_000_000) {
     return res.status(413).json({ error: "La registrazione audio supera il limite massimo consentito (circa 4 MB)." });
   }
@@ -3890,10 +4069,7 @@ Rispondi ESCLUSIVAMENTE in JSON valido con questo schema:
       throw new Error("Struttura JSON non valida ricevuta dal modello IA.");
     }
 
-    const safeSummaryHtml = String(parsed.summaryHtml || "")
-      .replace(/<(script|iframe|object|embed|style)\b[^>]*>[\s\S]*?<\/\1>/gi, "")
-      .replace(/\son\w+\s*=\s*(?:"[^"]*"|'[^']*'|[^\s>]+)/gi, "")
-      .replace(/javascript\s*:/gi, "");
+    const safeSummaryHtml = sanitizeAiHtml(String(parsed.summaryHtml || ""));
 
     return res.json({
       status: "success",
@@ -4094,7 +4270,16 @@ async function fetchFormPage(startUrl: string): Promise<{ html: string; finalUrl
       );
     }
 
-    const html = await response.text();
+    const MAX_FORM_HTML_BYTES = 5 * 1024 * 1024;
+    const declaredLen = Number(response.headers.get("content-length") || 0);
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_FORM_HTML_BYTES) {
+      throw new FormImportError("La pagina del modulo supera il limite massimo consentito (5 MB).", 413);
+    }
+    const buf = await response.arrayBuffer();
+    if (buf.byteLength > MAX_FORM_HTML_BYTES) {
+      throw new FormImportError("La pagina del modulo supera il limite massimo consentito (5 MB).", 413);
+    }
+    const html = new TextDecoder("utf-8").decode(buf);
     return { html, finalUrl: response.url || current };
   }
 
@@ -4229,7 +4414,39 @@ async function fetchAppsScriptAnswer(target: string): Promise<AppsScriptAnswer |
       break;
     }
     if (!response) return null;
-    const body = await response.text();
+    const MAX_APPS_SCRIPT_BODY_BYTES = 5 * 1024 * 1024;
+    const declaredLen = Number(response.headers.get("content-length") || "0");
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_APPS_SCRIPT_BODY_BYTES) {
+      return null;
+    }
+    let body = "";
+    if (response.body && typeof response.body.getReader === "function") {
+      const reader = response.body.getReader();
+      const chunks: Buffer[] = [];
+      let totalBytes = 0;
+      try {
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          if (value) {
+            totalBytes += value.byteLength;
+            if (totalBytes > MAX_APPS_SCRIPT_BODY_BYTES) {
+              try { await reader.cancel(); } catch {}
+              return null;
+            }
+            chunks.push(Buffer.from(value));
+          }
+        }
+      } finally {
+        try { reader.releaseLock(); } catch {}
+      }
+      body = Buffer.concat(chunks).toString("utf8");
+    } else {
+      body = await response.text();
+      if (Buffer.byteLength(body, "utf8") > MAX_APPS_SCRIPT_BODY_BYTES) {
+        return null;
+      }
+    }
     let json: unknown = null;
     try {
       json = JSON.parse(body);
@@ -4406,8 +4623,16 @@ const GOOGLE_IMPORT_RETURN_PARAM = "gforms_return";
 const GOOGLE_IMPORT_ERROR_PARAM = "gforms_error";
 const OAUTH_STATE_MAX_AGE_MS = 15 * 60 * 1000;
 const PENDING_IMPORT_MAX_AGE_MS = 20 * 60 * 1000;
+const MAX_PENDING_GOOGLE_IMPORTS = 100;
 const MAX_FORM_IMAGES = 40;
 const MAX_FORM_IMAGE_BYTES = 6 * 1024 * 1024;
+const ALLOWED_FORM_IMAGE_MIME_RE = /^image\/(png|jpeg|jpg|webp|gif)$/i;
+const SAFE_HOST_HEADER_RE = /^[a-zA-Z0-9.-]+(?::\d{1,5})?$/;
+
+export function isAllowedFormImageContentType(contentType: string): boolean {
+  const clean = String(contentType || "").split(";")[0].trim().toLowerCase();
+  return ALLOWED_FORM_IMAGE_MIME_RE.test(clean);
+}
 
 interface PendingGoogleImport {
   createdAt: number;
@@ -4422,6 +4647,11 @@ function cleanupPendingGoogleImports() {
   for (const [id, entry] of pendingGoogleImports) {
     if (now - entry.createdAt > PENDING_IMPORT_MAX_AGE_MS) pendingGoogleImports.delete(id);
   }
+  while (pendingGoogleImports.size >= MAX_PENDING_GOOGLE_IMPORTS) {
+    const oldestKey = pendingGoogleImports.keys().next().value;
+    if (!oldestKey) break;
+    pendingGoogleImports.delete(oldestKey);
+  }
 }
 
 function googleOAuthConfig() {
@@ -4430,19 +4660,38 @@ function googleOAuthConfig() {
   return { clientId, clientSecret, configured: !!(clientId && clientSecret) };
 }
 
+function sanitizeHostHeader(raw: string): string {
+  const first = String(raw || "").split(",")[0].trim();
+  if (!first || first.length > 253 || first.includes("..")) return "";
+  return SAFE_HOST_HEADER_RE.test(first) ? first : "";
+}
+
 /**
  * Base URL pubblica dell'app: `APP_URL` quando è configurata (consigliato in
- * produzione), altrimenti quella della richiesta (sviluppo locale).
+ * produzione), altrimenti quella della richiesta (sviluppo locale) validata
+ * strettamente contro header injection.
  */
-function publicBaseUrl(req: express.Request): string {
+export function publicBaseUrl(req: express.Request): string {
   const explicit = String(process.env.APP_URL || "").trim().replace(/\/+$/, "");
-  if (explicit) return explicit;
-  const proto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
+  if (explicit) {
+    try {
+      const u = new URL(explicit);
+      if (u.protocol === "http:" || u.protocol === "https:") {
+        return `${u.protocol}//${u.host}${u.pathname.replace(/\/+$/, "")}`;
+      }
+    } catch {
+      return "";
+    }
+    return "";
+  }
+  const rawProto = String(req.headers["x-forwarded-proto"] || req.protocol || "https")
     .split(",")[0]
-    .trim();
-  const host = String(req.headers["x-forwarded-host"] || req.get("host") || "")
-    .split(",")[0]
-    .trim();
+    .trim()
+    .toLowerCase();
+  const proto = rawProto === "http" || rawProto === "https" ? rawProto : "https";
+  const host =
+    sanitizeHostHeader(String(req.headers["x-forwarded-host"] || "")) ||
+    sanitizeHostHeader(String(req.get?.("host") || req.headers.host || ""));
   return host ? `${proto}://${host}` : "";
 }
 
@@ -4499,8 +4748,10 @@ async function downloadFormImage(uri: string, accessToken: string): Promise<stri
       signal: controller.signal,
     });
     if (!response.ok) return null;
-    const contentType = (response.headers.get("content-type") || "image/png").split(";")[0].trim();
-    if (!/^image\//i.test(contentType)) return null;
+    const contentType = (response.headers.get("content-type") || "image/png").split(";")[0].trim().toLowerCase();
+    if (!isAllowedFormImageContentType(contentType)) return null;
+    const declaredLen = Number(response.headers.get("content-length") || "0");
+    if (Number.isFinite(declaredLen) && declaredLen > MAX_FORM_IMAGE_BYTES) return null;
     const bytes = Buffer.from(await response.arrayBuffer());
     if (bytes.length === 0 || bytes.length > MAX_FORM_IMAGE_BYTES) return null;
     return `data:${contentType};base64,${bytes.toString("base64")}`;
@@ -4545,8 +4796,7 @@ app.get("/api/google/oauth/start", teacherAiRateLimiter, (req, res) => {
   const base = publicBaseUrl(req);
   const cfg = googleOAuthConfig();
   const fail = (message: string) => {
-    if (!base) return res.status(500).type("text/plain").send(message);
-    return res.redirect(`${base}/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
+    return res.redirect(`/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
   };
 
   if (!cfg.configured) {
@@ -4579,13 +4829,12 @@ app.get("/api/google/oauth/start", teacherAiRateLimiter, (req, res) => {
   }
 });
 
-app.get("/api/google/oauth/callback", async (req, res) => {
+app.get("/api/google/oauth/callback", teacherAiRateLimiter, async (req, res) => {
   const base = publicBaseUrl(req);
   const cfg = googleOAuthConfig();
   const fail = (message: string) => {
     console.warn("[Forms OAuth]", message);
-    if (!base) return res.status(500).type("text/plain").send(message);
-    return res.redirect(`${base}/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
+    return res.redirect(`/?${GOOGLE_IMPORT_ERROR_PARAM}=${encodeURIComponent(message)}`);
   };
 
   if (!cfg.configured) return fail("L'accesso Google non è configurato su questo server (GOOGLE_CLIENT_ID / GOOGLE_CLIENT_SECRET).");
@@ -4672,9 +4921,14 @@ app.get("/api/google/oauth/callback", async (req, res) => {
     }
 
     cleanupPendingGoogleImports();
+    while (pendingGoogleImports.size >= 100) {
+      const oldestKey = pendingGoogleImports.keys().next().value;
+      if (oldestKey === undefined) break;
+      pendingGoogleImports.delete(oldestKey);
+    }
     const id = crypto.randomUUID();
     pendingGoogleImports.set(id, { createdAt: Date.now(), form });
-    res.redirect(`${base}/?${GOOGLE_IMPORT_RETURN_PARAM}=${encodeURIComponent(id)}`);
+    res.redirect(`/?${GOOGLE_IMPORT_RETURN_PARAM}=${encodeURIComponent(id)}`);
   } catch (err: any) {
     return fail(err?.message ? `Lettura del modulo non riuscita: ${err.message}` : "Lettura del modulo non riuscita: riprova.");
   }

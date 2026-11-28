@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import {
   X,
   CheckCircle2,
@@ -23,10 +23,8 @@ import { resolveSubmissionClass, compareClassLabels, UNSPECIFIED_CLASS_LABEL } f
 import { downloadTextFile } from "../utils/examLibrary";
 import {
   detectGradeDiscrepancy,
-  getPendingSubjectiveCount,
-  isEvaluationPending,
+  isSubmissionPendingGrade,
   parseItalianGrade,
-  safeParseJson,
 } from "../utils";
 
 export interface BulkValidationUpdate {
@@ -76,10 +74,20 @@ export default function TeacherBulkGradingModal({
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [isSaving, setIsSaving] = useState(false);
   const [statusMsg, setStatusMsg] = useState<string | null>(null);
+  const mountedRef = useRef(true);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+    };
+  }, []);
 
   useEffect(() => {
     if (!isOpen) {
       setStatusMsg(null);
+      setOverrides({});
+      setSelectedIds(new Set());
       return;
     }
     const onKeyDown = (e: KeyboardEvent) => {
@@ -137,10 +145,7 @@ export default function TeacherBulkGradingModal({
     Number(s.AntiCopia_IncollaBloccato || 0) +
     Number(s.AntiCopia_SchermoDiviso || 0);
 
-  const isSubPending = (s: SavedSubmission) =>
-    isEvaluationPending(safeParseJson(s.Full_Evaluation)) ||
-    getPendingSubjectiveCount(s) > 0 ||
-    String(s.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+  const isSubPending = (s: SavedSubmission) => isSubmissionPendingGrade(s);
 
   const quickCounts = useMemo(() => {
     let unvalidated = 0;
@@ -190,8 +195,10 @@ export default function TeacherBulkGradingModal({
     const sorted = [...filtered];
     sorted.sort((a, b) => {
       if (sortOrder === "grade_desc" || sortOrder === "grade_asc") {
-        const rawA = parseItalianGrade(overrides[a.id] ?? a.Voto_Suggerito);
-        const rawB = parseItalianGrade(overrides[b.id] ?? b.Voto_Suggerito);
+        const effA = overrides[a.id] ?? (isSubPending(a) ? "N.V." : a.Voto_Suggerito);
+        const effB = overrides[b.id] ?? (isSubPending(b) ? "N.V." : b.Voto_Suggerito);
+        const rawA = parseItalianGrade(effA);
+        const rawB = parseItalianGrade(effB);
         const numA = Number.isFinite(rawA) ? rawA : sortOrder === "grade_desc" ? -1 : 99;
         const numB = Number.isFinite(rawB) ? rawB : sortOrder === "grade_desc" ? -1 : 99;
         if (numA !== numB) return sortOrder === "grade_desc" ? numB - numA : numA - numB;
@@ -260,7 +267,8 @@ export default function TeacherBulkGradingModal({
     let skippedNvCount = 0;
     for (const sub of targetRows) {
       const typedRaw = overrides[sub.id];
-      if (typedRaw !== undefined && typedRaw.trim() !== "") {
+      const hasTypedOverride = typedRaw !== undefined && typedRaw.trim() !== "";
+      if (hasTypedOverride) {
         const parsedOverride = parseItalianGrade(typedRaw);
         if (!Number.isFinite(parsedOverride) || parsedOverride < 0 || parsedOverride > 10.5) {
           const label = blindGradingMode ? `Studente ${getSubmissionBlindCode(sub)}` : (sub.Nome || "Studente");
@@ -268,12 +276,16 @@ export default function TeacherBulkGradingModal({
           continue;
         }
       }
-      const raw = typedRaw && typedRaw.trim() !== "" ? typedRaw : sub.Voto_Suggerito;
+      if (!hasTypedOverride && isSubPending(sub)) {
+        skippedNvCount++;
+        continue;
+      }
+      const raw = hasTypedOverride ? typedRaw : sub.Voto_Suggerito;
       if (!raw || String(raw).trim().toUpperCase().includes("N.V.")) {
         skippedNvCount++;
         continue;
       }
-      if (applyRoundingOnValidate || (typedRaw !== undefined && typedRaw.trim() !== "")) {
+      if (applyRoundingOnValidate || hasTypedOverride) {
         const formatted = formatGradeForRegister(raw, applyRoundingOnValidate ? roundingMode : "exact");
         updates.push({
           id: sub.id,
@@ -300,6 +312,7 @@ export default function TeacherBulkGradingModal({
     setStatusMsg(null);
     try {
       await onSaveBulkValidation(updates);
+      if (!mountedRef.current) return;
       const savedIdSet = new Set(updates.map((u) => u.id));
       setOverrides((prev) => {
         const next = { ...prev };
@@ -313,9 +326,10 @@ export default function TeacherBulkGradingModal({
       );
       setSelectedIds(new Set());
     } catch (err: any) {
+      if (!mountedRef.current) return;
       setStatusMsg(`❌ Errore salvataggio: ${err?.message || "riprova tra poco."}`);
     } finally {
-      setIsSaving(false);
+      if (mountedRef.current) setIsSaving(false);
     }
   };
 
@@ -358,7 +372,10 @@ export default function TeacherBulkGradingModal({
       onlyValidated: onlyValidatedExport,
       gradeOverrides: overrides,
     });
-    const pinSuffix = selectedPin === "ALL" ? "tutte" : selectedPin;
+    const pinSuffix =
+      selectedPin === "ALL"
+        ? "tutte"
+        : selectedPin.replace(/[^a-zA-Z0-9_-]+/g, "_") || "sessione";
     const classSuffix =
       selectedClass === "ALL"
         ? ""
@@ -368,7 +385,15 @@ export default function TeacherBulkGradingModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 animate-fadeIn">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Registro rapido, convalida ed esportazione"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !isSaving) onClose();
+      }}
+      className="fixed inset-0 z-50 bg-slate-950/85 backdrop-blur-md flex items-center justify-center p-3 sm:p-5 animate-fadeIn"
+    >
       <div className="bg-slate-900 border border-white/15 rounded-3xl w-full max-w-5xl max-h-[92vh] flex flex-col shadow-2xl overflow-hidden text-left">
         {/* Header */}
         <div className="p-5 border-b border-white/10 bg-slate-950/70 flex items-start justify-between gap-4">
@@ -622,7 +647,8 @@ export default function TeacherBulkGradingModal({
                 <tbody className="divide-y divide-white/5">
                   {rows.map((sub) => {
                     const code = getSubmissionBlindCode(sub);
-                    const effectiveRaw = overrides[sub.id] ?? sub.Voto_Suggerito;
+                    const pendingSub = isSubPending(sub);
+                    const effectiveRaw = overrides[sub.id] ?? (pendingSub ? "N.V." : sub.Voto_Suggerito);
                     const roundedPreview = formatGradeForRegister(effectiveRaw, roundingMode);
                     const isChecked = selectedIds.has(sub.id);
 
@@ -683,8 +709,8 @@ export default function TeacherBulkGradingModal({
                           </p>
                         </td>
                         <td className="p-3 text-center font-mono font-bold text-slate-200">
-                          {sub.Voto_Suggerito || "N.V."}
-                          {sub.Voto_Originale_IA && sub.Voto_Originale_IA !== sub.Voto_Suggerito && (
+                          {pendingSub ? "N.V." : (sub.Voto_Suggerito || "N.V.")}
+                          {!pendingSub && sub.Voto_Originale_IA && sub.Voto_Originale_IA !== sub.Voto_Suggerito && (
                             <span className="block text-[9px] text-slate-500 font-normal">
                               IA: {sub.Voto_Originale_IA}
                             </span>
@@ -702,6 +728,7 @@ export default function TeacherBulkGradingModal({
                               <input
                                 type="text"
                                 placeholder={
+                                  !pendingSub &&
                                   sub.Voto_Suggerito &&
                                   !String(sub.Voto_Suggerito).trim().toUpperCase().includes("N.V.")
                                     ? sub.Voto_Suggerito

@@ -148,18 +148,65 @@ export function detectGibberish(str: string | undefined): boolean {
 
 // Fetch helper with automatic retry for transient network/server-warmup issues
 export async function fetchWithRetry(url: string, options: RequestInit = {}, retries = 2, delayMs = 1000): Promise<Response> {
+  const createAbortError = () => {
+    try {
+      return new DOMException("Richiesta annullata.", "AbortError");
+    } catch {
+      const err = new Error("Richiesta annullata.");
+      err.name = "AbortError";
+      return err;
+    }
+  };
+  const isNonRetryableClientStatus = (status: number) =>
+    status >= 400 && status < 500 && status !== 408 && status !== 429;
+
+  if (options.signal?.aborted) {
+    throw createAbortError();
+  }
+
   let lastError: any;
-  for (let i = 0; i < retries; i++) {
+  const maxAttempts = Math.max(1, Math.floor(retries));
+  for (let i = 0; i < maxAttempts; i++) {
+    if (options.signal?.aborted) {
+      throw createAbortError();
+    }
     try {
       const response = await fetch(url, options);
       if (response.ok) return response;
       const text = await response.text().catch(() => '');
-      lastError = new Error(text || `Richiesta fallita con codice di stato HTTP ${response.status}`);
-    } catch (err) {
+      const httpError: any = new Error(text || `Richiesta fallita con codice di stato HTTP ${response.status}`);
+      httpError.status = response.status;
+      if (isNonRetryableClientStatus(response.status)) {
+        throw httpError;
+      }
+      lastError = httpError;
+    } catch (err: any) {
+      if (
+        err?.name === "AbortError" ||
+        options.signal?.aborted ||
+        (typeof err?.status === "number" && isNonRetryableClientStatus(err.status))
+      ) {
+        throw err;
+      }
       lastError = err;
     }
-    if (i < retries - 1) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    if (i < maxAttempts - 1) {
+      await new Promise<void>((resolve, reject) => {
+        const signal = options.signal;
+        if (signal?.aborted) {
+          reject(createAbortError());
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(timer);
+          reject(createAbortError());
+        };
+        const timer = setTimeout(() => {
+          signal?.removeEventListener("abort", onAbort);
+          resolve();
+        }, delayMs);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      });
     }
   }
   throw lastError || new Error("Richiesta fallita dopo diversi tentativi.");
@@ -510,7 +557,8 @@ export function computeGradeBreakdown(params: {
     return Number.isFinite(n) ? n : null;
   };
 
-  const clampScore = (v: any) => Math.min(10, Math.max(0, Number(v) || 0));
+  const clampScore = (v: any) =>
+    Math.min(10, Math.max(0, isValidNumericScore(v) ? parseNumericScore(v) : 0));
   const shortenQuestion = (q: any, fallback: string) => {
     const text = typeof q?.question === "string" ? q.question.trim() : "";
     if (!text) return fallback;
@@ -1104,6 +1152,7 @@ export function auditSubjectiveEvaluation(params: {
 export interface McSelectionEvaluation {
   hasSelection: boolean;
   hasCorrectKey: boolean;
+  correctIndex: number | null;
   selectedIndex: number | null;
   isCorrect: boolean;
   selectedText: string;
@@ -1117,7 +1166,16 @@ export interface McSelectionEvaluation {
  */
 export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEvaluation {
   const options = Array.isArray(q?.options) ? q.options : [];
-  const rawCorrect = q?.correctIndex;
+  const rawCorrect =
+    q?.correctIndex !== undefined && q?.correctIndex !== null
+      ? q.correctIndex
+      : q?.correctAnswer !== undefined && q?.correctAnswer !== null
+      ? q.correctAnswer
+      : q?.answer !== undefined && q?.answer !== null
+      ? q.answer
+      : q?.solution !== undefined && q?.solution !== null
+      ? q.solution
+      : q?.correctOption;
   let correctIdx = NaN;
   if (typeof rawCorrect === "number") {
     correctIdx = rawCorrect;
@@ -1125,11 +1183,20 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
     const trimmed = rawCorrect.trim();
     if (/^\d+$/.test(trimmed)) {
       correctIdx = Number(trimmed);
-    } else if (/^[A-Za-z]$/.test(trimmed)) {
-      correctIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+    } else if (trimmed) {
+      const lower = trimmed.toLowerCase();
+      const exactTextIdx = options.findIndex(
+        (opt: unknown) => String(opt ?? "").trim().toLowerCase() === lower
+      );
+      if (exactTextIdx >= 0) {
+        correctIdx = exactTextIdx;
+      } else if (/^[A-Za-z]$/.test(trimmed)) {
+        correctIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+      }
     }
   }
   const hasCorrectKey = Number.isInteger(correctIdx) && correctIdx >= 0 && correctIdx < options.length;
+  const resolvedCorrectIndex = hasCorrectKey ? correctIdx : null;
   const correctText = hasCorrectKey ? String(options[correctIdx] ?? "") : "";
 
   const isBlank =
@@ -1140,6 +1207,7 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
     return {
       hasSelection: false,
       hasCorrectKey,
+      correctIndex: resolvedCorrectIndex,
       selectedIndex: null,
       isCorrect: false,
       selectedText: "",
@@ -1152,6 +1220,7 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
     return {
       hasSelection: false,
       hasCorrectKey,
+      correctIndex: resolvedCorrectIndex,
       selectedIndex: null,
       isCorrect: false,
       selectedText: "",
@@ -1162,6 +1231,7 @@ export function evaluateMcSelection(q: any, rawSelected: unknown): McSelectionEv
   return {
     hasSelection: true,
     hasCorrectKey,
+    correctIndex: resolvedCorrectIndex,
     selectedIndex: parsedIdx,
     isCorrect: hasCorrectKey && parsedIdx === correctIdx,
     selectedText: String(options[parsedIdx] ?? ""),
@@ -1238,6 +1308,36 @@ export function isEvaluationPending(evaluation: any): boolean {
   );
 }
 
+/**
+ * True when a teacher has explicitly validated a concrete numeric grade
+ * (0..10, not "N.V.") on this submission (e.g. manual grade override or bulk
+ * validation of a previously pending submission).
+ */
+export function hasTeacherValidatedGrade(sub: any): boolean {
+  if (!sub || !sub.Convalida_Docente_At) return false;
+  const raw = String(sub.Voto_Suggerito ?? "").trim();
+  if (!raw || raw.toUpperCase().includes("N.V.")) return false;
+  const num = parseItalianGrade(raw);
+  return Number.isFinite(num) && num >= 0 && num <= 10.5;
+}
+
+/**
+ * True when a submission's overall grade is still suspended ("N.V.") awaiting
+ * AI evaluation or teacher review. Once the teacher explicitly validates a
+ * concrete numeric grade (`hasTeacherValidatedGrade(sub)`), the submission
+ * is no longer pending a grade.
+ */
+export function isSubmissionPendingGrade(sub: any, parsedEval?: any): boolean {
+  if (!sub) return false;
+  if (hasTeacherValidatedGrade(sub)) return false;
+  const ev = parsedEval !== undefined ? parsedEval : safeParseJson(sub.Full_Evaluation);
+  return (
+    isEvaluationPending(ev) ||
+    getPendingSubjectiveCount(sub) > 0 ||
+    String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.")
+  );
+}
+
 /** Parses JSON strings safely, passing existing objects through and returning null on failure. */
 export function safeParseJson<T = any>(value: unknown): T | null {
   if (value === null || value === undefined || value === "") return null;
@@ -1279,7 +1379,8 @@ export function extractBreakdownFromSubmission(sub: any): GradeBreakdownResult {
           tipo === "Workbook"
             ? String(answers?.wbRq?.[id] ?? answers?.oe?.[id] ?? "")
             : String(answers?.oe?.[id] ?? answers?.openEnded?.[id] ?? ""),
-        getDetailId: (d) => (tipo === "Workbook" ? d?.id : d?.questionId),
+        getDetailId: (d) =>
+          tipo === "Workbook" ? (d?.id ?? d?.questionId) : (d?.questionId ?? d?.id),
       });
       hasWrittenPending = !audit.complete;
     }
@@ -1341,7 +1442,8 @@ export function getPendingSubjectiveCount(sub: any): number {
         tipo === "Workbook"
           ? String(answers?.wbRq?.[id] ?? answers?.oe?.[id] ?? "")
           : String(answers?.oe?.[id] ?? answers?.openEnded?.[id] ?? ""),
-      getDetailId: (d) => (tipo === "Workbook" ? d?.id : d?.questionId),
+      getDetailId: (d) =>
+        tipo === "Workbook" ? (d?.id ?? d?.questionId) : (d?.questionId ?? d?.id),
     });
     return audit.missing.length;
   } catch {
@@ -1898,15 +2000,26 @@ export function areFibSynonyms(user: string, expected: string): boolean {
 }
 
 /**
- * Extracts expected FIB solution from either item.answer or [bracketed] text inside sentence.
+ * Extracts expected FIB solution from item.answer (or aliases expected/solution/correctAnswer)
+ * or [bracketed] text inside sentence.
  */
 export function extractFibExpected(fibOrSentence: any, rawAnswer?: string): string {
   if (typeof rawAnswer === "string" && rawAnswer.trim()) {
     return rawAnswer.trim();
   }
   if (typeof fibOrSentence === "object" && fibOrSentence !== null) {
-    if (typeof fibOrSentence.answer === "string" && fibOrSentence.answer.trim()) {
-      return fibOrSentence.answer.trim();
+    for (const key of ["answer", "expected", "solution", "correctAnswer"] as const) {
+      const candidate = fibOrSentence[key];
+      if (typeof candidate === "string" && candidate.trim()) {
+        return candidate.trim();
+      }
+      if (Array.isArray(candidate)) {
+        const joined = candidate
+          .map((item) => (typeof item === "string" ? item.trim() : ""))
+          .filter(Boolean)
+          .join("|");
+        if (joined) return joined;
+      }
     }
     if (typeof fibOrSentence.sentence === "string") {
       const match = fibOrSentence.sentence.match(/\[([^\]]+)\]/);
@@ -2061,15 +2174,27 @@ const VOID_AI_HTML_TAGS = new Set(["br", "hr"]);
 export function sanitizeAiHtml(rawHtml: string): string {
   if (!rawHtml || typeof rawHtml !== "string") return "";
 
-  // 1. Remove HTML comments completely
-  let working = rawHtml.replace(/<!--[\s\S]*?-->/g, "");
+  // 1 & 2a. Iteratively remove HTML comments and paired dangerous tags with their inner content
+  // to prevent nested-tag reconstruction (e.g. <scr<script></script>ipt>...</script>).
+  let working = rawHtml;
+  for (let pass = 0; pass < 6; pass++) {
+    const prev = working;
+    working = working.replace(/<!--[\s\S]*?-->/g, "");
+    for (const tag of STRIP_WITH_CONTENT_TAGS) {
+      const blockRe = new RegExp(`<\\s*${tag}\\b[^>]*>[\\s\\S]*?<\\s*\\/\\s*${tag}\\s*>`, "gi");
+      working = working.replace(blockRe, "");
+    }
+    if (working === prev) break;
+  }
 
-  // 2. Strip dangerous tags along with their inner content (including nested SVG/script)
-  for (const tag of STRIP_WITH_CONTENT_TAGS) {
-    const blockRe = new RegExp(`<\\s*${tag}\\b[^>]*>[\\s\\S]*?<\\s*\\/\\s*${tag}\\s*>`, "gi");
-    working = working.replace(blockRe, "");
-    const selfRe = new RegExp(`<\\s*${tag}\\b[^>]*\\/?>`, "gi");
-    working = working.replace(selfRe, "");
+  // 2b. Remove any leftover unpaired/self-closing dangerous tags
+  for (let pass = 0; pass < 3; pass++) {
+    const prev = working;
+    for (const tag of STRIP_WITH_CONTENT_TAGS) {
+      const selfRe = new RegExp(`<\\s*\\/?\\s*${tag}\\b[^>]*\\/?>`, "gi");
+      working = working.replace(selfRe, "");
+    }
+    if (working === prev) break;
   }
 
   // 3. Tokenize all remaining <...> tags against strict allowlist
@@ -2128,8 +2253,9 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
     // Fallback below for sandboxed iframes / non-focused documents
   }
   if (typeof document === "undefined") return false;
+  let ta: HTMLTextAreaElement | null = null;
   try {
-    const ta = document.createElement("textarea");
+    ta = document.createElement("textarea");
     ta.value = text;
     ta.setAttribute("readonly", "");
     ta.style.position = "fixed";
@@ -2139,10 +2265,12 @@ export async function copyTextToClipboard(text: string): Promise<boolean> {
     document.body.appendChild(ta);
     ta.focus();
     ta.select();
-    const ok = document.execCommand("copy");
-    document.body.removeChild(ta);
-    return ok;
+    return document.execCommand("copy");
   } catch {
     return false;
+  } finally {
+    if (ta && ta.parentNode) {
+      ta.parentNode.removeChild(ta);
+    }
   }
 }

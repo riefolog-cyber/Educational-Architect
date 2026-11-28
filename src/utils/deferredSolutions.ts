@@ -71,6 +71,8 @@ export function isDeferredUnlockedForStudent(params: DeferredUnlockParams): bool
     }
   }
 
+  const safeNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
+
   if (autoReleaseSolutions && (expiry || maxExtendedExpiry)) {
     const baseDeadline = computeEffectiveDeferredDeadlineMs({
       expiryIso: expiry,
@@ -82,7 +84,7 @@ export function isDeferredUnlockedForStudent(params: DeferredUnlockParams): bool
       baseDeadline !== null ? baseDeadline : 0,
       Number.isFinite(maxExtMs) ? maxExtMs : 0
     );
-    if (effectiveDeadline > 0 && nowMs >= effectiveDeadline) {
+    if (effectiveDeadline > 0 && safeNowMs >= effectiveDeadline) {
       return true;
     }
   }
@@ -98,8 +100,12 @@ export function addMinutesToExpiryIso(
   minutesToAdd: number,
   nowMs = Date.now()
 ): string {
-  const safeMinutes = Math.max(1, Math.min(120, Math.round(minutesToAdd)));
+  const rawMinutes = Number(minutesToAdd);
+  const safeMinutes = Number.isFinite(rawMinutes)
+    ? Math.max(1, Math.min(120, Math.round(rawMinutes)))
+    : 5;
+  const safeNowMs = Number.isFinite(nowMs) ? nowMs : Date.now();
   const currentMs = currentExpiryIso ? Date.parse(String(currentExpiryIso)) : NaN;
-  const anchorMs = Number.isFinite(currentMs) ? Math.max(nowMs, currentMs) : nowMs;
+  const anchorMs = Number.isFinite(currentMs) ? Math.max(safeNowMs, currentMs) : safeNowMs;
   return new Date(anchorMs + safeMinutes * 60 * 1000).toISOString();
 }

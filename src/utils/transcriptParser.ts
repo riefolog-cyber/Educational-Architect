@@ -24,7 +24,7 @@ const SEQUENCE_LINE = /^\d{1,6}$/;
 const HTML_TAG = /<[^>]*>/g;
 
 function safeCodePoint(cp: number): string {
-  if (!Number.isInteger(cp) || cp < 32 || cp > 0x10ffff) return " ";
+  if (!Number.isInteger(cp) || cp < 32 || cp > 0x10ffff || (cp >= 0xd800 && cp <= 0xdfff)) return " ";
   try {
     return String.fromCodePoint(cp);
   } catch {

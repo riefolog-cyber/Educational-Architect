@@ -3,6 +3,7 @@ import {
   parseItalianGrade,
   formatItalianScholasticGrade,
   isEvaluationPending,
+  isSubmissionPendingGrade,
   getPendingSubjectiveCount,
   safeParseJson,
 } from "../utils";
@@ -145,11 +146,11 @@ export function buildElectronicRegisterCsv(
     const overrideRaw = gradeOverrides[sub.id];
     const hasExplicitOverride = typeof overrideRaw === "string" && overrideRaw.trim() !== "";
     const parsedEval = safeParseJson(sub.Full_Evaluation);
-    const isPending =
-      !hasExplicitOverride &&
-      (isEvaluationPending(parsedEval) ||
-        getPendingSubjectiveCount(sub) > 0 ||
-        String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V."));
+    const isNaturallyPending =
+      isEvaluationPending(parsedEval) ||
+      getPendingSubjectiveCount(sub) > 0 ||
+      String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+    const isPending = !hasExplicitOverride && isSubmissionPendingGrade(sub, parsedEval);
     const rawGrade = hasExplicitOverride ? overrideRaw : isPending ? "N.V." : sub.Voto_Suggerito;
     const formatted = formatGradeForRegister(rawGrade, roundingMode);
     const blindCode = getSubmissionBlindCode(sub);
@@ -227,7 +228,7 @@ export function buildElectronicRegisterCsv(
       displayId,
       formatted.registerDecimal,
       formatted.scholasticLabel,
-      isPending ? "N.V." : (sub.Voto_Originale_IA || sub.Voto_Suggerito || ""),
+      isNaturallyPending && !sub.Voto_Originale_IA ? "N.V." : (sub.Voto_Originale_IA || sub.Voto_Suggerito || ""),
       validatedLabel,
       sub.Autovalutazione || "",
       String(oralCount),

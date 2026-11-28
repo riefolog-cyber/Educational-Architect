@@ -19,7 +19,29 @@ function maskBracketedFibAnswer(sentence: unknown): string {
   if (/_{2,}/.test(s) || /\.{3,}/.test(s)) {
     return s;
   }
-  return s.replace(/\[([^\]]+)\]/, "___");
+  return s.replace(/\[([^\]]+)\]/g, "___");
+}
+
+function extractFibKeyForSecurity(fib: any): string {
+  if (!fib || typeof fib !== "object") return "";
+  for (const key of ["answer", "expected", "solution", "correctAnswer"] as const) {
+    const candidate = fib[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+    if (Array.isArray(candidate)) {
+      const joined = candidate
+        .map((item) => (typeof item === "string" ? item.trim() : ""))
+        .filter(Boolean)
+        .join("|");
+      if (joined) return joined;
+    }
+  }
+  if (typeof fib.sentence === "string") {
+    const m = fib.sentence.match(/\[([^\]]+)\]/);
+    if (m?.[1]) return m[1].trim();
+  }
+  return "";
 }
 
 function deterministicHash(input: string): number {
@@ -171,42 +193,63 @@ export function stripExamAnswers(
       if (!q || typeof q !== "object") continue;
       mcSeq++;
       const qId = ensureUniqueItemId(q, seenMcIds, "mc", mcSeq);
+      const opts = Array.isArray(q.options) ? q.options : [];
+      const rawKey =
+        q.correctIndex !== undefined && q.correctIndex !== null
+          ? q.correctIndex
+          : q.correctAnswer !== undefined && q.correctAnswer !== null
+          ? q.correctAnswer
+          : q.answer !== undefined && q.answer !== null
+          ? q.answer
+          : q.solution !== undefined && q.solution !== null
+          ? q.solution
+          : q.correctOption;
       let effectiveCorrect: number | undefined;
       if (
-        q.correctIndex !== undefined &&
-        q.correctIndex !== null &&
-        typeof q.correctIndex !== "boolean" &&
-        String(q.correctIndex).trim() !== ""
+        rawKey !== undefined &&
+        rawKey !== null &&
+        typeof rawKey !== "boolean" &&
+        String(rawKey).trim() !== ""
       ) {
-        const rawC = typeof q.correctIndex === "string" ? q.correctIndex.trim() : q.correctIndex;
-        if (typeof rawC === "string" && /^[a-z]$/i.test(rawC)) {
-          const letterIdx = rawC.toUpperCase().charCodeAt(0) - 65;
-          if (Array.isArray(q.options) && letterIdx >= 0 && letterIdx < q.options.length) {
-            effectiveCorrect = letterIdx;
-          }
-        } else if (
+        const rawC = typeof rawKey === "string" ? rawKey.trim() : rawKey;
+        if (
           (typeof rawC === "number" && Number.isInteger(rawC)) ||
           (typeof rawC === "string" && /^\d+$/.test(rawC))
         ) {
-          effectiveCorrect = Number(rawC);
+          const parsedNum = Number(rawC);
+          if (opts.length === 0 || (parsedNum >= 0 && parsedNum < opts.length)) {
+            effectiveCorrect = parsedNum;
+          }
+        } else if (typeof rawC === "string") {
+          const lower = rawC.toLowerCase();
+          const textIdx = opts.findIndex(
+            (opt: unknown) => String(opt ?? "").trim().toLowerCase() === lower
+          );
+          if (textIdx >= 0) {
+            effectiveCorrect = textIdx;
+          } else if (/^[a-z]$/i.test(rawC)) {
+            const letterIdx = rawC.toUpperCase().charCodeAt(0) - 65;
+            if (letterIdx >= 0 && letterIdx < opts.length) {
+              effectiveCorrect = letterIdx;
+            }
+          }
         }
       }
 
       if (
         reduceDistractors &&
-        Array.isArray(q.options) &&
-        q.options.length >= 4 &&
+        opts.length >= 4 &&
         effectiveCorrect !== undefined &&
         effectiveCorrect >= 0 &&
-        effectiveCorrect < q.options.length
+        effectiveCorrect < opts.length
       ) {
         const wrongIndices: number[] = [];
-        for (let i = 0; i < q.options.length; i++) {
+        for (let i = 0; i < opts.length; i++) {
           if (i !== effectiveCorrect) wrongIndices.push(i);
         }
         if (wrongIndices.length > 0) {
           const dropPick = wrongIndices[deterministicHash(qId || String(q.question || "")) % wrongIndices.length];
-          q.options = q.options.filter((_: any, idx: number) => idx !== dropPick);
+          q.options = opts.filter((_: any, idx: number) => idx !== dropPick);
           if (dropPick < effectiveCorrect) {
             effectiveCorrect -= 1;
           }
@@ -220,6 +263,10 @@ export function stripExamAnswers(
         answerKey.explanations[qId] = q.explanation;
       }
       delete q.correctIndex;
+      delete q.correctAnswer;
+      delete q.answer;
+      delete q.solution;
+      delete q.correctOption;
       delete q.explanation;
     }
   };
@@ -229,11 +276,7 @@ export function stripExamAnswers(
       if (!fib || typeof fib !== "object") continue;
       fibSeq++;
       const fId = ensureUniqueItemId(fib, seenFibIds, "fib", fibSeq);
-      let expected = typeof fib.answer === "string" ? fib.answer : "";
-      if (!expected && typeof fib.sentence === "string") {
-        const m = fib.sentence.match(/\[([^\]]+)\]/);
-        if (m?.[1]) expected = m[1];
-      }
+      const expected = extractFibKeyForSecurity(fib);
       if (fId && expected) {
         answerKey.fib[fId] = expected;
       }
@@ -241,6 +284,9 @@ export function stripExamAnswers(
         fib.sentence = maskBracketedFibAnswer(fib.sentence);
       }
       delete fib.answer;
+      delete fib.expected;
+      delete fib.solution;
+      delete fib.correctAnswer;
     }
   };
 
@@ -631,12 +677,25 @@ export function validateExamKeysForLaunch(examData: any): ExamLaunchValidationRe
         errors.push(`${label}: contiene un'opzione di risposta vuota.`);
       }
       const rawIdx = q.correctIndex;
-      const isValidType =
-        (typeof rawIdx === "number" && Number.isInteger(rawIdx)) ||
-        (typeof rawIdx === "string" && /^\d+$/.test(rawIdx.trim()));
-      const parsedIdx = isValidType ? Number(rawIdx) : NaN;
+      let parsedIdx = NaN;
+      if (typeof rawIdx === "number" && Number.isInteger(rawIdx)) {
+        parsedIdx = rawIdx;
+      } else if (typeof rawIdx === "string") {
+        const trimmedIdx = rawIdx.trim();
+        if (/^\d+$/.test(trimmedIdx)) {
+          parsedIdx = Number(trimmedIdx);
+        } else if (/^[A-Za-z]$/.test(trimmedIdx)) {
+          parsedIdx = trimmedIdx.toUpperCase().charCodeAt(0) - 65;
+        }
+      }
       if (!Number.isInteger(parsedIdx) || parsedIdx < 0 || (opts.length > 0 && parsedIdx >= opts.length)) {
         errors.push(`${label}: chiave corretta ('correctIndex') mancante o fuori intervallo.`);
+      }
+      if (q.weight !== undefined && q.weight !== null && String(q.weight).trim() !== "") {
+        const w = Number(q.weight);
+        if (!Number.isFinite(w) || w <= 0) {
+          errors.push(`${label}: peso ('weight') non valido (deve essere un numero maggiore di 0).`);
+        }
       }
       const qId = String(q.id || "").trim();
       if (qId) {
@@ -662,9 +721,8 @@ export function validateExamKeysForLaunch(examData: any): ExamLaunchValidationRe
       if (!sentence) {
         errors.push(`${label}: manca la frase da completare ('sentence').`);
       }
-      const ans = String(f.answer || "").trim();
-      const hasBracket = /\[([^\]]+)\]/.test(sentence);
-      if (!ans && !hasBracket) {
+      const ans = extractFibKeyForSecurity(f);
+      if (!ans) {
         errors.push(`${label}: manca la parola chiave attesa ('answer' o token tra [parentesi]).`);
       }
       const fId = String(f.id || "").trim();

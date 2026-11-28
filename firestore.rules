@@ -278,6 +278,7 @@ service cloud.firestore {
     function isStudentLiveCreate(data, sessionId) {
       return isValidLiveStudentWrite(data) &&
         'studentEmail' in data && data.studentEmail is string && data.studentEmail.size() > 0 &&
+        (!isSignedIn() || isTeacher() || data.studentEmail.lower() == request.auth.token.email.lower()) &&
         exists(/databases/$(database)/documents/active_sessions/$(sessionId)) &&
         !('remoteUnlockId' in data) &&
         !('unlockedAt' in data) &&
@@ -290,6 +291,8 @@ service cloud.firestore {
     function isStudentLiveUpdate(sessionId) {
       return isValidLiveStudentWrite(incoming()) &&
         exists(/databases/$(database)/documents/active_sessions/$(sessionId)) &&
+        (!isSignedIn() || isTeacher() || !('studentEmail' in existing()) || existing().studentEmail.lower() == request.auth.token.email.lower()) &&
+        (!('studentEmail' in existing()) || incoming().get('studentEmail', '').lower() == existing().studentEmail.lower()) &&
         !incoming().diff(existing()).affectedKeys().hasAny([
           'remoteUnlockId', 'unlockedAt', 'unlockedBy', 'teacherNotice', 'teacherNoticeAt', 'extendedExpiryIso'
         ]) &&
@@ -298,8 +301,8 @@ service cloud.firestore {
         incoming().get('tabSwitches', 0) >= existing().get('tabSwitches', 0) &&
         incoming().get('pasteAttempts', 0) >= existing().get('pasteAttempts', 0) &&
         (
-          incoming().get('locked', false) == true ||
-          existing().get('locked', false) == false
+          (incoming().get('locked', false) == true && incoming().get('lockState', 'locked') == 'locked') ||
+          (existing().get('locked', false) == false && existing().get('lockState', 'unlocked') != 'locked')
         );
     }
 
@@ -310,7 +313,14 @@ service cloud.firestore {
 
     // Collection for authorized teachers (only primary super-admins can grant/revoke teacher roles)
     match /docenti/{docId} {
-      allow get: if isSignedIn() && isValidDocId(docId);
+      allow get: if isValidDocId(docId) && (
+        isPrimaryTeacher() ||
+        (isSignedIn() && (
+          docId == request.auth.uid ||
+          docId == request.auth.token.email ||
+          docId.lower() == request.auth.token.email.lower()
+        ))
+      );
       allow list: if isPrimaryTeacher() || (isSignedIn() && resource.data.email == request.auth.token.email);
       allow create, update: if isPrimaryTeacher() && isValidDocId(docId) && isValidDocente(incoming());
       allow delete: if isPrimaryTeacher() && isValidDocId(docId);
@@ -326,12 +336,35 @@ service cloud.firestore {
       );
     }
 
+    function isIncomingOwnerOrPrimaryTeacher(ownerEmail) {
+      return isPrimaryTeacher() || (
+        isTeacher() &&
+        ownerEmail is string &&
+        ownerEmail.size() > 0 &&
+        ownerEmail.lower() == request.auth.token.email.lower()
+      );
+    }
+
+    function isSessionOwnerOrPrimaryTeacher(sessionId) {
+      return isPrimaryTeacher() || (
+        isTeacher() && (
+          !exists(/databases/$(database)/documents/active_sessions/$(sessionId)) ||
+          !(get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.get('teacherEmail', '') is string) ||
+          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.get('teacherEmail', '').size() == 0 ||
+          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.get('teacherEmail', '').lower() == request.auth.token.email.lower()
+        )
+      );
+    }
+
     // Library of teacher-saved exams, reusable across classes/sessions
     match /exam_library/{docId} {
       allow get: if isTeacher() && isValidId(docId);
       allow list: if isTeacher();
-      allow create: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming());
-      allow update: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
+      allow create: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming()) && isIncomingOwnerOrPrimaryTeacher(incoming().get('teacherEmail', ''));
+      allow update: if isTeacher() && isValidId(docId) && isValidExamLibraryItem(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', '')) && (
+        isIncomingOwnerOrPrimaryTeacher(incoming().get('teacherEmail', '')) ||
+        incoming().get('teacherEmail', '') == existing().get('teacherEmail', '')
+      );
       allow delete: if isTeacher() && isValidId(docId) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
     }
 
@@ -339,8 +372,8 @@ service cloud.firestore {
     match /shared_exams/{shareCode} {
       allow get: if isTeacher() && isValidId(shareCode);
       allow list: if isTeacher() && (isPrimaryTeacher() || resource.data.teacherEmail == request.auth.token.email);
-      allow create: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming());
-      allow update: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming()) && (isPrimaryTeacher() || (existing().teacherEmail is string && existing().teacherEmail.lower() == request.auth.token.email.lower()));
+      allow create: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming()) && isIncomingOwnerOrPrimaryTeacher(incoming().teacherEmail);
+      allow update: if isTeacher() && isValidId(shareCode) && isValidSharedExam(incoming()) && (isPrimaryTeacher() || (existing().teacherEmail is string && existing().teacherEmail.lower() == request.auth.token.email.lower())) && isIncomingOwnerOrPrimaryTeacher(incoming().teacherEmail);
       allow delete: if isValidId(shareCode) && (isPrimaryTeacher() || (isTeacher() && existing().teacherEmail is string && existing().teacherEmail.lower() == request.auth.token.email.lower()));
     }
 
@@ -368,26 +401,31 @@ service cloud.firestore {
     match /active_sessions/{sessionId} {
       allow get: if isValidId(sessionId);
       allow list: if isTeacher();
-      allow create: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming());
-      allow update: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
+      allow create: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming()) && isIncomingOwnerOrPrimaryTeacher(incoming().get('teacherEmail', ''));
+      allow update: if isTeacher() && isValidId(sessionId) && isValidActiveSession(incoming()) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', '')) && (
+        isIncomingOwnerOrPrimaryTeacher(incoming().get('teacherEmail', '')) ||
+        incoming().get('teacherEmail', '') == existing().get('teacherEmail', '')
+      );
       allow delete: if isTeacher() && isValidId(sessionId) && isOwnerOrPrimaryTeacher(existing().get('teacherEmail', ''));
 
       match /live_students/{studentId} {
-        allow get: if isValidId(sessionId) && isValidId(studentId);
+        allow get: if isValidId(sessionId) && isValidId(studentId) && (
+          isTeacher() ||
+          !isSignedIn() ||
+          resource == null ||
+          !('studentEmail' in resource.data) ||
+          (resource.data.studentEmail is string && resource.data.studentEmail.lower() == request.auth.token.email.lower())
+        );
         allow list: if isTeacher();
         allow create: if isValidId(sessionId) && isValidId(studentId) && (
-          (isTeacher() && isValidLiveStudentWrite(incoming())) ||
+          (isValidLiveStudentWrite(incoming()) && isSessionOwnerOrPrimaryTeacher(sessionId)) ||
           isStudentLiveCreate(incoming(), sessionId)
         );
         allow update: if isValidId(sessionId) && isValidId(studentId) && (
-          (isTeacher() && isValidLiveStudentWrite(incoming())) ||
+          (isValidLiveStudentWrite(incoming()) && isSessionOwnerOrPrimaryTeacher(sessionId)) ||
           isStudentLiveUpdate(sessionId)
         );
-        allow delete: if isTeacher() && isValidId(sessionId) && isValidId(studentId) && (
-          isPrimaryTeacher() ||
-          !exists(/databases/$(database)/documents/active_sessions/$(sessionId)) ||
-          get(/databases/$(database)/documents/active_sessions/$(sessionId)).data.get('teacherEmail', '').lower() == request.auth.token.email.lower()
-        );
+        allow delete: if isValidId(sessionId) && isValidId(studentId) && isSessionOwnerOrPrimaryTeacher(sessionId);
       }
     }
   }

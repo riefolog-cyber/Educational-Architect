@@ -2,9 +2,11 @@ import React, { useState, useRef, useEffect } from "react";
 import { Sparkles, X, BookOpen, Layers, CheckCircle2, AlertCircle, ArrowRight, Loader2, Clapperboard, FileUp, FileText, Trash2, ShieldCheck, CopyPlus } from "lucide-react";
 import { parseTranscriptFile, MAX_TRANSCRIPT_CHARS, type TranscriptFormat } from "../utils/transcriptParser";
 import { validateExamKeysForLaunch } from "../utils/examSecurity";
-import { collectExamMultipleChoice, safeParseJson } from "../utils";
+import { collectExamMultipleChoice, collectQuizOpenEnded, evaluateMcSelection, isWorkbookExamData, safeParseJson } from "../utils";
 import { getAuthHeaders } from "../firebase";
 import { AiModalPrefill } from "../types";
+
+const MAX_TEXT_UPLOAD_BYTES = 5 * 1024 * 1024;
 
 export interface ParallelVariantOutput {
   title: string;
@@ -50,6 +52,9 @@ export default function AiExamGeneratorModal({
   const [strictSourceOnly, setStrictSourceOnly] = useState<boolean>(true);
   const [generateParallelVariant, setGenerateParallelVariant] = useState<boolean>(false);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const activeFileReaderRef = useRef<FileReader | null>(null);
+  const isOpenRef = useRef<boolean>(isOpen);
+  isOpenRef.current = isOpen;
   const [generatedResult, setGeneratedResult] = useState<{
     title: string;
     formattedJson: string;
@@ -61,7 +66,17 @@ export default function AiExamGeneratorModal({
     variantWarning?: string | null;
   } | null>(null);
 
+  const abortActiveFileReader = () => {
+    if (activeFileReaderRef.current) {
+      try {
+        activeFileReaderRef.current.abort();
+      } catch {}
+      activeFileReaderRef.current = null;
+    }
+  };
+
   const abortInFlight = () => {
+    abortActiveFileReader();
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
       abortControllerRef.current = null;
@@ -117,7 +132,7 @@ export default function AiExamGeneratorModal({
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [isOpen, isLoading]);
+  }, [isOpen, isLoading, onClose]);
 
   if (!isOpen) return null;
 
@@ -127,8 +142,16 @@ export default function AiExamGeneratorModal({
     e.target.value = "";
     if (!file) return;
     setError(null);
+    if (file.size > MAX_TEXT_UPLOAD_BYTES) {
+      setError("Il file selezionato supera 5 MB. Riduci la dimensione o carica un estratto.");
+      return;
+    }
+    abortActiveFileReader();
     const reader = new FileReader();
+    activeFileReaderRef.current = reader;
     reader.onload = (event) => {
+      if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+      activeFileReaderRef.current = null;
       try {
         const raw = String(event.target?.result || "");
         const parsed = parseTranscriptFile(file.name, raw);
@@ -145,11 +168,16 @@ export default function AiExamGeneratorModal({
         setError("Lettura del file non riuscita: " + (err?.message || "formato non supportato."));
       }
     };
-    reader.onerror = () => setError("Lettura del file non riuscita. Riprova con un altro file.");
+    reader.onerror = () => {
+      if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+      activeFileReaderRef.current = null;
+      setError("Lettura del file non riuscita. Riprova con un altro file.");
+    };
     reader.readAsText(file);
   };
 
   const handleRemoveTranscript = () => {
+    abortActiveFileReader();
     setTranscriptFileName(null);
     setTranscriptMeta(null);
     setTranscriptNotice(null);
@@ -168,8 +196,12 @@ export default function AiExamGeneratorModal({
         setError("Il PDF selezionato supera 6 MB. Comprimi o riduci le pagine prima di caricarlo.");
         return;
       }
+      abortActiveFileReader();
       const reader = new FileReader();
+      activeFileReaderRef.current = reader;
       reader.onload = (event) => {
+        if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+        activeFileReaderRef.current = null;
         const result = String(event.target?.result || "");
         const commaIdx = result.indexOf(",");
         const base64Part = commaIdx >= 0 ? result.slice(commaIdx + 1) : result;
@@ -183,13 +215,26 @@ export default function AiExamGeneratorModal({
         setStrictSourceOnly(true);
         setGeneratedResult(null);
       };
-      reader.onerror = () => setError("Lettura del PDF non riuscita. Riprova con un altro file.");
+      reader.onerror = () => {
+        if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+        activeFileReaderRef.current = null;
+        setError("Lettura del PDF non riuscita. Riprova con un altro file.");
+      };
       reader.readAsDataURL(file);
       return;
     }
 
+    if (file.size > MAX_TEXT_UPLOAD_BYTES) {
+      setError("Il file di appunti selezionato supera 5 MB. Riduci la dimensione prima di caricarlo.");
+      return;
+    }
+
+    abortActiveFileReader();
     const reader = new FileReader();
+    activeFileReaderRef.current = reader;
     reader.onload = (event) => {
+      if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+      activeFileReaderRef.current = null;
       try {
         const raw = String(event.target?.result || "");
         const parsed = parseTranscriptFile(file.name, raw);
@@ -207,11 +252,16 @@ export default function AiExamGeneratorModal({
         setError("Lettura file non riuscita: " + (err?.message || "formato non supportato."));
       }
     };
-    reader.onerror = () => setError("Lettura file appunti non riuscita.");
+    reader.onerror = () => {
+      if (!isOpenRef.current || activeFileReaderRef.current !== reader) return;
+      activeFileReaderRef.current = null;
+      setError("Lettura file appunti non riuscita.");
+    };
     reader.readAsText(file);
   };
 
   const handleRemovePdf = () => {
+    abortActiveFileReader();
     setPdfBase64(null);
     setPdfFileName(null);
     setPdfSizeKb(0);
@@ -219,7 +269,8 @@ export default function AiExamGeneratorModal({
 
   const handleGenerate = async () => {
     if (isLoading) return;
-    const hasPdf = Boolean(pdfBase64);
+    const activePdfBase64 = sourceTab === "pdf" ? pdfBase64 : null;
+    const hasPdf = Boolean(activePdfBase64);
     const trimmedTopic = topic.trim().slice(0, MAX_TRANSCRIPT_CHARS);
     if (!trimmedTopic && !hasPdf) {
       setError(
@@ -252,10 +303,15 @@ export default function AiExamGeneratorModal({
         difficulty,
         strictSourceOnly:
           sourceTab === "pdf" || sourceTab === "transcript" || hasPdf ? strictSourceOnly : false,
-        sourceFileName: pdfFileName || transcriptFileName || undefined,
+        sourceFileName:
+          sourceTab === "pdf"
+            ? pdfFileName || undefined
+            : sourceTab === "transcript"
+            ? transcriptFileName || undefined
+            : undefined,
       };
-      if (pdfBase64) {
-        payload.pdfBase64 = pdfBase64;
+      if (activePdfBase64) {
+        payload.pdfBase64 = activePdfBase64;
         payload.pdfMimeType = "application/pdf";
       }
 
@@ -280,7 +336,7 @@ export default function AiExamGeneratorModal({
 
       // Allow GET fallback only for short topic-only prompts without PDF
       if (!resp.ok && (resp.status === 404 || resp.status === 405)) {
-        if (pdfBase64 || trimmedTopic.length > 1500) {
+        if (activePdfBase64 || trimmedTopic.length > 1500) {
           throw new Error(
             "La richiesta POST è stata bloccata dalla rete/proxy e la fonte selezionata supera il limite per il fallback URL."
           );
@@ -388,7 +444,15 @@ export default function AiExamGeneratorModal({
   };
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Generatore verifiche con Intelligenza Artificiale"
+      onClick={(e) => {
+        if (e.target === e.currentTarget && !isLoading) handleCloseModal();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-3 sm:p-4 bg-slate-950/80 backdrop-blur-md animate-fadeIn"
+    >
       <div className="bg-slate-900 border border-white/15 rounded-3xl w-full max-w-2xl max-h-[90vh] flex flex-col shadow-2xl overflow-hidden text-left">
         {/* Header */}
         <div className="p-5 border-b border-white/10 flex items-center justify-between bg-slate-950/50">
@@ -433,7 +497,10 @@ export default function AiExamGeneratorModal({
               <div className="grid grid-cols-3 p-1 bg-slate-950/70 border border-white/10 rounded-2xl text-xs font-semibold gap-1">
                 <button
                   type="button"
-                  onClick={() => setSourceTab("topic")}
+                  onClick={() => {
+                    abortActiveFileReader();
+                    setSourceTab("topic");
+                  }}
                   className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                     sourceTab === "topic"
                       ? "bg-indigo-600 text-white shadow-md font-bold"
@@ -445,7 +512,10 @@ export default function AiExamGeneratorModal({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSourceTab("pdf")}
+                  onClick={() => {
+                    abortActiveFileReader();
+                    setSourceTab("pdf");
+                  }}
                   className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                     sourceTab === "pdf"
                       ? "bg-amber-600 text-white shadow-md font-bold"
@@ -457,7 +527,10 @@ export default function AiExamGeneratorModal({
                 </button>
                 <button
                   type="button"
-                  onClick={() => setSourceTab("transcript")}
+                  onClick={() => {
+                    abortActiveFileReader();
+                    setSourceTab("transcript");
+                  }}
                   className={`py-2 px-2.5 rounded-xl transition-all cursor-pointer flex items-center justify-center gap-1.5 ${
                     sourceTab === "transcript"
                       ? "bg-teal-600 text-white shadow-md font-bold"
@@ -487,7 +560,7 @@ export default function AiExamGeneratorModal({
                       <FileUp className="w-5 h-5" />
                       <span>Carica dispensa PDF o appunti del docente (.pdf, .txt, .md)</span>
                       <span className="text-[10px] font-normal text-amber-300/75">
-                        PDF fino a 6 MB inviati direttamente al motore multimodale Gemini
+                        PDF fino a 6 MB analizzati direttamente dal motore IA multimodale
                       </span>
                     </button>
                   ) : (
@@ -617,9 +690,11 @@ export default function AiExamGeneratorModal({
 
               {/* Format selection */}
               <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                <div
+                <button
+                  type="button"
+                  aria-pressed={examType === "quiz"}
                   onClick={() => setExamType("quiz")}
-                  className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
+                  className={`text-left p-3.5 rounded-2xl border cursor-pointer transition-all ${
                     examType === "quiz"
                       ? "bg-indigo-950/40 border-indigo-400/50 shadow-md shadow-indigo-500/10 ring-1 ring-indigo-400/30"
                       : "bg-slate-950/40 border-white/10 hover:border-white/20 text-slate-400"
@@ -632,11 +707,13 @@ export default function AiExamGeneratorModal({
                   <p className="text-[11px] text-slate-400 leading-normal">
                     Quesiti con 4 opzioni plausibili, spiegazione didattica ed eventuale riflessione aperta.
                   </p>
-                </div>
+                </button>
 
-                <div
+                <button
+                  type="button"
+                  aria-pressed={examType === "workbook"}
                   onClick={() => setExamType("workbook")}
-                  className={`p-3.5 rounded-2xl border cursor-pointer transition-all ${
+                  className={`text-left p-3.5 rounded-2xl border cursor-pointer transition-all ${
                     examType === "workbook"
                       ? "bg-teal-950/40 border-teal-400/50 shadow-md shadow-teal-500/10 ring-1 ring-teal-400/30"
                       : "bg-slate-950/40 border-white/10 hover:border-white/20 text-slate-400"
@@ -649,7 +726,7 @@ export default function AiExamGeneratorModal({
                   <p className="text-[11px] text-slate-400 leading-normal">
                     Sezioni tematiche con testi da completare (parole chiave mancanti) e domande argomentative.
                   </p>
-                </div>
+                </button>
               </div>
 
               {/* Options Grid */}
@@ -782,11 +859,6 @@ export default function AiExamGeneratorModal({
                   <p className="text-slate-400 text-[11px]">
                     Tempo consigliato per gli studenti: ~{generatedResult.recommendedDurationMinutes} minuti.
                     {generatedResult.summaryDescription && ` ${generatedResult.summaryDescription}`}
-                    {generatedResult.modelUsed && (
-                      <span className="block mt-1 font-mono text-[10px] text-indigo-300/80">
-                        Modello utilizzato: {generatedResult.modelUsed}
-                      </span>
-                    )}
                   </p>
                   {generatedResult.parallelVariant && (
                     <p className="mt-1.5 text-[11px] text-indigo-200 bg-indigo-500/15 border border-indigo-500/30 rounded-lg px-2.5 py-1 inline-flex items-center gap-1.5">
@@ -798,9 +870,8 @@ export default function AiExamGeneratorModal({
               </div>
 
               {(() => {
-                const primaryAudit = validateExamKeysForLaunch(
-                  generatedResult.examObj || safeParseJson(generatedResult.formattedJson)
-                );
+                const previewObj = generatedResult.examObj || safeParseJson(generatedResult.formattedJson);
+                const primaryAudit = validateExamKeysForLaunch(previewObj);
                 const variantAudit = generatedResult.parallelVariant
                   ? validateExamKeysForLaunch(safeParseJson(generatedResult.parallelVariant.formattedJson))
                   : null;
@@ -811,7 +882,9 @@ export default function AiExamGeneratorModal({
                     : []),
                 ];
                 const allKeysValid = primaryAudit.valid && (!variantAudit || variantAudit.valid);
-                const previewMc = collectExamMultipleChoice(generatedResult.examObj);
+                const isGeneratedWorkbook = isWorkbookExamData(previewObj);
+                const previewMc = collectExamMultipleChoice(previewObj);
+                const previewOe = collectQuizOpenEnded(previewObj);
 
                 return (
                   <div className="space-y-2.5">
@@ -840,9 +913,9 @@ export default function AiExamGeneratorModal({
                       <div className="flex items-center justify-between text-[10px] font-bold uppercase tracking-wider text-slate-400">
                         <span>
                           Anteprima Quesiti Generati (
-                          {examType === "quiz"
-                            ? `${previewMc.length} crocette`
-                            : `${generatedResult.examObj?.sections?.length || 0} sezioni`}
+                          {!isGeneratedWorkbook
+                            ? `${previewMc.length} crocette${previewOe.length > 0 ? ` · ${previewOe.length} aperte` : ""}`
+                            : `${previewObj?.sections?.length || 0} sezioni`}
                           ):
                         </span>
                         <span
@@ -856,33 +929,44 @@ export default function AiExamGeneratorModal({
                         </span>
                       </div>
                       <div className="p-3 bg-slate-950/80 rounded-2xl border border-white/10 max-h-56 overflow-y-auto space-y-2.5 font-mono text-[11px] text-slate-300">
-                        {examType === "quiz" ? (
-                          previewMc.map((mc: any, idx: number) => {
-                            const hasKey =
-                              typeof mc?.correctIndex === "number" &&
-                              Number.isInteger(mc.correctIndex) &&
-                              Array.isArray(mc?.options) &&
-                              mc.correctIndex >= 0 &&
-                              mc.correctIndex < mc.options.length;
-                            return (
-                              <div key={mc?.id || idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
+                        {!isGeneratedWorkbook ? (
+                          previewMc.length > 0 ? (
+                            previewMc.map((mc: any, idx: number) => {
+                              const mcCheck = evaluateMcSelection(mc, 0);
+                              const hasKey =
+                                mcCheck.hasCorrectKey &&
+                                mcCheck.correctIndex !== null &&
+                                Array.isArray(mc?.options) &&
+                                mcCheck.correctIndex >= 0 &&
+                                mcCheck.correctIndex < mc.options.length;
+                              return (
+                                <div key={mc?.id ?? idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
+                                  <p className="text-white font-sans font-bold">
+                                    {idx + 1}. {mc.question}
+                                  </p>
+                                  {hasKey ? (
+                                    <p className="text-teal-400 text-[10px]">
+                                      ✓ Risposta corretta: {mcCheck.correctText || mc.options[mcCheck.correctIndex!]}
+                                    </p>
+                                  ) : (
+                                    <p className="text-amber-300 text-[10px]">
+                                      ⚠ Chiave mancante o fuori intervallo: completa nell'Editor
+                                    </p>
+                                  )}
+                                </div>
+                              );
+                            })
+                          ) : (
+                            previewOe.map((oe: any, idx: number) => (
+                              <div key={oe?.id ?? idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
                                 <p className="text-white font-sans font-bold">
-                                  {idx + 1}. {mc.question}
+                                  Aperta {idx + 1}. {oe.question}
                                 </p>
-                                {hasKey ? (
-                                  <p className="text-teal-400 text-[10px]">
-                                    ✓ Risposta corretta: {mc.options[mc.correctIndex]}
-                                  </p>
-                                ) : (
-                                  <p className="text-amber-300 text-[10px]">
-                                    ⚠ Chiave mancante o fuori intervallo: completa nell'Editor
-                                  </p>
-                                )}
                               </div>
-                            );
-                          })
+                            ))
+                          )
                         ) : (
-                          generatedResult.examObj?.sections?.map((sec: any, idx: number) => (
+                          previewObj?.sections?.map((sec: any, idx: number) => (
                             <div key={idx} className="pb-2 border-b border-white/5 last:border-0 last:pb-0">
                               <p className="text-white font-sans font-bold">{sec.title}</p>
                               <p className="text-slate-400 text-[10px] font-sans line-clamp-2">{sec.sintesi}</p>
@@ -912,7 +996,7 @@ export default function AiExamGeneratorModal({
               <button
                 type="button"
                 onClick={handleGenerate}
-                disabled={isLoading || (!topic.trim() && !pdfBase64)}
+                disabled={isLoading || (sourceTab === "pdf" ? !pdfBase64 && !topic.trim() : !topic.trim())}
                 className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-500 disabled:bg-slate-800 disabled:text-slate-600 text-white font-bold rounded-xl text-xs flex items-center gap-2 shadow-lg shadow-indigo-600/20 cursor-pointer transition-all active:scale-[0.98]"
               >
                 {isLoading ? (

@@ -8,8 +8,10 @@ import {
   computeFilaEquitySummary,
   computeGradeDistribution,
   computeMetacognitionSummary,
-  matchesGradeBand,
+  matchesNumericGradeBand,
+  type ExamOutcomeMatrix,
   type GradeDistributionBandKey,
+  type GradeDistributionSummary,
 } from "../utils/examAnalytics";
 import { getAuthHeaders as defaultGetAuthHeaders } from "../firebase";
 import {
@@ -17,6 +19,7 @@ import {
   collectWorkbookFillInTheBlank,
   copyTextToClipboard,
   evaluateMcSelection,
+  extractFibExpected,
   isValidNumericScore,
   safeParseJson,
   sanitizeAiHtml,
@@ -68,6 +71,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
   const [generatingSheet, setGeneratingSheet] = useState(false);
   const [reviewSheet, setReviewSheet] = useState<MiniReviewSheetResult | null>(null);
   const [copiedSheet, setCopiedSheet] = useState(false);
+  const mountedRef = useRef(true);
   const copiedTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const synthesisAbortRef = useRef<AbortController | null>(null);
   const sheetAbortRef = useRef<AbortController | null>(null);
@@ -90,42 +94,47 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     setReviewSheet(null);
     setSynthesisError(null);
     setGradeBandFilter(null);
+    setFilaFilter("all");
     setSynthesizingErrors(false);
     setGeneratingSheet(false);
   }, [cohortSignature]);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
       synthesisAbortRef.current?.abort();
       sheetAbortRef.current?.abort();
     };
   }, []);
 
+  const getSubDomandeKey = (sub: SavedSubmission) =>
+    `${sub.id}:${typeof sub.Domande_Esame === "string" ? sub.Domande_Esame.length : 0}`;
+
   // Hydrate stripped/deferred exam solutions on-demand when teacher opens the panel
   useEffect(() => {
     if (!isOpen || submissions.length === 0) return;
 
     const toHydrate = submissions.filter((sub) => {
-      if (!sub?.id || resolvedExamBySubId[sub.id]) return false;
+      if (!sub?.id || resolvedExamBySubId[getSubDomandeKey(sub)]) return false;
       const rawDomande = safeParseJson(sub.Domande_Esame);
       if (!rawDomande || typeof rawDomande !== "object") return false;
       const missingMc = collectExamMultipleChoice(rawDomande).some(
         (q: any) => Array.isArray(q?.options) && q.options.length > 0 && !evaluateMcSelection(q, 0).hasCorrectKey
       );
-      const missingFib = collectWorkbookFillInTheBlank(rawDomande).some((f: any) => {
-        const ans = String(f?.answer || "").trim();
-        const bracket = typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence);
-        return !ans && !bracket;
-      });
+      const missingFib = collectWorkbookFillInTheBlank(rawDomande).some(
+        (f: any) => !extractFibExpected(f)
+      );
       return missingMc || missingFib;
     });
 
     if (toHydrate.length === 0) return;
-    let cancelled = false;
+    const controller = new AbortController();
+    const { signal } = controller;
 
     const unstrippedSiblings = submissions
-      .map((s) => safeParseJson(resolvedExamBySubId[s.id] || s.Domande_Esame))
+      .map((s) => safeParseJson(resolvedExamBySubId[getSubDomandeKey(s)] || s.Domande_Esame))
       .filter((obj) => {
         if (!obj || typeof obj !== "object") return false;
         const mcs = collectExamMultipleChoice(obj);
@@ -133,72 +142,134 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
         return (
           (mcs.length > 0 || fibs.length > 0) &&
           mcs.every((q: any) => evaluateMcSelection(q, 0).hasCorrectKey) &&
-          fibs.every((f: any) => Boolean(String(f?.answer || "").trim()) || (typeof f?.sentence === "string" && /\[([^\]]+)\]/.test(f.sentence)))
+          fibs.every((f: any) => Boolean(extractFibExpected(f)))
         );
       });
 
     (async () => {
       try {
-        const authHeaders = await resolveAuthHeaders();
         const updates: Record<string, string> = {};
         const fallbackCandidates: any[] = [...unstrippedSiblings];
+        const remainingForVault: SavedSubmission[] = [];
 
-        await Promise.all(
-          toHydrate.map(async (sub) => {
-            const rawDomande = safeParseJson(sub.Domande_Esame);
-            const parsedMcOrder = safeParseJson(sub.MC_Order) || undefined;
-            let resolvedObj: any = null;
+        const tryRestoreLocally = (sub: SavedSubmission, rawDomande: any, parsedMcOrder: any): any | null => {
+          const libRes = restoreExamFromTeacherSources(rawDomande, {
+            titleHint: examTitle || sub.Session_Titolo || rawDomande?.title,
+            libraryItems: libraryExams,
+            fallbackExamObjects: fallbackCandidates,
+            mcOptionOrder: parsedMcOrder,
+          });
+          return libRes.restored ? libRes.restoredExam : null;
+        };
 
-            if (sub.Pin && !attemptedVaultIdsRef.current.has(sub.id)) {
-              attemptedVaultIdsRef.current.add(sub.id);
-              try {
-                const subClass = resolveSubmissionClass(sub);
-                const resp = await fetch("/api/session/unlock-solutions", {
-                  method: "POST",
-                  headers: {
-                    "Content-Type": "application/json",
-                    ...authHeaders,
-                  },
-                  body: JSON.stringify({
-                    pin: String(sub.Pin).trim().toUpperCase(),
-                    sessionId: String(sub.Session_Id || "").trim(),
-                    studentEmail: sub.Email || "",
-                    studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
-                    assignedFila: sub.Assigned_Fila || "",
-                    mcOptionOrder: parsedMcOrder,
-                    examData: rawDomande,
-                    answers: safeParseJson(sub.Risposte_Studente) || {},
-                    tipo: sub.Tipo || "Quiz",
-                  }),
-                });
-                const data = resp.ok ? await resp.json().catch(() => null) : null;
-                if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
-                  resolvedObj = data.resolvedDomande;
-                  fallbackCandidates.push(resolvedObj);
-                }
-              } catch {
-                // Fall back to teacher library/sibling below
-              }
-            }
+        // Pass 1: restore from local teacher library or already-complete sibling exams with zero network requests
+        for (const sub of toHydrate) {
+          if (signal.aborted) return;
+          const cacheKey = getSubDomandeKey(sub);
+          const rawDomande = safeParseJson(sub.Domande_Esame);
+          const parsedMcOrder = safeParseJson(sub.MC_Order) || undefined;
+          const localObj = tryRestoreLocally(sub, rawDomande, parsedMcOrder);
+          if (localObj) {
+            updates[cacheKey] = JSON.stringify(localObj);
+            fallbackCandidates.push(localObj);
+          } else {
+            remainingForVault.push(sub);
+          }
+        }
 
-            if (!resolvedObj) {
-              const libRes = restoreExamFromTeacherSources(rawDomande, {
-                titleHint: examTitle || sub.Session_Titolo || rawDomande?.title,
-                libraryItems: libraryExams,
-                fallbackExamObjects: fallbackCandidates,
-                mcOptionOrder: parsedMcOrder,
+        if (remainingForVault.length > 0 && !signal.aborted) {
+          const authHeaders = await resolveAuthHeaders();
+          if (signal.aborted) return;
+
+          const unlockViaServer = async (
+            sub: SavedSubmission,
+            cacheKey: string,
+            rawDomande: any,
+            parsedMcOrder: any
+          ): Promise<any | null> => {
+            if (!sub.Pin || attemptedVaultIdsRef.current.has(cacheKey)) return null;
+            attemptedVaultIdsRef.current.add(cacheKey);
+            let completedVaultRequest = false;
+            try {
+              const subClass = resolveSubmissionClass(sub);
+              const resp = await fetch("/api/session/unlock-solutions", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  ...authHeaders,
+                },
+                body: JSON.stringify({
+                  pin: String(sub.Pin).trim().toUpperCase(),
+                  sessionId: String(sub.Session_Id || "").trim(),
+                  studentEmail: sub.Email || "",
+                  studentClass: subClass === UNSPECIFIED_CLASS_LABEL ? "" : subClass,
+                  assignedFila: sub.Assigned_Fila || "",
+                  mcOptionOrder: parsedMcOrder,
+                  examData: rawDomande,
+                  answers: safeParseJson(sub.Risposte_Studente) || {},
+                  tipo: sub.Tipo || "Quiz",
+                }),
+                signal,
               });
-              if (libRes.restored) {
-                resolvedObj = libRes.restoredExam;
+              if (signal.aborted) {
+                attemptedVaultIdsRef.current.delete(cacheKey);
+                return null;
+              }
+              completedVaultRequest = true;
+              const data = resp.ok ? await resp.json().catch(() => null) : null;
+              if (resp.ok && data?.unlocked && data?.keyRestored !== false && data?.resolvedDomande) {
+                fallbackCandidates.push(data.resolvedDomande);
+                return data.resolvedDomande;
+              }
+            } catch {
+              if (signal.aborted && !completedVaultRequest) {
+                attemptedVaultIdsRef.current.delete(cacheKey);
               }
             }
+            return null;
+          };
 
-            if (resolvedObj) {
-              updates[sub.id] = JSON.stringify(resolvedObj);
+          // Group by (Pin, Session_Id, Assigned_Fila): unlock 1 representative per track, then restore siblings locally
+          const groups = new Map<string, SavedSubmission[]>();
+          for (const sub of remainingForVault) {
+            const gKey = `${String(sub.Pin || "").trim().toUpperCase()}::${String(sub.Session_Id || "").trim()}::${String(sub.Assigned_Fila || "").trim()}`;
+            const list = groups.get(gKey);
+            if (list) list.push(sub);
+            else groups.set(gKey, [sub]);
+          }
+
+          for (const groupSubs of groups.values()) {
+            if (signal.aborted) return;
+            const [rep, ...siblings] = groupSubs;
+            const repKey = getSubDomandeKey(rep);
+            const repRaw = safeParseJson(rep.Domande_Esame);
+            const repMcOrder = safeParseJson(rep.MC_Order) || undefined;
+
+            const repResolved =
+              tryRestoreLocally(rep, repRaw, repMcOrder) ||
+              (await unlockViaServer(rep, repKey, repRaw, repMcOrder));
+            if (signal.aborted) return;
+            if (repResolved) {
+              updates[repKey] = JSON.stringify(repResolved);
             }
-          })
-        );
-        if (!cancelled && Object.keys(updates).length > 0) {
+
+            for (const sib of siblings) {
+              if (signal.aborted) return;
+              const sibKey = getSubDomandeKey(sib);
+              const sibRaw = safeParseJson(sib.Domande_Esame);
+              const sibMcOrder = safeParseJson(sib.MC_Order) || undefined;
+              const sibResolved =
+                tryRestoreLocally(sib, sibRaw, sibMcOrder) ||
+                (await unlockViaServer(sib, sibKey, sibRaw, sibMcOrder));
+              if (signal.aborted) return;
+              if (sibResolved) {
+                updates[sibKey] = JSON.stringify(sibResolved);
+              }
+            }
+          }
+        }
+
+        if (!signal.aborted && Object.keys(updates).length > 0) {
           setResolvedExamBySubId((prev) => ({ ...prev, ...updates }));
         }
       } catch {
@@ -207,15 +278,16 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     })();
 
     return () => {
-      cancelled = true;
+      controller.abort();
     };
   }, [isOpen, submissions, resolvedExamBySubId, resolveAuthHeaders, libraryExams, examTitle]);
 
   const hydratedSubmissions = useMemo(() => {
     if (Object.keys(resolvedExamBySubId).length === 0) return submissions;
-    return submissions.map((s) =>
-      resolvedExamBySubId[s.id] ? { ...s, Domande_Esame: resolvedExamBySubId[s.id] } : s
-    );
+    return submissions.map((s) => {
+      const resolved = resolvedExamBySubId[getSubDomandeKey(s)];
+      return resolved ? { ...s, Domande_Esame: resolved } : s;
+    });
   }, [submissions, resolvedExamBySubId]);
 
   const filaBundle = useMemo(() => {
@@ -241,8 +313,14 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
 
   const equitySummary = useMemo(() => computeFilaEquitySummary(hydratedSubmissions), [hydratedSubmissions]);
   const metacognitionSummary = useMemo(() => computeMetacognitionSummary(activeSubmissions), [activeSubmissions]);
-  const gradeDistribution = useMemo(() => computeGradeDistribution(activeSubmissions), [activeSubmissions]);
-  const outcomeMatrix = useMemo(() => buildExamOutcomeMatrix(activeSubmissions), [activeSubmissions]);
+  const gradeDistribution: GradeDistributionSummary = useMemo(
+    () => computeGradeDistribution(activeSubmissions),
+    [activeSubmissions]
+  );
+  const outcomeMatrix: ExamOutcomeMatrix = useMemo(
+    () => buildExamOutcomeMatrix(activeSubmissions),
+    [activeSubmissions]
+  );
 
   const totalItems =
     (analysis?.mcStats.length || 0) +
@@ -350,7 +428,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
               (d: any) => String(s.kind === "open_ended" ? (d?.questionId ?? d?.id) : (d?.id ?? d?.questionId)) === String(s.id)
             );
             // Only collect genuinely low-scoring evaluated answers; never misclassify ungraded pending answers as errors
-            if (!detail || !isValidNumericScore(detail.score) || Number(detail.score) >= 6) continue;
+            if (!detail || !isValidNumericScore(detail.score) || Number(String(detail.score).trim().replace(",", ".")) >= 6) continue;
             const scrubbed = scrubPromptPii(rawAns, { fullName: sub.Nome, email: sub.Email }).scrubbedText.trim();
             if (scrubbed) sampleErrors.push(scrubbed.slice(0, 220));
           }
@@ -503,10 +581,13 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
       ...reviewSheet.quickExercises.map((ex, i) => `${i + 1}. ${ex.prompt}\n   Soluzione: ${ex.solution}`),
     ].join("\n");
     const ok = await copyTextToClipboard(text);
+    if (!mountedRef.current) return;
     if (ok) {
       setCopiedSheet(true);
       if (copiedTimerRef.current) clearTimeout(copiedTimerRef.current);
-      copiedTimerRef.current = setTimeout(() => setCopiedSheet(false), 2000);
+      copiedTimerRef.current = setTimeout(() => {
+        if (mountedRef.current) setCopiedSheet(false);
+      }, 2000);
     }
   };
 
@@ -529,17 +610,20 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
     const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `item_analysis_${slug}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    setTimeout(() => URL.revokeObjectURL(url), 1000);
+    try {
+      a.href = url;
+      a.download = `item_analysis_${slug}.csv`;
+      document.body.appendChild(a);
+      a.click();
+    } finally {
+      if (a.parentNode) a.parentNode.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
   };
 
   const displayedMatrixRows = outcomeMatrix.rows.filter((r) => {
     if (onlyIssuesInMatrix && !r.hasIssues) return false;
-    if (gradeBandFilter && !matchesGradeBand(r.finalGrade, gradeBandFilter)) return false;
+    if (gradeBandFilter && !matchesNumericGradeBand(r.numericGrade, gradeBandFilter)) return false;
     return true;
   });
 
@@ -600,6 +684,13 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                       key={tab.key}
                       type="button"
                       onClick={() => {
+                        synthesisAbortRef.current?.abort();
+                        synthesisAbortRef.current = null;
+                        sheetAbortRef.current?.abort();
+                        sheetAbortRef.current = null;
+                        setSynthesizingErrors(false);
+                        setGeneratingSheet(false);
+                        setSynthesisError(null);
                         setFilaFilter(tab.key);
                         setGradeBandFilter(null);
                         setErrorSynthesis(null);
@@ -689,12 +780,12 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
             </div>
           )}
 
-          {(gradeDistribution.gradedCount > 0 || gradeDistribution.pendingCount > 0) && (
+          {(gradeDistribution.gradedCount > 0 || gradeDistribution.nvCount > 0) && (
             <div className="p-3 rounded-xl bg-slate-900/70 border border-white/10 space-y-2.5">
               <div className="flex flex-wrap items-center justify-between gap-2 text-[11px]">
                 <span className="font-bold text-slate-200 flex items-center gap-1.5">
                   <BarChart2 className="w-3.5 h-3.5 text-teal-400" />
-                  <span>Distribuzione Voti per Fascia ({gradeDistribution.gradedCount} valutati{gradeDistribution.pendingCount > 0 ? ` · ${gradeDistribution.pendingCount} N.V.` : ""})</span>
+                  <span>Distribuzione Voti per Fascia ({gradeDistribution.gradedCount} valutati{gradeDistribution.nvCount > 0 ? ` · ${gradeDistribution.nvCount} N.V.` : ""})</span>
                 </span>
                 {gradeBandFilter && (
                   <button
@@ -709,14 +800,15 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
               {gradeDistribution.gradedCount > 0 && (
                 <div className="w-full h-2.5 rounded-full bg-slate-950 border border-white/5 overflow-hidden flex">
                   {gradeDistribution.buckets
-                    .filter((b) => b.key !== "pending" && b.count > 0)
+                    .filter((b) => b.key !== "nv" && b.count > 0)
                     .map((b) => {
-                      const barColors: Record<string, string> = {
-                        excellent: "bg-emerald-500",
-                        good: "bg-teal-400",
-                        sufficient: "bg-sky-400",
-                        almost: "bg-amber-400",
-                        insufficient: "bg-rose-500",
+                      const barColors: Record<GradeDistributionBandKey, string> = {
+                        b80_105: "bg-emerald-500",
+                        b70_79: "bg-teal-400",
+                        b60_69: "bg-sky-400",
+                        b45_59: "bg-amber-400",
+                        lt45: "bg-rose-500",
+                        nv: "bg-slate-500",
                       };
                       return (
                         <button
@@ -737,26 +829,26 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
               )}
               <div className="flex flex-wrap items-center gap-1.5">
                 {gradeDistribution.buckets
-                  .filter((b) => b.key !== "pending" || b.count > 0)
+                  .filter((b) => b.key !== "nv" || b.count > 0)
                   .map((b) => {
                     const isActive = gradeBandFilter === b.key;
-                    const pillColors: Record<string, string> = {
-                      excellent: isActive
+                    const pillColors: Record<GradeDistributionBandKey, string> = {
+                      b80_105: isActive
                         ? "bg-emerald-500 text-slate-950 border-emerald-400"
                         : "bg-emerald-500/10 text-emerald-300 border-emerald-500/25 hover:bg-emerald-500/20",
-                      good: isActive
+                      b70_79: isActive
                         ? "bg-teal-400 text-slate-950 border-teal-300"
                         : "bg-teal-500/10 text-teal-300 border-teal-500/25 hover:bg-teal-500/20",
-                      sufficient: isActive
+                      b60_69: isActive
                         ? "bg-sky-400 text-slate-950 border-sky-300"
                         : "bg-sky-500/10 text-sky-300 border-sky-500/25 hover:bg-sky-500/20",
-                      almost: isActive
+                      b45_59: isActive
                         ? "bg-amber-400 text-slate-950 border-amber-300"
                         : "bg-amber-500/10 text-amber-300 border-amber-500/25 hover:bg-amber-500/20",
-                      insufficient: isActive
+                      lt45: isActive
                         ? "bg-rose-500 text-white border-rose-400"
                         : "bg-rose-500/10 text-rose-300 border-rose-500/25 hover:bg-rose-500/20",
-                      pending: isActive
+                      nv: isActive
                         ? "bg-amber-500 text-slate-950 border-amber-400"
                         : "bg-slate-800 text-amber-300 border-amber-500/30 hover:bg-slate-700",
                     };
@@ -775,7 +867,7 @@ const ExamItemAnalysisPanel: React.FC<ExamItemAnalysisPanelProps> = React.memo((
                         }`}
                       >
                         {b.label}: <span className="font-mono">{b.count}</span>
-                        {b.key !== "pending" && b.count > 0 && (
+                        {b.key !== "nv" && b.count > 0 && (
                           <span className="opacity-80 ml-1">({b.percent}%)</span>
                         )}
                       </button>

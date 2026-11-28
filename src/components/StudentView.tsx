@@ -64,6 +64,7 @@ import {
   requestAppFullScreen,
   isAppFullScreen,
   isFibAnswerCorrect,
+  extractFibExpected,
   getFibSentenceParts,
   mcWeightedScore,
   fibWeightedScore,
@@ -82,7 +83,8 @@ import {
   isWorkbookExamData,
   auditSubjectiveEvaluation,
   isEvaluationPending,
-  getPendingSubjectiveCount,
+  isSubmissionPendingGrade,
+  isValidNumericScore,
   safeParseJson
 } from "../utils";
 import { normalizeExamStructure } from "../utils/examStructureRepair";
@@ -122,6 +124,7 @@ import {
   UNSPECIFIED_CLASS_LABEL,
 } from "../utils/classGrouping";
 import { isDeferredUnlockedForStudent } from "../utils/deferredSolutions";
+import { normalizeQuestionImage } from "../utils/googleFormsLink";
 
 function getLiveStudentDocId(email?: string | null, targetPin?: string | null): string {
   return deriveStudentPseudonym(email || "anonimo", String(targetPin || "").trim().toUpperCase());
@@ -174,10 +177,11 @@ function QuestionMeta({ q, tone }: { q: any; tone?: "amber" | "teal" }) {
 
 /** Figura della domanda (importata da Google Moduli o allegata dal docente). */
 function QuestionFigure({ src }: { src?: string }) {
-  if (!src) return null;
+  const safeSrc = normalizeQuestionImage(src);
+  if (!safeSrc) return null;
   return (
     <img
-      src={src}
+      src={safeSrc}
       alt="Figura della domanda"
       draggable={false}
       onContextMenu={(e) => e.preventDefault()}
@@ -340,13 +344,22 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const [selectedPastSub, setSelectedPastSub] = useState<any | null>(null);
   const [generatingPlan, setGeneratingPlan] = useState(false);
   const [recoveryProgress, setRecoveryProgress] = useState<RecoveryProgress | null>(null);
+  const mountedRef = useRef<boolean>(true);
   const recoveryAbortRef = useRef<AbortController | null>(null);
+  const audioAbortRef = useRef<AbortController | null>(null);
+  const evalPollAbortRef = useRef<AbortController | null>(null);
   const submittingEvalRef = useRef<boolean>(false);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       recoveryAbortRef.current?.abort();
       recoveryAbortRef.current = null;
+      audioAbortRef.current?.abort();
+      audioAbortRef.current = null;
+      evalPollAbortRef.current?.abort();
+      evalPollAbortRef.current = null;
     };
   }, []);
   
@@ -591,6 +604,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   useEffect(() => {
     if (activeScreen !== "exam-space") {
       stopSpeech();
+      if (audioTimerRef.current) {
+        clearInterval(audioTimerRef.current);
+        audioTimerRef.current = null;
+      }
+      try {
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state !== "inactive") {
+          mediaRecorderRef.current.stop();
+        }
+      } catch {}
     }
   }, [activeScreen, stopSpeech]);
 
@@ -695,6 +717,11 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     isInteractingWithInAppDialogRef.current = true;
     try {
       const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      if (!mountedRef.current || activeScreenRef.current !== "exam-space") {
+        stream.getTracks().forEach((t) => t.stop());
+        scheduleDialogInteractionEnd(0);
+        return;
+      }
       if (!isAppleMobile() && !isAppFullScreen()) {
         setIsFullscreenBlocked(false);
         closeFullscreenExit();
@@ -742,15 +769,23 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           audioTimerRef.current = null;
         }
         stream.getTracks().forEach((t) => t.stop());
-        setRecordingAudioForId(null);
+        if (mountedRef.current) {
+          setRecordingAudioForId(null);
+        }
 
         const blob = new Blob(audioChunksRef.current, { type: recorder.mimeType || chosenMime || "audio/webm" });
         audioChunksRef.current = [];
         if (blob.size < 400) {
-          setInfractionToastMsg("Registrazione troppo breve: tieni premuto o parla più vicino al microfono.");
+          if (mountedRef.current && activeScreenRef.current === "exam-space") {
+            setInfractionToastMsg("Registrazione troppo breve: tieni premuto o parla più vicino al microfono.");
+          }
           return;
         }
 
+        if (!mountedRef.current || activeScreenRef.current !== "exam-space") return;
+        audioAbortRef.current?.abort();
+        const audioController = new AbortController();
+        audioAbortRef.current = audioController;
         setTranscribingAudioForId(fieldKey);
         try {
           const dataUrl: string = await new Promise((resolve, reject) => {
@@ -759,9 +794,13 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             reader.onerror = () => reject(new Error("Errore lettura audio"));
             reader.readAsDataURL(blob);
           });
+          if (audioController.signal.aborted || !mountedRef.current || activeScreenRef.current !== "exam-space") {
+            return;
+          }
           const resp = await fetch("/api/transcribe-audio", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
+            signal: audioController.signal,
             body: JSON.stringify({
               audioBase64: dataUrl,
               mimeType: blob.type || "audio/webm",
@@ -770,6 +809,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
             }),
           });
           const data = await resp.json().catch(() => ({}));
+          if (audioController.signal.aborted || !mountedRef.current || activeScreenRef.current !== "exam-space") {
+            return;
+          }
           if (!resp.ok || !data?.transcript) {
             throw new Error(data?.error || "Trascrizione audio non riuscita.");
           }
@@ -777,9 +819,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           oralQuestionIdsRef.current.add(fieldKey);
           setInfractionToastMsg("🎙️ Risposta vocale trascritta nel campo di testo!");
         } catch (err: any) {
+          if (err?.name === "AbortError" || audioController.signal.aborted || !mountedRef.current) return;
           setAppAlert({ msg: `⚠️ ${err?.message || "Impossibile trascrivere la registrazione vocale."}` });
         } finally {
-          setTranscribingAudioForId(null);
+          if (audioAbortRef.current === audioController) {
+            audioAbortRef.current = null;
+          }
+          if (mountedRef.current) {
+            setTranscribingAudioForId(null);
+          }
         }
       };
 
@@ -1250,7 +1298,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           const freshlyAppliedLocalLock = Date.now() - lockAppliedAtRef.current < 5000;
           if (
             lockedRef.current &&
-            (!isDocLocked || data?.lockState === "unlocked") &&
+            !isDocLocked &&
+            data?.lockState !== "locked" &&
             !freshlyAppliedLocalLock
           ) {
             releaseExamLockRef.current("remote");
@@ -1432,7 +1481,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
     const processMcList = (list: any[], allowShuffle: boolean, scopeTag: string) => {
       const mappedList = list.map((q: any) => {
         if (!q || !Array.isArray(q.options) || q.options.length < 2) return q;
-        const qId = String(q.id || "");
+        const qId = q.id !== undefined && q.id !== null && String(q.id).trim() !== "" ? String(q.id) : "";
         const existingOrder = qId && savedOrder && Array.isArray(savedOrder[qId]) && savedOrder[qId].length === q.options.length
           ? savedOrder[qId]
           : null;
@@ -1450,17 +1499,25 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           nextOrder[qId] = chosenOrder;
         }
         const reorderedOptions = chosenOrder.map((origIdx) => q.options[origIdx]);
-        const hasCorrectIdx = q.correctIndex !== undefined && q.correctIndex !== null;
+        const resolvedOrigCorrect = evaluateMcSelection(q, 0).correctIndex;
+        const hasCorrectIdx = resolvedOrigCorrect !== null;
         const newCorrectIndex = hasCorrectIdx
-          ? chosenOrder.findIndex((origIdx) => Number(origIdx) === Number(q.correctIndex))
+          ? chosenOrder.findIndex((origIdx) => Number(origIdx) === resolvedOrigCorrect)
           : -1;
-        return {
+        const nextQ: any = {
           ...q,
           options: reorderedOptions,
-          ...(hasCorrectIdx ? { correctIndex: newCorrectIndex !== -1 ? newCorrectIndex : q.correctIndex } : {}),
         };
+        if (hasCorrectIdx && newCorrectIndex !== -1) {
+          nextQ.correctIndex = newCorrectIndex;
+          delete nextQ.correctAnswer;
+          delete nextQ.answer;
+          delete nextQ.solution;
+          delete nextQ.correctOption;
+        }
+        return nextQ;
       });
-      return allowShuffle && !savedOrder
+      return allowShuffle
         ? computeDeterministicItemOrder(mappedList, `${baseSeed}|mc_list|${scopeTag}`)
         : mappedList;
     };
@@ -3367,6 +3424,27 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
 
   // OPTIMIZATION 3: Poll evaluation queue and save final results permanently on completion
   const pollJobStatusAndSave = async (jobId: string, rescue: any, isBackgroundResume = false) => {
+    evalPollAbortRef.current?.abort();
+    const pollController = new AbortController();
+    evalPollAbortRef.current = pollController;
+    const pollSignal = pollController.signal;
+    const sleepAbortable = (ms: number) =>
+      new Promise<void>((resolve) => {
+        if (pollSignal.aborted) {
+          resolve();
+          return;
+        }
+        const onAbort = () => {
+          clearTimeout(t);
+          resolve();
+        };
+        const t = setTimeout(() => {
+          pollSignal.removeEventListener("abort", onAbort);
+          resolve();
+        }, ms);
+        pollSignal.addEventListener("abort", onAbort, { once: true });
+      });
+
     try {
       setActiveScreen("evaluating");
       setSavingStatus("Connessione e verifica dello stato della correzione...");
@@ -3383,6 +3461,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
       let reenqueues = 0;
       const MAX_REENQUEUES = 3; // Survive server restarts transparently
       while (true) {
+        if (pollSignal.aborted || !mountedRef.current) return;
         pollAttempts++;
         if (Date.now() - pollingStartedAt > MAX_WAIT_MS) {
           throw new Error("Il tempo di attesa per la correzione è scaduto (15 minuti). Le tue risposte sono salvate nella bozza locale: premi di nuovo Consegna per riprovare.");
@@ -3392,7 +3471,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
           // Attesa crescente con jitter: 40 studenti in coda non devono battere
           // tutti sullo stesso secondo e pesare sul server.
           const delay = Math.min(700 + pollAttempts * 120, 2600) + Math.random() * 350;
-          await new Promise(r => setTimeout(r, delay));
+          await sleepAbortable(delay);
+          if (pollSignal.aborted || !mountedRef.current) return;
         }
         isFirstPoll = false;
 
@@ -3404,27 +3484,32 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
         let statusResp: Response | null = null;
         let pollFetchErr: any = null;
         for (let rTry = 0; rTry < 3; rTry++) {
+          if (pollSignal.aborted || !mountedRef.current) return;
           try {
             const resp = await fetch(
               statusUrl,
-              currentJobToken ? { headers: { "x-job-token": currentJobToken } } : {}
+              currentJobToken
+                ? { headers: { "x-job-token": currentJobToken }, signal: pollSignal }
+                : { signal: pollSignal }
             );
             if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
               pollFetchErr = new Error(`Servizio temporaneamente non raggiungibile (HTTP ${resp.status})`);
               if (rTry < 2) {
-                await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+                await sleepAbortable(1000 * (rTry + 1));
                 continue;
               }
             }
             statusResp = resp;
             break;
-          } catch (netErr) {
+          } catch (netErr: any) {
+            if (netErr?.name === "AbortError" || pollSignal.aborted || !mountedRef.current) return;
             pollFetchErr = netErr;
             if (rTry < 2) {
-              await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+              await sleepAbortable(1000 * (rTry + 1));
             }
           }
         }
+        if (pollSignal.aborted || !mountedRef.current) return;
         if (!statusResp) {
           throw pollFetchErr || new Error("Errore di rete durante la verifica dello stato della correzione.");
         }
@@ -3437,8 +3522,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
               const reEnqueueResp = await fetch("/api/evaluate/enqueue", {
                 method: "POST",
                 headers: { "Content-Type": "application/json" },
+                signal: pollSignal,
                 body: JSON.stringify(rescue.payload)
               });
+              if (pollSignal.aborted || !mountedRef.current) return;
               if (reEnqueueResp.ok) {
                 const reEnqueueData = await reEnqueueResp.json();
                 if (reEnqueueData.jobId) {
@@ -3453,7 +3540,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   continue;
                 }
               }
-            } catch (reErr) {
+            } catch (reErr: any) {
+              if (reErr?.name === "AbortError" || pollSignal.aborted || !mountedRef.current) return;
               console.warn("Riaccodamento automatico fallito:", reErr);
             }
           }
@@ -4020,6 +4108,10 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
   const handleRestart = () => {
     recoveryAbortRef.current?.abort();
     recoveryAbortRef.current = null;
+    audioAbortRef.current?.abort();
+    audioAbortRef.current = null;
+    evalPollAbortRef.current?.abort();
+    evalPollAbortRef.current = null;
     submittingEvalRef.current = false;
     setGeneratingPlan(false);
     setRecoveryProgress(null);
@@ -4307,9 +4399,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     const unlockedPast = unlockedPastSubmissions[selectedPastSub.id];
                     const parsedExamData = unlockedPast?.examData || safeParseJson(selectedPastSub.Domande_Esame) || {};
 
-                    const pastIsPending =
-                      isEvaluationPending(parsedEval) ||
-                      getPendingSubjectiveCount(selectedPastSub) > 0;
+                    const pastIsPending = isSubmissionPendingGrade(selectedPastSub, parsedEval);
                     const pastGrade = pastIsPending
                       ? "N.V."
                       : selectedPastSub.Voto_Suggerito || "N/A";
@@ -4509,7 +4599,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
                             <div>
                               <p className="text-slate-500">Autovalutazione</p>
-                              <p className="text-xs font-bold text-slate-200 mt-0.5">{selectedPastSub.Autovalutazione}/10</p>
+                              <p className="text-xs font-bold text-slate-200 mt-0.5">
+                                {selectedPastSub.Autovalutazione ? `${selectedPastSub.Autovalutazione}/10` : "N.D."}
+                              </p>
                             </div>
                             {selectedPastSub.Tipo === "Quiz" ? (
                               <div>
@@ -4611,7 +4703,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                             fibList.map((fib: any, fIdx: number) => {
                               const rawVal = parsedAnswers?.wbFib?.[fib.id] ?? parsedAnswers?.fib?.[fib.id] ?? "";
                               const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
-                              const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                              const expected = extractFibExpected(fib);
                               const hasExpected = String(expected).trim().length > 0;
                               const hideFibDetail = pastSolutionsMasked || !hasExpected;
                               const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
@@ -4716,8 +4808,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                 {entries.map((entry: any, iIdx: number) => {
                                   const ansValue = entry.answer || "";
                                   const itemEval = entry.detail;
-                                  const hasEvaluation = !!itemEval;
-                                  const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                                  const hasEvaluation = Boolean(itemEval && isValidNumericScore(itemEval.score));
+                                  const score = hasEvaluation ? Number(String(itemEval.score).trim().replace(",", ".")) : null;
                                   const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
                                   return (
@@ -4733,7 +4825,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                       <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
                                         <div className="flex-1 space-y-1 leading-relaxed text-left">
                                           <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                                          <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                                          <p
+                                            dangerouslySetInnerHTML={{
+                                              __html: !hasEvaluation
+                                                ? "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente."
+                                                : pastSolutionsMasked
+                                                ? "Commento analitico riservato fino allo sblocco delle soluzioni differite."
+                                                : formatMarkdown(itemEval.feedback),
+                                            }}
+                                          />
                                         </div>
                                         <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
                                           !hasEvaluation
@@ -4772,8 +4872,8 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                 {entries.map((entry: any, iIdx: number) => {
                                   const ansValue = entry.answer || "";
                                   const itemEval = entry.detail;
-                                  const hasEvaluation = !!itemEval;
-                                  const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                                  const hasEvaluation = Boolean(itemEval && isValidNumericScore(itemEval.score));
+                                  const score = hasEvaluation ? Number(String(itemEval.score).trim().replace(",", ".")) : null;
                                   const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
                                   return (
@@ -4788,7 +4888,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                       <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
                                         <div className="flex-1 space-y-1 leading-relaxed text-left">
                                           <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                                          <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                                          <p
+                                            dangerouslySetInnerHTML={{
+                                              __html: !hasEvaluation
+                                                ? "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente."
+                                                : pastSolutionsMasked
+                                                ? "Commento analitico riservato fino allo sblocco delle soluzioni differite."
+                                                : formatMarkdown(itemEval.feedback),
+                                            }}
+                                          />
                                         </div>
                                         <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
                                           !hasEvaluation
@@ -4971,9 +5079,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                                 hour: "2-digit",
                                 minute: "2-digit"
                               }) : "N/D";
-                              const listIsPending =
-                                isEvaluationPending(sub.Full_Evaluation) ||
-                                getPendingSubjectiveCount(sub) > 0;
+                              const listIsPending = isSubmissionPendingGrade(sub);
                               const subClass = resolveSubmissionClass(sub);
                               const listDeferredLocked =
                                 Boolean(sub.Soluzioni_Differite) && !pastSessionSolutionsReleased[sub.id];
@@ -5797,7 +5903,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     <div className="space-y-3.5">
                       {examData.fillInTheBlank.map((fib: any, fIdx: number) => {
                         const userText = answers.wbFib[fib.id] || "";
-                        const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+                        const { before, after } = getFibSentenceParts(fib.sentence, extractFibExpected(fib));
                         return (
                           <div key={fib.id || fIdx} id={`wb_root_fib_${fib.id || fIdx}`} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300 transition-all">
                             <span>{before}</span>
@@ -5860,7 +5966,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                         <div className="space-y-3.5">
                           {sec.fillInTheBlank.map((fib: any, fIdx: number) => {
                             const userText = answers.wbFib[fib.id] || "";
-                            const { before, after } = getFibSentenceParts(fib.sentence, fib.answer);
+                            const { before, after } = getFibSentenceParts(fib.sentence, extractFibExpected(fib));
                             
                             return (
                               <div key={fib.id} id={`wb_sec_${sIdx}_fib_${fib.id || fIdx}`} className="p-3 bg-slate-950/50 border border-white/5 rounded-xl leading-relaxed text-sm text-slate-300 transition-all">
@@ -6537,8 +6643,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     {entries.map((entry: any, iIdx: number) => {
                       const ansValue = entry.answer || "";
                       const itemEval = entry.detail;
-                      const hasEvaluation = !!itemEval;
-                      const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                      const hasEvaluation = Boolean(itemEval && isValidNumericScore(itemEval.score));
+                      const score = hasEvaluation ? Number(String(itemEval.score).trim().replace(",", ".")) : null;
+                      const hideActiveSubjectiveFeedback = deferSolutionsSession && !solutionsReleased;
 
                       const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
@@ -6555,13 +6662,22 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
                             <div className="flex-1 space-y-1 leading-relaxed">
                               <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                              <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                              <p
+                                dangerouslySetInnerHTML={{
+                                  __html: !hasEvaluation
+                                    ? "Valutazione in attesa di correzione: la risposta è stata consegnata regolarmente e verrà valutata dal docente."
+                                    : hideActiveSubjectiveFeedback
+                                    ? "Commento analitico riservato fino allo sblocco delle soluzioni differite."
+                                    : formatMarkdown(itemEval.feedback),
+                                }}
+                              />
                             </div>
                             <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
                               !hasEvaluation
                                 ? "bg-slate-500/10 text-slate-300 border-slate-500/30"
                                 : (score ?? 0) >= 6
-                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"                                : "bg-red-500/10 text-red-400 border-red-500/20"
+                                ? "bg-emerald-500/10 text-emerald-400 border-emerald-500/20"
+                                : "bg-red-500/10 text-red-400 border-red-500/20"
                             }`}>
                               Voto: {hasEvaluation ? `${score}/10` : "N.V."}
                             </div>
@@ -6585,7 +6701,7 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                   const hideSol = deferSolutionsSession && !solutionsReleased;
                   const rawVal = answers.wbFib?.[fib.id] ?? "";
                   const val = typeof rawVal === "string" ? rawVal.trim() : (rawVal?.[0] || "").trim();
-                  const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "") || "";
+                  const expected = extractFibExpected(fib);
                   const hasExpected = String(expected).trim().length > 0;
                   const hideFibDetail = hideSol || !hasExpected;
                   const isCorrect = hasExpected && isFibAnswerCorrect(val, expected, fib.sentence);
@@ -6691,8 +6807,9 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                     {entries.map((entry: any, iIdx: number) => {
                       const ansValue = entry.answer || "";
                       const itemEval = entry.detail;
-                      const hasEvaluation = !!itemEval;
-                      const score = hasEvaluation ? Number(itemEval.score) || 0 : null;
+                      const hasEvaluation = Boolean(itemEval && isValidNumericScore(itemEval.score));
+                      const score = hasEvaluation ? Number(String(itemEval.score).trim().replace(",", ".")) : null;
+                      const hideActiveSubjectiveFeedback = deferSolutionsSession && !solutionsReleased;
 
                       const displayAnswer = ansValue === "[VUOTO]" ? "Scena Muta (Risposta non compilata o evasiva)" : ansValue;
 
@@ -6708,7 +6825,15 @@ export default function StudentView({ user, onLogout, onBack, initialStudentClas
                           <div className="flex flex-col sm:flex-row gap-4 items-start bg-indigo-500/5 p-4 rounded-xl border border-indigo-500/10 text-xs text-indigo-200">
                             <div className="flex-1 space-y-1 leading-relaxed">
                               <span className="font-bold text-[10px] uppercase tracking-wider text-teal-400 block mb-0.5">Analisi Didattica IA</span>
-                              <p dangerouslySetInnerHTML={{ __html: hasEvaluation ? formatMarkdown(itemEval.feedback) : "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente." }} />
+                              <p
+                                dangerouslySetInnerHTML={{
+                                  __html: !hasEvaluation
+                                    ? "Valutazione in attesa di correzione: la riflessione è stata consegnata regolarmente e verrà valutata dal docente."
+                                    : hideActiveSubjectiveFeedback
+                                    ? "Commento analitico riservato fino allo sblocco delle soluzioni differite."
+                                    : formatMarkdown(itemEval.feedback),
+                                }}
+                              />
                             </div>
                             <div className={`px-3.5 py-2 rounded-xl text-center shrink-0 border font-bold text-sm ${
                               !hasEvaluation

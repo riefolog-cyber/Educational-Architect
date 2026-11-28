@@ -213,7 +213,7 @@ export interface AnswersScrubResult<T = any> {
 
 /**
  * Returns a non-mutating copy of student answers with PII scrubbed from all
- * text-bearing maps (`oe`, `openEnded`, `wbRq`, `wbFib`), leaving numeric
+ * text-bearing maps (`oe`, `openEnded`, `wbRq`, `wbFib`, `fib`), leaving numeric
  * multiple-choice selections (`mc`) untouched.
  */
 export function scrubAnswersForAi<T extends Record<string, any>>(
@@ -232,7 +232,7 @@ export function scrubAnswersForAi<T extends Record<string, any>>(
   let redactionsCount = 0;
   const detectedTypes = new Set<string>();
 
-  const textBuckets = ["oe", "openEnded", "wbRq", "wbFib"] as const;
+  const textBuckets = ["oe", "openEnded", "wbRq", "wbFib", "fib"] as const;
   for (const bucket of textBuckets) {
     const src = answers[bucket];
     if (src && typeof src === "object" && !Array.isArray(src)) {

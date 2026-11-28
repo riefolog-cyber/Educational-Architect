@@ -1,5 +1,5 @@
 import type { ClassSummary, SavedSubmission } from "../types";
-import { formatItalianScholasticGrade, parseItalianGrade, getPendingSubjectiveCount, isEvaluationPending, safeParseJson } from "../utils";
+import { formatItalianScholasticGrade, parseItalianGrade, isSubmissionPendingGrade, safeParseJson } from "../utils";
 
 export const UNSPECIFIED_CLASS_LABEL = "Classe non specificata";
 
@@ -116,8 +116,7 @@ export function compareClassLabels(a: string, b: string): number {
 }
 
 function defaultNumericGrade(sub: SavedSubmission): number {
-  const ev = safeParseJson(sub?.Full_Evaluation);
-  if (isEvaluationPending(ev) || getPendingSubjectiveCount(sub) > 0) return -1;
+  if (isSubmissionPendingGrade(sub)) return -1;
   const n = parseItalianGrade(sub?.Voto_Suggerito);
   return Number.isFinite(n) ? n : -1;
 }

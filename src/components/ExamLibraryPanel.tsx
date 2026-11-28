@@ -112,8 +112,12 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
     }
   }, [renamingLibraryId]);
 
+  const mountedRef = useRef(true);
+
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
       }
@@ -122,12 +126,14 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
 
   const handleCopyShareCode = async (code: string) => {
     const ok = await copyTextToClipboard(code);
+    if (!mountedRef.current) return;
     if (ok) {
       setCopiedCode(code);
       if (copyTimerRef.current !== null) {
         window.clearTimeout(copyTimerRef.current);
       }
       copyTimerRef.current = window.setTimeout(() => {
+        if (!mountedRef.current) return;
         setCopiedCode((prev) => (prev === code ? null : prev));
         copyTimerRef.current = null;
       }, 2500);
@@ -139,12 +145,13 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
     setSharingItemId(item.id);
     try {
       const code = await onShareItem(item);
+      if (!mountedRef.current) return;
       setSharedCodesById((prev) => ({ ...prev, [item.id]: code }));
       await handleCopyShareCode(code);
     } catch {
       // Parent handler already reports the error message in libraryMsg.
     } finally {
-      setSharingItemId(null);
+      if (mountedRef.current) setSharingItemId(null);
     }
   };
 
@@ -156,12 +163,13 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
     setImportingCode(true);
     try {
       await onImportByShareCode(shareCodeInput.trim());
+      if (!mountedRef.current) return;
       setShareCodeInput("");
       setShowCodeImport(false);
     } catch {
       // Parent handler already reports the error message in libraryMsg.
     } finally {
-      setImportingCode(false);
+      if (mountedRef.current) setImportingCode(false);
     }
   };
 
@@ -630,11 +638,13 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                     {onRevokeShare && (
                       <button
                         type="button"
-                        disabled={revokingCode === sh.shareCode}
+                        disabled={Boolean(revokingCode)}
                         onClick={async () => {
+                          if (revokingCode) return;
                           setRevokingCode(sh.shareCode);
                           try {
                             await onRevokeShare(sh.shareCode);
+                            if (!mountedRef.current) return;
                             setSharedCodesById((prev) => {
                               const next: Record<string, string> = {};
                               for (const k of Object.keys(prev)) {
@@ -645,7 +655,7 @@ const ExamLibraryPanel: React.FC<ExamLibraryPanelProps> = React.memo(({
                           } catch {
                             // Parent handler already reports the error message in libraryMsg.
                           } finally {
-                            setRevokingCode(null);
+                            if (mountedRef.current) setRevokingCode(null);
                           }
                         }}
                         className="px-2 py-1 rounded-md bg-rose-500/15 hover:bg-rose-500/25 text-rose-300 text-[10px] font-semibold cursor-pointer disabled:opacity-50"

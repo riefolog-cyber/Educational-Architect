@@ -1,4 +1,4 @@
-import React, { useState, useEffect, Suspense, lazy } from "react";
+import React, { useState, useEffect, useRef, Suspense, lazy } from "react";
 import { 
   onAuthStateChanged, 
   signInWithPopup, 
@@ -210,7 +210,9 @@ export default function App() {
   const [sharedPcMode, setSharedPcMode] = useState(() => isSharedPcSessionActive());
   const [directError, setDirectError] = useState("");
   const [googleStudentClass, setGoogleStudentClass] = useState("");
-  const [showWorkspaceHelp, setShowWorkspaceHelp] = useState(false);
+  const [showWorkspaceAccordion, setShowWorkspaceAccordion] = useState(false);
+  const [showWorkspaceModal, setShowWorkspaceModal] = useState(false);
+  const roleCheckSeqRef = useRef(0);
 
   const [activePane, setActivePane] = useState<"home" | "student" | "teacher">("home");
   const [showPrivacyModal, setShowPrivacyModal] = useState(false);
@@ -240,8 +242,14 @@ export default function App() {
 
   // Verify and Bootstrap user role function (fast & non-blocking for students)
   const checkUserRoleAndBootstrap = async (currentUser: any) => {
+    const seq = ++roleCheckSeqRef.current;
+    const isStillCurrent = () =>
+      roleCheckSeqRef.current === seq &&
+      (!currentUser?.uid || !auth?.currentUser || auth.currentUser.uid === currentUser.uid);
+
     if (!currentUser) {
       setRole("student");
+      setRoleChecking(false);
       return;
     }
     
@@ -252,8 +260,11 @@ export default function App() {
       normalizedEmail === "riefolog@gmail.com";
 
     if (isHardcodedTeacher) {
-      setRole("admin");
-      setRoleError("");
+      if (isStillCurrent()) {
+        setRole("admin");
+        setRoleError("");
+        setRoleChecking(false);
+      }
       return;
     }
 
@@ -268,11 +279,15 @@ export default function App() {
         const normalizedEmail = currentUser.email.trim().toLowerCase();
         let isAuthorizedTeacher = false;
 
-        const directIds = Array.from(new Set([normalizedEmail, String(currentUser.uid || "").trim()].filter(Boolean)));
+        const directIds = Array.from(
+          new Set([normalizedEmail, String(currentUser.email || "").trim(), String(currentUser.uid || "").trim()].filter(Boolean))
+        );
         for (const docId of directIds) {
+          if (!isStillCurrent()) return;
           try {
             const snap = await getDoc(doc(dbFirestore, "docenti", docId));
-            if (snap.exists() && snap.data()?.role === "admin") {
+            const snapRole = snap.data()?.role;
+            if (snap.exists() && (snapRole === "admin" || snapRole === "teacher")) {
               isAuthorizedTeacher = true;
               break;
             }
@@ -285,23 +300,31 @@ export default function App() {
           const docentiCollectionRef = collection(dbFirestore, "docenti");
           const candidates = Array.from(new Set([currentUser.email, normalizedEmail]));
           for (const emailCandidate of candidates) {
+            if (!isStillCurrent()) return;
             const q = query(docentiCollectionRef, where("email", "==", emailCandidate));
             const querySnapshot = await getDocs(q);
-            if (!querySnapshot.empty && querySnapshot.docs.some((d) => d.data()?.role === "admin")) {
+            if (!querySnapshot.empty && querySnapshot.docs.some((d) => {
+              const r = d.data()?.role;
+              return r === "admin" || r === "teacher";
+            })) {
               isAuthorizedTeacher = true;
               break;
             }
           }
         }
 
-        if (isAuthorizedTeacher) {
+        if (isStillCurrent() && isAuthorizedTeacher) {
           setRole("admin");
         }
       } catch (e: any) {
         console.warn("Verifica ruolo docente secondario:", e);
-        setRoleError("Verifica temporaneamente non riuscita: se sei un docente abilitato, ricarica la pagina.");
+        if (isStillCurrent()) {
+          setRoleError("Verifica temporaneamente non riuscita: se sei un docente abilitato, ricarica la pagina.");
+        }
       } finally {
-        setRoleChecking(false);
+        if (roleCheckSeqRef.current === seq) {
+          setRoleChecking(false);
+        }
       }
     }
   };
@@ -317,13 +340,13 @@ export default function App() {
 
   // Close Google Workspace troubleshooting modal with Escape key
   useEffect(() => {
-    if (!showWorkspaceHelp) return;
+    if (!showWorkspaceModal) return;
     const onKeyDown = (e: KeyboardEvent) => {
-      if (e.key === "Escape") setShowWorkspaceHelp(false);
+      if (e.key === "Escape") setShowWorkspaceModal(false);
     };
     window.addEventListener("keydown", onKeyDown);
     return () => window.removeEventListener("keydown", onKeyDown);
-  }, [showWorkspaceHelp]);
+  }, [showWorkspaceModal]);
 
   // Auth changed listener with redirect support & direct session recovery
   useEffect(() => {
@@ -335,7 +358,9 @@ export default function App() {
     // 1. Check if student previously logged in via Direct Student Access (sessionStorage or localStorage)
     let hasSavedDirect = false;
     try {
-      const savedDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
+      const savedDirect = isSharedPcSessionActive()
+        ? sessionStorage.getItem("direct_student_user")
+        : (sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user"));
       if (savedDirect) {
         const parsed = JSON.parse(savedDirect);
         if (parsed?.email) {
@@ -348,8 +373,8 @@ export default function App() {
         }
       }
     } catch {
-      sessionStorage.removeItem("direct_student_user");
-      localStorage.removeItem("direct_student_user");
+      try { sessionStorage.removeItem("direct_student_user"); } catch {}
+      try { localStorage.removeItem("direct_student_user"); } catch {}
     }
 
     if (!auth) {
@@ -398,7 +423,9 @@ export default function App() {
       } else {
         // If not logged into Firebase, preserve direct student session if stored
         try {
-          const currentDirect = sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user");
+          const currentDirect = isSharedPcSessionActive()
+            ? sessionStorage.getItem("direct_student_user")
+            : (sessionStorage.getItem("direct_student_user") || localStorage.getItem("direct_student_user"));
           if (currentDirect) {
             const parsedDirect = JSON.parse(currentDirect);
             if (!hasSavedDirect && parsedDirect?.email) {
@@ -407,15 +434,19 @@ export default function App() {
               setRole("student");
             }
           } else {
+            roleCheckSeqRef.current++;
             setUser(null);
             setGoogleStudentClass("");
             setRole("student");
             setRoleError("");
+            setRoleChecking(false);
           }
         } catch {
+          roleCheckSeqRef.current++;
           setUser(null);
           setGoogleStudentClass("");
           setRole("student");
+          setRoleChecking(false);
         }
       }
       setAuthLoading(false);
@@ -502,8 +533,8 @@ export default function App() {
     e.preventDefault();
     setDirectError("");
 
-    const nome = directName.trim();
-    const cognome = directSurname.trim();
+    const nome = directName.trim().slice(0, 70);
+    const cognome = directSurname.trim().slice(0, 70);
     const classe = normalizeClassLabel(directClass);
     let email = directEmail.trim().toLowerCase().replace(/\s+/g, "");
 
@@ -567,6 +598,8 @@ export default function App() {
   };
 
   const handleSignOut = async () => {
+    roleCheckSeqRef.current++;
+    setRoleChecking(false);
     wipeSharedPcStudentStorage();
     setSharedPcMode(false);
     setDirectName("");
@@ -663,15 +696,15 @@ export default function App() {
                     </div>
                   )}
 
-                  {/* Apple mobile (iPhone/iPad) AI Studio access guidance */}
+                  {/* Apple mobile (iPhone/iPad) Safari cookie access guidance */}
                   {appleMobileDetected && !inAppBrowserDetected && (
                     <div className="bg-rose-950/50 border border-rose-500/30 p-4 rounded-2xl text-left text-xs leading-relaxed text-rose-100 space-y-2 shadow-lg">
                       <div className="flex items-center gap-2 font-bold text-rose-200">
                         <Smartphone className="w-4 h-4 shrink-0" />
-                        <span>Usi un iPhone/iPad? Leggi qui se Google mostra "Non disponi dell'accesso a AI Studio"</span>
+                        <span>Usi un iPhone/iPad? Leggi qui se Safari blocca l'accesso Google</span>
                       </div>
                       <p className="text-[11px] text-rose-100/90 leading-relaxed">
-                        Se con lo <b>stesso account scolastico</b> su Android entri e su iPhone no, <b>non è un problema di permessi</b>: è Safari che blocca i cookie di sessione di AI Studio (protezione anti-tracciamento di Apple). Prova in ordine:
+                        Se con lo <b>stesso account scolastico</b> su Android entri e su iPhone no, <b>non è un problema di permessi</b>: è Safari che blocca i cookie di sessione tra siti (protezione anti-tracciamento di Apple). Prova in ordine:
                       </p>
                       <ol className="text-[11px] text-rose-100/90 leading-relaxed list-decimal list-inside space-y-1 pl-1">
                         <li><b>Apri il link in Chrome per iOS</b> (se installato) oppure in Safari, non dentro WhatsApp/Classroom.</li>
@@ -786,6 +819,7 @@ export default function App() {
                               <input
                                 type="text"
                                 required
+                                maxLength={70}
                                 value={directName}
                                 onChange={(e) => setDirectName(e.target.value)}
                                 placeholder="es. Marco"
@@ -799,6 +833,7 @@ export default function App() {
                               <input
                                 type="text"
                                 required
+                                maxLength={70}
                                 value={directSurname}
                                 onChange={(e) => setDirectSurname(e.target.value)}
                                 placeholder="es. Rossi"
@@ -961,7 +996,8 @@ export default function App() {
                       <div className="pt-2 border-t border-white/5">
                         <button
                           type="button"
-                          onClick={() => setShowWorkspaceHelp(!showWorkspaceHelp)}
+                          onClick={() => setShowWorkspaceAccordion((prev) => !prev)}
+                          aria-expanded={showWorkspaceAccordion}
                           className="w-full text-left text-[11px] font-semibold text-slate-400 hover:text-teal-300 flex items-center justify-between gap-1 transition-colors cursor-pointer py-1"
                         >
                           <span className="flex items-center gap-1.5">
@@ -969,11 +1005,11 @@ export default function App() {
                             <span>Perché con Google alcuni studenti entrano e altri no? (Limite accessi?)</span>
                           </span>
                           <span className="text-[10px] text-slate-500 font-mono">
-                            {showWorkspaceHelp ? "▲ Chiudi" : "▼ Leggi"}
+                            {showWorkspaceAccordion ? "▲ Chiudi" : "▼ Leggi"}
                           </span>
                         </button>
 
-                        {showWorkspaceHelp && (
+                        {showWorkspaceAccordion && (
                           <div className="mt-2 p-3 bg-slate-950/80 border border-white/10 rounded-xl text-[11px] text-slate-300 leading-relaxed text-left space-y-2 animate-fadeIn">
                             <p className="font-bold text-teal-300">
                               1. Nessun limite di accessi simultanei
@@ -1007,7 +1043,7 @@ export default function App() {
                       <div className="pt-2 border-t border-white/5">
                         <button
                           type="button"
-                          onClick={() => setShowWorkspaceHelp(true)}
+                          onClick={() => setShowWorkspaceModal(true)}
                           className="inline-flex items-center gap-1.5 text-[11px] text-slate-400 hover:text-teal-300 transition-colors cursor-pointer"
                         >
                           <HelpCircle className="w-3.5 h-3.5 text-teal-400" />
@@ -1034,6 +1070,7 @@ export default function App() {
                           </div>
 
                           <button
+                            type="button"
                             onClick={() => setActivePane("student")}
                             className="mt-6 w-full py-3 bg-indigo-600 hover:bg-indigo-500 text-white font-bold text-xs tracking-wider uppercase rounded-xl flex items-center justify-center gap-1 cursor-pointer transition-colors shadow-lg active:scale-95"
                           >
@@ -1056,6 +1093,7 @@ export default function App() {
 
                           {role === "admin" ? (
                             <button
+                              type="button"
                               onClick={() => setActivePane("teacher")}
                               className="mt-6 w-full py-3 bg-emerald-500 hover:bg-emerald-400 text-emerald-950 font-bold text-xs tracking-wider uppercase rounded-xl flex items-center justify-center gap-1 cursor-pointer transition-colors shadow-lg active:scale-95"
                             >
@@ -1073,6 +1111,7 @@ export default function App() {
                                   Sei il docente proprietario e vuoi attivare il ruolo Docente? Clicca qui sotto per forzare la verifica e il Bootstrap automatico.
                                 </p>
                                 <button
+                                  type="button"
                                   onClick={() => checkUserRoleAndBootstrap(user)}
                                   disabled={roleChecking}
                                   className="w-full py-2 bg-emerald-500/10 hover:bg-emerald-500/20 active:bg-emerald-500/30 text-emerald-400 border border-emerald-500/20 rounded-lg text-[10px] font-bold tracking-wider uppercase cursor-pointer disabled:opacity-50 flex items-center justify-center gap-2 transition-all"
@@ -1110,6 +1149,7 @@ export default function App() {
                           </p>
                         </div>
                         <button
+                          type="button"
                           onClick={handleSignOut}
                           className="w-full sm:w-auto text-[10px] uppercase font-bold text-red-400 hover:text-red-300 bg-red-500/5 px-4 py-2.5 rounded-xl border border-red-500/10 shrink-0 select-none cursor-pointer text-center"
                         >
@@ -1182,12 +1222,12 @@ export default function App() {
       />
 
       {/* Google Workspace & Domain Troubleshooting Modal */}
-      {showWorkspaceHelp && (
+      {showWorkspaceModal && (
         <div
           role="dialog"
           aria-modal="true"
           aria-label="Diagnostica accesso dominio scolastico"
-          onClick={() => setShowWorkspaceHelp(false)}
+          onClick={() => setShowWorkspaceModal(false)}
           className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 overflow-y-auto"
         >
           <div
@@ -1210,7 +1250,7 @@ export default function App() {
               </div>
               <button
                 type="button"
-                onClick={() => setShowWorkspaceHelp(false)}
+                onClick={() => setShowWorkspaceModal(false)}
                 className="p-1.5 text-slate-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
               >
                 <X className="w-5 h-5" />
@@ -1267,7 +1307,7 @@ export default function App() {
             <div className="pt-2 border-t border-white/10 flex justify-end">
               <button
                 type="button"
-                onClick={() => setShowWorkspaceHelp(false)}
+                onClick={() => setShowWorkspaceModal(false)}
                 className="px-5 py-2.5 bg-slate-800 hover:bg-slate-700 text-white font-bold text-xs rounded-xl transition-colors cursor-pointer"
               >
                 Ho Capito, Chiudi

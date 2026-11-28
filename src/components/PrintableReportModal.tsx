@@ -1,9 +1,10 @@
 import React, { useEffect } from "react";
 import { Printer, X, ShieldCheck, GraduationCap, Award } from "lucide-react";
-import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, formatMarkdown, isEvaluationPending, getPendingSubjectiveCount, isValidNumericScore, safeParseJson } from "../utils";
+import { extractBreakdownFromSubmission, buildSubjectiveReviewEntries, collectQuizOpenEnded, collectWorkbookReflections, formatMarkdown, isSubmissionPendingGrade, isValidNumericScore, safeParseJson } from "../utils";
 import GradeCalculationReport from "./GradeCalculationReport";
 import { getSubmissionBlindCode } from "../utils/privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "../utils/classGrouping";
+import { normalizeQuestionImage } from "../utils/googleFormsLink";
 
 interface PrintableReportModalProps {
   isOpen: boolean;
@@ -73,10 +74,7 @@ export default function PrintableReportModal({
   const examObj = safeParseJson(submission.Domande_Esame);
   const answersObj = safeParseJson(submission.Risposte_Studente);
   const isQuiz = String(submission.Tipo || "").toLowerCase() === "quiz";
-  const pendingEvaluation =
-    isEvaluationPending(evaluationObj) ||
-    getPendingSubjectiveCount(submission) > 0 ||
-    String(submission.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+  const pendingEvaluation = isSubmissionPendingGrade(submission, evaluationObj);
   const subjectiveEntries = buildSubjectiveReviewEntries(
     isQuiz
       ? collectQuizOpenEnded(examObj)
@@ -111,7 +109,7 @@ export default function PrintableReportModal({
         hour: "2-digit",
         minute: "2-digit"
       })
-    : new Date().toLocaleDateString("it-IT");
+    : "N.D.";
 
   const parsedValidatedMs = submission.Convalida_Docente_At
     ? Date.parse(submission.Convalida_Docente_At)
@@ -127,13 +125,27 @@ export default function PrintableReportModal({
       ? examObj.images
       : undefined;
 
+  const safeExamImages: Array<[string, string]> = effectiveExamImages
+    ? Object.entries(effectiveExamImages)
+        .map(([qid, src]): [string, string] => [qid, normalizeQuestionImage(src)])
+        .filter(([, src]) => Boolean(src))
+    : [];
+
   const tabSwitches = Number(submission.AntiCopia_TabSwitch) || 0;
   const pasteBlocked = Number(submission.AntiCopia_IncollaBloccato) || 0;
   const splitScreens = Number(submission.AntiCopia_SchermoDiviso) || 0;
   const isSecurityClean = tabSwitches === 0 && pasteBlocked === 0 && splitScreens === 0;
 
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto animate-fadeIn">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Scheda di valutazione stampabile"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-4 bg-slate-950/85 backdrop-blur-md overflow-y-auto animate-fadeIn"
+    >
       {/* Container */}
       <div className="bg-slate-900 border border-white/20 rounded-3xl w-full max-w-4xl max-h-[95vh] flex flex-col shadow-2xl overflow-hidden my-auto">
         {/* Modal Top Bar (Hidden during actual print) */}
@@ -144,6 +156,7 @@ export default function PrintableReportModal({
           </div>
           <div className="flex items-center gap-2">
             <button
+              type="button"
               onClick={handlePrint}
               className="px-4 py-2 bg-indigo-600 hover:bg-indigo-500 text-white font-bold rounded-xl text-xs flex items-center gap-1.5 shadow-lg shadow-indigo-600/20 cursor-pointer transition-all active:scale-[0.98]"
             >
@@ -151,6 +164,7 @@ export default function PrintableReportModal({
               <span>Stampa o Salva PDF</span>
             </button>
             <button
+              type="button"
               onClick={onClose}
               className="p-2 text-slate-400 hover:text-white rounded-xl hover:bg-white/5 transition-colors cursor-pointer"
             >
@@ -243,7 +257,7 @@ export default function PrintableReportModal({
                   <span className="text-2xl font-bold text-amber-800">
                     {submission.Autovalutazione || "N.D."}
                   </span>
-                  <span className="text-xs text-amber-800">/ 10</span>
+                  {submission.Autovalutazione && <span className="text-xs text-amber-800">/ 10</span>}
                 </div>
                 <p className="text-[10px] text-amber-800 mt-1">
                   Stima formulata dall'alunno prima della pubblicazione del voto.
@@ -318,12 +332,15 @@ export default function PrintableReportModal({
                   <div className="space-y-2">
                     {subjectiveEntries.map((entry, idx) => {
                       const hasValidScore = Boolean(entry.detail && isValidNumericScore(entry.detail.score));
+                      const formattedScore = hasValidScore
+                        ? String(entry.detail.score).trim().replace(",", ".")
+                        : null;
                       return (
                       <div key={entry.id || idx} className="p-3 bg-white border border-slate-200 rounded-xl space-y-1">
                         <div className="flex items-center justify-between text-xs font-bold text-slate-900">
                           <span>{isQuiz ? `Quesito Aperto ${idx + 1}` : `Riflessione Critica ${idx + 1}`}</span>
                           <span className={`px-2 py-0.5 rounded font-mono ${hasValidScore ? "bg-indigo-100 text-indigo-800" : "bg-amber-100 text-amber-800"}`}>
-                            Punteggio: {hasValidScore ? `${entry.detail.score}/10` : "N.V. (in attesa)"}
+                            Punteggio: {hasValidScore ? `${formattedScore}/10` : "N.V. (in attesa)"}
                           </span>
                         </div>
                         {entry.question?.question && (
@@ -332,7 +349,11 @@ export default function PrintableReportModal({
                         <p className="text-slate-700 text-[11px] leading-relaxed italic">
                           Risposta: &ldquo;{entry.answer === "[VUOTO]" ? "[Nessuna risposta valida]" : (entry.answer || "Assente")}&rdquo;
                         </p>
-                        {hasValidScore && entry.detail?.feedback ? (
+                        {hasValidScore && deferredSolutionsLocked ? (
+                          <p className="text-slate-600 text-[11px] leading-relaxed italic">
+                            Commento analitico riservato fino allo sblocco delle soluzioni differite.
+                          </p>
+                        ) : hasValidScore && entry.detail?.feedback ? (
                           <div
                             className="text-slate-700 text-[11px] leading-relaxed [&_strong]:text-slate-900 [&_strong]:font-bold"
                             dangerouslySetInnerHTML={{
@@ -355,13 +376,13 @@ export default function PrintableReportModal({
             </div>
 
             {/* Figure della prova */}
-            {effectiveExamImages && Object.keys(effectiveExamImages).length > 0 && (
+            {safeExamImages.length > 0 && (
               <div className="space-y-2.5">
                 <h3 className="text-xs font-bold uppercase tracking-wider text-slate-800">
                   Figure della Prova
                 </h3>
                 <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-                  {Object.entries(effectiveExamImages).map(([qid, src]) => (
+                  {safeExamImages.map(([qid, src]) => (
                     <div key={qid} className="border border-slate-200 rounded-xl p-2 bg-white">
                       <img src={src} alt={`Figura ${qid}`} className="max-h-48 w-auto max-w-full object-contain mx-auto" />
                     </div>

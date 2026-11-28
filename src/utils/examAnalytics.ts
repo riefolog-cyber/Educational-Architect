@@ -18,10 +18,10 @@ import {
   collectWorkbookFillInTheBlank,
   collectWorkbookReflections,
   evaluateMcSelection,
+  extractFibExpected,
   formatItalianScholasticGrade,
-  getPendingSubjectiveCount,
-  isEvaluationPending,
   isFibAnswerCorrect,
+  isSubmissionPendingGrade,
   isValidNumericScore,
   parseItalianGrade,
   safeParseJson,
@@ -31,10 +31,7 @@ import { resolveSubmissionClass } from "./classGrouping";
 import { sanitizeCsvCell } from "./gradebookExport";
 
 function hasFibKey(fib: any): boolean {
-  if (!fib || typeof fib !== "object") return false;
-  if (typeof fib.answer === "string" && fib.answer.trim().length > 0) return true;
-  if (typeof fib.sentence === "string" && /\[[^\]]+\]/.test(fib.sentence)) return true;
-  return false;
+  return Boolean(extractFibExpected(fib));
 }
 
 export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamItemAnalysis {
@@ -92,12 +89,12 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
 
     const mcById = new Map<string, any>();
     for (const mq of recMcQuestions) {
-      const id = String(mq?.id || "");
+      const id = mq?.id !== undefined && mq?.id !== null && String(mq.id) !== "" ? String(mq.id) : "";
       if (id && !mcById.has(id)) mcById.set(id, mq);
     }
     const fibById = new Map<string, any>();
     for (const fq of recFibQuestions) {
-      const id = String(fq?.id || "");
+      const id = fq?.id !== undefined && fq?.id !== null && String(fq.id) !== "" ? String(fq.id) : "";
       if (id && !fibById.has(id)) fibById.set(id, fq);
     }
 
@@ -130,7 +127,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
   const mcQuestions: any[] = collectExamMultipleChoice(referenceExam);
 
   const mcStats: McItemStat[] = mcQuestions.map((q: any, idx: number) => {
-    const qId = String(q?.id || `mc_${idx}`);
+    const qId = q?.id !== undefined && q?.id !== null && String(q.id) !== "" ? String(q.id) : `mc_${idx}`;
     let correctCount = 0;
     let errorCount = 0;
     let blankCount = 0;
@@ -191,7 +188,7 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
   const fibQuestions: any[] = collectWorkbookFillInTheBlank(referenceExam);
 
   const fibStats: FibItemStat[] = fibQuestions.map((fib: any, idx: number) => {
-    const fId = String(fib?.id || `fib_${idx}`);
+    const fId = fib?.id !== undefined && fib?.id !== null && String(fib.id) !== "" ? String(fib.id) : `fib_${idx}`;
     let correctCount = 0;
     let keyedResponses = 0;
     let unkeyedResponses = 0;
@@ -206,7 +203,8 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
         continue;
       }
       keyedResponses++;
-      if (isFibAnswerCorrect(val, studentFib.answer, studentFib.sentence)) {
+      const studentExpected = extractFibExpected(studentFib);
+      if (isFibAnswerCorrect(val, studentExpected, studentFib.sentence)) {
         correctCount++;
       } else if (val.trim()) {
         const cleanWrong = val.trim();
@@ -223,11 +221,12 @@ export function computeExamItemAnalysis(submissions: SavedSubmission[]): ExamIte
 
     const totalResponses = parsedRecords.length;
     const accuracyPercent = keyedResponses > 0 ? Math.round((correctCount / keyedResponses) * 100) : 0;
+    const resolvedExpected = extractFibExpected(fib);
     return {
       id: fId,
       index: idx + 1,
       sentence: String(fib?.sentence || `Completamento ${idx + 1}`),
-      expectedAnswer: String(fib?.answer || ""),
+      expectedAnswer: resolvedExpected,
       totalResponses,
       correctCount,
       keyedResponses,
@@ -342,12 +341,7 @@ export interface MetacognitionSummary {
 }
 
 function resolveNumericFinalGrade(sub: SavedSubmission): number {
-  const ev = safeParseJson(sub.Full_Evaluation);
-  if (
-    isEvaluationPending(ev) ||
-    getPendingSubjectiveCount(sub) > 0 ||
-    String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.")
-  ) {
+  if (isSubmissionPendingGrade(sub)) {
     return NaN;
   }
   const g = parseItalianGrade(sub.Voto_Suggerito);
@@ -524,14 +518,14 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
     if (!referenceExam) referenceExam = parsed;
 
     collectExamMultipleChoice(parsed).forEach((q: any, idx: number) => {
-      const qId = String(q?.id || `mc_${idx}`);
+      const qId = q?.id !== undefined && q?.id !== null && String(q.id) !== "" ? String(q.id) : `mc_${idx}`;
       if (!seenMc.has(qId)) {
         seenMc.add(qId);
         mcQuestions.push({ ...q, __matrixId: qId });
       }
     });
     collectWorkbookFillInTheBlank(parsed).forEach((f: any, idx: number) => {
-      const fId = String(f?.id || `fib_${idx}`);
+      const fId = f?.id !== undefined && f?.id !== null && String(f.id) !== "" ? String(f.id) : `fib_${idx}`;
       if (!seenFib.has(fId)) {
         seenFib.add(fId);
         fibQuestions.push({ ...f, __matrixId: fId });
@@ -600,11 +594,13 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
 
     const studentMcById = new Map<string, any>();
     studentMcList.forEach((sq: any, i: number) => {
-      studentMcById.set(String(sq?.id || `mc_${i}`), sq);
+      const id = sq?.id !== undefined && sq?.id !== null && String(sq.id) !== "" ? String(sq.id) : `mc_${i}`;
+      studentMcById.set(id, sq);
     });
     const studentFibById = new Map<string, any>();
     studentFibList.forEach((sf: any, i: number) => {
-      studentFibById.set(String(sf?.id || `fib_${i}`), sf);
+      const id = sf?.id !== undefined && sf?.id !== null && String(sf.id) !== "" ? String(sf.id) : `fib_${i}`;
+      studentFibById.set(id, sf);
     });
 
     const oeEntries = buildSubjectiveReviewEntries(
@@ -667,7 +663,7 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
         cells.push({ columnKey: `fib:${fId}`, status: "blank" });
       } else if (!hasFibKey(studentFib)) {
         cells.push({ columnKey: `fib:${fId}`, status: "unkeyed", detailText: trimmed });
-      } else if (isFibAnswerCorrect(trimmed, studentFib?.answer, studentFib?.sentence)) {
+      } else if (isFibAnswerCorrect(trimmed, extractFibExpected(studentFib), studentFib?.sentence)) {
         cells.push({ columnKey: `fib:${fId}`, status: "correct", detailText: trimmed });
       } else {
         cells.push({ columnKey: `fib:${fId}`, status: "wrong", detailText: trimmed });
@@ -734,10 +730,7 @@ export function buildExamOutcomeMatrix(submissions: SavedSubmission[]): ExamOutc
       }
     });
 
-    const isPending =
-      isEvaluationPending(evaluation) ||
-      getPendingSubjectiveCount(sub) > 0 ||
-      String(sub.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+    const isPending = isSubmissionPendingGrade(sub, evaluation);
     const finalGrade = isPending ? "N.V." : String(sub.Voto_Suggerito || "N.D.");
     const numericGrade = resolveNumericFinalGrade(sub);
     const hasIssues =
@@ -905,17 +898,20 @@ export interface GradeDistributionSummary {
   buckets: GradeDistributionBucket[];
 }
 
-export function matchesGradeBand(sub: SavedSubmission, band: GradeDistributionBandKey): boolean {
-  const num = resolveNumericFinalGrade(sub);
-  if (!Number.isFinite(num)) {
+export function matchesNumericGradeBand(numericGrade: number, band: GradeDistributionBandKey): boolean {
+  if (!Number.isFinite(numericGrade)) {
     return band === "nv";
   }
-  if (band === "lt45") return num < 4.5;
-  if (band === "b45_59") return num >= 4.5 && num < 6;
-  if (band === "b60_69") return num >= 6 && num < 7;
-  if (band === "b70_79") return num >= 7 && num < 8;
-  if (band === "b80_105") return num >= 8;
+  if (band === "lt45") return numericGrade < 4.5;
+  if (band === "b45_59") return numericGrade >= 4.5 && numericGrade < 6;
+  if (band === "b60_69") return numericGrade >= 6 && numericGrade < 7;
+  if (band === "b70_79") return numericGrade >= 7 && numericGrade < 8;
+  if (band === "b80_105") return numericGrade >= 8;
   return false;
+}
+
+export function matchesGradeBand(sub: SavedSubmission, band: GradeDistributionBandKey): boolean {
+  return matchesNumericGradeBand(resolveNumericFinalGrade(sub), band);
 }
 
 export function computeGradeDistribution(submissions: SavedSubmission[]): GradeDistributionSummary {

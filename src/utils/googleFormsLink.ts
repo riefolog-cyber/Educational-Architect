@@ -283,7 +283,7 @@ function collectImageUrls(value: unknown, found: string[]): void {
       if (!found.includes(s)) found.push(s);
       return;
     }
-    if (/^https?:\/\/[^"\s<>]+$/i.test(s)) {
+    if (/^https:\/\/[^"\s<>]+$/i.test(s)) {
       const looksLikeImage =
         /\.(png|jpe?g|gif|webp|avif)(\?|#|$)/i.test(s) ||
         /googleusercontent|ggpht|forms\.google.*image/i.test(s);
@@ -544,6 +544,7 @@ export function applyFormDataAnswerKey(
     });
 
     let matched = 0;
+    let updated = 0;
     const questions = form.questions.map((q) => {
       const found = byId.get(q.id) || byTitle.get(matchKey(q.question));
       if (!found) return q;
@@ -570,6 +571,7 @@ export function applyFormDataAnswerKey(
       const points = typeof found.points === "number" && found.points > 0 ? found.points : q.points;
 
       if (correctIndex === undefined && points === q.points && note === q.note) return q;
+      updated++;
       if (correctIndex !== undefined) matched++;
       return {
         ...q,
@@ -579,8 +581,12 @@ export function applyFormDataAnswerKey(
       };
     });
 
-    if (matched === 0) return form;
-    return { ...form, questions, keySource: source, keyedCount: matched };
+    if (updated === 0) return form;
+    return {
+      ...form,
+      questions,
+      ...(matched > 0 ? { keySource: source, keyedCount: matched } : {}),
+    };
   } catch {
     return form;
   }
@@ -652,6 +658,18 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
     : [];
 
   const importedVia: LinkedFormOrigin = raw.importedVia === "google" ? "google" : "script";
+  const rawSourceUrl = cleanFormText(raw.sourceUrl);
+  let safeSourceUrl = "";
+  if (rawSourceUrl) {
+    try {
+      const parsedSource = new URL(rawSourceUrl);
+      if (parsedSource.protocol === "https:") {
+        safeSourceUrl = parsedSource.toString();
+      }
+    } catch {
+      safeSourceUrl = "";
+    }
+  }
 
   return {
     title,
@@ -660,7 +678,7 @@ export function normalizeLinkedFormPayload(input: unknown): LinkedFormPayload | 
     skipped,
     ...(cleanFormText(raw.scriptVersion) ? { scriptVersion: cleanFormText(raw.scriptVersion) } : {}),
     importedVia,
-    sourceUrl: cleanFormText(raw.sourceUrl),
+    sourceUrl: safeSourceUrl,
     ...(keyed > 0 ? { keySource: "script" as LinkedFormKeySource, keyedCount: keyed } : {}),
   };
 }

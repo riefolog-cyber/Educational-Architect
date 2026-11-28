@@ -15,7 +15,8 @@ import {
 } from "lucide-react";
 import { buildExamPreviewSummary } from "../utils/examPreview";
 import { stripExamAnswers, restoreExamAnswers, validateExamKeysForLaunch } from "../utils/examSecurity";
-import { collectExamMultipleChoice, collectQuizOpenEnded, evaluateMcSelection } from "../utils";
+import { normalizeQuestionImage } from "../utils/googleFormsLink";
+import { collectExamMultipleChoice, collectQuizOpenEnded, evaluateMcSelection, extractFibExpected } from "../utils";
 
 interface ExamPreviewModalProps {
   isOpen: boolean;
@@ -29,11 +30,10 @@ function maskFibSentence(sentence: unknown, reveal: boolean, expectedAnswer?: st
   if (reveal) {
     if (/\[[^\]]+\]/.test(s)) return s;
     if (expectedAnswer && /_{2,}|\.{3,}/.test(s)) {
-      return s.replace(/_{2,}|\.{3,}/, `[${expectedAnswer}]`);
+      return s.replace(/_{2,}|\.{3,}/, () => `[${expectedAnswer}]`);
     }
     return s;
   }
-  if (/_{2,}|\.{3,}/.test(s)) return s;
   return s.replace(/\[[^\]]+\]/g, "___");
 }
 
@@ -90,7 +90,11 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
   const rootFib: any[] = Array.isArray(displayData.fillInTheBlank) ? displayData.fillInTheBlank : [];
 
   const renderImageBlock = (itemId: unknown) => {
-    const src = itemId ? imagesMap[String(itemId)] : undefined;
+    const rawSrc =
+      itemId !== undefined && itemId !== null && String(itemId) !== ""
+        ? imagesMap[String(itemId)]
+        : undefined;
+    const src = normalizeQuestionImage(rawSrc);
     if (!src) return null;
     return (
       <div className="mt-2 mb-2">
@@ -107,7 +111,7 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
     const opts: string[] = Array.isArray(q?.options) ? q.options : [];
     return (
       <div
-        key={q?.id || `${prefixLabel}_${idx}`}
+        key={q?.id ?? `${prefixLabel}_${idx}`}
         className="p-3.5 rounded-2xl bg-slate-950/60 border border-white/10 space-y-2.5"
       >
         <div className="flex items-start justify-between gap-2">
@@ -136,7 +140,7 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
                 }`}
               >
                 <span className="font-mono text-[10px] text-slate-400 shrink-0">
-                  {String.fromCharCode(65 + oIdx)}.
+                  {oIdx < 26 ? String.fromCharCode(65 + oIdx) : String(oIdx + 1)}.
                 </span>
                 <span className="flex-1">{opt}</span>
                 {isCorrect && <CheckCircle className="w-3.5 h-3.5 text-emerald-400 shrink-0" />}
@@ -156,7 +160,7 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
 
   const renderOpenCard = (q: any, idx: number, badge: string) => (
     <div
-      key={q?.id || `${badge}_${idx}`}
+      key={q?.id ?? `${badge}_${idx}`}
       className="p-3.5 rounded-2xl bg-slate-950/60 border border-white/10 space-y-2"
     >
       <div className="flex items-start justify-between gap-2">
@@ -183,33 +187,44 @@ const ExamPreviewModal: React.FC<ExamPreviewModalProps> = ({
     </div>
   );
 
-  const renderFibCard = (f: any, idx: number) => (
-    <div
-      key={f?.id || `fib_${idx}`}
-      className="p-3 rounded-xl bg-slate-950/60 border border-white/10 space-y-1.5"
-    >
-      <div className="flex items-start justify-between gap-2">
-        <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
-          <span className="text-teal-400 font-mono font-bold mr-1.5">F{idx + 1}.</span>
-          {maskFibSentence(f?.sentence, showTeacherKey, f?.answer)}
-        </p>
-        {f?.weight && Number(f.weight) !== 1 && (
-          <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-mono shrink-0">
-            Peso ×{f.weight}
-          </span>
+  const renderFibCard = (f: any, idx: number) => {
+    const expected = extractFibExpected(f);
+    return (
+      <div
+        key={f?.id ?? `fib_${idx}`}
+        className="p-3 rounded-xl bg-slate-950/60 border border-white/10 space-y-1.5"
+      >
+        <div className="flex items-start justify-between gap-2">
+          <p className="text-xs sm:text-sm text-slate-200 leading-relaxed">
+            <span className="text-teal-400 font-mono font-bold mr-1.5">F{idx + 1}.</span>
+            {maskFibSentence(f?.sentence, showTeacherKey, expected)}
+          </p>
+          {f?.weight && Number(f.weight) !== 1 && (
+            <span className="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-300 border border-indigo-500/30 text-[10px] font-mono shrink-0">
+              Peso ×{f.weight}
+            </span>
+          )}
+        </div>
+        {renderImageBlock(f?.id)}
+        {showTeacherKey && expected && (
+          <p className="text-[11px] text-emerald-300 font-semibold">
+            Soluzione attesa: <span className="font-mono bg-emerald-500/15 px-1.5 py-0.5 rounded">{expected}</span>
+          </p>
         )}
       </div>
-      {renderImageBlock(f?.id)}
-      {showTeacherKey && f?.answer && (
-        <p className="text-[11px] text-emerald-300 font-semibold">
-          Soluzione attesa: <span className="font-mono bg-emerald-500/15 px-1.5 py-0.5 rounded">{f.answer}</span>
-        </p>
-      )}
-    </div>
-  );
+    );
+  };
 
   return (
-    <div className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-5">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="Anteprima verifica"
+      onClick={(e) => {
+        if (e.target === e.currentTarget) onClose();
+      }}
+      className="fixed inset-0 bg-slate-950/85 backdrop-blur-sm z-50 flex items-center justify-center p-3 sm:p-5"
+    >
       <div className="bg-slate-900 border border-white/10 w-full max-w-4xl rounded-3xl shadow-2xl overflow-hidden flex flex-col max-h-[92vh] animate-fadeIn">
         {/* Header */}
         <div className="flex flex-wrap items-center justify-between gap-3 bg-slate-950 px-5 py-4 border-b border-white/10">

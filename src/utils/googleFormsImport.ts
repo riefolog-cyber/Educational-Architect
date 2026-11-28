@@ -552,6 +552,7 @@ function buildWorkbook(rows: ParsedRow[], title: string): {
         question: cleanedQuestion,
       };
       if (row.criteria) item.criteria = row.criteria;
+      else if (row.answer) item.criteria = `Risposta attesa: ${row.answer}`;
       if (row.weight && row.weight !== 1) item.weight = row.weight;
       bucket.reflections.push(item);
     }

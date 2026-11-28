@@ -68,7 +68,7 @@ import {
   UNSPECIFIED_CLASS_LABEL
 } from "../utils/classGrouping";
 import { exportSubmissionPdf, exportSubmissionsZip, exportBlankExamPaperPdf, exportExamLedgerPdf } from "../utils/pdfExport";
-import { formatItalianScholasticGrade, isFibAnswerCorrect, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, applySubjectiveRetouchToDetails, isEvaluationPending, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml, isWorkbookExamData, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, evaluateMcSelection } from "../utils";
+import { formatItalianScholasticGrade, isFibAnswerCorrect, extractFibExpected, mcWeightedScore, fibWeightedScore, detectGibberish, detectGradeDiscrepancy, parseItalianGrade, computeGradeBreakdown, auditSubjectiveEvaluation, applySubjectiveRetouchToDetails, isEvaluationPending, isSubmissionPendingGrade, getPendingSubjectiveCount, safeParseJson, sanitizeAiHtml, isWorkbookExamData, collectExamMultipleChoice, collectQuizOpenEnded, collectWorkbookFillInTheBlank, collectWorkbookReflections, evaluateMcSelection } from "../utils";
 import {
   deriveStudentPseudonym,
   getSubmissionBlindCode,
@@ -160,9 +160,18 @@ function submissionStructuredAccuracy(sub: SavedSubmission): number | null {
   }
 }
 
+function safeTimeMs(value?: string | number | null): number {
+  if (typeof value === "number") return Number.isFinite(value) ? value : 0;
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
 // Borderline case: math grade in [5.5, 6) but solid structured part (>=70%).
+// Never flag pending (N.V.) submissions that hold a stale numeric grade.
 // The final call belongs to the teacher, never to an automatic bump.
 export function isBorderlineSubmission(sub: SavedSubmission): boolean {
+  if (isSubmissionPendingGrade(sub)) return false;
   const n = parseSubmissionNumericGrade(sub.Voto_Suggerito);
   if (isNaN(n) || n < 5.5 || n >= 6) return false;
   const acc = submissionStructuredAccuracy(sub);
@@ -173,13 +182,10 @@ export function isBorderlineSubmission(sub: SavedSubmission): boolean {
  * Grade to show in the registry, in the exports and in the header.
  *
  * A submission whose written open answers were never scored must read "N.V."
- * everywhere: showing the old numeric value (e.g. "2.0" stored before the fix)
- * would defeat the safety gate and let a wrong grade reach the registry/CSV.
+ * everywhere until a teacher explicitly validates a concrete manual grade.
  */
 export function displaySubmissionGrade(sub: any): string {
-  const ev = safeParseJson(sub?.Full_Evaluation);
-  if (isEvaluationPending(ev)) return "N.V.";
-  if (getPendingSubjectiveCount(sub) > 0) return "N.V.";
+  if (isSubmissionPendingGrade(sub)) return "N.V.";
   return sub?.Voto_Suggerito || "N/A";
 }
 
@@ -218,12 +224,44 @@ export function clusterInfractionsHint(log: any[]): string | null {
  */
 async function requestAiReevaluation(
   payload: any,
-  onQueueProgress?: (info: { status: "pending" | "processing"; position?: number }) => void
+  onQueueProgress?: (info: { status: "pending" | "processing"; position?: number }) => void,
+  signal?: AbortSignal
 ): Promise<any> {
+  const throwIfAborted = () => {
+    if (signal?.aborted) {
+      const err = new Error("Ricalcolo interrotto.");
+      err.name = "AbortError";
+      throw err;
+    }
+  };
+  const sleepWithSignal = (ms: number) =>
+    new Promise<void>((resolve, reject) => {
+      if (signal?.aborted) {
+        const err = new Error("Ricalcolo interrotto.");
+        err.name = "AbortError";
+        reject(err);
+        return;
+      }
+      const onAbort = () => {
+        clearTimeout(timer);
+        const err = new Error("Ricalcolo interrotto.");
+        err.name = "AbortError";
+        reject(err);
+      };
+      const timer = setTimeout(() => {
+        signal?.removeEventListener("abort", onAbort);
+        resolve();
+      }, ms);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
+
+  throwIfAborted();
   const authHeaders = await getAuthHeaders();
+  throwIfAborted();
   const enqueueResp = await fetch("/api/evaluate/enqueue", {
     method: "POST",
     headers: { "Content-Type": "application/json", ...authHeaders },
+    signal,
     body: JSON.stringify(payload)
   });
 
@@ -252,9 +290,10 @@ async function requestAiReevaluation(
   let attempt = 0;
 
   while (Date.now() - startedAt < maxWaitMs) {
+    throwIfAborted();
     if (attempt > 0) {
       const delay = Math.min(800 + attempt * 150, 3000) + Math.random() * 300;
-      await new Promise((r) => setTimeout(r, delay));
+      await sleepWithSignal(delay);
     }
     attempt++;
 
@@ -264,23 +303,26 @@ async function requestAiReevaluation(
     let statusResp: Response | null = null;
     let pollNetErr: any = null;
     for (let rTry = 0; rTry < 3; rTry++) {
+      throwIfAborted();
       try {
         const resp = await fetch(statusUrl, {
           headers: jobToken ? { "x-job-token": jobToken } : undefined,
+          signal,
         });
         if (resp.status === 502 || resp.status === 503 || resp.status === 504) {
           pollNetErr = new Error(`Errore temporaneo del server (HTTP ${resp.status}).`);
           if (rTry < 2) {
-            await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+            await sleepWithSignal(1000 * (rTry + 1));
             continue;
           }
         }
         statusResp = resp;
         break;
-      } catch (err) {
+      } catch (err: any) {
+        if (err?.name === "AbortError" || signal?.aborted) throw err;
         pollNetErr = err;
         if (rTry < 2) {
-          await new Promise((r) => setTimeout(r, 1000 * (rTry + 1)));
+          await sleepWithSignal(1000 * (rTry + 1));
         }
       }
     }
@@ -329,6 +371,18 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const [expiryTime, setExpiryTime] = useState(getCurrentTimeHHMM);
   const [isExpiryCustom, setIsExpiryCustom] = useState(false);
   const timeInputRef = useRef<HTMLInputElement>(null);
+  const reevalAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(() => {
+    const controller = new AbortController();
+    reevalAbortRef.current = controller;
+    return () => {
+      controller.abort();
+      if (reevalAbortRef.current === controller) {
+        reevalAbortRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (isExpiryCustom) return;
@@ -509,16 +563,19 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     e.stopPropagation();
     if (!pinValue || pinValue === "—") return;
     const fallbackCopy = () => {
+      let area: HTMLTextAreaElement | null = null;
       try {
-        const area = document.createElement("textarea");
+        area = document.createElement("textarea");
         area.value = pinValue;
         area.style.position = "fixed";
         area.style.opacity = "0";
         document.body.appendChild(area);
         area.select();
         document.execCommand("copy");
-        document.body.removeChild(area);
-      } catch {}
+      } catch {
+      } finally {
+        if (area && area.parentNode) area.parentNode.removeChild(area);
+      }
     };
     if (navigator.clipboard?.writeText) {
       navigator.clipboard.writeText(pinValue).catch(fallbackCopy);
@@ -560,8 +617,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           ...data
         } as SavedSubmission);
       });
-      // Sort recently created submissions first
-      list.sort((a, b) => new Date(b.Timestamp).getTime() - new Date(a.Timestamp).getTime());
+      // Sort recently created submissions first (NaN-safe)
+      list.sort((a, b) => safeTimeMs(b.Timestamp) - safeTimeMs(a.Timestamp));
       setSubmissions(list);
     } catch (e: any) {
       console.error("Error reading submissions:", e);
@@ -614,7 +671,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           classNoticeAt: d.classNoticeAt || undefined,
         });
       });
-      list.sort((a, b) => new Date(b.createdAt || 0).getTime() - new Date(a.createdAt || 0).getTime());
+      list.sort((a, b) => safeTimeMs(b.createdAt) - safeTimeMs(a.createdAt));
       setActiveSessions(list);
     } catch (e) {
       console.warn("Impossibile leggere le sessioni attive:", e);
@@ -1703,6 +1760,10 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const file = e.target.files?.[0];
     e.target.value = "";
     if (!file) return;
+    if (file.size > 10 * 1024 * 1024) {
+      setLibraryMsg("❌ File troppo grande (limite massimo 10 MB per il backup libreria).");
+      return;
+    }
     const effectiveEmail = user?.email || "docente_sandbox@scuola.it";
     const reader = new FileReader();
     reader.onload = async (event) => {
@@ -1796,16 +1857,23 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const file = e.target.files?.[0];
     if (!file) return;
     const inputEl = e.target;
+    if (file.size > 5 * 1024 * 1024) {
+      setValidationError("Il file selezionato supera il limite massimo di 5 MB per una singola verifica.");
+      setValidationOk(false);
+      inputEl.value = "";
+      return;
+    }
 
     const reader = new FileReader();
     reader.onload = (event) => {
       const text = (event.target?.result as string) || "";
       setJsonText(text);
       setLoadedLibraryItemId(null); // Fresh upload: decouple from prior session item
+      let extractedTitle = "";
       try {
         const parsed = tolerantJsonParse(text);
         if (parsed && typeof parsed === "object") {
-          const extractedTitle = (parsed.title || parsed.titolo || file.name.replace(/\.[^/.]+$/, "")).trim();
+          extractedTitle = String(parsed.title || parsed.titolo || file.name.replace(/\.[^/.]+$/, "")).trim();
           if (extractedTitle) {
             setMateria(extractedTitle);
           }
@@ -1814,7 +1882,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
       const valid = validateExamJSON(text);
       if (!valid && canAutoCorrectStructure(text)) {
         // Automatically attempt repair on upload with clear notice!
-        const repairResult = autoCorrectExamJSON(text, materia.trim());
+        const repairResult = autoCorrectExamJSON(text, (extractedTitle || materia).trim());
         if (repairResult.success) {
           setJsonText(repairResult.correctedJson);
           setAutoCorrectionNotice(repairResult);
@@ -1947,6 +2015,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
 
         // Strip solution keys on the server so students never receive correctIndex/answer in browser memory
+        const createdAtIso = new Date().toISOString();
+        const newSessionId = `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
         const authHeaders = await getAuthHeaders();
         const prepResp = await fetch("/api/session/prepare", {
           method: "POST",
@@ -1955,6 +2025,9 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             examData: examObj,
             ...(filaBExamObj ? { filaBExamData: filaBExamObj } : {}),
             reduceDistractors: besReduceDistractors,
+            pin: targetPin,
+            sessionId: newSessionId,
+            deferSolutions: Boolean(deferSolutions),
           }),
         });
         const prepData = await prepResp.json().catch(() => ({}));
@@ -2005,7 +2078,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           ...filaBExtra,
           severityPreset: "normale",
           active: true,
-          createdAt: new Date().toISOString()
+          createdAt: createdAtIso,
+          sessionId: newSessionId
         };
 
         // Purge leftovers from any previous run of this same PIN so two different
@@ -2034,8 +2108,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           severityPreset: "normale",
           active: true,
           maxExtendedExpiry: "",
-          createdAt: new Date().toISOString(),
-          sessionId: `run_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          createdAt: createdAtIso,
+          sessionId: newSessionId,
           backendUrl: "AI_STUDIO_GENAI_INTEGRATA"
         };
 
@@ -2325,7 +2399,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const initialMcList = collectExamMultipleChoice(effectiveDomandeObj);
     const initialFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
     const hasMissingMcKey = initialMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey);
-    const hasMissingFibKey = initialFibList.some((f: any) => !String(f?.answer ?? "").trim());
+    const hasMissingFibKey = initialFibList.some((f: any) => !extractFibExpected(f));
 
     if ((hasMissingMcKey || hasMissingFibKey) && sub.Pin) {
       try {
@@ -2365,7 +2439,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const postVaultFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
     if (
       postVaultMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey) ||
-      postVaultFibList.some((f: any) => !String(f?.answer ?? "").trim())
+      postVaultFibList.some((f: any) => !extractFibExpected(f))
     ) {
       const siblingObjs = submissions
         .filter((s) => s.id !== sub.id)
@@ -2386,7 +2460,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const verifiedFibList = collectWorkbookFillInTheBlank(effectiveDomandeObj);
     if (
       verifiedMcList.some((q: any) => !evaluateMcSelection(q, 0).hasCorrectKey) ||
-      verifiedFibList.some((f: any) => !String(f?.answer ?? "").trim())
+      verifiedFibList.some((f: any) => !extractFibExpected(f))
     ) {
       throw new Error(
         "Chiavi di correzione oggettive mancanti o non decifrabili per questa consegna: ricalcolo annullato per evitare di azzerare i punteggi MC/FIB."
@@ -2508,7 +2582,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           if (!options?.silent && qInfo.status === "pending" && qInfo.position) {
             showNotify("success", `⏳ Ricalcolo in coda (posizione ${qInfo.position})...`, 3500);
           }
-        });
+        }, reevalAbortRef.current?.signal);
 
         const audit = auditSubjectiveEvaluation({
           questions: oeList,
@@ -2558,7 +2632,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
       let correctFib = 0;
       fibList.forEach((fib: any) => {
-        if (isFibAnswerCorrect(fibAnswersMap?.[fib.id], fib.answer, fib.sentence)) correctFib++;
+        if (isFibAnswerCorrect(fibAnswersMap?.[fib.id], extractFibExpected(fib), fib.sentence)) correctFib++;
       });
 
       if (!hasFibAnswers && correctFib === 0 && sub.Punteggio_FIB && sub.Punteggio_FIB > 0) {
@@ -2583,6 +2657,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         }
         updatedPunteggioMC = correctMc;
       }
+      const wbMcs = mcWeightedScore(wbMcList, ansObj.mc || {});
 
       const breakdownAnswers: any = {};
       if (hasFibAnswers) breakdownAnswers.wbFib = fibAnswersMap;
@@ -2656,6 +2731,8 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
             domande: effectiveDomandeObj,
             risposte: aiSafeWbAnswers,
             punteggioMC: correctMc,
+            punteggioMCPesato: wbMcs.weightedCorrect,
+            pesoMCTotale: wbMcs.weightedTotal,
             punteggioFIB: correctFib,
             totaleFIB: fibList.length,
             punteggioFIBPesato: fibs.weightedCorrect,
@@ -2666,7 +2743,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
           if (!options?.silent && qInfo.status === "pending" && qInfo.position) {
             showNotify("success", `⏳ Ricalcolo in coda (posizione ${qInfo.position})...`, 3500);
           }
-        });
+        }, reevalAbortRef.current?.signal);
 
         const audit = auditSubjectiveEvaluation({
           questions: rqList,
@@ -2770,7 +2847,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     if (!dbFirestore || bulkRecalculatingProgress) return;
     const pendingList = targetSubs.filter((s) => {
       const meta = submissionMetaMap.get(s.id);
-      return (meta ? meta.displayGrade === "N.V." || meta.pendingOpen > 0 : isEvaluationPending(safeParseJson(s.Full_Evaluation)) || getPendingSubjectiveCount(s) > 0 || s.Voto_Suggerito === "N.V.");
+      return meta ? meta.isPending : isSubmissionPendingGrade(s);
     });
     if (pendingList.length === 0) return;
 
@@ -2822,7 +2899,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
         Convalida_Docente_At: new Date().toISOString(),
         Convalida_Docente_Email: String(user?.email || ""),
       };
-      if (!sub.Voto_Originale_IA && sub.Voto_Suggerito && sub.Voto_Suggerito !== "N.V.") {
+      if (!sub.Voto_Originale_IA && sub.Voto_Suggerito) {
         payload.Voto_Originale_IA = sub.Voto_Suggerito;
       }
       await updateDoc(doc(dbFirestore, "valutazioni", sub.id), payload);
@@ -2843,6 +2920,12 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
   const handleValidateSubmission = async (sub: SavedSubmission) => {
     if (!dbFirestore) {
       setAppAlert({ msg: "⚠️ Database scolastico non disponibile." });
+      return;
+    }
+    if (isSubmissionPendingGrade(sub)) {
+      setAppAlert({
+        msg: "⚠️ Questa consegna è ancora in stato N.V. (in attesa): inserisci prima un voto manuale o valuta le risposte aperte.",
+      });
       return;
     }
     setValidatingId(sub.id);
@@ -3130,12 +3213,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
     const url = URL.createObjectURL(blob);
     const link = document.createElement("a");
-    link.href = url;
-    link.setAttribute("download", filename);
-    document.body.appendChild(link);
-    link.click();
-    document.body.removeChild(link);
-    setTimeout(() => URL.revokeObjectURL(url), 100);
+    try {
+      link.href = url;
+      link.setAttribute("download", filename);
+      document.body.appendChild(link);
+      link.click();
+    } finally {
+      if (link.parentNode) link.parentNode.removeChild(link);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
   };
 
   // Export single exam roster directly to CSV for class gradebook
@@ -3441,10 +3527,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
     submissions.forEach((sub) => {
       const pendingOpen = getPendingSubjectiveCount(sub);
       const ev = safeParseJson(sub?.Full_Evaluation);
-      const isPending =
-        isEvaluationPending(ev) ||
-        pendingOpen > 0 ||
-        String(sub?.Voto_Suggerito || "").trim().toUpperCase().includes("N.V.");
+      const isPending = isSubmissionPendingGrade(sub, ev);
       const displayGrade = isPending ? "N.V." : (sub?.Voto_Suggerito || "N/A");
       const rawNum = isPending ? -1 : parseSubmissionNumericGrade(sub.Voto_Suggerito);
       const numericGrade = Number.isNaN(rawNum) ? -1 : rawNum;
@@ -5311,9 +5394,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                     {(() => {
                       const pendingNvCount = filteredSubmissions.filter((s) => {
                         const meta = submissionMetaMap.get(s.id);
-                        return meta
-                          ? meta.displayGrade === "N.V." || meta.pendingOpen > 0
-                          : isEvaluationPending(safeParseJson(s.Full_Evaluation)) || getPendingSubjectiveCount(s) > 0 || s.Voto_Suggerito === "N.V.";
+                        return meta ? meta.isPending : isSubmissionPendingGrade(s);
                       }).length;
                       if (pendingNvCount === 0) return null;
                       return (
@@ -7621,15 +7702,15 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
 
               <div className="p-4 bg-rose-500/10 border border-rose-500/20 rounded-2xl space-y-2">
                 <p className="font-bold text-rose-300 flex items-center gap-1.5 text-sm">
-                  <span>📱 5. Errore "Non disponi dell'accesso a AI Studio" (Google Admin su iPhone)</span>
+                  <span>📱 5. Blocco accesso Google / cookie di sessione su iPhone e iPad</span>
                 </p>
                 <p className="text-slate-300 text-[11px] leading-relaxed">
-                  Se compare la schermata bianca con logo Google Admin <i>"Spiacenti, non disponi dell'accesso a AI Studio. Il tuo account è gestito da un'organizzazione che ha disattivato questo servizio"</i>:
+                  Se su iPhone/iPad compare una schermata di blocco Google Admin o l'accesso viene interrotto subito dopo la scelta dell'account:
                 </p>
                 <div className="space-y-1.5 text-[11px] text-slate-200">
                   <p><b>Perché accade su iPhone (anche quando con lo stesso account su Android si entra)?</b></p>
                   <p className="text-slate-400">
-                    Se con lo stesso account scolastico su Android l'accesso riesce e su iPhone no, <b>non è un problema di permessi dell'account</b>: è il browser di Apple che blocca i cookie di sessione di AI Studio (protezione ITP anti-tracciamento). Inoltre Safari su iPhone memorizza l'account scolastico usato per Classroom/Drive e lo invia in automatico ai server Google, che mostrano il blocco anche se si prova con un account diverso.
+                    Se con lo stesso account scolastico su Android l'accesso riesce e su iPhone no, spesso <b>non è un problema di permessi dell'account</b>: è Safari su iOS che blocca i cookie di sessione tra siti (protezione ITP anti-tracciamento) e invia automaticamente la sessione scolastica di Classroom/Drive.
                   </p>
                   <p><b>Come far entrare subito gli studenti da iPhone (3 opzioni):</b></p>
                   <ol className="list-decimal list-inside text-rose-200/90 space-y-1.5 pl-1">
@@ -7639,7 +7720,7 @@ export default function TeacherDashboard({ user, onBack }: TeacherDashboardProps
                   </ol>
                   <p className="pt-1"><b>Per sbloccare definitivamente gli account scolastici:</b></p>
                   <p className="text-slate-400">
-                    L'amministratore Google Workspace dell'istituto deve andare su <code>admin.google.com</code> &rarr; <i>Applicazioni</i> &rarr; <i>Servizi Google aggiuntivi</i> &rarr; <b>Google AI Studio</b> e impostare lo stato su <b>"ATTIVO per tutti"</b> (o per l'Unità Organizzativa degli Studenti).
+                    L'amministratore Google Workspace dell'istituto può autorizzare l'applicazione da <code>admin.google.com</code> &rarr; <i>Sicurezza</i> &rarr; <i>Controllo accessi e dati</i> &rarr; <i>Controlli API</i> per l'Unità Organizzativa degli Studenti.
                   </p>
                 </div>
               </div>

@@ -74,6 +74,8 @@ async function main() {
     stripBase64ImagesForPrompt,
     collectExistingExamIds,
     allocateUniqueExamId,
+    publicBaseUrl,
+    isAllowedFormImageContentType,
   } = await import("../server");
 
   const sampleRawExam = {
@@ -1283,6 +1285,350 @@ async function main() {
         "/api/google/oauth/result?id=non-existent-import-id"
       );
       assert.equal(missingOauthRes.status, 404);
+    });
+
+    await runTest("Round 14 Fix: publicBaseUrl respinge header X-Forwarded-Host/Proto malevoli e OAuth usa redirect relativi", async () => {
+      const prevAppUrl = process.env.APP_URL;
+      try {
+        delete process.env.APP_URL;
+
+        const fakeReq = (headers: Record<string, string>, protocol = "https") =>
+          ({
+            headers,
+            protocol,
+            get: (name: string) => headers[name.toLowerCase()],
+          } as any);
+
+        // Rejects injected host with path/userinfo/spaces and falls back to safe Host header
+        const injectedHost = publicBaseUrl(
+          fakeReq({
+            "x-forwarded-proto": "javascript",
+            "x-forwarded-host": "evil.com/phish@legit.local",
+            host: "127.0.0.1:3000",
+          })
+        );
+        assert.equal(injectedHost, "https://127.0.0.1:3000");
+
+        // Rejects both invalid x-forwarded-host and invalid host
+        const allInvalid = publicBaseUrl(
+          fakeReq({
+            "x-forwarded-host": "evil.com\\backslash",
+            host: "bad host:3000",
+          })
+        );
+        assert.equal(allInvalid, "");
+
+        // Accepts valid forwarded host and http/https proto
+        const validFwd = publicBaseUrl(
+          fakeReq({
+            "x-forwarded-proto": "http, https",
+            "x-forwarded-host": "scuola.example.it:8443",
+          })
+        );
+        assert.equal(validFwd, "http://scuola.example.it:8443");
+
+        // /api/google/oauth/start redirects relatively (never off-origin via spoofed X-Forwarded-Host)
+        const oauthRedirect = await new Promise<{ status: number; location: string }>((resolve, reject) => {
+          const req = http.request(
+            {
+              hostname: "127.0.0.1",
+              port,
+              path: "/api/google/oauth/start?url=https%3A%2F%2Fdocs.google.com%2Fforms%2Fd%2Fabc%2Fedit",
+              method: "GET",
+              headers: {
+                "X-Forwarded-Host": "evil.attacker.invalid",
+                "X-Forwarded-Proto": "https",
+              },
+            },
+            (res) => {
+              res.resume();
+              res.on("end", () =>
+                resolve({
+                  status: res.statusCode || 0,
+                  location: String(res.headers.location || ""),
+                })
+              );
+            }
+          );
+          req.on("error", reject);
+          req.end();
+        });
+        assert.equal(oauthRedirect.status, 302);
+        assert.ok(oauthRedirect.location.startsWith("/?gforms_error="), `Redirect deve essere relativo, ricevuto: ${oauthRedirect.location}`);
+        assert.ok(!oauthRedirect.location.includes("evil.attacker.invalid"));
+      } finally {
+        if (prevAppUrl === undefined) delete process.env.APP_URL;
+        else process.env.APP_URL = prevAppUrl;
+      }
+    });
+
+    await runTest("Round 14 Fix: isAllowedFormImageContentType consente solo raster sicuri e blocca SVG/HTML", async () => {
+      assert.equal(isAllowedFormImageContentType("image/png"), true);
+      assert.equal(isAllowedFormImageContentType("image/jpeg; charset=binary"), true);
+      assert.equal(isAllowedFormImageContentType("image/webp"), true);
+      assert.equal(isAllowedFormImageContentType("image/gif"), true);
+      assert.equal(isAllowedFormImageContentType("image/svg+xml"), false);
+      assert.equal(isAllowedFormImageContentType("image/svg+xml; charset=utf-8"), false);
+      assert.equal(isAllowedFormImageContentType("text/html"), false);
+      assert.equal(isAllowedFormImageContentType(""), false);
+    });
+
+    await runTest("Round 17 Fix: binding crittografico PIN/sessionId/deferSolutions blocca decifratura cross-PIN su unlock-solutions e evaluate/enqueue", async () => {
+      const secretLiveExam = {
+        title: "Verifica Segreta LIVE2",
+        multipleChoice: [
+          {
+            id: "live_mc1",
+            question: "Chi compose la Divina Commedia?",
+            options: ["Petrarca", "Dante Alighieri", "Boccaccio", "Ariosto"],
+            correctIndex: 1,
+            explanation: "Dante Alighieri compose la Divina Commedia.",
+          },
+        ],
+        openEnded: [],
+      };
+      const oldExam = {
+        title: "Verifica Vecchia OLD1",
+        multipleChoice: [
+          {
+            id: "old_mc1",
+            question: "2 + 3 = ?",
+            options: ["4", "5", "6", "7"],
+            correctIndex: 1,
+            explanation: "2 + 3 = 5.",
+          },
+        ],
+        openEnded: [],
+      };
+
+      const prepLive = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/session/prepare",
+        {
+          examData: secretLiveExam,
+          pin: "LIVE2",
+          sessionId: "run_live_2",
+          deferSolutions: true,
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(prepLive.status, 200);
+      const liveKey = prepLive.data.encryptedAnswerKey;
+      const liveSanitized = prepLive.data.sanitizedExam;
+
+      const prepOld = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/session/prepare",
+        {
+          examData: oldExam,
+          pin: "OLD1",
+          sessionId: "run_old_1",
+          deferSolutions: false,
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(prepOld.status, 200);
+      const oldKey = prepOld.data.encryptedAnswerKey;
+      const oldSanitized = prepOld.data.sanitizedExam;
+
+      // 1. unlock-solutions: OLD1 is unlocked, attacker replays LIVE2's encryptedAnswerKey under PIN OLD1 -> 403
+      mockSessionDocFields = {
+        sessionId: { stringValue: "run_old_1" },
+        deferSolutions: { booleanValue: false },
+        solutionsReleased: { booleanValue: true },
+        encryptedAnswerKey: { stringValue: oldKey },
+      };
+      const crossUnlock1 = await httpJsonRequest(port, "POST", "/api/session/unlock-solutions", {
+        pin: "OLD1",
+        sessionId: "run_old_1",
+        studentEmail: "furbo@scuola.it",
+        studentClass: "3A",
+        encryptedAnswerKey: liveKey,
+        examData: liveSanitized,
+        answers: { mc: { live_mc1: 0 } },
+        tipo: "Quiz",
+      });
+      assert.equal(crossUnlock1.status, 403);
+
+      // Even if OLD1 doc has no encryptedAnswerKey stored, _vaultMeta.pin binding still blocks with 403
+      mockSessionDocFields = {
+        sessionId: { stringValue: "run_old_1" },
+        deferSolutions: { booleanValue: false },
+        solutionsReleased: { booleanValue: true },
+      };
+      const crossUnlock2 = await httpJsonRequest(port, "POST", "/api/session/unlock-solutions", {
+        pin: "OLD1",
+        sessionId: "run_old_1",
+        studentEmail: "furbo@scuola.it",
+        studentClass: "3A",
+        encryptedAnswerKey: liveKey,
+        examData: liveSanitized,
+        answers: { mc: { live_mc1: 0 } },
+        tipo: "Quiz",
+      });
+      assert.equal(crossUnlock2.status, 403);
+
+      // Legitimate student unlock for OLD1 with OLD1's own key still succeeds
+      mockSessionDocFields = {
+        sessionId: { stringValue: "run_old_1" },
+        deferSolutions: { booleanValue: false },
+        solutionsReleased: { booleanValue: true },
+        encryptedAnswerKey: { stringValue: oldKey },
+      };
+      const legitOldUnlock = await httpJsonRequest(port, "POST", "/api/session/unlock-solutions", {
+        pin: "OLD1",
+        sessionId: "run_old_1",
+        studentEmail: "onesto@scuola.it",
+        studentClass: "3A",
+        encryptedAnswerKey: oldKey,
+        examData: oldSanitized,
+        answers: { mc: { old_mc1: 1 } },
+        tipo: "Quiz",
+      });
+      assert.equal(legitOldUnlock.status, 200);
+      assert.equal(legitOldUnlock.data.unlocked, true);
+      assert.equal(legitOldUnlock.data.resolvedDomande?.multipleChoice?.[0]?.correctIndex, 1);
+
+      // Authenticated teacher can still unlock LIVE2 even while locked for students
+      const teacherLiveUnlock = await httpJsonRequest(
+        port,
+        "POST",
+        "/api/session/unlock-solutions",
+        {
+          pin: "LIVE2",
+          sessionId: "run_live_2",
+          studentEmail: "studente@scuola.it",
+          encryptedAnswerKey: liveKey,
+          examData: liveSanitized,
+          answers: { mc: { live_mc1: 0 } },
+          tipo: "Quiz",
+        },
+        { Authorization: "Bearer test-primary-teacher-token" }
+      );
+      assert.equal(teacherLiveUnlock.status, 200);
+      assert.equal(teacherLiveUnlock.data.resolvedDomande?.multipleChoice?.[0]?.correctIndex, 1);
+
+      // 2. evaluate/enqueue: attacker replays LIVE2 key with blank sessionPin & deferSolutions=false -> MUST NOT leak answers
+      const blankPinEnq = await httpJsonRequest(port, "POST", "/api/evaluate/enqueue", {
+        tipo: "Quiz",
+        studentPseudoId: "STU-ORACLE-1",
+        sessionPin: "",
+        deferSolutions: false,
+        encryptedAnswerKey: liveKey,
+        report: {
+          domande: liveSanitized,
+          risposte: { mc: { live_mc1: 0 }, oe: {}, wbFib: {}, wbRq: {} },
+          autovalutazione: "6",
+        },
+      });
+      assert.equal(blankPinEnq.status, 200);
+      let blankStatus: any = null;
+      for (let i = 0; i < 20; i++) {
+        blankStatus = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/evaluate/status/${encodeURIComponent(blankPinEnq.data.jobId)}?token=${encodeURIComponent(blankPinEnq.data.jobToken || "")}`,
+          undefined,
+          { "x-job-token": blankPinEnq.data.jobToken }
+        );
+        if (blankStatus.data?.status === "completed" || blankStatus.data?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.equal(blankStatus?.data?.status, "completed");
+      const blankEv = blankStatus.data.evaluation;
+      assert.equal(blankEv.deferredSolutionsLocked, true);
+      assert.equal(blankEv.resolvedDomande, undefined);
+      assert.equal(blankEv.gradeBreakdown, undefined);
+      assert.ok(!JSON.stringify(blankEv).includes("Dante Alighieri"));
+
+      // 3. evaluate/enqueue: attacker replays LIVE2 key under unlocked PIN OLD1 -> MUST NOT leak LIVE2 answers
+      const crossPinEnq = await httpJsonRequest(port, "POST", "/api/evaluate/enqueue", {
+        tipo: "Quiz",
+        studentPseudoId: "STU-ORACLE-2",
+        sessionPin: "OLD1",
+        sessionId: "run_old_1",
+        deferSolutions: false,
+        encryptedAnswerKey: liveKey,
+        report: {
+          domande: liveSanitized,
+          risposte: { mc: { live_mc1: 0 }, oe: {}, wbFib: {}, wbRq: {} },
+          autovalutazione: "6",
+        },
+      });
+      assert.equal(crossPinEnq.status, 200);
+      let crossStatus: any = null;
+      for (let i = 0; i < 20; i++) {
+        crossStatus = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/evaluate/status/${encodeURIComponent(crossPinEnq.data.jobId)}?token=${encodeURIComponent(crossPinEnq.data.jobToken || "")}`,
+          undefined,
+          { "x-job-token": crossPinEnq.data.jobToken }
+        );
+        if (crossStatus.data?.status === "completed" || crossStatus.data?.status === "failed") break;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      assert.equal(crossStatus?.data?.status, "completed");
+      const crossEv = crossStatus.data.evaluation;
+      assert.equal(crossEv.deferredSolutionsLocked, true);
+      assert.equal(crossEv.resolvedDomande, undefined);
+      assert.ok(!JSON.stringify(crossEv).includes("Dante Alighieri"));
+    });
+
+    await runTest("Round 17 Fix: /api/transcribe-audio rifiuta con 400 payload audio vuoti o base64 non validi", async () => {
+      const emptyPrefixRes = await httpJsonRequest(port, "POST", "/api/transcribe-audio", {
+        audioBase64: "data:audio/webm;base64,",
+        mimeType: "audio/webm",
+      });
+      assert.equal(emptyPrefixRes.status, 400);
+
+      const badCharsRes = await httpJsonRequest(port, "POST", "/api/transcribe-audio", {
+        audioBase64: "data:audio/webm;base64,not-valid!base64?payload@@@",
+        mimeType: "audio/webm",
+      });
+      assert.equal(badCharsRes.status, 400);
+
+      const tooShortRes = await httpJsonRequest(port, "POST", "/api/transcribe-audio", {
+        audioBase64: "AAAA",
+        mimeType: "audio/webm",
+      });
+      assert.equal(tooShortRes.status, 400);
+    });
+
+    await runTest("Round 20 Fix: rate limiter attivo anche su GET API (/api/google/oauth/result) preservando i probe GET su /api/analyze-exam", async () => {
+      const testIpHeader = { "X-Forwarded-For": "198.51.100.77" };
+      // First 30 requests hit the route (404 for unknown ID), 31st must be blocked with 429
+      for (let i = 0; i < 30; i++) {
+        const res = await httpJsonRequest(
+          port,
+          "GET",
+          `/api/google/oauth/result?id=rl-check-${i}`,
+          undefined,
+          testIpHeader
+        );
+        assert.equal(res.status, 404);
+      }
+      const blockedRes = await httpJsonRequest(
+        port,
+        "GET",
+        "/api/google/oauth/result?id=rl-check-over-limit",
+        undefined,
+        testIpHeader
+      );
+      assert.equal(blockedRes.status, 429);
+
+      // Lightweight GET health probe on /api/analyze-exam (same teacherAiRateLimiter) remains exempt even after burst
+      const probeRes = await httpJsonRequest(
+        port,
+        "GET",
+        "/api/analyze-exam",
+        undefined,
+        testIpHeader
+      );
+      assert.equal(probeRes.status, 200);
+      assert.equal(probeRes.data?.status, "ok");
     });
   } finally {
     globalThis.fetch = originalFetch;

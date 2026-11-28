@@ -15,6 +15,7 @@ import {
 import { parseGoogleFormsImport, type GoogleFormsImportResult } from "../utils/googleFormsImport";
 import {
   buildExamFromLinkedForm,
+  normalizeQuestionImage,
   type LinkedFormPayload,
   type LinkedFormQuestion
 } from "../utils/googleFormsLink";
@@ -83,13 +84,29 @@ export default function GoogleFormsImportModal({
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const imageInputRef = useRef<HTMLInputElement | null>(null);
   const fetchAbortRef = useRef<AbortController | null>(null);
+  const csvReaderRef = useRef<FileReader | null>(null);
+  const isOpenRef = useRef(isOpen);
+  const linkedSeqRef = useRef(0);
+
+  const abortCsvReader = () => {
+    if (csvReaderRef.current) {
+      try {
+        csvReaderRef.current.abort();
+      } catch {}
+      csvReaderRef.current = null;
+    }
+  };
 
   useEffect(() => {
+    isOpenRef.current = isOpen;
     if (!isOpen) {
+      linkedSeqRef.current++;
+      abortCsvReader();
       fetchAbortRef.current?.abort();
       fetchAbortRef.current = null;
       setLoadingLink(false);
       setLoadingScript(false);
+      setUploadingImageId(null);
       return;
     }
     const handleKeyDown = (e: KeyboardEvent) => {
@@ -106,6 +123,8 @@ export default function GoogleFormsImportModal({
 
   useEffect(() => {
     return () => {
+      isOpenRef.current = false;
+      abortCsvReader();
       fetchAbortRef.current?.abort();
       fetchAbortRef.current = null;
     };
@@ -116,9 +135,15 @@ export default function GoogleFormsImportModal({
   /** Le immagini importate vengono ricodificate subito: il quiz deve restare leggero. */
   const withCompressedImages = async (form: LinkedFormPayload): Promise<LinkedFormPayload> => {
     const questions = await Promise.all(
-      form.questions.map(async (q) =>
-        q.image ? { ...q, image: await compressImageSource(q.image) } : q
-      )
+      form.questions.map(async (q) => {
+        if (!q.image) return q;
+        const safe = normalizeQuestionImage(await compressImageSource(q.image));
+        if (!safe) {
+          const { image: _dropped, ...rest } = q;
+          return rest as LinkedFormQuestion;
+        }
+        return { ...q, image: safe };
+      })
     );
     return { ...form, questions };
   };
@@ -134,11 +159,13 @@ export default function GoogleFormsImportModal({
     const target = imageTarget;
     setImageTarget(null);
     if (!file || !target) return;
+    const seqAtStart = linkedSeqRef.current;
     setUploadingImageId(target);
     setError(null);
     setResult(null);
     try {
       const src = await fileToExamImage(file);
+      if (!isOpenRef.current || linkedSeqRef.current !== seqAtStart) return;
       setLinked((prev) =>
         prev
           ? {
@@ -148,9 +175,12 @@ export default function GoogleFormsImportModal({
           : prev
       );
     } catch (err: any) {
+      if (!isOpenRef.current || linkedSeqRef.current !== seqAtStart) return;
       setError(err?.message || "Immagine non importata.");
     } finally {
-      setUploadingImageId(null);
+      if (isOpenRef.current && linkedSeqRef.current === seqAtStart) {
+        setUploadingImageId(null);
+      }
     }
   };
 
@@ -187,6 +217,9 @@ export default function GoogleFormsImportModal({
   };
 
   const resetAll = () => {
+    linkedSeqRef.current++;
+    abortCsvReader();
+    setUploadingImageId(null);
     setRawText("");
     setFileName(null);
     setError(null);
@@ -205,23 +238,44 @@ export default function GoogleFormsImportModal({
       setError("Il file selezionato supera i 5 MB: riduci le dimensioni e riprova.");
       return;
     }
+    abortCsvReader();
+    fetchAbortRef.current?.abort();
+    fetchAbortRef.current = null;
+    setLoadingLink(false);
+    setLoadingScript(false);
+    const seqAtStart = ++linkedSeqRef.current;
     const reader = new FileReader();
+    csvReaderRef.current = reader;
     reader.onload = (event) => {
+      if (csvReaderRef.current === reader) csvReaderRef.current = null;
+      if (!isOpenRef.current || linkedSeqRef.current !== seqAtStart) return;
       const text = String(event.target?.result || "");
       if (!text.trim()) {
         setError("Il file selezionato è vuoto.");
         return;
       }
+      setUploadingImageId(null);
       setRawText(text);
       setFileName(file.name);
       setLinked(null);
+      setAnswers({});
     };
-    reader.onerror = () => setError("Impossibile leggere il file selezionato.");
+    reader.onerror = () => {
+      if (csvReaderRef.current === reader) csvReaderRef.current = null;
+      if (!isOpenRef.current || linkedSeqRef.current !== seqAtStart) return;
+      setError("Impossibile leggere il file selezionato.");
+    };
+    reader.onabort = () => {
+      if (csvReaderRef.current === reader) csvReaderRef.current = null;
+    };
     reader.readAsText(file);
   };
 
   const handleLinkRead = async () => {
     if (loadingLink || loadingScript) return;
+    abortCsvReader();
+    linkedSeqRef.current++;
+    setUploadingImageId(null);
     setError(null);
     setResult(null);
     setLinked(null);
@@ -271,6 +325,9 @@ export default function GoogleFormsImportModal({
 
   const handleScriptRead = async () => {
     if (loadingLink || loadingScript) return;
+    abortCsvReader();
+    linkedSeqRef.current++;
+    setUploadingImageId(null);
     setError(null);
     setResult(null);
     setLinked(null);
@@ -495,7 +552,8 @@ export default function GoogleFormsImportModal({
                 <button
                   type="button"
                   onClick={resetAll}
-                  className="text-[10px] text-slate-400 hover:text-red-300 font-semibold flex items-center gap-1 cursor-pointer shrink-0"
+                  disabled={loadingLink || loadingScript || imageBusy}
+                  className="text-[10px] text-slate-400 hover:text-red-300 font-semibold flex items-center gap-1 cursor-pointer shrink-0 disabled:opacity-40"
                 >
                   <Trash2 className="w-3 h-3" />
                   Svuota
@@ -539,10 +597,12 @@ export default function GoogleFormsImportModal({
                         </span>
                       </div>
 
-                      {q.image ? (
+                      {(() => {
+                        const safeImage = normalizeQuestionImage(q.image);
+                        return safeImage ? (
                         <div className="flex items-start gap-2 pl-4">
                           <img
-                            src={q.image}
+                            src={safeImage}
                             alt="Figura della domanda"
                             className="max-h-24 w-auto max-w-full rounded-lg border border-white/10 bg-white p-1 object-contain"
                           />
@@ -579,7 +639,8 @@ export default function GoogleFormsImportModal({
                           )}
                           Immagine
                         </button>
-                      )}
+                      );
+                      })()}
 
                       {isChoice && (
                         <div className="flex flex-wrap gap-1 pl-4">
@@ -725,7 +786,8 @@ export default function GoogleFormsImportModal({
                     <button
                       type="button"
                       onClick={resetAll}
-                      className="text-[11px] text-slate-400 hover:text-red-300 font-semibold flex items-center gap-1 cursor-pointer"
+                      disabled={loadingLink || loadingScript || imageBusy}
+                      className="text-[11px] text-slate-400 hover:text-red-300 font-semibold flex items-center gap-1 cursor-pointer disabled:opacity-40"
                     >
                       <Trash2 className="w-3.5 h-3.5" />
                       Svuota
@@ -843,7 +905,7 @@ export default function GoogleFormsImportModal({
             <button
               type="button"
               onClick={handleAnalyze}
-              disabled={!hasInput}
+              disabled={!hasInput || loadingLink || loadingScript || imageBusy}
               className="px-4 py-2 rounded-xl bg-teal-600 hover:bg-teal-500 text-white text-xs font-bold transition-colors cursor-pointer disabled:opacity-40 flex items-center justify-center gap-1.5"
             >
               <CheckCircle2 className="w-3.5 h-3.5" />

@@ -142,7 +142,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                   </div>
                   <div>
                     <div className="flex items-center gap-2">
-                      <p className="font-bold text-amber-300 text-xs sm:text-sm">IA Generativa (Gemini)</p>
+                      <p className="font-bold text-amber-300 text-xs sm:text-sm">Motore di IA Generativa</p>
                       <span className="text-[9px] font-mono bg-amber-500/20 text-amber-300 px-1.5 py-0.5 rounded">
                         Zero Dati Personali
                       </span>
@@ -229,7 +229,7 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
               </div>
             </div>
 
-            {/* Note on Google AI Studio vs Enterprise Architecture */}
+            {/* Architectural transparency note */}
             <div className="p-4 bg-slate-950/90 border border-slate-700/60 rounded-2xl space-y-2">
               <div className="flex items-center justify-between gap-2 flex-wrap">
                 <span className="text-[11px] font-bold font-mono text-slate-200 uppercase tracking-wider flex items-center gap-1.5">
@@ -237,11 +237,11 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
                   Nota di Trasparenza Architetturale
                 </span>
                 <span className="text-[10px] font-mono px-2 py-0.5 rounded bg-white/5 text-slate-400 border border-white/10">
-                  Google AI Studio Proxy
+                  Server Proxy Protetto
                 </span>
               </div>
               <p className="text-xs text-slate-300 leading-relaxed">
-                L'applicazione fa da <b>scudo crittografico (Proxy)</b>: anche se il motore di inferenza risiede su Google AI Studio, i dati anagrafici restano confinati nel database protetto (Firestore) e <b>non possono in alcun modo raggiungere i server di Gemini</b>. Per l'adozione formale dell'intero istituto, l'infrastruttura è nativamente pronta per la migrazione al tenant Google Cloud Workspace for Education della scuola.
+                L'applicazione agisce come <b>scudo crittografico (Proxy)</b>: i dati anagrafici degli studenti restano confinati nel database protetto dell'istituto e <b>non vengono mai trasmessi al motore di valutazione automatica</b>. Per l'adozione formale dell'intero istituto, l'infrastruttura è nativamente pronta per l'integrazione con il tenant Google Workspace for Education della scuola.
               </p>
             </div>
 
@@ -270,10 +270,11 @@ export function PrivacyInfoModal({ isOpen, onClose }: PrivacyInfoModalProps) {
 
 export function PrivacyBannerBox({ onOpenModal }: { onOpenModal: () => void }) {
   return (
-    <div 
+    <button
+      type="button"
       id="privacy-gdpr-banner"
       onClick={onOpenModal}
-      className="bg-slate-900/40 hover:bg-slate-900/60 backdrop-blur-xl border border-teal-500/20 hover:border-teal-500/40 p-4 sm:p-5 rounded-2xl text-left transition-all duration-200 cursor-pointer shadow-lg group"
+      className="w-full bg-slate-900/40 hover:bg-slate-900/60 backdrop-blur-xl border border-teal-500/20 hover:border-teal-500/40 p-4 sm:p-5 rounded-2xl text-left transition-all duration-200 cursor-pointer shadow-lg group"
     >
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-3">
@@ -301,6 +302,6 @@ export function PrivacyBannerBox({ onOpenModal }: { onOpenModal: () => void }) {
           <ArrowRight className="w-4 h-4" />
         </div>
       </div>
-    </div>
+    </button>
   );
 }

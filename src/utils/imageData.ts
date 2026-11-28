@@ -8,7 +8,7 @@
  * usually takes a 200 KB picture down to 15-40 KB.
  */
 
-import { MAX_IMAGE_CHARS } from "./googleFormsLink";
+import { MAX_IMAGE_CHARS, normalizeQuestionImage } from "./googleFormsLink";
 
 export const MAX_IMAGE_SIDE = 720;
 export const MAX_RAW_IMAGE_BYTES = 12 * 1024 * 1024; // 12 MB pre-decode cap
@@ -60,20 +60,29 @@ function loadImage(src: string): Promise<HTMLImageElement> {
  * fills a white background so transparent diagrams do not turn black.
  */
 export async function compressImageSource(src: string, maxSide = MAX_IMAGE_SIDE): Promise<string> {
-  if (!src || !src.startsWith("data:image/")) return src;
-  const isSvg = isBlockedSvgDataUrl(src);
+  if (typeof src !== "string") return "";
+  const trimmed = src.trim();
+  if (!trimmed) return "";
+  const isSvg = isBlockedSvgDataUrl(trimmed);
+  if (!/^data:image\//i.test(trimmed)) {
+    return normalizeQuestionImage(trimmed);
+  }
+  const safeFallback = isSvg ? "" : normalizeQuestionImage(trimmed);
+  if (typeof document === "undefined" || typeof Image === "undefined") {
+    return safeFallback;
+  }
   try {
-    const img = await loadImage(src);
+    const img = await loadImage(trimmed);
     const width = img.naturalWidth || img.width;
     const height = img.naturalHeight || img.height;
-    if (!width || !height) return isSvg ? "" : src;
+    if (!width || !height) return safeFallback;
 
     const scale = Math.max(width, height) > maxSide ? maxSide / Math.max(width, height) : 1;
     const canvas = document.createElement("canvas");
     canvas.width = Math.max(1, Math.round(width * scale));
     canvas.height = Math.max(1, Math.round(height * scale));
     const ctx = canvas.getContext("2d");
-    if (!ctx) return isSvg ? "" : src;
+    if (!ctx) return safeFallback;
     ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
 
     let out = canvas.toDataURL("image/webp", WEBP_QUALITY);
@@ -86,12 +95,13 @@ export async function compressImageSource(src: string, maxSide = MAX_IMAGE_SIDE)
       ctx.restore();
       out = canvas.toDataURL("image/jpeg", WEBP_QUALITY);
     }
-    if (!out || !out.startsWith("data:") || isBlockedSvgDataUrl(out)) return isSvg ? "" : src;
+    const safeOut = normalizeQuestionImage(out);
+    if (!safeOut || isBlockedSvgDataUrl(safeOut)) return safeFallback;
     // Never return raw SVG; for raster images, keep whichever representation is smaller.
-    if (isSvg) return out;
-    return out.length < src.length ? out : src;
+    if (isSvg) return safeOut;
+    return !safeFallback || safeOut.length < safeFallback.length ? safeOut : safeFallback;
   } catch {
-    return isSvg ? "" : src;
+    return safeFallback;
   }
 }
 

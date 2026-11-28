@@ -59,18 +59,21 @@ var FORM_ID = "";
 /** true = colonne separate da virgola; false = punto e virgola (Excel italiano). */
 var USE_COMMA = false;
 
-/** Numero massimo di opzioni esportate (l'app accetta da A a H). */
+/** Numero massimo di opzioni esportate nel CSV (colonne da A a H). */
 var MAX_OPTIONS = 8;
+
+/** Numero massimo di opzioni esportate via Web App JSON (da A a Z). */
+var WEB_APP_MAX_OPTIONS = 26;
 
 /** Peso massimo di una singola immagine esportata (in byte). */
 var MAX_IMAGE_BYTES = 900 * 1024;
 
 /** Versione dello script: l'app la mostra per capire se il deployment è vecchio. */
-var SCRIPT_VERSION = "2026-10-25 immagini+diagnostica403";
+var SCRIPT_VERSION = "2026-11-28 csv14col+raster+26opt";
 
 // ---------------------------------------------------------------------------
 
-var LETTERS = ["A", "B", "C", "D", "E", "F", "G", "H"];
+var LETTERS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ".split("");
 
 function esportaModuloInCsv() {
   var form = FORM_ID ? FormApp.openById(FORM_ID) : FormApp.getActiveForm();
@@ -120,13 +123,14 @@ function esportaModuloInCsv() {
       var gridRows = grid.getRows() || [];
       var columns = (grid.getColumns() || []).join(" | ");
       for (var r = 0; r < gridRows.length; r++) {
-        rows.push([
-          "aperta",
-          section,
-          safeText(item.getTitle()) + " — " + safeText(gridRows[r]),
-          "", "", "", "", "", "", "", "",
-          "Griglia a scelta singola. Colonne: " + columns
-        ]);
+        rows.push(
+          openRow(
+            section,
+            safeText(item.getTitle()) + " — " + safeText(gridRows[r]),
+            questionPoints(item),
+            "Griglia a scelta singola. Colonne: " + columns
+          )
+        );
       }
       continue;
     }
@@ -136,62 +140,68 @@ function esportaModuloInCsv() {
       var cRows = cGrid.getRows() || [];
       var cColumns = (cGrid.getColumns() || []).join(" | ");
       for (var cr = 0; cr < cRows.length; cr++) {
-        rows.push([
-          "aperta",
-          section,
-          safeText(item.getTitle()) + " — " + safeText(cRows[cr]),
-          "", "", "", "", "", "", "", "",
-          "Griglia a scelta multipla. Colonne: " + cColumns
-        ]);
+        rows.push(
+          openRow(
+            section,
+            safeText(item.getTitle()) + " — " + safeText(cRows[cr]),
+            questionPoints(item),
+            "Griglia a scelta multipla. Colonne: " + cColumns
+          )
+        );
       }
       continue;
     }
 
     if (type === FormApp.ItemType.SCALE) {
       var scale = item.asScaleItem();
-      rows.push([
-        "aperta",
-        section,
-        safeText(item.getTitle()),
-        "", "", "", "", "", "", "", "",
-        "Scala da " + scale.getLowerBound() + " a " + scale.getUpperBound() +
-          (scale.getLeftLabel() ? " (sinistra: " + safeText(scale.getLeftLabel()) + ")" : "") +
-          (scale.getRightLabel() ? " (destra: " + safeText(scale.getRightLabel()) + ")" : "")
-      ]);
+      rows.push(
+        openRow(
+          section,
+          safeText(item.getTitle()),
+          questionPoints(item),
+          "Scala da " + scale.getLowerBound() + " a " + scale.getUpperBound() +
+            (scale.getLeftLabel() ? " (sinistra: " + safeText(scale.getLeftLabel()) + ")" : "") +
+            (scale.getRightLabel() ? " (destra: " + safeText(scale.getRightLabel()) + ")" : "")
+        )
+      );
       continue;
     }
 
     if (type === FormApp.ItemType.TEXT || type === FormApp.ItemType.PARAGRAPH_TEXT) {
-      rows.push([
-        "aperta",
-        section,
-        safeText(item.getTitle()),
-        "", "", "", "", "", "", "", "",
-        questionPoints(item) ? "Risposta breve corretta automaticamente da Google" : ""
-      ]);
+      var textPoints = questionPoints(item);
+      rows.push(
+        openRow(
+          section,
+          safeText(item.getTitle()),
+          textPoints,
+          textPoints > 0 ? "Risposta breve corretta automaticamente da Google" : ""
+        )
+      );
       continue;
     }
 
     if (type === FormApp.ItemType.DATE || type === FormApp.ItemType.TIME ||
         type === FormApp.ItemType.DATETIME || type === FormApp.ItemType.DURATION) {
-      rows.push([
-        "aperta",
-        section,
-        safeText(item.getTitle()),
-        "", "", "", "", "", "", "", "",
-        "Risposta di tipo data/ora: da svolgere come risposta breve."
-      ]);
+      rows.push(
+        openRow(
+          section,
+          safeText(item.getTitle()),
+          questionPoints(item),
+          "Risposta di tipo data/ora: da svolgere come risposta breve."
+        )
+      );
       continue;
     }
 
     // Qualsiasi altro tipo: importato come domanda aperta, senza perdere il testo.
-    rows.push([
-      "aperta",
-      section,
-      safeText(item.getTitle()),
-      "", "", "", "", "", "", "", "",
-      "Tipo di domanda non gestito automaticamente (" + type + ")."
-    ]);
+    rows.push(
+      openRow(
+        section,
+        safeText(item.getTitle()),
+        questionPoints(item),
+        "Tipo di domanda non gestito automaticamente (" + type + ")."
+      )
+    );
   }
 
   if (rows.length === 0) {
@@ -225,11 +235,33 @@ function esportaModuloInCsv() {
 }
 
 /**
+ * Costruisce una riga di 14 colonne allineate per domande aperte / griglie / scale.
+ */
+function openRow(section, question, points, criteria) {
+  return [
+    "aperta",
+    section,
+    question,
+    "", "", "", "", "", "", "", "",
+    "",
+    points > 0 ? String(points) : "",
+    criteria || ""
+  ];
+}
+
+/**
  * Costruisce una riga per le domande con opzioni (crocette, tendina, caselle).
  */
 function choiceRow(choices, item, section, tipo, warnings, kindLabel) {
   var options = [];
   var correctIndexes = [];
+  if (choices.length > MAX_OPTIONS) {
+    warnings.push(
+      '"' + safeText(item.getTitle()) + '": ' + choices.length +
+      " opzioni presenti, nel CSV vengono esportate solo le prime " + MAX_OPTIONS +
+      " (usa la Web App per fino a " + WEB_APP_MAX_OPTIONS + " opzioni)."
+    );
+  }
   for (var i = 0; i < choices.length && i < MAX_OPTIONS; i++) {
     options.push(safeText(choices[i].getValue()));
     if (isCorrectChoice(choices[i])) correctIndexes.push(i);
@@ -457,15 +489,23 @@ function costruisciJsonModulo(form) {
       continue;
     }
 
+    if ((question.kind === "mc" || question.kind === "checkbox") && question.options.length < 2) {
+      question.kind = "open";
+      question.options = [];
+      correctIndexes = [];
+      question.note = "Domanda a scelta con meno di 2 opzioni valide: convertita in domanda aperta.";
+    }
+
     if (correctIndexes.length === 1) {
       question.correctIndex = correctIndexes[0];
     } else if (correctIndexes.length > 1) {
       // L'app corregge una risposta alla volta: la prima è la chiave, le altre
-      // restano indicatene nella nota.
+      // restano indicate nella nota.
       question.correctIndex = correctIndexes[0];
       var accettate = [];
       for (var c = 0; c < correctIndexes.length; c++) {
-        accettate.push(LETTERS[correctIndexes[c]]);
+        var idxLetter = correctIndexes[c];
+        accettate.push(idxLetter < LETTERS.length ? LETTERS[idxLetter] : String(idxLetter + 1));
       }
       question.note = "Risposte accettate nel modulo: " + accettate.join(", ");
     }
@@ -500,7 +540,7 @@ function readChoiceValues(choices, correctIndexes) {
   // deve mai alterare la corrispondenza lettera -> posizione.
   var values = [];
   var correctFlags = [];
-  for (var i = 0; i < choices.length && i < MAX_OPTIONS; i++) {
+  for (var i = 0; i < choices.length && i < WEB_APP_MAX_OPTIONS; i++) {
     var value = safeText(choices[i].getValue());
     if (!value) continue;
     values.push(value);
@@ -596,6 +636,15 @@ function leggiImmaginiDaApi(formId) {
   return risultato;
 }
 
+/** Consente solo formati immagine raster sicuri (mai SVG). */
+function normalizeSafeRasterImageMime(rawMime) {
+  var mime = String(rawMime || "").split(";")[0].trim().toLowerCase();
+  if (mime === "image/svg+xml" || mime.indexOf("svg") !== -1) return "";
+  if (/^image\/(png|jpe?g|webp|gif|avif)$/.test(mime)) return mime;
+  if (!mime || mime === "application/octet-stream") return "image/png";
+  return "";
+}
+
 /** Scarica il contentUri dell'immagine e lo converte in data URL. */
 function scaricaImmagineApi(contentUri, token) {
   try {
@@ -607,8 +656,8 @@ function scaricaImmagineApi(contentUri, token) {
     var blob = risposta.getBlob();
     var bytes = blob.getBytes();
     if (!bytes || !bytes.length || bytes.length > MAX_IMAGE_BYTES) return "";
-    var tipo = blob.getContentType() || "image/png";
-    if (!/^image\//.test(tipo)) tipo = "image/png";
+    var tipo = normalizeSafeRasterImageMime(blob.getContentType());
+    if (!tipo) return "";
     return "data:" + tipo + ";base64," + Utilities.base64Encode(bytes);
   } catch (e) {
     return "";
@@ -630,7 +679,8 @@ function leggiImmagineItem(imageItem) {
           Math.round(MAX_IMAGE_BYTES / 1024) + " KB"
       };
     }
-    var tipo = blob.getContentType() || "image/png";
+    var tipo = normalizeSafeRasterImageMime(blob.getContentType());
+    if (!tipo) return { src: "", motivo: "formato immagine non supportato (usa PNG, JPG, WebP o GIF)" };
     return { src: "data:" + tipo + ";base64," + Utilities.base64Encode(bytes), motivo: "" };
   } catch (e) {
     return { src: "", motivo: "lettura non riuscita" };

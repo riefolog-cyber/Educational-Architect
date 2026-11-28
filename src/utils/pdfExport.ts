@@ -13,9 +13,9 @@ import {
   collectWorkbookFillInTheBlank,
   collectWorkbookReflections,
   evaluateMcSelection,
+  extractFibExpected,
   formatItalianScholasticGrade,
-  getPendingSubjectiveCount,
-  isEvaluationPending,
+  isSubmissionPendingGrade,
   isValidNumericScore,
   isWorkbookExamData,
   safeParseJson,
@@ -23,6 +23,26 @@ import {
 import { buildExamLedgerSummary } from "./examAnalytics";
 import { getSubmissionBlindCode } from "./privacyPseudonym";
 import { resolveSubmissionClass, UNSPECIFIED_CLASS_LABEL } from "./classGrouping";
+import { normalizeQuestionImage } from "./googleFormsLink";
+
+function resolveSafePdfRasterImage(src: unknown): string {
+  const safe = normalizeQuestionImage(src);
+  return safe && /^data:image\//i.test(safe) ? safe : "";
+}
+
+function pdfOptionLabel(index: number): string {
+  return index >= 0 && index < 26 ? String.fromCharCode(65 + index) : String(index + 1);
+}
+
+function sanitizeFilenameSlug(raw: unknown, fallback: string): string {
+  return (
+    String(raw || "")
+      .toLowerCase()
+      .replace(/[^a-z0-9_-]/g, "_")
+      .replace(/_+/g, "_")
+      .replace(/^_|_$/g, "") || fallback
+  );
+}
 
 export interface PdfExportOptions {
   blindMode?: boolean;
@@ -30,23 +50,8 @@ export interface PdfExportOptions {
 }
 
 function resolveDisplayGrade(sub: SavedSubmission): string {
-  const ev = safeParseJson(sub?.Full_Evaluation);
-  if (isEvaluationPending(ev)) return "N.V.";
-  if (getPendingSubjectiveCount(sub) > 0) return "N.V.";
+  if (isSubmissionPendingGrade(sub)) return "N.V.";
   return sub?.Voto_Suggerito || "N/A";
-}
-
-function parseStrictCorrectIndex(raw: unknown, optionsLength: number): number | null {
-  if (typeof raw === "number") {
-    return Number.isInteger(raw) && raw >= 0 && raw < optionsLength ? raw : null;
-  }
-  if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    if (!/^\d+$/.test(trimmed)) return null;
-    const parsed = Number.parseInt(trimmed, 10);
-    return Number.isInteger(parsed) && parsed >= 0 && parsed < optionsLength ? parsed : null;
-  }
-  return null;
 }
 
 export function sanitizePdfText(text: string): string {
@@ -232,7 +237,10 @@ export function createSubmissionPdfDoc(
   doc.text(`Classe / Sez.: ${sanitizePdfText(classDisplay)}`, 18, currentY + 18);
   doc.text(`Codice PIN: ${sanitizePdfText(sub.Pin || "N/D")}`, 18, currentY + 24);
 
-  const dateStr = sub.Timestamp ? new Date(sub.Timestamp).toLocaleString("it-IT") : "N/D";
+  const parsedTs = sub.Timestamp ? Date.parse(sub.Timestamp) : NaN;
+  const dateStr = Number.isFinite(parsedTs)
+    ? new Date(parsedTs).toLocaleString("it-IT")
+    : (sub.Timestamp ? String(sub.Timestamp) : "N/D");
   const filaText = sub.Assigned_Fila ? ` (Fila ${sub.Assigned_Fila})` : "";
   doc.text(sanitizePdfText(`Tipologia Prova: ${sub.Tipo || "N/D"}${filaText}`), 110, currentY + 6);
   doc.text(sanitizePdfText(`Data Svolgimento: ${dateStr}`), 110, currentY + 12);
@@ -394,8 +402,8 @@ export function createSubmissionPdfDoc(
     currentY += 6;
   }
 
-  // 5.5 PIANO DI RECUPERO IA
-  const recoveryPlan = sub.Piano_Recupero;
+  // 5.5 PIANO DI RECUPERO IA (mascherato se soluzioni differite attive)
+  const recoveryPlan = deferredSolutionsLocked ? "" : sub.Piano_Recupero;
   if (recoveryPlan) {
     checkPageBreak(15);
     doc.setFont("Helvetica", "bold");
@@ -442,7 +450,7 @@ export function createSubmissionPdfDoc(
         writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
         currentY += 1;
 
-        const mcImg = domandeObj?.images?.[q.id];
+        const mcImg = resolveSafePdfRasterImage(domandeObj?.images?.[q.id]);
         if (mcImg) {
           checkPageBreak(70);
           try {
@@ -495,7 +503,7 @@ export function createSubmissionPdfDoc(
         writeText(`Domanda Aperta ${idx + 1}: ${questionText}`, 9, true, [15, 23, 42], 15);
         currentY += 1;
 
-        const oeImg = domandeObj?.images?.[entry.id];
+        const oeImg = resolveSafePdfRasterImage(domandeObj?.images?.[entry.id]);
         if (oeImg) {
           checkPageBreak(70);
           try {
@@ -512,7 +520,11 @@ export function createSubmissionPdfDoc(
           checkPageBreak(12);
           writeText(`Analisi Correttiva Tutor IA (Voto: ${entry.detail.score}/10):`, 8.5, true, [79, 70, 229], 15);
           currentY += 1;
-          writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          if (deferredSolutionsLocked) {
+            writeText("Commento analitico riservato fino allo sblocco delle soluzioni differite.", 8.5, false, [100, 116, 139], 15);
+          } else {
+            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          }
         } else {
           checkPageBreak(12);
           writeText('Valutazione IA non disponibile: la risposta va corretta dal docente (usa "Ricalcola Voto").', 8.5, true, [185, 28, 28], 15);
@@ -543,7 +555,7 @@ export function createSubmissionPdfDoc(
         writeText(`Domanda ${idx + 1}: ${q.question}`, 9, true, [51, 65, 85], 15);
         currentY += 1;
 
-        const wbMcImg = domandeObj?.images?.[q.id];
+        const wbMcImg = resolveSafePdfRasterImage(domandeObj?.images?.[q.id]);
         if (wbMcImg) {
           checkPageBreak(70);
           try {
@@ -602,8 +614,8 @@ export function createSubmissionPdfDoc(
       allFibItems.forEach(({ fib, label }) => {
         const rawVal = ansObj.wbFib?.[fib.id] ?? ansObj.fib?.[fib.id];
         const val = typeof rawVal === "string" ? rawVal : rawVal?.[0] || "";
-        const expected = fib.answer || (typeof fib.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "");
-        const hasKey = !deferredSolutionsLocked && Boolean(String(expected || "").trim());
+        const expected = extractFibExpected(fib);
+        const hasKey = !deferredSolutionsLocked && Boolean(expected);
         const isCorrect = hasKey && isFibAnswerCorrect(val, expected, fib.sentence);
         const { before, after } = getFibSentenceParts(fib.sentence, expected);
         const statusLabel = !hasKey ? "Chiave protetta" : isCorrect ? "Corretto" : "Errato";
@@ -613,7 +625,7 @@ export function createSubmissionPdfDoc(
         writeText(`${label}:`, 9, true, [51, 65, 85], 15);
         currentY += 1;
 
-        const fibImg = domandeObj?.images?.[fib.id];
+        const fibImg = resolveSafePdfRasterImage(domandeObj?.images?.[fib.id]);
         if (fibImg) {
           checkPageBreak(70);
           try {
@@ -659,7 +671,7 @@ export function createSubmissionPdfDoc(
         writeText(`Quesito: ${questionText}`, 9, true, [15, 23, 42], 15);
         currentY += 1;
 
-        const reflImg = domandeObj?.images?.[entry.id];
+        const reflImg = resolveSafePdfRasterImage(domandeObj?.images?.[entry.id]);
         if (reflImg) {
           checkPageBreak(70);
           try {
@@ -676,7 +688,11 @@ export function createSubmissionPdfDoc(
           checkPageBreak(12);
           writeText(`Feedback Didattico Customizzato (Punteggio: ${entry.detail.score}/10):`, 8.5, true, [79, 70, 229], 15);
           currentY += 1;
-          writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          if (deferredSolutionsLocked) {
+            writeText("Commento analitico riservato fino allo sblocco delle soluzioni differite.", 8.5, false, [100, 116, 139], 15);
+          } else {
+            writeParagraphs(entry.detail.feedback || "", 8.5, [79, 70, 229], 15);
+          }
         } else {
           checkPageBreak(12);
           writeText('Valutazione IA non disponibile: la riflessione va corretta dal docente (usa "Ricalcola Voto").', 8.5, true, [185, 28, 28], 15);
@@ -696,9 +712,16 @@ export function createSubmissionPdfDoc(
   doc.setFontSize(7.5);
   doc.setTextColor(100, 116, 139);
   const piiCount = Number(sub.PII_Oscurate_Count || 0);
-  const convalidaText = sub.Convalida_Docente_At
-    ? `Convalida docente: ${new Date(sub.Convalida_Docente_At).toLocaleString("it-IT")}${blindMode ? "" : sub.Convalida_Docente_Email ? ` (${sub.Convalida_Docente_Email})` : ""}`
-    : "Valutazione in attesa di convalida esplicita del docente";
+  let convalidaText = "Valutazione in attesa di convalida esplicita del docente";
+  if (sub.Convalida_Docente_At) {
+    const convalidaDate = new Date(sub.Convalida_Docente_At);
+    const formattedDate = Number.isNaN(convalidaDate.getTime())
+      ? "data registrata"
+      : convalidaDate.toLocaleString("it-IT");
+    const teacherSuffix =
+      !blindMode && sub.Convalida_Docente_Email ? ` (${sub.Convalida_Docente_Email})` : "";
+    convalidaText = `Convalida docente: ${formattedDate}${teacherSuffix}`;
+  }
   doc.text(
     sanitizePdfText(`Pseudonimo IA: ${blindCode} | PII filtrate al prompt: ${piiCount} | ${convalidaText}`),
     15,
@@ -723,11 +746,12 @@ export async function exportSubmissionPdf(
     blindMode,
     deferredSolutionsLocked: Boolean(options?.deferredSolutionsLocked),
   });
-  const blindSlug = getSubmissionBlindCode(sub).toLowerCase().replace(/[^a-z0-9_-]/g, "_");
+  const blindSlug = sanitizeFilenameSlug(getSubmissionBlindCode(sub), "studente");
   const formattedName = blindMode
     ? blindSlug
-    : (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
-  doc.save(`esito_ea_${formattedName}_pin_${sub.Pin || "esame"}.pdf`);
+    : sanitizeFilenameSlug(sub.Nome, "studente");
+  const pinSlug = sanitizeFilenameSlug(sub.Pin, "esame");
+  doc.save(`esito_ea_${formattedName}_pin_${pinSlug}.pdf`);
 }
 
 export async function exportSubmissionsZip(
@@ -759,9 +783,9 @@ export async function exportSubmissionsZip(
     const arrayBuffer = doc.output("arraybuffer");
 
     const rawName = blindMode
-      ? getSubmissionBlindCode(sub).toLowerCase().replace(/[^a-z0-9_-]/g, "_")
-      : (sub.Nome || "studente").toLowerCase().replace(/[^a-z0-9]/g, "_");
-    const pinPart = (sub.Pin || "esame").toLowerCase().replace(/[^a-z0-9]/g, "_");
+      ? sanitizeFilenameSlug(getSubmissionBlindCode(sub), "studente")
+      : sanitizeFilenameSlug(sub.Nome, "studente");
+    const pinPart = sanitizeFilenameSlug(sub.Pin, "esame");
     const baseFilename = `esito_${rawName}_pin_${pinPart}`;
     const count = usedFilenames.get(baseFilename) || 0;
     usedFilenames.set(baseFilename, count + 1);
@@ -776,18 +800,18 @@ export async function exportSubmissionsZip(
     compressionOptions: { level: 6 },
   });
 
-  const cleanZipName = (zipBaseName || "verifiche_classe")
-    .toLowerCase()
-    .replace(/[^a-z0-9-_]/g, "_")
-    .replace(/_+/g, "_");
+  const cleanZipName = sanitizeFilenameSlug(zipBaseName, "verifiche_classe");
   const url = URL.createObjectURL(zipBlob);
-  const link = document.createElement("a");
-  link.href = url;
-  link.download = `${cleanZipName}.zip`;
-  document.body.appendChild(link);
-  link.click();
-  document.body.removeChild(link);
-  setTimeout(() => URL.revokeObjectURL(url), 1000);
+  try {
+    const link = document.createElement("a");
+    link.href = url;
+    link.download = `${cleanZipName}.zip`;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+  } finally {
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  }
 
   return cleanZipName;
 }
@@ -857,10 +881,10 @@ export async function exportBlankExamPaperPdf(
     }
   };
 
-  const renderQuestionImage = (qId?: string) => {
-    if (!qId) return;
-    const imgData = examObj?.images?.[qId];
-    if (!imgData || typeof imgData !== "string") return;
+  const renderQuestionImage = (qId?: string | number) => {
+    if (qId === undefined || qId === null || String(qId) === "") return;
+    const imgData = resolveSafePdfRasterImage(examObj?.images?.[String(qId)]);
+    if (!imgData) return;
     checkBreak(58);
     try {
       doc.addImage(imgData, resolveJsPdfImageFormat(imgData), 18, currentY, 72, 52);
@@ -921,15 +945,16 @@ export async function exportBlankExamPaperPdf(
       renderQuestionImage(q?.id);
       const opts = Array.isArray(q?.options) ? q.options : [];
       opts.forEach((opt: string, oIdx: number) => {
-        const letter = String.fromCharCode(65 + oIdx);
+        const letter = pdfOptionLabel(oIdx);
         writeWrapped(`[  ] ${letter}) ${String(opt)}`, 9.5, false, [51, 65, 85], 20, 4.6);
       });
-      const correctIdx = parseStrictCorrectIndex(q?.correctIndex, opts.length);
+      const mcEval = evaluateMcSelection(q, 0);
+      const correctIdx = mcEval.hasCorrectKey && mcEval.correctIndex !== null ? mcEval.correctIndex : null;
       if (correctIdx !== null) {
         mcKeyEntries.push({
           num: mcCounter,
           question: String(q?.question || ""),
-          letter: String.fromCharCode(65 + correctIdx),
+          letter: pdfOptionLabel(correctIdx),
           text: String(opts[correctIdx] || ""),
         });
       }
@@ -947,15 +972,14 @@ export async function exportBlankExamPaperPdf(
     currentY += 1.5;
     examObj.fillInTheBlank.forEach((fib: any) => {
       fibCounter++;
-      const rawAns = String(fib?.answer || "").trim();
-      const bracketMatch = typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "";
-      const { before, after } = getFibSentenceParts(fib?.sentence || "", rawAns || bracketMatch || "");
+      const resolvedAns = extractFibExpected(fib);
+      const { before, after } = getFibSentenceParts(fib?.sentence || "", resolvedAns);
       const maskedSentence = `${fibCounter}. ${before} ________________ ${after}`;
       writeWrapped(maskedSentence, 9.5, false, [30, 41, 59], 17, 4.8);
       renderQuestionImage(fib?.id);
       fibKeyEntries.push({
         num: fibCounter,
-        answer: rawAns || bracketMatch || "N/D",
+        answer: resolvedAns || "N/D",
       });
       currentY += 1.5;
     });
@@ -1009,15 +1033,14 @@ export async function exportBlankExamPaperPdf(
       currentY += 1.5;
       sec.fillInTheBlank.forEach((fib: any) => {
         fibCounter++;
-        const rawAns = String(fib?.answer || "").trim();
-        const bracketMatch = typeof fib?.sentence === "string" ? fib.sentence.match(/\[([^\]]+)\]/)?.[1] : "";
-        const { before, after } = getFibSentenceParts(fib?.sentence || "", rawAns || bracketMatch || "");
+        const resolvedAns = extractFibExpected(fib);
+        const { before, after } = getFibSentenceParts(fib?.sentence || "", resolvedAns);
         const maskedSentence = `${fibCounter}. ${before} ________________ ${after}`;
         writeWrapped(maskedSentence, 9.5, false, [30, 41, 59], 17, 4.8);
         renderQuestionImage(fib?.id);
         fibKeyEntries.push({
           num: fibCounter,
-          answer: rawAns || bracketMatch || "N/D",
+          answer: resolvedAns || "N/D",
         });
         currentY += 1.5;
       });
@@ -1323,9 +1346,7 @@ export async function exportExamLedgerPdf(
     currentY += rowHeightMm;
   });
 
-  const slug = (summary.examTitle || "tabellone")
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "_")
-    .replace(/^_|_$/g, "");
-  doc.save(`tabellone_${slug}_pin_${summary.pin.toLowerCase()}.pdf`);
+  const slug = sanitizeFilenameSlug(summary.examTitle, "tabellone");
+  const pinSlug = sanitizeFilenameSlug(summary.pin, "esame");
+  doc.save(`tabellone_${slug}_pin_${pinSlug}.pdf`);
 }

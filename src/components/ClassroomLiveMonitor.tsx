@@ -152,16 +152,25 @@ export default function ClassroomLiveMonitor({
   const getMonitorName = (s: Pick<LiveStudentData, "id" | "studentName" | "studentEmail">) =>
     blindLimMode ? `Studente ${getMonitorCode(s)}` : s.studentName;
 
-  const timersRef = useRef<number[]>([]);
+  const mountedRef = useRef(true);
+  const activePinRef = useRef(cleanPin);
+  activePinRef.current = cleanPin;
+  const timersRef = useRef<Set<number>>(new Set());
   const scheduleTimer = (fn: () => void, ms: number) => {
-    const id = window.setTimeout(fn, ms);
-    timersRef.current.push(id);
+    const id = window.setTimeout(() => {
+      timersRef.current.delete(id);
+      if (!mountedRef.current) return;
+      fn();
+    }, ms);
+    timersRef.current.add(id);
   };
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       timersRef.current.forEach((id) => window.clearTimeout(id));
-      timersRef.current = [];
+      timersRef.current.clear();
     };
   }, []);
 
@@ -385,6 +394,16 @@ export default function ClassroomLiveMonitor({
     });
   }, [distinctClasses, resolvedStudents]);
 
+  const isIsoAtOrAfter = (ackIso?: string, noticeIso?: string): boolean => {
+    if (!ackIso || !noticeIso) return false;
+    const ackMs = Date.parse(ackIso);
+    const noticeMs = Date.parse(noticeIso);
+    if (Number.isFinite(ackMs) && Number.isFinite(noticeMs)) {
+      return ackMs >= noticeMs;
+    }
+    return ackIso >= noticeIso;
+  };
+
   const classNoticeAckStats = useMemo(() => {
     if (!activeClassNotice) return null;
     const targetCls = normalizeClassLabel(activeClassNotice.targetClass);
@@ -394,7 +413,7 @@ export default function ClassroomLiveMonitor({
       return normalizeClassLabel(s.studentClass) === targetCls;
     });
     const acked = recipients.filter(
-      (s) => s.classNoticeAckAt && s.classNoticeAckAt >= activeClassNotice.at
+      (s) => isIsoAtOrAfter(s.classNoticeAckAt, activeClassNotice.at)
     ).length;
     return { acked, total: recipients.length };
   }, [activeClassNotice, resolvedStudents]);
@@ -419,7 +438,7 @@ export default function ClassroomLiveMonitor({
       if (filter === "stuck") return isStudentStuck(s);
       if (filter === "in_progress") return s.status === "in_progress" || s.status === "self_evaluating";
       if (filter === "submitted") return s.status === "submitted";
-      if (filter === "alerts") return s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0;
+      if (filter === "alerts") return (s.status !== "offline" || s.locked) && (s.locked || s.tabSwitches > 0 || s.pasteAttempts > 0);
       return s.status !== "offline" || s.locked || s.id === noticeTargetId;
     })
     .sort((a, b) => {
@@ -486,23 +505,28 @@ export default function ClassroomLiveMonitor({
     ];
     const csvContent = "\uFEFF" + rows.map((r) => r.join(";")).join("\r\n");
     const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+    const safePinSlug = cleanPin.replace(/[^A-Za-z0-9_-]+/g, "_") || "sessione";
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
-    a.href = url;
-    a.download = `monitor_aula_${cleanPin}_${new Date().toISOString().slice(0, 10)}.csv`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    scheduleTimer(() => URL.revokeObjectURL(url), 1000);
+    try {
+      a.href = url;
+      a.download = `monitor_aula_${safePinSlug}_${new Date().toISOString().slice(0, 10)}.csv`;
+      document.body.appendChild(a);
+      a.click();
+    } finally {
+      if (a.parentNode) a.parentNode.removeChild(a);
+      window.setTimeout(() => URL.revokeObjectURL(url), 1000);
+    }
   };
 
   const handleClearRoom = async () => {
     if (!dbFirestore || !cleanPin || clearing) return;
+    const opPin = cleanPin;
 
     setClearing(true);
     setClearError(null);
     try {
-      const liveColRef = collection(dbFirestore, "active_sessions", cleanPin, "live_students");
+      const liveColRef = collection(dbFirestore, "active_sessions", opPin, "live_students");
       const snap = await getDocs(liveColRef);
 
       if (!snap.empty) {
@@ -517,6 +541,7 @@ export default function ClassroomLiveMonitor({
         }
       }
 
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       // Also ensure local state is immediately cleared without waiting for listener
       progressChangedAtRef.current = {};
       setStudents([]);
@@ -525,10 +550,11 @@ export default function ClassroomLiveMonitor({
       scheduleTimer(() => setClearSuccess(false), 3500);
     } catch (err: any) {
       console.warn("Svuotamento aula non riuscito:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setClearError(err?.message || "Impossibile svuotare l'aula. Verifica i permessi o la connessione.");
       scheduleTimer(() => setClearError(null), 5000);
     } finally {
-      setClearing(false);
+      if (mountedRef.current) setClearing(false);
     }
   };
 
@@ -536,28 +562,32 @@ export default function ClassroomLiveMonitor({
   // live_students document and drops the blocking overlay as soon as it changes.
   const handleRemoteUnlock = async (studentId: string) => {
     if (!dbFirestore || !cleanPin || unlockingId) return;
+    const opPin = cleanPin;
     setUnlockingId(studentId);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", studentId), {
         remoteUnlockId: `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         lockState: "unlocked",
         locked: false,
         unlockedAt: new Date().toISOString()
       });
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setUnlockSuccessId(studentId);
       scheduleTimer(() => setUnlockSuccessId(null), 3500);
     } catch (err: any) {
       console.warn("Sblocco remoto non riuscito:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setNoticeError(err?.message || "Impossibile sbloccare la postazione dello studente. Riprova tra poco.");
       scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
-      setUnlockingId(null);
+      if (mountedRef.current) setUnlockingId(null);
     }
   };
 
   // Batch remote unlock: unlocks all locked students in the classroom at once with 1 click
   const handleUnlockAll = async () => {
     if (!dbFirestore || !cleanPin || unlockingAll) return;
+    const opPin = cleanPin;
     const lockedStudents = students.filter(s => s.locked);
     if (lockedStudents.length === 0) return;
 
@@ -568,7 +598,7 @@ export default function ClassroomLiveMonitor({
       const baseUnlockId = `u_all_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
       const results = await Promise.allSettled(
         lockedStudents.map((s) =>
-          updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", s.id), {
+          updateDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", s.id), {
             remoteUnlockId: `${baseUnlockId}_${s.id}`,
             lockState: "unlocked",
             locked: false,
@@ -576,6 +606,7 @@ export default function ClassroomLiveMonitor({
           })
         )
       );
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       const succeeded = results.filter((r) => r.status === "fulfilled").length;
       const failed = results.length - succeeded;
       if (succeeded > 0) {
@@ -593,10 +624,11 @@ export default function ClassroomLiveMonitor({
       }
     } catch (err) {
       console.warn("Sblocco cumulativo aula non riuscito:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setNoticeError("Impossibile completare lo sblocco cumulativo.");
       scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
-      setUnlockingAll(false);
+      if (mountedRef.current) setUnlockingAll(false);
     }
   };
 
@@ -604,15 +636,17 @@ export default function ClassroomLiveMonitor({
 
   const handleRemoveStudent = async (studentId: string) => {
     if (!dbFirestore || !cleanPin || removingId) return;
+    const opPin = cleanPin;
     setRemovingId(studentId);
     try {
-      await deleteDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId));
+      await deleteDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", studentId));
     } catch (err: any) {
       console.warn("Rimozione studente non riuscita:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setNoticeError(err?.message || "Impossibile rimuovere la postazione dall'aula live.");
       scheduleTimer(() => setNoticeError(null), 5000);
     } finally {
-      setRemovingId(null);
+      if (mountedRef.current) setRemovingId(null);
     }
   };
 
@@ -620,12 +654,13 @@ export default function ClassroomLiveMonitor({
 
   const handleExtendStudentTime = async (student: LiveStudentData, minutesToAdd: number) => {
     if (!dbFirestore || !cleanPin || extendingId) return;
+    const opPin = cleanPin;
     setExtendingId(student.id);
     setNoticeError(null);
     try {
       const currentAnchor = student.extendedExpiryIso || student.besExpiryIso || activeMonitoredSession?.expiry || null;
       const nextIso = addMinutesToExpiryIso(currentAnchor, minutesToAdd);
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", student.id), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", student.id), {
         extendedExpiryIso: nextIso,
       });
       // Keep session-level maxExtendedExpiry up to date so autoReleaseSolutions waits for this extension
@@ -635,14 +670,15 @@ export default function ClassroomLiveMonitor({
       const nextMs = Date.parse(nextIso);
       if (Number.isFinite(nextMs) && (!Number.isFinite(currentMaxMs) || nextMs > currentMaxMs)) {
         try {
-          await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+          await updateDoc(doc(dbFirestore, "active_sessions", opPin), {
             maxExtendedExpiry: nextIso,
           });
-          onSessionMaxExtended?.(cleanPin, nextIso);
+          onSessionMaxExtended?.(opPin, nextIso);
         } catch (syncMaxErr) {
           console.warn("Aggiornamento maxExtendedExpiry sessione non riuscito (non bloccante):", syncMaxErr);
         }
       }
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setExtendedOk({ id: student.id, minutes: minutesToAdd });
       scheduleTimer(
         () =>
@@ -653,60 +689,67 @@ export default function ClassroomLiveMonitor({
       );
     } catch (err: any) {
       console.warn("Estensione tempo studente non riuscita:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       const errMsg = `Impossibile concedere +${minutesToAdd} min: ${err?.message || "errore"}`;
       setNoticeError(errMsg);
       scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 5000);
     } finally {
-      setExtendingId(null);
+      if (mountedRef.current) setExtendingId(null);
     }
   };
 
   const handleSendNotice = async (studentId: string) => {
     const clean = noticeText.trim().slice(0, 280);
     if (!dbFirestore || !cleanPin || !clean || sendingNotice) return;
+    const opPin = cleanPin;
     setSendingNotice(true);
     setNoticeError(null);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", studentId), {
         teacherNotice: clean,
         teacherNoticeAt: new Date().toISOString(),
       });
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setNoticeTargetId(null);
       setNoticeText("");
       setNoticeSentId(studentId);
       scheduleTimer(() => setNoticeSentId((prev) => (prev === studentId ? null : prev)), 4000);
     } catch (err: any) {
       console.warn("Invio avviso studente non riuscito:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       const errMsg = err?.code === "permission-denied"
         ? "Invio messaggio bloccato dalle regole Firestore (permessi insufficienti o campo non consentito)."
         : `Impossibile inviare l'avviso allo studente: ${err?.message || "errore di rete"}`;
       setNoticeError(errMsg);
       scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 6000);
     } finally {
-      setSendingNotice(false);
+      if (mountedRef.current) setSendingNotice(false);
     }
   };
 
   const handleClearNotice = async (studentId: string) => {
     if (!dbFirestore || !cleanPin || clearingNoticeId) return;
+    const opPin = cleanPin;
     setClearingNoticeId(studentId);
     setNoticeError(null);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin, "live_students", studentId), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin, "live_students", studentId), {
         teacherNotice: "",
         teacherNoticeAt: "",
       });
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       if (noticeTargetId === studentId) {
         setNoticeTargetId(null);
         setNoticeText("");
       }
     } catch (err: any) {
       console.warn("Rimozione avviso studente non riuscita:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       const errMsg = `Impossibile rimuovere l'avviso: ${err?.message || "errore"}`;
       setNoticeError(errMsg);
       scheduleTimer(() => setNoticeError((prev) => (prev === errMsg ? null : prev)), 5000);
     } finally {
-      setClearingNoticeId(null);
+      if (mountedRef.current) setClearingNoticeId(null);
     }
   };
 
@@ -714,17 +757,19 @@ export default function ClassroomLiveMonitor({
     e?.preventDefault();
     const clean = classNoticeInput.trim().slice(0, 280);
     if (!dbFirestore || !cleanPin || !clean || sendingClassNotice) return;
+    const opPin = cleanPin;
     setSendingClassNotice(true);
     setClassNoticeFeedback(null);
     const effectiveTarget = distinctClasses.length > 1 ? classNoticeTargetClass : "ALL";
     const targetCls = effectiveTarget === "ALL" ? "" : normalizeClassLabel(effectiveTarget);
     try {
       const nowIso = new Date().toISOString();
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin), {
         classNotice: clean,
         classNoticeAt: nowIso,
         classNoticeTargetClass: targetCls,
       });
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setActiveClassNotice({ text: clean, at: nowIso, targetClass: targetCls || undefined });
       setClassNoticeInput("");
       setClassNoticeFeedback({
@@ -736,6 +781,7 @@ export default function ClassroomLiveMonitor({
       scheduleTimer(() => setClassNoticeFeedback(null), 4000);
     } catch (err: any) {
       console.warn("Invio avviso alla classe non riuscito:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setClassNoticeFeedback({
         type: "error",
         msg:
@@ -745,20 +791,22 @@ export default function ClassroomLiveMonitor({
       });
       scheduleTimer(() => setClassNoticeFeedback(null), 6000);
     } finally {
-      setSendingClassNotice(false);
+      if (mountedRef.current) setSendingClassNotice(false);
     }
   };
 
   const handleClearClassNotice = async () => {
     if (!dbFirestore || !cleanPin || sendingClassNotice) return;
+    const opPin = cleanPin;
     setSendingClassNotice(true);
     setClassNoticeFeedback(null);
     try {
-      await updateDoc(doc(dbFirestore, "active_sessions", cleanPin), {
+      await updateDoc(doc(dbFirestore, "active_sessions", opPin), {
         classNotice: "",
         classNoticeAt: "",
         classNoticeTargetClass: "",
       });
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setActiveClassNotice(null);
       setClassNoticeFeedback({
         type: "success",
@@ -767,12 +815,13 @@ export default function ClassroomLiveMonitor({
       scheduleTimer(() => setClassNoticeFeedback(null), 3500);
     } catch (err: any) {
       console.warn("Rimozione avviso classe non riuscita:", err);
+      if (!mountedRef.current || activePinRef.current !== opPin) return;
       setClassNoticeFeedback({
         type: "error",
         msg: `Impossibile rimuovere l'avviso: ${err?.message || "errore"}`,
       });
     } finally {
-      setSendingClassNotice(false);
+      if (mountedRef.current) setSendingClassNotice(false);
     }
   };
 
@@ -1124,8 +1173,10 @@ export default function ClassroomLiveMonitor({
                 PIN: {cleanPin || "—"}
               </span>
               {activeMonitoredSession?.maxExtendedExpiry &&
+                Number.isFinite(Date.parse(activeMonitoredSession.maxExtendedExpiry)) &&
                 Date.parse(activeMonitoredSession.maxExtendedExpiry) > currentTime &&
                 (!activeMonitoredSession.expiry ||
+                  !Number.isFinite(Date.parse(activeMonitoredSession.expiry)) ||
                   Date.parse(activeMonitoredSession.maxExtendedExpiry) >
                     Date.parse(activeMonitoredSession.expiry) + 30_000) && (
                   <span
@@ -1278,23 +1329,26 @@ export default function ClassroomLiveMonitor({
             <span>Feed Real-time Attivo</span>
           </div>
 
-          {pin && onTerminateSession && (
-            confirmingPin === pin ? (
+          {cleanPin && onTerminateSession && (() => {
+            const normConfirm = (confirmingPin || "").trim().toUpperCase();
+            const normTerm = (terminatingPin || "").trim().toUpperCase();
+            const isTerminatingThis = normTerm === cleanPin;
+            return normConfirm === cleanPin ? (
               <div className="flex items-center gap-1.5">
                 <button
                   type="button"
-                  onClick={() => { onTerminateSession(pin); setConfirmingPin(null); }}
-                  disabled={terminatingPin === pin || terminatingAll}
+                  onClick={() => { onTerminateSession(cleanPin); setConfirmingPin(null); }}
+                  disabled={isTerminatingThis || terminatingAll}
                   className="px-3 py-1.5 rounded-xl bg-red-600 border border-red-500 text-white hover:bg-red-500 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
                   title="Conferma terminazione"
                 >
-                  {terminatingPin === pin ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <StopCircle className="w-3.5 h-3.5" />}
-                  <span>{terminatingPin === pin ? "Terminazione..." : "Conferma termina"}</span>
+                  {isTerminatingThis ? <RefreshCw className="w-3.5 h-3.5 animate-spin" /> : <StopCircle className="w-3.5 h-3.5" />}
+                  <span>{isTerminatingThis ? "Terminazione..." : "Conferma termina"}</span>
                 </button>
                 <button
                   type="button"
                   onClick={() => setConfirmingPin(null)}
-                  disabled={terminatingPin === pin || terminatingAll}
+                  disabled={isTerminatingThis || terminatingAll}
                   className="px-2 py-1.5 rounded-xl bg-slate-950/70 border border-white/10 text-slate-300 hover:text-white text-xs font-semibold cursor-pointer transition-colors disabled:opacity-50"
                   title="Annulla"
                 >
@@ -1304,25 +1358,25 @@ export default function ClassroomLiveMonitor({
             ) : (
               <button
                 type="button"
-                onClick={() => setConfirmingPin(pin)}
-                disabled={terminatingPin === pin || terminatingAll}
+                onClick={() => setConfirmingPin(cleanPin)}
+                disabled={isTerminatingThis || terminatingAll}
                 className="px-3 py-1.5 rounded-xl bg-red-950/70 border border-red-500/30 text-red-300 hover:text-white hover:bg-red-600 text-xs font-semibold flex items-center gap-1.5 cursor-pointer transition-colors disabled:opacity-50"
                 title="Termina e annulla la sessione d'aula selezionata"
               >
-                {terminatingPin === pin ? (
+                {isTerminatingThis ? (
                   <RefreshCw className="w-3.5 h-3.5 animate-spin" />
                 ) : (
                   <StopCircle className="w-3.5 h-3.5" />
                 )}
-                <span>{terminatingPin === pin ? "Terminazione..." : "Termina sessione"}</span>
+                <span>{isTerminatingThis ? "Terminazione..." : "Termina sessione"}</span>
               </button>
-            )
-          )}
+            );
+          })()}
 
           {confirmClear ? (
             <div className="flex items-center gap-1.5 animate-fadeIn bg-red-950/90 border border-red-500/50 p-1 rounded-xl shadow-lg">
               <span className="text-[11px] text-red-200 font-semibold px-1.5 whitespace-nowrap">
-                Svuotare l'aula {pin ? `(PIN ${pin})` : ""}?
+                Svuotare l'aula {cleanPin ? `(PIN ${cleanPin})` : ""}?
               </span>
               <button
                 type="button"
@@ -1357,7 +1411,7 @@ export default function ClassroomLiveMonitor({
             <button
               type="button"
               onClick={() => {
-                if (!pin) {
+                if (!cleanPin) {
                   setClearError("Seleziona prima una sessione d'aula dal riquadro sopra per svuotarla.");
                   scheduleTimer(() => setClearError(null), 4000);
                   return;
@@ -1518,7 +1572,7 @@ export default function ClassroomLiveMonitor({
                   <button
                     type="button"
                     onClick={() => handleRemoteUnlock(lockedList[0].id)}
-                    disabled={unlockingId === lockedList[0].id}
+                    disabled={Boolean(unlockingId) || unlockingAll}
                     className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-50"
                     title={`Sblocca immediatamente la prova di ${getMonitorName(lockedList[0])}`}
                   >
@@ -1543,7 +1597,7 @@ export default function ClassroomLiveMonitor({
                   <button
                     type="button"
                     onClick={handleUnlockAll}
-                    disabled={unlockingAll}
+                    disabled={unlockingAll || Boolean(unlockingId)}
                     className="flex-1 sm:flex-initial px-4 py-2 bg-emerald-500 hover:bg-emerald-400 text-slate-950 font-bold text-xs rounded-xl flex items-center justify-center gap-1.5 transition-all shadow-lg shadow-emerald-500/20 cursor-pointer disabled:opacity-50"
                     title="Sblocca simultaneamente tutti gli studenti bloccati di questa sessione"
                   >
@@ -1588,7 +1642,7 @@ export default function ClassroomLiveMonitor({
                     key={ls.id}
                     type="button"
                     onClick={() => handleRemoteUnlock(ls.id)}
-                    disabled={unlockingId === ls.id}
+                    disabled={Boolean(unlockingId) || unlockingAll}
                     className="px-2.5 py-1 rounded-lg bg-emerald-500/20 hover:bg-emerald-500/30 border border-emerald-500/50 text-emerald-200 hover:text-white text-[11px] font-bold flex items-center gap-1 transition-all cursor-pointer disabled:opacity-50"
                     title={`Sblocca solo ${getMonitorName(ls)}`}
                   >
@@ -1618,9 +1672,10 @@ export default function ClassroomLiveMonitor({
 
       {/* Metric Cards */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
-        <div 
+        <button
+          type="button"
           onClick={() => setFilter("all")}
-          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+          className={`text-left p-4 rounded-2xl border transition-all cursor-pointer group ${
             filter === "all" ? "bg-indigo-950/50 border-indigo-500/50 ring-2 ring-indigo-500/30 shadow-lg shadow-indigo-950/40" : "bg-slate-900/60 border-white/10 hover:border-indigo-500/30 hover:bg-slate-900/80"
           }`}
         >
@@ -1630,11 +1685,12 @@ export default function ClassroomLiveMonitor({
           </div>
           <p className="text-2xl font-bold font-mono text-white">{connectedCount}</p>
           <p className="text-[10px] text-slate-400 mt-1">Dispositivi in aula</p>
-        </div>
+        </button>
 
-        <div 
+        <button
+          type="button"
           onClick={() => setFilter(filter === "in_progress" ? "all" : "in_progress")}
-          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+          className={`text-left p-4 rounded-2xl border transition-all cursor-pointer group ${
             filter === "in_progress" ? "bg-amber-950/50 border-amber-500/50 ring-2 ring-amber-500/30 shadow-lg shadow-amber-950/40" : "bg-slate-900/60 border-white/10 hover:border-amber-500/30 hover:bg-slate-900/80"
           }`}
         >
@@ -1644,11 +1700,12 @@ export default function ClassroomLiveMonitor({
           </div>
           <p className="text-2xl font-bold font-mono text-amber-300">{inProgressCount}</p>
           <p className="text-[10px] text-slate-400 mt-1">Stanno compilando</p>
-        </div>
+        </button>
 
-        <div 
+        <button
+          type="button"
           onClick={() => setFilter(filter === "submitted" ? "all" : "submitted")}
-          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+          className={`text-left p-4 rounded-2xl border transition-all cursor-pointer group ${
             filter === "submitted" ? "bg-emerald-950/50 border-emerald-500/50 ring-2 ring-emerald-500/30 shadow-lg shadow-emerald-950/40" : "bg-slate-900/60 border-white/10 hover:border-emerald-500/30 hover:bg-slate-900/80"
           }`}
         >
@@ -1667,11 +1724,12 @@ export default function ClassroomLiveMonitor({
           <p className="text-[10px] text-slate-400 mt-1">
             {submittedCount === 0 ? "Nessuna consegna" : submittedCount === 1 ? "1 prova completata" : `${submittedCount} prove completate`}
           </p>
-        </div>
+        </button>
 
-        <div 
+        <button
+          type="button"
           onClick={() => setFilter(filter === "locked" || filter === "alerts" ? "all" : lockedCount > 0 ? "locked" : "alerts")}
-          className={`p-4 rounded-2xl border transition-all cursor-pointer group ${
+          className={`text-left p-4 rounded-2xl border transition-all cursor-pointer group ${
             filter === "locked" || filter === "alerts" ? "bg-red-950/50 border-red-500/50 ring-2 ring-red-500/40 shadow-lg shadow-red-950/40" : "bg-slate-900/60 border-white/10 hover:border-red-500/30 hover:bg-slate-900/80"
           }`}
         >
@@ -1694,7 +1752,7 @@ export default function ClassroomLiveMonitor({
           <p className="text-[10px] text-slate-400 mt-1">
             {lockedCount > 0 ? "Richiedono sblocco 1-click" : "Uscite / Copia-incolla"}
           </p>
-        </div>
+        </button>
       </div>
 
       {/* Filter and Search Bar */}
@@ -1718,6 +1776,7 @@ export default function ClassroomLiveMonitor({
           <span className="text-[10px] text-slate-500 uppercase font-bold mr-1">Filtra:</span>
           {lockedCount > 0 && (
             <button
+              type="button"
               onClick={() => setFilter(filter === "locked" ? "all" : "locked")}
               className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
                 filter === "locked"
@@ -1731,6 +1790,7 @@ export default function ClassroomLiveMonitor({
           )}
           {stuckCount > 0 && (
             <button
+              type="button"
               onClick={() => setFilter(filter === "stuck" ? "all" : "stuck")}
               className={`px-3 py-1.5 rounded-xl text-xs font-bold cursor-pointer transition-all flex items-center gap-1.5 ${
                 filter === "stuck"
@@ -1751,6 +1811,7 @@ export default function ClassroomLiveMonitor({
           ].map(({ id, label, count }) => (
             <button
               key={id}
+              type="button"
               onClick={() => setFilter(id as any)}
               className={`px-3 py-1.5 rounded-xl text-xs font-semibold cursor-pointer transition-all flex items-center gap-1.5 ${
                 filter === id
@@ -1821,7 +1882,7 @@ export default function ClassroomLiveMonitor({
             <RefreshCw className="w-6 h-6 animate-spin mx-auto text-indigo-400" />
             <p className="text-xs">Connessione al canale d'aula in corso...</p>
           </div>
-        ) : !pin ? (
+        ) : !cleanPin ? (
           <div className="p-8 text-center text-slate-500 space-y-2">
             <Clock className="w-8 h-8 mx-auto text-slate-600 opacity-60" />
             <p className="text-sm font-semibold text-slate-400">Nessuna sessione selezionata.</p>
@@ -1842,7 +1903,7 @@ export default function ClassroomLiveMonitor({
                 : "Nessun alunno corrisponde ai filtri selezionati."}
             </p>
             <p className="text-xs text-slate-500 max-w-sm mx-auto">
-              Gli studenti appariranno qui automaticamente appena inseriscono il PIN {pin} ed entrano nella prova.
+              Gli studenti appariranno qui automaticamente appena inseriscono il PIN {cleanPin} ed entrano nella prova.
             </p>
           </div>
         ) : (
@@ -1983,9 +2044,7 @@ export default function ClassroomLiveMonitor({
                                   ? "Avviso docente attivo (LIM Cieca)"
                                   : `Avviso inviato: “${student.teacherNotice}”`}
                               </span>
-                              {student.teacherNoticeAckAt &&
-                                student.teacherNoticeAt &&
-                                student.teacherNoticeAckAt >= student.teacherNoticeAt && (
+                              {isIsoAtOrAfter(student.teacherNoticeAckAt, student.teacherNoticeAt) && (
                                   <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 border border-emerald-500/35 text-emerald-300 font-mono text-[9px] font-bold shrink-0">
                                     ✓ Letto
                                   </span>
@@ -1993,8 +2052,7 @@ export default function ClassroomLiveMonitor({
                             </p>
                           )}
                           {activeClassNotice &&
-                            student.classNoticeAckAt &&
-                            student.classNoticeAckAt >= activeClassNotice.at &&
+                            isIsoAtOrAfter(student.classNoticeAckAt, activeClassNotice.at) &&
                             (!activeClassNotice.targetClass ||
                               normalizeClassLabel(student.studentClass) === activeClassNotice.targetClass) && (
                               <p className="text-[10px] text-teal-300 mt-0.5 flex items-center gap-1">
@@ -2063,7 +2121,7 @@ export default function ClassroomLiveMonitor({
                         <button
                           type="button"
                           onClick={() => handleRemoteUnlock(student.id)}
-                          disabled={unlockingId === student.id}
+                          disabled={Boolean(unlockingId) || unlockingAll}
                           className="px-3.5 py-2 rounded-xl bg-emerald-500 hover:bg-emerald-400 text-slate-950 text-xs font-bold flex items-center gap-1.5 cursor-pointer shadow-md shadow-emerald-500/25 transition-all hover:scale-105 active:scale-95 disabled:opacity-50 shrink-0"
                           title={`Sblocca la prova di ${getMonitorName(student)} con 1 click`}
                         >
@@ -2123,7 +2181,7 @@ export default function ClassroomLiveMonitor({
                           <button
                             type="button"
                             onClick={() => handleExtendStudentTime(student, 5)}
-                            disabled={extendingId === student.id}
+                            disabled={Boolean(extendingId)}
                             title={`Concedi +5 minuti extra individuali a ${getMonitorName(student)}`}
                             className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition-colors border disabled:opacity-50 ${
                               extendedOk?.id === student.id && extendedOk.minutes === 5
@@ -2136,7 +2194,7 @@ export default function ClassroomLiveMonitor({
                           <button
                             type="button"
                             onClick={() => handleExtendStudentTime(student, 10)}
-                            disabled={extendingId === student.id}
+                            disabled={Boolean(extendingId)}
                             title={`Concedi +10 minuti extra individuali a ${getMonitorName(student)}`}
                             className={`px-2 py-1 rounded-lg text-[10px] font-mono font-bold cursor-pointer transition-colors border disabled:opacity-50 ${
                               extendedOk?.id === student.id && extendedOk.minutes === 10

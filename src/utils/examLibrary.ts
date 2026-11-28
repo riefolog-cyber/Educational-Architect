@@ -356,19 +356,28 @@ function deduplicateAndSort(items: ExamLibraryItem[]): ExamLibraryItem[] {
   return finalItems;
 }
 
+function clampNonNegativeInt(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  if (Number.isFinite(n) && n >= 0) return Math.round(n);
+  const fb = Number(fallback);
+  return Number.isFinite(fb) && fb >= 0 ? Math.round(fb) : 0;
+}
+
 function buildFirestorePayload(item: ExamLibraryItem) {
   const cleanSharedCode =
     typeof item.sharedCode === "string" && item.sharedCode.trim()
       ? item.sharedCode.trim().toUpperCase().replace(/[^A-Z0-9]/g, "").slice(0, 16)
       : "";
+  const safeTitle = String(item.title || "Verifica salvata").trim().slice(0, 300) || "Verifica salvata";
+  const safeSource = normalizeLibrarySource(item.source).slice(0, 120) || "Editor";
   return {
     id: String(item.id),
     teacherEmail: normalizeEmail(item.teacherEmail) || "anon",
-    title: String(item.title || "Verifica salvata"),
+    title: safeTitle,
     examType: item.examType === "Workbook" ? "Workbook" : "Quiz",
     examJson: String(item.examJson || ""),
-    source: normalizeLibrarySource(item.source),
-    questionCount: Number.isFinite(Number(item.questionCount)) ? Number(item.questionCount) : 0,
+    source: safeSource,
+    questionCount: clampNonNegativeInt(item.questionCount, 0),
     ...(cleanSharedCode ? { sharedCode: cleanSharedCode } : {}),
     createdAt: String(item.createdAt || new Date().toISOString()),
     updatedAt: String(item.updatedAt || new Date().toISOString()),
@@ -690,7 +699,7 @@ export async function renameLibraryExam(
   id: string,
   newTitle: string
 ): Promise<ExamLibraryItem | null> {
-  const cleanTitle = (newTitle || "").trim();
+  const cleanTitle = (newTitle || "").trim().slice(0, 300);
   if (!cleanTitle) {
     throw new Error("Il titolo della verifica non può essere vuoto.");
   }
@@ -858,13 +867,20 @@ export function parseLibraryBackup(raw: string, teacherEmail: string): NewLibrar
     }
     const sanitizedJson = sanitizeWorkbookExamJson(it.examJson);
     const detected = countLibraryQuestions(parsedExam);
-    const resolvedCount = Number(it.questionCount) > 0 ? Number(it.questionCount) : detected.count;
+    const rawCount = Number(it.questionCount);
+    const resolvedCount =
+      Number.isFinite(rawCount) && rawCount > 0
+        ? Math.min(Math.round(rawCount), 5000)
+        : clampNonNegativeInt(detected.count, 0);
     return {
       teacherEmail,
-      title: String(it.title || parsedExam?.title || `Verifica importata ${idx + 1}`),
+      title:
+        String(it.title || parsedExam?.title || `Verifica importata ${idx + 1}`)
+          .trim()
+          .slice(0, 300) || `Verifica importata ${idx + 1}`,
       examType: it.examType === "Workbook" || detected.type === "Workbook" ? "Workbook" : "Quiz",
       examJson: sanitizedJson,
-      source: String(it.source || "Backup importato"),
+      source: String(it.source || "Backup importato").trim().slice(0, 120) || "Backup importato",
       questionCount: resolvedCount,
     } as NewLibraryExam;
   });
@@ -917,10 +933,10 @@ export async function publishSharedExam(
     await setDoc(doc(dbFirestore, "shared_exams", cleanCode), {
       shareCode: cleanCode,
       teacherEmail: normEmail,
-      title: String(item.title || "Verifica condivisa"),
+      title: String(item.title || "Verifica condivisa").trim().slice(0, 300) || "Verifica condivisa",
       examType: item.examType === "Workbook" ? "Workbook" : "Quiz",
       examJson: sanitizeWorkbookExamJson(item.examJson),
-      questionCount: Number(item.questionCount) || 0,
+      questionCount: clampNonNegativeInt(item.questionCount, 0),
       createdAt: nowIso,
     });
     // Persist sharedCode on the library item (cloud + local cache) so reloads reuse it
@@ -979,7 +995,9 @@ export async function listMySharedExams(teacherEmail: string): Promise<SharedExa
       }
     })
   );
-  return Array.from(byCode.values()).sort((a, b) => (b.createdAt > a.createdAt ? 1 : -1));
+  return Array.from(byCode.values()).sort((a, b) =>
+    String(b.createdAt || "").localeCompare(String(a.createdAt || ""))
+  );
 }
 
 export async function revokeSharedExam(shareCode: string, teacherEmail?: string): Promise<void> {
@@ -1029,6 +1047,50 @@ export async function revokeSharedExam(shareCode: string, teacherEmail?: string)
   }
 }
 
+export interface SanitizedSharedExamImport {
+  title: string;
+  examType: "Quiz" | "Workbook";
+  examJson: string;
+  questionCount: number;
+}
+
+export function sanitizeSharedExamImport(
+  data: any,
+  cleanCode: string
+): SanitizedSharedExamImport {
+  if (!data?.examJson || typeof data.examJson !== "string") {
+    throw new Error("La verifica condivisa non contiene dati validi.");
+  }
+
+  let parsed: any;
+  try {
+    parsed = JSON.parse(data.examJson);
+  } catch {
+    throw new Error("La verifica condivisa contiene dati danneggiati e non può essere importata.");
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("La verifica condivisa non ha una struttura valida.");
+  }
+
+  const { type, count } = countLibraryQuestions(parsed);
+  const rawTitle = String(data.title || "").trim() || String(parsed?.title || "").trim();
+  const title = (rawTitle || `Verifica condivisa (${cleanCode})`).slice(0, 300);
+  const rawCount = Number(data.questionCount);
+  const questionCount =
+    Number.isFinite(rawCount) && rawCount > 0
+      ? Math.min(Math.floor(rawCount), 5000)
+      : count;
+
+  const sanitizedJson = sanitizeWorkbookExamJson(data.examJson);
+
+  return {
+    title,
+    examType: data.examType === "Workbook" || type === "Workbook" ? "Workbook" : "Quiz",
+    examJson: sanitizedJson,
+    questionCount,
+  };
+}
+
 export async function importSharedExamByCode(
   rawCode: string,
   teacherEmail: string
@@ -1058,33 +1120,18 @@ export async function importSharedExamByCode(
     throw new Error(`Nessuna verifica trovata con il codice "${cleanCode}". Controlla che il collega lo abbia copiato correttamente.`);
   }
 
-  const data = snap.data() as any;
-  if (!data?.examJson || typeof data.examJson !== "string") {
-    throw new Error("La verifica condivisa non contiene dati validi.");
-  }
-
-  let parsed: any;
-  try {
-    parsed = JSON.parse(data.examJson);
-  } catch {
-    throw new Error("La verifica condivisa contiene dati danneggiati e non può essere importata.");
-  }
-  if (!parsed || typeof parsed !== "object") {
-    throw new Error("La verifica condivisa non ha una struttura valida.");
-  }
-
-  const { type, count } = countLibraryQuestions(parsed);
-  const title = String(data.title || parsed?.title || `Verifica condivisa (${cleanCode})`);
+  const sanitized = sanitizeSharedExamImport(snap.data(), cleanCode);
   const saveResult = await saveLibraryExam({
     teacherEmail,
-    title,
-    examType: data.examType === "Workbook" || type === "Workbook" ? "Workbook" : "Quiz",
-    examJson: data.examJson,
+    title: sanitized.title,
+    examType: sanitized.examType,
+    examJson: sanitized.examJson,
     source: `Condivisa da collega (${cleanCode})`,
-    questionCount: Number(data.questionCount) || count,
+    questionCount: sanitized.questionCount,
   });
 
-  return { title, questionCount: Number(data.questionCount) || count, saveResult };
+  return { title: sanitized.title, questionCount: sanitized.questionCount, saveResult };
 }
+
 
 

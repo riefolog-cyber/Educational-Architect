@@ -14,9 +14,12 @@ export default function GradeCalculationReport({
 }: GradeCalculationReportProps) {
   const [copied, setCopied] = useState(false);
   const copyTimer = useRef<number | null>(null);
+  const mountedRef = useRef(true);
 
   useEffect(() => {
+    mountedRef.current = true;
     return () => {
+      mountedRef.current = false;
       if (copyTimer.current !== null) {
         window.clearTimeout(copyTimer.current);
       }
@@ -36,11 +39,13 @@ export default function GradeCalculationReport({
     ].join("\n");
 
     const ok = await copyTextToClipboard(text);
-    if (!ok) return;
+    if (!ok || !mountedRef.current) return;
 
     setCopied(true);
     if (copyTimer.current !== null) window.clearTimeout(copyTimer.current);
-    copyTimer.current = window.setTimeout(() => setCopied(false), 2000);
+    copyTimer.current = window.setTimeout(() => {
+      if (mountedRef.current) setCopied(false);
+    }, 2000);
   };
 
   const hasSubjectiveWeights =

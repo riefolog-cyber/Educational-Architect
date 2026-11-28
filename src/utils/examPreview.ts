@@ -4,6 +4,8 @@ import {
   collectQuizOpenEnded,
   collectWorkbookFillInTheBlank,
   collectWorkbookReflections,
+  evaluateMcSelection,
+  extractFibExpected,
   isWorkbookExamData,
   safeParseJson,
 } from "../utils";
@@ -12,17 +14,7 @@ function hasStrictValidMcKey(q: any): boolean {
   if (!q || typeof q !== "object") return false;
   const optsLen = Array.isArray(q.options) ? q.options.length : 0;
   if (optsLen < 2) return false;
-  const raw = q.correctIndex;
-  if (typeof raw === "number") {
-    return Number.isInteger(raw) && raw >= 0 && raw < optsLen;
-  }
-  if (typeof raw === "string") {
-    const trimmed = raw.trim();
-    if (!/^\d+$/.test(trimmed)) return false;
-    const parsed = Number.parseInt(trimmed, 10);
-    return Number.isInteger(parsed) && parsed >= 0 && parsed < optsLen;
-  }
-  return false;
+  return evaluateMcSelection(q, 0).hasCorrectKey;
 }
 
 export interface ExamPreviewSummary {
@@ -140,12 +132,7 @@ export function extractReusableExamFromSubmissions(
     const allMcHaveKeys = mcList.every((q: any) => hasStrictValidMcKey(q));
     if (!allMcHaveKeys) continue;
 
-    const allFibHaveKeys = fibList.every((f: any) => {
-      if (!f || typeof f !== "object") return false;
-      if (typeof f.answer === "string" && f.answer.trim().length > 0) return true;
-      if (typeof f.sentence === "string" && /\[[^\]]+\]/.test(f.sentence)) return true;
-      return false;
-    });
+    const allFibHaveKeys = fibList.every((f: any) => Boolean(extractFibExpected(f)));
     if (!allFibHaveKeys) continue;
 
     const cloned = JSON.parse(JSON.stringify(parsed));

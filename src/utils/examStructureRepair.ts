@@ -1,4 +1,17 @@
 import { QuizExam, WorkbookExam } from "../types";
+import { normalizeQuestionImage } from "./googleFormsLink";
+
+function sanitizeImagesMap(rawImages: unknown): Record<string, string> | undefined {
+  if (!rawImages || typeof rawImages !== "object" || Array.isArray(rawImages)) return undefined;
+  const out: Record<string, string> = {};
+  for (const [k, v] of Object.entries(rawImages as Record<string, unknown>)) {
+    const key = String(k || "").trim();
+    if (!key) continue;
+    const safe = normalizeQuestionImage(v);
+    if (safe) out[key] = safe;
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
 
 export interface ExamCorrectionResult {
   success: boolean;
@@ -20,7 +33,7 @@ export interface ExamCorrectionResult {
 function preservedDidacticFields(q: any): { weight?: number; criteria?: string } {
   const out: { weight?: number; criteria?: string } = {};
   const w = Number(q?.weight ?? q?.peso);
-  if (!isNaN(w) && w > 0 && w !== 1) out.weight = w;
+  if (Number.isFinite(w) && w > 0 && w !== 1) out.weight = w;
   const c =
     typeof q?.criteria === "string" && q.criteria.trim()
       ? q.criteria.trim()
@@ -455,7 +468,83 @@ export function tolerantJsonParse(rawText: string): any {
 }
 
 /**
+ * Resolves a raw MC correct-answer indicator to a 0-based option index.
+ * Checks exact option text BEFORE single-letter A..Z shorthand so exams with
+ * single-letter options (e.g. ["C", "O", "H", "N"] and correctAnswer: "C")
+ * match option 0 ("C") rather than index 2 ("H").
+ */
+function resolveMcCorrectIndex(
+  rawCorrect: unknown,
+  optionsArray: string[]
+): { index: number; resolved: boolean; convertedFromOneBased?: boolean } {
+  const len = optionsArray.length;
+  if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
+    if (rawCorrect >= 0 && (len === 0 || rawCorrect < len)) {
+      return { index: rawCorrect, resolved: true };
+    }
+    if (len > 0 && rawCorrect === len) {
+      return { index: rawCorrect - 1, resolved: true, convertedFromOneBased: true };
+    }
+    return { index: 0, resolved: false };
+  }
+  if (typeof rawCorrect === "string" && rawCorrect.trim() !== "") {
+    const trimmed = rawCorrect.trim();
+    if (len > 0) {
+      const exactIdx = optionsArray.findIndex(
+        (opt) => opt.trim().toLowerCase() === trimmed.toLowerCase()
+      );
+      if (exactIdx >= 0) {
+        return { index: exactIdx, resolved: true };
+      }
+    }
+    if (/^[A-Z]$/i.test(trimmed)) {
+      const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
+      if (len === 0 || letterIdx < len) {
+        return { index: letterIdx, resolved: true };
+      }
+    }
+    if (/^\d+$/.test(trimmed)) {
+      const num = parseInt(trimmed, 10);
+      if (num >= 0 && (len === 0 || num < len)) {
+        return { index: num, resolved: true };
+      }
+      if (len > 0 && num === len) {
+        return { index: num - 1, resolved: true, convertedFromOneBased: true };
+      }
+    }
+    return { index: 0, resolved: false };
+  }
+  if (typeof rawCorrect === "boolean") {
+    const isTrueFalseOpts =
+      len === 2 &&
+      /^(vero|true|s[iì])$/i.test(optionsArray[0].trim()) &&
+      /^(falso|false|no)$/i.test(optionsArray[1].trim());
+    if (isTrueFalseOpts) {
+      return { index: rawCorrect ? 0 : 1, resolved: true };
+    }
+    return { index: 0, resolved: false };
+  }
+  return { index: 0, resolved: false };
+}
+
+function extractRawFibAnswerString(fib: any): string {
+  if (!fib || typeof fib !== "object") return "";
+  const candidates = [fib.answer, fib.expected, fib.solution, fib.correctAnswer, fib.risposta, fib.soluzione];
+  for (const raw of candidates) {
+    if (Array.isArray(raw)) {
+      const joined = raw.map((x) => String(x ?? "").trim()).filter(Boolean).join(" | ");
+      if (joined) return joined;
+    } else if (raw !== undefined && raw !== null) {
+      const text = String(raw).trim();
+      if (text) return text;
+    }
+  }
+  return "";
+}
+
+/**
  * Sanitizes a single fill-in-the-blank item in place:
+ * normalizes answer alias keys (`expected`/`solution`/`correctAnswer`/`risposta`/`soluzione`),
  * converts "[answer]" or embedded answer words into "________" while preserving
  * the omitted solution in `fib.answer`. Supports multi-alternative answers separated by |, ; or /.
  * Returns true if the item was modified.
@@ -463,6 +552,20 @@ export function tolerantJsonParse(rawText: string): any {
 export function sanitizeFibQuestion(fib: any): boolean {
   if (!fib || typeof fib !== "object" || typeof fib.sentence !== "string") return false;
   let changed = false;
+
+  if (!fib.answer || (typeof fib.answer === "string" && !fib.answer.trim()) || Array.isArray(fib.answer)) {
+    const normalizedAns = extractRawFibAnswerString(fib);
+    if (normalizedAns) {
+      fib.answer = normalizedAns;
+      changed = true;
+    }
+  }
+  for (const aliasKey of ["expected", "solution", "correctAnswer", "risposta", "soluzione"]) {
+    if (aliasKey in fib) {
+      delete fib[aliasKey];
+      changed = true;
+    }
+  }
 
   if (/\[([^\]]+)\]/.test(fib.sentence)) {
     const match = fib.sentence.match(/\[([^\]]+)\]/);
@@ -531,10 +634,11 @@ export function normalizeExamStructure<T = any>(examObj: T): T {
               id: oe.id || `ref_${lastSec.reflectionQuestions.length + 1}`,
               question: oe.question,
               ...(oe.criteria || oe.criteri ? { criteria: oe.criteria || oe.criteri } : {}),
-              ...(!isNaN(w) && w > 0 && w !== 1 ? { weight: w } : {}),
+              ...(Number.isFinite(w) && w > 0 && w !== 1 ? { weight: w } : {}),
             });
           }
         }
+        delete obj.openEnded;
       }
     }
   } else if (Array.isArray(obj.reflectionQuestions) && obj.reflectionQuestions.length > 0) {
@@ -547,7 +651,7 @@ export function normalizeExamStructure<T = any>(examObj: T): T {
           id: rq.id || `q_ref_${obj.openEnded.length + 1}`,
           question: rq.question,
           ...(rq.criteria || rq.criteri ? { criteria: rq.criteria || rq.criteri } : {}),
-          ...(!isNaN(w) && w > 0 && w !== 1 ? { weight: w } : {}),
+          ...(Number.isFinite(w) && w > 0 && w !== 1 ? { weight: w } : {}),
         });
       }
     }
@@ -587,20 +691,18 @@ export function normalizeExamStructure<T = any>(examObj: T): T {
         obj.images[candidate] = obj.images[origId];
       }
 
-      if (isMc && item.correctIndex !== undefined && item.correctIndex !== null) {
-        const optsLen = Array.isArray(item.options) ? item.options.length : 0;
-        if (typeof item.correctIndex === "string") {
-          const trimmed = item.correctIndex.trim();
-          if (/^\d+$/.test(trimmed)) {
-            const parsed = Number(trimmed);
-            if (optsLen === 0 || parsed < optsLen) {
-              item.correctIndex = parsed;
-            }
-          } else if (/^[a-z]$/i.test(trimmed)) {
-            const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
-            if (letterIdx >= 0 && (optsLen === 0 || letterIdx < optsLen)) {
-              item.correctIndex = letterIdx;
-            }
+      if (isMc) {
+        const opts = Array.isArray(item.options) ? item.options.map((o: any) => String(o ?? "")) : [];
+        const rawKey =
+          item.correctIndex ??
+          item.correctAnswer ??
+          item.answer ??
+          item.solution ??
+          item.correctOption;
+        if (rawKey !== undefined && rawKey !== null) {
+          const resolved = resolveMcCorrectIndex(rawKey, opts);
+          if (resolved.resolved) {
+            item.correctIndex = resolved.index;
           }
         }
       }
@@ -761,9 +863,9 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       const correctedFib = Array.isArray(rawFib)
         ? rawFib.map((item: any, fIdx: number) => {
             const fibObj = {
-              id: item.id || `fib_${sIdx + 1}_${fIdx + 1}`,
+              id: item?.id !== undefined && item?.id !== null && String(item.id).trim() !== "" ? item.id : `fib_${sIdx + 1}_${fIdx + 1}`,
               sentence: String(item.sentence || item.frase || item.testo || item.prompt || ""),
-              answer: String(item.answer || item.risposta || item.soluzione || ""),
+              answer: extractRawFibAnswerString(item),
               ...preservedDidacticFields(item),
             };
             sanitizeFibQuestion(fibObj);
@@ -775,7 +877,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       const rawRef = sec.reflectionQuestions || sec.riflessione || sec.domandeRiflessione || sec.domande || sec.domandeAperte || [];
       const correctedRef = Array.isArray(rawRef)
         ? rawRef.map((item: any, rIdx: number) => ({
-            id: item.id || `ref_${sIdx + 1}_${rIdx + 1}`,
+            id: typeof item === "object" && item?.id !== undefined && item?.id !== null && String(item.id).trim() !== "" ? item.id : `ref_${sIdx + 1}_${rIdx + 1}`,
             question: typeof item === "string" ? item : (item.question || item.domanda || item.testo || item.prompt || ""),
             ...preservedDidacticFields(item),
           }))
@@ -788,31 +890,29 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
             const opts = Array.isArray(item.options || item.opzioni)
               ? (item.options || item.opzioni).map((o: any) => String(o || ""))
               : [];
-            const rawCorrectVal = item.correctIndex ?? item.rispostaCorretta ?? item.indiceCorretta;
-            let parsedCIdx = NaN;
-            if (typeof rawCorrectVal === "number" && Number.isInteger(rawCorrectVal)) {
-              parsedCIdx = rawCorrectVal;
-            } else if (typeof rawCorrectVal === "string") {
-              const trimmed = rawCorrectVal.trim();
-              if (/^\d+$/.test(trimmed)) {
-                parsedCIdx = Number(trimmed);
-              } else if (/^[a-z]$/i.test(trimmed)) {
-                parsedCIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
-              }
-            }
-            const validCIdx =
-              Number.isInteger(parsedCIdx) &&
-              parsedCIdx >= 0 &&
-              (opts.length === 0 || parsedCIdx < opts.length);
-            const cIdx = validCIdx ? parsedCIdx : 0;
+            const rawCorrectVal =
+              item.correctIndex ??
+              item.rispostaCorretta ??
+              item.indiceCorretta ??
+              item.correctAnswer ??
+              item.answer ??
+              item.solution ??
+              item.correctOption ??
+              item.corretta ??
+              item.correct ??
+              item.esatta ??
+              item.soluzione ??
+              item.isCorrect;
+            const resolvedMc = resolveMcCorrectIndex(rawCorrectVal, opts);
+            const cIdx = resolvedMc.resolved ? resolvedMc.index : 0;
             const qLabel = String(item.question || item.domanda || `Domanda ${mIdx + 1}`);
-            if (!validCIdx) {
+            if (!resolvedMc.resolved) {
               wbMissingKeyWarnings.push(
                 `Sezione "${secTitle}", domanda "${qLabel.slice(0, 45)}": chiave corretta mancante o non valida, impostata temporaneamente su opzione A (indice 0).`
               );
             }
             return {
-              id: item.id || `q_mc_${sIdx + 1}_${mIdx + 1}`,
+              id: item?.id !== undefined && item?.id !== null && String(item.id).trim() !== "" ? item.id : `q_mc_${sIdx + 1}_${mIdx + 1}`,
               question: qLabel,
               options: opts.length > 0 ? opts : ["Opzione A", "Opzione B", "Opzione C", "Opzione D"],
               correctIndex: cIdx,
@@ -832,19 +932,68 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       });
     });
 
+    const normalizedRootMc = Array.isArray(parsed.multipleChoice)
+      ? parsed.multipleChoice.map((item: any, mIdx: number) => {
+          const opts = Array.isArray(item?.options || item?.opzioni)
+            ? (item.options || item.opzioni).map((o: any) => String(o || ""))
+            : [];
+          const rawCorrectVal =
+            item?.correctIndex ??
+            item?.rispostaCorretta ??
+            item?.indiceCorretta ??
+            item?.correctAnswer ??
+            item?.answer ??
+            item?.solution ??
+            item?.correctOption ??
+            item?.corretta ??
+            item?.correct ??
+            item?.esatta ??
+            item?.soluzione ??
+            item?.isCorrect;
+          const resolvedMc = resolveMcCorrectIndex(rawCorrectVal, opts);
+          const qLabel = String(item?.question || item?.domanda || `Domanda ${mIdx + 1}`);
+          if (!resolvedMc.resolved) {
+            wbMissingKeyWarnings.push(
+              `Domanda radice "${qLabel.slice(0, 45)}": chiave corretta mancante o non valida, impostata temporaneamente su opzione A (indice 0).`
+            );
+          }
+          return {
+            id: item?.id !== undefined && item?.id !== null && String(item.id).trim() !== "" ? item.id : `q_mc_root_${mIdx + 1}`,
+            question: qLabel,
+            options: opts.length > 0 ? opts : ["Opzione A", "Opzione B", "Opzione C", "Opzione D"],
+            correctIndex: resolvedMc.resolved ? resolvedMc.index : 0,
+            ...preservedDidacticFields(item),
+          };
+        })
+      : undefined;
+
+    const normalizedRootFib = Array.isArray(parsed.fillInTheBlank)
+      ? parsed.fillInTheBlank.map((item: any, fIdx: number) => {
+          const fibObj = {
+            id: item?.id !== undefined && item?.id !== null && String(item.id).trim() !== "" ? item.id : `fib_root_${fIdx + 1}`,
+            sentence: String(item?.sentence || item?.frase || item?.testo || item?.prompt || ""),
+            answer: extractRawFibAnswerString(item),
+            ...preservedDidacticFields(item),
+          };
+          sanitizeFibQuestion(fibObj);
+          return fibObj;
+        })
+      : undefined;
+
     changes.push(`Riorganizzate ${correctedSections.length} sezioni didattiche con 'sintesi', 'fillInTheBlank', 'multipleChoice' e 'reflectionQuestions'.`);
     if (wbMissingKeyWarnings.length > 0) {
       changes.push(...wbMissingKeyWarnings.map((w) => `⚠️ ${w}`));
     }
 
+    const sanitizedImages = sanitizeImagesMap(parsed.images);
     const finalWorkbook: WorkbookExam = {
       title,
       sections: correctedSections,
       answerKey: parsed.answerKey || parsed.criteri || undefined,
-      ...(parsed.multipleChoice && Array.isArray(parsed.multipleChoice) ? { multipleChoice: parsed.multipleChoice } : {}),
-      ...(parsed.fillInTheBlank && Array.isArray(parsed.fillInTheBlank) ? { fillInTheBlank: parsed.fillInTheBlank } : {}),
+      ...(normalizedRootMc && normalizedRootMc.length > 0 ? { multipleChoice: normalizedRootMc } : {}),
+      ...(normalizedRootFib && normalizedRootFib.length > 0 ? { fillInTheBlank: normalizedRootFib } : {}),
       ...(parsed.reflectionQuestions && Array.isArray(parsed.reflectionQuestions) ? { reflectionQuestions: parsed.reflectionQuestions } : {}),
-      ...(parsed.images ? { images: parsed.images } : {}),
+      ...(sanitizedImages ? { images: sanitizedImages } : {}),
     };
     normalizeExamStructure(finalWorkbook);
 
@@ -993,7 +1142,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       // Determine correctIndex
       let correctIdx = 0;
       let hasResolvedKey = false;
-      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
+      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.answer ?? q.solution ?? q.correctOption ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
 
       if (rawCorrect === false || (typeof rawCorrect === "string" && ["falso", "false", "f", "no"].includes(rawCorrect.toLowerCase().trim()))) {
         const falseIdx = optionsArray.findIndex((o) => /^(falso|false|f|no)$/i.test(o.trim()));
@@ -1026,7 +1175,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       }
 
       mcList.push({
-        id: q.id || `q_mc_${mcList.length + 1}`,
+        id: q.id !== undefined && q.id !== null && String(q.id).trim() !== "" ? q.id : `q_mc_${mcList.length + 1}`,
         question: questionText,
         options: optionsArray,
         correctIndex: correctIdx,
@@ -1045,53 +1194,13 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
           )
         : ["Vero", "Falso"];
 
-      // Determine correctIndex
-      let correctIdx = 0;
-      let hasResolvedKey = false;
-      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
-
-      if (typeof rawCorrect === "number" && Number.isInteger(rawCorrect)) {
-        if (rawCorrect >= 0 && rawCorrect < optionsArray.length) {
-          correctIdx = rawCorrect;
-          hasResolvedKey = true;
-        } else if (rawCorrect === optionsArray.length && rawCorrect > 0) {
-          // 1-based index adjustment
-          correctIdx = rawCorrect - 1;
-          hasResolvedKey = true;
-          changes.push(`Convertito indice risposta 1-based (${rawCorrect}) in indice 0-based (${correctIdx}) per domanda '${questionText.slice(0, 30)}...'`);
-        }
-      } else if (typeof rawCorrect === "string" && rawCorrect.trim() !== "") {
-        const trimmed = rawCorrect.trim();
-        // Check letters A, B, C, D...
-        if (/^[A-E]$/i.test(trimmed)) {
-          const letterIdx = trimmed.toUpperCase().charCodeAt(0) - 65;
-          if (letterIdx < optionsArray.length) {
-            correctIdx = letterIdx;
-            hasResolvedKey = true;
-          }
-        } else {
-          // Check matching option text
-          const foundIdx = optionsArray.findIndex((opt) => opt.trim().toLowerCase() === trimmed.toLowerCase());
-          if (foundIdx >= 0) {
-            correctIdx = foundIdx;
-            hasResolvedKey = true;
-          } else if (/^\d+$/.test(trimmed)) {
-            const num = parseInt(trimmed, 10);
-            if (num >= 0 && num < optionsArray.length) {
-              correctIdx = num;
-              hasResolvedKey = true;
-            } else if (num === optionsArray.length && num > 0) {
-              correctIdx = num - 1;
-              hasResolvedKey = true;
-            }
-          }
-        }
-      } else if (rawCorrect === false) {
-        correctIdx = 1;
-        hasResolvedKey = true;
-      } else if (rawCorrect === true) {
-        correctIdx = 0;
-        hasResolvedKey = true;
+      // Determine correctIndex (exact option text matched before A..Z shorthand)
+      const rawCorrect = q.correctIndex ?? q.rispostaCorretta ?? q.correctAnswer ?? q.answer ?? q.solution ?? q.correctOption ?? q.corretta ?? q.correct ?? q.esatta ?? q.soluzione ?? q.isCorrect;
+      const resolvedQuizMc = resolveMcCorrectIndex(rawCorrect, optionsArray);
+      const correctIdx = resolvedQuizMc.resolved ? resolvedQuizMc.index : 0;
+      const hasResolvedKey = resolvedQuizMc.resolved;
+      if (resolvedQuizMc.convertedFromOneBased) {
+        changes.push(`Convertito indice risposta 1-based (${rawCorrect}) in indice 0-based (${correctIdx}) per domanda '${questionText.slice(0, 30)}...'`);
       }
 
       if (!hasResolvedKey) {
@@ -1101,7 +1210,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
       }
 
       mcList.push({
-        id: q.id || `q_mc_${mcList.length + 1}`,
+        id: q.id !== undefined && q.id !== null && String(q.id).trim() !== "" ? q.id : `q_mc_${mcList.length + 1}`,
         question: questionText,
         options: optionsArray,
         correctIndex: correctIdx,
@@ -1115,7 +1224,7 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     if (isExplicitOpen || !rawOptions || !Array.isArray(rawOptions) || rawOptions.length < 2) {
       openCount++;
       openList.push({
-        id: q.id || `q_open_${openList.length + 1}`,
+        id: q.id !== undefined && q.id !== null && String(q.id).trim() !== "" ? q.id : `q_open_${openList.length + 1}`,
         question: questionText,
         ...preservedDidacticFields(q),
       });
@@ -1191,12 +1300,14 @@ export function autoCorrectExamJSON(rawText: string, defaultSubject = ""): ExamC
     changes.push(...quizMissingKeyWarnings.map((w) => `⚠️ ${w}`));
   }
 
+  const sanitizedQuizImages = sanitizeImagesMap(parsed?.images);
   const finalQuiz: QuizExam = {
     title,
     multipleChoice: mcList.length > 0 ? mcList : undefined,
     openEnded: openList.length > 0 ? openList : undefined,
-    ...(parsed?.images ? { images: parsed.images } : {}),
+    ...(sanitizedQuizImages ? { images: sanitizedQuizImages } : {}),
   };
+  normalizeExamStructure(finalQuiz);
 
   const formattedJson = JSON.stringify(finalQuiz, null, 2);
 
